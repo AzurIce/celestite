@@ -6,20 +6,25 @@
   "scripts": {
     "start": "vite",
     "dev": "vite",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "build": "vite build",
     "serve": "vite preview",
     "tauri": "tauri"
   },
   "license": "MIT",
   "dependencies": {
-    "solid-js": "^1.9.3",
+    "@kobalte/core": "^0.13.14",
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "lucide-solid": "^1.49.0",
+    "solid-js": "^1.9.3"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^26.6.3",
     "typescript": "~6.0.3",
+    "unocss": "^66.10.5",
     "vite": "^8.0.16",
-    "vite-plugin-solid": "^2.11.12",
-    "@tauri-apps/cli": "^2"
+    "vite-plugin-solid": "^2.11.12"
   }
 }

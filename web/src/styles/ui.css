@@ -1,0 +1,84 @@
+/* Component base styles live in UnoCSS shortcuts; keep state and slot selectors here. */
+.ui-button[data-size="sm"] {
+  --uno: "h-control-sm px-2 text-ui-sm";
+}
+
+.ui-button[data-variant="primary"] {
+  --uno: "border-transparent bg-accent text-accent-foreground";
+}
+
+.ui-button[data-variant="primary"]:hover {
+  --uno: "bg-accent-hover";
+}
+
+.ui-button[data-variant="ghost"] {
+  --uno: "border-transparent bg-transparent";
+}
+
+.ui-button[data-variant="ghost"]:hover,
+.ui-button[data-expanded] {
+  --uno: "bg-muted";
+}
+
+.ui-button[data-variant="danger"] {
+  --uno: "text-danger";
+}
+
+.ui-button:disabled,
+.ui-button[data-disabled] {
+  --uno: "opacity-45 pointer-events-none";
+}
+
+/* Override button padding at both sizes while keeping a square icon target. */
+.ui-button.ui-icon-button {
+  --uno: "p-0";
+}
+
+.ui-button.ui-icon-button[data-size="sm"] {
+  --uno: "w-control-sm";
+}
+
+.ui-dialog {
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+}
+
+.ui-dialog > h2 {
+  --uno: "pr-6 text-ui-heading font-semibold";
+}
+
+.ui-dialog > p {
+  --uno: "mt-2 text-secondary";
+}
+
+.ui-tooltip,
+.ui-menu {
+  transform-origin: var(--kb-popper-content-transform-origin);
+}
+
+.ui-tooltip {
+  max-width: min(280px, calc(100vw - 16px));
+}
+
+.ui-menu {
+  max-width: calc(100vw - 16px);
+  max-height: var(--kb-popper-content-available-height, calc(100dvh - 16px));
+}
+
+.ui-menu-item[data-highlighted] {
+  --uno: "bg-muted";
+}
+
+.ui-menu-item[data-disabled] {
+  --uno: "opacity-45";
+}
+
+.ui-input[data-invalid] {
+  --uno: "border-danger";
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-button {
+    --uno: "transition-none";
+  }
+}
