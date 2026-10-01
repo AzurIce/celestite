@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import solid from "vite-plugin-solid";
+import solid from "@solidjs/vite-plugin";
 import UnoCSS from "unocss/vite";
 import { fileURLToPath, URL } from "node:url";
 import process from "node:process";

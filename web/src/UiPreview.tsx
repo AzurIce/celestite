@@ -7,7 +7,7 @@ import {
   Moon,
   Plus,
   Sun,
-} from "lucide-solid";
+} from "@/components/icons";
 import {
   Button,
   IconButton,
@@ -158,7 +158,7 @@ function UiPreview() {
         <ContextMenu>
           <ContextMenuTrigger
             as="div"
-            tabIndex={0}
+            tabindex={0}
             aria-label="笔记，右键或按 Shift+F10 打开操作菜单"
             class="flex min-h-24 items-center justify-center gap-2 rounded-ui border border-dashed border-border bg-background p-4"
           >

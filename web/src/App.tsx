@@ -1,11 +1,12 @@
-import { lazy } from "solid-js";
+import { lazy, Loading } from "solid-js";
 
 function App() {
-  if (import.meta.env.DEV && window.location.pathname === "/ui") {
-    const UiPreview = lazy(() => import("./UiPreview"));
-    return <UiPreview />;
-  }
-  return <main />;
+  const UiPreview = lazy(() => import("./UiPreview"));
+  return (
+    <Loading fallback={<main>加载组件预览…</main>}>
+      <UiPreview />
+    </Loading>
+  );
 }
 
 export default App;

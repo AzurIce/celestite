@@ -5,7 +5,7 @@ import type {
   DropdownMenuSeparatorProps as PrimitiveSeparatorProps,
 } from "@kobalte/core/dropdown-menu";
 import type { PolymorphicProps } from "@kobalte/core/polymorphic";
-import { splitProps } from "solid-js";
+import { omit } from "solid-js";
 import { cx } from "./utils";
 
 export const DropdownMenu = MenuPrimitive;
@@ -21,27 +21,27 @@ export type DropdownMenuSeparatorProps = PolymorphicProps<
 >;
 
 export function DropdownMenuContent(props: DropdownMenuContentProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
     <MenuPrimitive.Portal>
-      <MenuPrimitive.Content {...rest} class={cx("ui-menu", local.class)} />
+      <MenuPrimitive.Content {...rest} class={cx("ui-menu", props.class)} />
     </MenuPrimitive.Portal>
   );
 }
 
 export function DropdownMenuItem(props: DropdownMenuItemProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
-    <MenuPrimitive.Item {...rest} class={cx("ui-menu-item", local.class)} />
+    <MenuPrimitive.Item {...rest} class={cx("ui-menu-item", props.class)} />
   );
 }
 
 export function DropdownMenuSeparator(props: DropdownMenuSeparatorProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
     <MenuPrimitive.Separator
       {...rest}
-      class={cx("ui-menu-separator", local.class)}
+      class={cx("ui-menu-separator", props.class)}
     />
   );
 }

@@ -5,7 +5,7 @@ import type {
   ContextMenuSeparatorProps as PrimitiveSeparatorProps,
 } from "@kobalte/core/context-menu";
 import type { PolymorphicProps } from "@kobalte/core/polymorphic";
-import { splitProps } from "solid-js";
+import { omit } from "solid-js";
 import { cx } from "./utils";
 
 export const ContextMenu = MenuPrimitive;
@@ -21,27 +21,27 @@ export type ContextMenuSeparatorProps = PolymorphicProps<
 >;
 
 export function ContextMenuContent(props: ContextMenuContentProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
     <MenuPrimitive.Portal>
-      <MenuPrimitive.Content {...rest} class={cx("ui-menu", local.class)} />
+      <MenuPrimitive.Content {...rest} class={cx("ui-menu", props.class)} />
     </MenuPrimitive.Portal>
   );
 }
 
 export function ContextMenuItem(props: ContextMenuItemProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
-    <MenuPrimitive.Item {...rest} class={cx("ui-menu-item", local.class)} />
+    <MenuPrimitive.Item {...rest} class={cx("ui-menu-item", props.class)} />
   );
 }
 
 export function ContextMenuSeparator(props: ContextMenuSeparatorProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
     <MenuPrimitive.Separator
       {...rest}
-      class={cx("ui-menu-separator", local.class)}
+      class={cx("ui-menu-separator", props.class)}
     />
   );
 }

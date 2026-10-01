@@ -7,7 +7,7 @@ import type {
   TextFieldErrorMessageProps as PrimitiveErrorMessageProps,
 } from "@kobalte/core/text-field";
 import type { PolymorphicProps } from "@kobalte/core/polymorphic";
-import { splitProps } from "solid-js";
+import { omit } from "solid-js";
 import { cx } from "./utils";
 
 export type TextFieldProps = PolymorphicProps<"div", PrimitiveRootProps>;
@@ -29,38 +29,38 @@ export type TextFieldErrorMessageProps = PolymorphicProps<
 >;
 
 export function TextFieldLabel(props: TextFieldLabelProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
-    <FieldPrimitive.Label {...rest} class={cx("ui-field-label", local.class)} />
+    <FieldPrimitive.Label {...rest} class={cx("ui-field-label", props.class)} />
   );
 }
 
 export function TextFieldDescription(props: TextFieldDescriptionProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
     <FieldPrimitive.Description
       {...rest}
-      class={cx("ui-field-description", local.class)}
+      class={cx("ui-field-description", props.class)}
     />
   );
 }
 
 export function TextFieldErrorMessage(props: TextFieldErrorMessageProps) {
-  const [local, rest] = splitProps(props, ["class"]);
+  const rest = omit(props, "class");
   return (
     <FieldPrimitive.ErrorMessage
       {...rest}
-      class={cx("ui-field-error", local.class)}
+      class={cx("ui-field-error", props.class)}
     />
   );
 }
 
 export function TextField(props: TextFieldProps) {
-  const [local, rest] = splitProps(props, ["class"]);
-  return <FieldPrimitive {...rest} class={cx("ui-text-field", local.class)} />;
+  const rest = omit(props, "class");
+  return <FieldPrimitive {...rest} class={cx("ui-text-field", props.class)} />;
 }
 
 export function TextFieldInput(props: TextFieldInputProps) {
-  const [local, rest] = splitProps(props, ["class"]);
-  return <FieldPrimitive.Input {...rest} class={cx("ui-input", local.class)} />;
+  const rest = omit(props, "class");
+  return <FieldPrimitive.Input {...rest} class={cx("ui-input", props.class)} />;
 }

@@ -1,0 +1,148 @@
+diff --git a/node_modules/@kobalte/core/.bun-tag-60fdca3269d91ab9 b/.bun-tag-60fdca3269d91ab9
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/dismissable-layer/DXLD03yU.js b/dist/dismissable-layer/DXLD03yU.js
+index fde40e74ee904abceeb2c1daa3ce86f8dd9e38c8..2fbc6eb8356862414addb3e5609ebba40f5238e1 100644
+--- a/dist/dismissable-layer/DXLD03yU.js
++++ b/dist/dismissable-layer/DXLD03yU.js
+@@ -1,6 +1,6 @@
+ import { n as layerStack } from "../layer-stack/DUp9FXTP.js";
+ import { createComponent, insert, ref, spread, template } from "@solidjs/web";
+-import { createContext, createEffect, createMemo, createSignal, omit, onSettled, useContext } from "solid-js";
++import { createContext, createEffect, createMemo, createSignal, omit, untrack, useContext } from "solid-js";
+ import { interactOutside } from "@solid-primitives/interaction";
+ import { createShortcut } from "@solid-primitives/keyboard";
+ //#region src/dismissable-layer/dismissable-layer-context.tsx
+@@ -54,22 +54,21 @@ function DismissableLayer(props) {
+ 			props.onDismiss();
+ 		}
+ 	}, { preventDefault: false });
+-	onSettled(() => {
+-		if (!ref$1()) return;
++	createEffect(ref$1, (element) => {
++		if (!element) return;
+ 		layerStack.addLayer({
+-			node: ref$1(),
+-			isPointerBlocking: isPointerBlocking(),
++			node: element,
++			isPointerBlocking: untrack(isPointerBlocking),
+ 			dismiss: props.onDismiss
+ 		});
+-		const unregisterFromParentLayer = parentContext?.registerNestedLayer(ref$1());
++		const unregisterFromParentLayer = parentContext?.registerNestedLayer(element);
+ 		layerStack.assignPointerEventToLayers();
+-		layerStack.disableBodyPointerEvents(ref$1());
++		layerStack.disableBodyPointerEvents(element);
+ 		return () => {
+-			if (!ref$1()) return;
+-			layerStack.removeLayer(ref$1());
++			layerStack.removeLayer(element);
+ 			unregisterFromParentLayer?.();
+ 			layerStack.assignPointerEventToLayers();
+-			layerStack.restoreBodyPointerEvents(ref$1());
++			layerStack.restoreBodyPointerEvents(element);
+ 		};
+ 	});
+ 	createEffect(() => ({
+diff --git a/dist/dismissable-layer/RyRdwdaj.jsx b/dist/dismissable-layer/RyRdwdaj.jsx
+index 725bd171d1c95781d497718917d1dc3ebd363276..36c330fb669094af8b686136863de3f68989d1ab 100644
+--- a/dist/dismissable-layer/RyRdwdaj.jsx
++++ b/dist/dismissable-layer/RyRdwdaj.jsx
+@@ -1,5 +1,5 @@
+ import { n as layerStack } from "../layer-stack/DUp9FXTP.jsx";
+-import { createContext, createEffect, createMemo, createSignal, omit, onSettled, useContext } from "solid-js";
++import { createContext, createEffect, createMemo, createSignal, omit, untrack, useContext } from "solid-js";
+ import { interactOutside } from "@solid-primitives/interaction";
+ import { createShortcut } from "@solid-primitives/keyboard";
+ //#region src/dismissable-layer/dismissable-layer-context.tsx
+@@ -52,22 +52,21 @@ function DismissableLayer(props) {
+ 			props.onDismiss();
+ 		}
+ 	}, { preventDefault: false });
+-	onSettled(() => {
+-		if (!ref()) return;
++	createEffect(ref, (element) => {
++		if (!element) return;
+ 		layerStack.addLayer({
+-			node: ref(),
+-			isPointerBlocking: isPointerBlocking(),
++			node: element,
++			isPointerBlocking: untrack(isPointerBlocking),
+ 			dismiss: props.onDismiss
+ 		});
+-		const unregisterFromParentLayer = parentContext?.registerNestedLayer(ref());
++		const unregisterFromParentLayer = parentContext?.registerNestedLayer(element);
+ 		layerStack.assignPointerEventToLayers();
+-		layerStack.disableBodyPointerEvents(ref());
++		layerStack.disableBodyPointerEvents(element);
+ 		return () => {
+-			if (!ref()) return;
+-			layerStack.removeLayer(ref());
++			layerStack.removeLayer(element);
+ 			unregisterFromParentLayer?.();
+ 			layerStack.assignPointerEventToLayers();
+-			layerStack.restoreBodyPointerEvents(ref());
++			layerStack.restoreBodyPointerEvents(element);
+ 		};
+ 	});
+ 	createEffect(() => ({
+diff --git a/dist/text-field/G9saLSdu.js b/dist/text-field/G9saLSdu.js
+index a7e1f89c14a6187dc0bbcecb3c2c2c76a10c48ba..1dc869506d01a2038a98aebf89536977379d739c 100644
+--- a/dist/text-field/G9saLSdu.js
++++ b/dist/text-field/G9saLSdu.js
+@@ -6,7 +6,7 @@ import { n as createFormControlField, t as FORM_CONTROL_FIELD_PROP_NAMES } from
+ import { t as FormControlErrorMessage } from "../form-control-error-message/D9jUVumc.js";
+ import { t as FormControlLabel } from "../form-control-label/DqQ24y8m.js";
+ import { createComponent, mergeProps } from "@solidjs/web";
+-import { createContext, createEffect, createSignal, createUniqueId, merge, omit, untrack, useContext } from "solid-js";
++import { createContext, createEffect, createSignal, flush, createUniqueId, merge, omit, untrack, useContext } from "solid-js";
+ import { access } from "@solid-primitives/utils";
+ import { composeEventHandlers } from "@kobalte/utils";
+ import { createFormResetListener } from "@solid-primitives/form";
+@@ -85,7 +85,7 @@ function TextFieldRoot(props) {
+ 	const defaultId = `textfield-${createUniqueId()}`;
+ 	const mergedProps = merge({ id: defaultId }, props);
+ 	const others = omit(mergedProps, "ref", "value", "defaultValue", "onChange", ...FORM_CONTROL_PROP_NAMES);
+-	const initialValue = mergedProps.value;
++	const initialValue = untrack(() => mergedProps.value);
+ 	const [value, setValue] = (0, primitives_exports.createControllableSignal)({
+ 		value: () => initialValue === void 0 ? void 0 : mergedProps.value ?? "",
+ 		defaultValue: () => mergedProps.defaultValue,
+@@ -97,6 +97,7 @@ function TextFieldRoot(props) {
+ 		if (formControlContext.isReadOnly() || formControlContext.isDisabled()) return;
+ 		const target = e.target;
+ 		setValue(target.value);
++		flush();
+ 		target.value = value() ?? "";
+ 	};
+ 	const context = {
+diff --git a/dist/text-field/YCMSE_vD.jsx b/dist/text-field/YCMSE_vD.jsx
+index d76f69baf915610d414e6a6730aef2a00041b3d9..921f9a0fb04180d1eeb3fd7266fdf61f4679e9ac 100644
+--- a/dist/text-field/YCMSE_vD.jsx
++++ b/dist/text-field/YCMSE_vD.jsx
+@@ -5,7 +5,7 @@ import { a as createFormControl, i as FORM_CONTROL_PROP_NAMES, n as FormControlC
+ import { n as createFormControlField, t as FORM_CONTROL_FIELD_PROP_NAMES } from "../create-form-control-field/5-BHfdGI.jsx";
+ import { t as FormControlErrorMessage } from "../form-control-error-message/B1cNIdVV.jsx";
+ import { t as FormControlLabel } from "../form-control-label/Czoesrj9.jsx";
+-import { createContext, createEffect, createSignal, createUniqueId, merge, omit, untrack, useContext } from "solid-js";
++import { createContext, createEffect, createSignal, flush, createUniqueId, merge, omit, untrack, useContext } from "solid-js";
+ import { access } from "@solid-primitives/utils";
+ import { composeEventHandlers } from "@kobalte/utils";
+ import { createFormResetListener } from "@solid-primitives/form";
+@@ -40,7 +40,7 @@ function TextFieldRoot(props) {
+ 	const defaultId = `textfield-${createUniqueId()}`;
+ 	const mergedProps = merge({ id: defaultId }, props);
+ 	const others = omit(mergedProps, "ref", "value", "defaultValue", "onChange", ...FORM_CONTROL_PROP_NAMES);
+-	const initialValue = mergedProps.value;
++	const initialValue = untrack(() => mergedProps.value);
+ 	const [value, setValue] = (0, primitives_exports.createControllableSignal)({
+ 		value: () => initialValue === void 0 ? void 0 : mergedProps.value ?? "",
+ 		defaultValue: () => mergedProps.defaultValue,
+@@ -52,6 +52,7 @@ function TextFieldRoot(props) {
+ 		if (formControlContext.isReadOnly() || formControlContext.isDisabled()) return;
+ 		const target = e.target;
+ 		setValue(target.value);
++		flush();
+ 		target.value = value() ?? "";
+ 	};
+ 	const context = {

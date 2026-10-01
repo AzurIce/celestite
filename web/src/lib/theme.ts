@@ -15,8 +15,7 @@ function readTheme(): ThemeMode {
 const [theme, updateTheme] = createSignal<ThemeMode>(readTheme());
 export { theme };
 
-function applyTheme() {
-  const mode = theme();
+function applyTheme(mode: ThemeMode) {
   document.documentElement.dataset.theme =
     mode === "system"
       ? window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -27,7 +26,8 @@ function applyTheme() {
 
 export function setTheme(mode: ThemeMode) {
   updateTheme(mode);
-  applyTheme();
+  // Solid 2 的 signal 写入在微任务提交，直接使用传入值更新 DOM。
+  applyTheme(mode);
   try {
     // TODO: 这个在 tauri 下肯定是要保存到编辑器的持久化设置里而不是浏览器 localStorage 里的，结合后面的后端抽象应该要做一些重构与设计
     localStorage.setItem(storageKey, mode);
@@ -37,10 +37,10 @@ export function setTheme(mode: ThemeMode) {
 }
 
 export function initializeTheme() {
-  applyTheme();
+  applyTheme(theme());
   const media = window.matchMedia("(prefers-color-scheme: dark)");
   const onChange = () => {
-    if (theme() === "system") applyTheme();
+    if (theme() === "system") applyTheme("system");
   };
   media.addEventListener("change", onChange);
   return () => media.removeEventListener("change", onChange);
