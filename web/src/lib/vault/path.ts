@@ -14,9 +14,16 @@ export function vaultPath(value: string): VaultPath {
     value.includes("\\") ||
     value.includes("\0") ||
     /^[a-zA-Z]:/.test(value) ||
-    (value !== "" && value.split("/").some((part) => part === "" || part === "." || part === ".."))
+    (value !== "" &&
+      value
+        .split("/")
+        .some((part) => part === "" || part === "." || part === ".."))
   ) {
-    throw new VaultError("InvalidPath", "Expected a Vault-relative path", value);
+    throw new VaultError(
+      "InvalidPath",
+      "Expected a Vault-relative path",
+      value,
+    );
   }
   return value as VaultPath;
 }
@@ -28,10 +35,17 @@ export function childPath(parent: VaultPath, name: string): VaultPath {
   return vaultPath(parent ? `${parent}/${name}` : name);
 }
 
-export function splitPath(path: VaultPath): { parent: VaultPath; name: string } {
+export function splitPath(path: VaultPath): {
+  parent: VaultPath;
+  name: string;
+} {
   vaultPath(path);
   if (path === ROOT_PATH) {
-    throw new VaultError("InvalidPath", "This operation requires a non-root path", path);
+    throw new VaultError(
+      "InvalidPath",
+      "This operation requires a non-root path",
+      path,
+    );
   }
   const separator = path.lastIndexOf("/");
   return {

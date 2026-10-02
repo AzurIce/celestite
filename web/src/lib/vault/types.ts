@@ -37,7 +37,11 @@ export interface VaultBackend {
    * 保存调用时的完整内容，不隐式创建父目录。
    * 已有文件在提交前保留旧内容；成功不等于断电持久性保证。
    */
-  writeFile(path: VaultPath, data: Uint8Array, options: WriteFileOptions): Promise<void>;
+  writeFile(
+    path: VaultPath,
+    data: Uint8Array,
+    options: WriteFileOptions,
+  ): Promise<void>;
   /** 默认只创建一级；recursive 可以部分完成，不提供回滚。 */
   mkdir(path: VaultPath, options?: { recursive?: boolean }): Promise<void>;
   /** 不允许删除 Vault 根；非空目录需要 recursive。 */

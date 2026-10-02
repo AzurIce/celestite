@@ -1,10 +1,13 @@
 import { lazy, Loading } from "solid-js";
 
 function App() {
-  const UiPreview = lazy(() => import("./UiPreview"));
+  const Page =
+    import.meta.env.DEV && window.location.pathname === "/ui"
+      ? lazy(() => import("./UiPreview"))
+      : lazy(() => import("./VaultWorkspace"));
   return (
-    <Loading fallback={<main>加载组件预览…</main>}>
-      <UiPreview />
+    <Loading fallback={<main>正在加载…</main>}>
+      <Page />
     </Loading>
   );
 }

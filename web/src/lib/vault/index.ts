@@ -1,4 +1,10 @@
-export type { ChangeHint, Entry, EntryStat, VaultBackend, WriteFileOptions } from "./types";
+export type {
+  ChangeHint,
+  Entry,
+  EntryStat,
+  VaultBackend,
+  WriteFileOptions,
+} from "./types";
 export type { RenamePhase, VaultErrorCode } from "./errors";
 export { VaultError, VaultRenameError } from "./errors";
 export type { VaultPath } from "./path";

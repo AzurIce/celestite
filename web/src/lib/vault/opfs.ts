@@ -1,7 +1,13 @@
 import { isDomError, opfsError, VaultError, VaultRenameError } from "./errors";
 import { childPath, ROOT_PATH, splitPath, vaultPath } from "./path";
 import type { VaultPath } from "./path";
-import type { ChangeHint, Entry, EntryStat, VaultBackend, WriteFileOptions } from "./types";
+import type {
+  ChangeHint,
+  Entry,
+  EntryStat,
+  VaultBackend,
+  WriteFileOptions,
+} from "./types";
 
 type OpfsEntry = FileSystemFileHandle | FileSystemDirectoryHandle;
 
@@ -13,7 +19,11 @@ type OpfsEntry = FileSystemFileHandle | FileSystemDirectoryHandle;
 export async function openOpfsVault(id = "default"): Promise<VaultBackend> {
   vaultPath(id);
   if (id === "" || id.includes("/")) {
-    throw new VaultError("InvalidPath", "Vault id must be a single directory name", id);
+    throw new VaultError(
+      "InvalidPath",
+      "Vault id must be a single directory name",
+      id,
+    );
   }
   if (
     typeof navigator === "undefined" ||
@@ -22,14 +32,21 @@ export async function openOpfsVault(id = "default"): Promise<VaultBackend> {
     typeof FileSystemFileHandle === "undefined" ||
     typeof FileSystemFileHandle.prototype.createWritable !== "function"
   ) {
-    throw new VaultError("Unsupported", "OPFS writable files and Web Locks are required");
+    throw new VaultError(
+      "Unsupported",
+      "OPFS writable files and Web Locks are required",
+    );
   }
 
   try {
     const opfs = await navigator.storage.getDirectory();
     const vaults = await opfs.getDirectoryHandle("vaults", { create: true });
     const root = await vaults.getDirectoryHandle(id, { create: true });
-    return new OpfsVaultBackend(root, navigator.locks, `celestite.vault.opfs:${id}`);
+    return new OpfsVaultBackend(
+      root,
+      navigator.locks,
+      `celestite.vault.opfs:${id}`,
+    );
   } catch (error) {
     throw opfsError(error, "openVault", id);
   }
@@ -48,7 +65,9 @@ class OpfsVaultBackend implements VaultBackend {
   ) {}
 
   async *readDir(path: VaultPath): AsyncIterable<Entry> {
-    const directory = await this.run("readDir", path, () => this.directory(vaultPath(path)));
+    const directory = await this.run("readDir", path, () =>
+      this.directory(vaultPath(path)),
+    );
     const iterator = directory.entries();
     while (true) {
       // 不跨 yield 持有锁或操作计数，close 不会被暂停的迭代器阻塞。
@@ -66,7 +85,12 @@ class OpfsVaultBackend implements VaultBackend {
         const entry = await this.entry(path);
         if (entry.kind === "directory") return { path, kind: "directory" };
         const file = await entry.getFile();
-        return { path, kind: "file", size: file.size, modifiedAt: file.lastModified };
+        return {
+          path,
+          kind: "file",
+          size: file.size,
+          modifiedAt: file.lastModified,
+        };
       } catch (error) {
         if (isDomError(error, "NotFoundError")) return null;
         throw error;
@@ -79,13 +103,21 @@ class OpfsVaultBackend implements VaultBackend {
       vaultPath(path);
       const entry = await this.entry(path);
       if (entry.kind !== "file") {
-        throw new VaultError("NotFile", "Cannot read a directory as a file", path);
+        throw new VaultError(
+          "NotFile",
+          "Cannot read a directory as a file",
+          path,
+        );
       }
       return new Uint8Array(await (await entry.getFile()).arrayBuffer());
     });
   }
 
-  writeFile(path: VaultPath, data: Uint8Array, options: WriteFileOptions): Promise<void> {
+  writeFile(
+    path: VaultPath,
+    data: Uint8Array,
+    options: WriteFileOptions,
+  ): Promise<void> {
     return this.run("writeFile", path, async () => {
       const { parent, name } = splitPath(path);
       // 在第一次 await 前复制，排队保存不受调用者之后修改 buffer 的影响。
@@ -104,10 +136,15 @@ class OpfsVaultBackend implements VaultBackend {
           throw new VaultError("NotFound", "File does not exist", path);
         }
         if (existing?.kind === "directory") {
-          throw new VaultError("NotFile", "Cannot write a directory as a file", path);
+          throw new VaultError(
+            "NotFile",
+            "Cannot write a directory as a file",
+            path,
+          );
         }
 
-        const file = existing ?? await directory.getFileHandle(name, { create: true });
+        const file =
+          existing ?? (await directory.getFileHandle(name, { create: true }));
         let writable: FileSystemWritableFileStream | undefined;
         try {
           writable = await file.createWritable();
@@ -115,14 +152,24 @@ class OpfsVaultBackend implements VaultBackend {
           await writable.close();
         } catch (error) {
           // 已有文件通过 abort 保留旧内容；新建失败时清理空条目。
-          try { await writable?.abort(); } catch { /* 流可能已经关闭或出错。 */ }
+          try {
+            await writable?.abort();
+          } catch {
+            /* 流可能已经关闭或出错。 */
+          }
           if (!existing) {
             try {
               await directory.removeEntry(name);
             } catch (cleanupError) {
-              throw new VaultError("IO", "Write failed and the new entry could not be removed", path, {
-                writeError: error, cleanupError,
-              });
+              throw new VaultError(
+                "IO",
+                "Write failed and the new entry could not be removed",
+                path,
+                {
+                  writeError: error,
+                  cleanupError,
+                },
+              );
             }
           }
           throw error;
@@ -141,7 +188,11 @@ class OpfsVaultBackend implements VaultBackend {
           return;
         }
         if (path === ROOT_PATH) {
-          throw new VaultError("AlreadyExists", "Vault root already exists", path);
+          throw new VaultError(
+            "AlreadyExists",
+            "Vault root already exists",
+            path,
+          );
         }
         const { parent, name } = splitPath(path);
         const directory = await this.directory(parent);
@@ -172,39 +223,68 @@ class OpfsVaultBackend implements VaultBackend {
       await this.mutate(async () => {
         const sourceParent = await this.directory(sourcePath.parent);
         const source = await this.findEntry(sourceParent, sourcePath.name);
-        if (!source) throw new VaultError("NotFound", "Source entry does not exist", from);
+        if (!source)
+          throw new VaultError("NotFound", "Source entry does not exist", from);
         if (from === to) return;
         if (source.kind === "directory" && to.startsWith(`${from}/`)) {
-          throw new VaultError("InvalidPath", "Cannot move a directory into itself", to);
+          throw new VaultError(
+            "InvalidPath",
+            "Cannot move a directory into itself",
+            to,
+          );
         }
         const targetParent = await this.directory(targetPath.parent);
         if (await this.findEntry(targetParent, targetPath.name)) {
-          throw new VaultError("AlreadyExists", "Target entry already exists", to);
+          throw new VaultError(
+            "AlreadyExists",
+            "Target entry already exists",
+            to,
+          );
         }
 
         let target: OpfsEntry | undefined;
         try {
-          target = source.kind === "file"
-            ? await targetParent.getFileHandle(targetPath.name, { create: true })
-            : await targetParent.getDirectoryHandle(targetPath.name, { create: true });
+          target =
+            source.kind === "file"
+              ? await targetParent.getFileHandle(targetPath.name, {
+                  create: true,
+                })
+              : await targetParent.getDirectoryHandle(targetPath.name, {
+                  create: true,
+                });
           await this.copyEntry(source, target, to);
         } catch (error) {
           let cleanupError: VaultError | undefined;
           if (target) {
             try {
-              await targetParent.removeEntry(targetPath.name, { recursive: true });
+              await targetParent.removeEntry(targetPath.name, {
+                recursive: true,
+              });
             } catch (cleanup) {
               cleanupError = opfsError(cleanup, "remove", to);
             }
           }
-          throw new VaultRenameError(opfsError(error, "copy", to), from, to, "copy", cleanupError);
+          throw new VaultRenameError(
+            opfsError(error, "copy", to),
+            from,
+            to,
+            "copy",
+            cleanupError,
+          );
         }
 
         // 复制全部成功后才开始删除。删除可能部分完成，此后绝不能回滚目标。
         try {
-          await sourceParent.removeEntry(sourcePath.name, { recursive: source.kind === "directory" });
+          await sourceParent.removeEntry(sourcePath.name, {
+            recursive: source.kind === "directory",
+          });
         } catch (error) {
-          throw new VaultRenameError(opfsError(error, "remove", from), from, to, "remove-source");
+          throw new VaultRenameError(
+            opfsError(error, "remove", from),
+            from,
+            to,
+            "remove-source",
+          );
         }
       });
     });
@@ -217,14 +297,22 @@ class OpfsVaultBackend implements VaultBackend {
   close(): Promise<void> {
     if (!this.closing) {
       this.closed = true;
-      this.closing = Promise.allSettled([...this.pending]).then(() => undefined);
+      this.closing = Promise.allSettled([...this.pending]).then(
+        () => undefined,
+      );
     }
     return this.closing;
   }
 
-  private run<T>(operation: string, path: VaultPath, task: () => Promise<T>): Promise<T> {
+  private run<T>(
+    operation: string,
+    path: VaultPath,
+    task: () => Promise<T>,
+  ): Promise<T> {
     if (this.closed) {
-      return Promise.reject(new VaultError("Closed", "Vault backend is closed", path));
+      return Promise.reject(
+        new VaultError("Closed", "Vault backend is closed", path),
+      );
     }
     const promise = (async () => {
       try {
@@ -245,7 +333,11 @@ class OpfsVaultBackend implements VaultBackend {
   }
 
   /** 只在已持有 Vault 写锁时调用；顺序复制，失败后没有后台复制任务残留。 */
-  private async copyEntry(source: OpfsEntry, target: OpfsEntry, path: VaultPath): Promise<void> {
+  private async copyEntry(
+    source: OpfsEntry,
+    target: OpfsEntry,
+    path: VaultPath,
+  ): Promise<void> {
     if (source.kind === "file" && target.kind === "file") {
       const file = await source.getFile();
       const reader = file.stream().getReader();
@@ -260,19 +352,38 @@ class OpfsVaultBackend implements VaultBackend {
           copied += chunk.value.byteLength;
         }
         if (copied !== file.size) {
-          throw new VaultError("IO", "File stream length changed during copy", path);
+          throw new VaultError(
+            "IO",
+            "File stream length changed during copy",
+            path,
+          );
         }
         await writable.close();
       } catch (error) {
         let cancelError: unknown;
         let abortError: unknown;
-        try { await reader.cancel(); } catch (cancel) { cancelError = cancel; }
-        try { await writable?.abort(); } catch (abort) { abortError = abort; }
+        try {
+          await reader.cancel();
+        } catch (cancel) {
+          cancelError = cancel;
+        }
+        try {
+          await writable?.abort();
+        } catch (abort) {
+          abortError = abort;
+        }
         if (cancelError !== undefined || abortError !== undefined) {
           const copyError = opfsError(error, "copy", path);
-          throw new VaultError(copyError.code, "Copy failed and stream cleanup failed", path, {
-            copyError, cancelError, abortError,
-          });
+          throw new VaultError(
+            copyError.code,
+            "Copy failed and stream cleanup failed",
+            path,
+            {
+              copyError,
+              cancelError,
+              abortError,
+            },
+          );
         }
         throw error;
       } finally {
@@ -283,17 +394,25 @@ class OpfsVaultBackend implements VaultBackend {
     if (source.kind === "directory" && target.kind === "directory") {
       for await (const [name, entry] of source.entries()) {
         const destination = childPath(path, name);
-        const child = entry.kind === "file"
-          ? await target.getFileHandle(name, { create: true })
-          : await target.getDirectoryHandle(name, { create: true });
+        const child =
+          entry.kind === "file"
+            ? await target.getFileHandle(name, { create: true })
+            : await target.getDirectoryHandle(name, { create: true });
         await this.copyEntry(entry, child, destination);
       }
       return;
     }
-    throw new VaultError("IO", "Source and target kinds differ during copy", path);
+    throw new VaultError(
+      "IO",
+      "Source and target kinds differ during copy",
+      path,
+    );
   }
 
-  private async directory(path: VaultPath, create = false): Promise<FileSystemDirectoryHandle> {
+  private async directory(
+    path: VaultPath,
+    create = false,
+  ): Promise<FileSystemDirectoryHandle> {
     let directory = this.root;
     let current = ROOT_PATH;
     for (const name of path === ROOT_PATH ? [] : path.split("/")) {
@@ -302,7 +421,12 @@ class OpfsVaultBackend implements VaultBackend {
         directory = await directory.getDirectoryHandle(name, { create });
       } catch (error) {
         if (isDomError(error, "TypeMismatchError")) {
-          throw new VaultError("NotDirectory", "Path component is not a directory", current, error);
+          throw new VaultError(
+            "NotDirectory",
+            "Path component is not a directory",
+            current,
+            error,
+          );
         }
         throw error;
       }
@@ -319,12 +443,16 @@ class OpfsVaultBackend implements VaultBackend {
     return entry;
   }
 
-  private async findEntry(directory: FileSystemDirectoryHandle, name: string): Promise<OpfsEntry | null> {
+  private async findEntry(
+    directory: FileSystemDirectoryHandle,
+    name: string,
+  ): Promise<OpfsEntry | null> {
     try {
       return await directory.getFileHandle(name);
     } catch (error) {
       if (isDomError(error, "NotFoundError")) return null;
-      if (isDomError(error, "TypeMismatchError")) return directory.getDirectoryHandle(name);
+      if (isDomError(error, "TypeMismatchError"))
+        return directory.getDirectoryHandle(name);
       throw error;
     }
   }

@@ -1,0 +1,6 @@
+# 构建产物与依赖不参与格式化
+dist
+node_modules
+test-results
+playwright-report
+patches

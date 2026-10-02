@@ -1,15 +1,18 @@
 import { expect, test as base } from "@playwright/test";
 
 const test = base.extend<{ runtimeErrors: string[] }>({
-  runtimeErrors: [async ({ page }, use) => {
-    const errors: string[] = [];
-    page.on("pageerror", (error) => errors.push(error.message));
-    page.on("console", (message) => {
-      if (message.type() === "error") errors.push(message.text());
-    });
-    await use(errors);
-    expect(errors).toEqual([]);
-  }, { auto: true }],
+  runtimeErrors: [
+    async ({ page }, use) => {
+      const errors: string[] = [];
+      page.on("pageerror", (error) => errors.push(error.message));
+      page.on("console", (message) => {
+        if (message.type() === "error") errors.push(message.text());
+      });
+      await use(errors);
+      expect(errors).toEqual([]);
+    },
+    { auto: true },
+  ],
 });
 
 test.beforeEach(async ({ page }) => {
@@ -17,7 +20,9 @@ test.beforeEach(async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Celestite" })).toBeVisible();
 });
 
-test("controlled input, dialog focus, dismissal and repeated portal cleanup", async ({ page }) => {
+test("controlled input, dialog focus, dismissal and repeated portal cleanup", async ({
+  page,
+}) => {
   const input = page.getByRole("textbox", { name: "笔记名称" });
   await input.fill("");
   await input.pressSequentially("Solid 2");
@@ -31,12 +36,18 @@ test("controlled input, dialog focus, dismissal and repeated portal cleanup", as
     await expect(dialog).toContainText("Solid 2");
     await expect(dialog.getByRole("button", { name: "Dismiss" })).toBeFocused();
     await page.keyboard.press("Tab");
-    await expect(dialog.getByRole("button", { name: "关闭弹窗" })).toBeFocused();
+    await expect(
+      dialog.getByRole("button", { name: "关闭弹窗" }),
+    ).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(dialog.getByRole("button", { name: "Dismiss" })).toBeFocused();
     if (close === "escape") await page.keyboard.press("Escape");
-    else if (close === "button") await dialog.getByRole("button", { name: "关闭弹窗" }).click();
-    else await page.locator(".ui-dialog-overlay").click({ position: { x: 5, y: 5 } });
+    else if (close === "button")
+      await dialog.getByRole("button", { name: "关闭弹窗" }).click();
+    else
+      await page
+        .locator(".ui-dialog-overlay")
+        .click({ position: { x: 5, y: 5 } });
     await expect(dialog).toBeHidden();
     await expect(trigger).toBeFocused();
     await expect(page.locator("body")).not.toHaveCSS("pointer-events", "none");
@@ -53,7 +64,9 @@ test("dropdown keyboard navigation, selection and Escape", async ({ page }) => {
   await expect(page.getByRole("status")).toHaveText("点击了复制链接");
   await expect(page.getByRole("menu")).toBeHidden();
   await trigger.click();
-  await expect(page.getByRole("menuitem", { name: "导出（暂不可用）" })).toHaveAttribute("aria-disabled", "true");
+  await expect(
+    page.getByRole("menuitem", { name: "导出（暂不可用）" }),
+  ).toHaveAttribute("aria-disabled", "true");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menu")).toBeHidden();
   await expect(trigger).toBeFocused();
@@ -67,12 +80,16 @@ test("context menu supports pointer and keyboard access", async ({ page }) => {
   await expect(page.getByRole("menu")).toBeHidden();
   await trigger.focus();
   await page.keyboard.press("Shift+F10");
-  await expect(page.getByRole("menuitem", { name: "打开笔记", exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "打开笔记", exact: true }),
+  ).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("menu")).toBeHidden();
 });
 
-test("theme commits immediately, persists, follows system and reaches portals", async ({ page }) => {
+test("theme commits immediately, persists, follows system and reaches portals", async ({
+  page,
+}) => {
   const selectTheme = async (name: string) => {
     await page.getByRole("button", { name: "主题", exact: true }).click();
     await page.getByRole("menuitem", { name, exact: true }).click();
@@ -80,7 +97,9 @@ test("theme commits immediately, persists, follows system and reaches portals", 
   await selectTheme("深色");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.getByRole("button", { name: "打开弹窗" }).click();
-  const surface = await page.locator("section").evaluate((el) => getComputedStyle(el).backgroundColor);
+  const surface = await page
+    .locator("section")
+    .evaluate((el) => getComputedStyle(el).backgroundColor);
   await expect(page.getByRole("dialog")).toHaveCSS("background-color", surface);
   await page.keyboard.press("Escape");
   await page.reload();
@@ -94,11 +113,18 @@ test("theme commits immediately, persists, follows system and reaches portals", 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 });
 
-test("SVG icons, disabled buttons, tooltip and theme dimensions", async ({ page }) => {
+test("SVG icons, disabled buttons, tooltip and theme dimensions", async ({
+  page,
+}) => {
   const button = page.getByRole("button", { name: "新建笔记", exact: true });
   await expect(button).toHaveCSS("height", "32px");
   await expect(button.locator("svg")).toHaveAttribute("width", "16");
-  expect(await button.locator("svg path").first().evaluate((el) => el.namespaceURI)).toBe("http://www.w3.org/2000/svg");
+  expect(
+    await button
+      .locator("svg path")
+      .first()
+      .evaluate((el) => el.namespaceURI),
+  ).toBe("http://www.w3.org/2000/svg");
   await expect(page.getByRole("button", { name: "不可用" })).toBeDisabled();
   await button.click();
   await expect(page.getByRole("status")).toHaveText("点击了新建笔记");
@@ -106,9 +132,13 @@ test("SVG icons, disabled buttons, tooltip and theme dimensions", async ({ page 
   await expect(page.getByRole("tooltip")).toHaveText("添加笔记");
 });
 
-test("mobile preview fits viewport and home remains empty", async ({ page }) => {
+test("mobile preview fits viewport and home opens the default Vault", async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 360, height: 720 });
-  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(360);
   await page.goto("/");
-  await expect(page.locator("main")).toBeEmpty();
+  await expect(page.getByRole("tree", { name: "文件树" })).toBeVisible();
 });

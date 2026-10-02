@@ -1,6 +1,22 @@
 import {
   Check as check,
   ChevronDown as chevronDown,
+  ChevronRight as chevronRight,
+  ChevronLeft as chevronLeft,
+  Folder as folder,
+  FolderOpen as folderOpen,
+  FolderPlus as folderPlus,
+  FilePlus as filePlus,
+  RefreshCw as refreshCw,
+  ChevronsUp as chevronsUp,
+  Scissors as scissors,
+  Copy as copy,
+  ClipboardPaste as clipboardPaste,
+  Pencil as pencil,
+  Trash2 as trash2,
+  Download as download,
+  Upload as upload,
+  Move as move,
   FileText as fileText,
   Monitor as monitor,
   Moon as moon,
@@ -53,6 +69,22 @@ function createIcon(node: IconNode, name: string) {
 
 export const Check = createIcon(check, "check");
 export const ChevronDown = createIcon(chevronDown, "chevron-down");
+export const ChevronRight = createIcon(chevronRight, "chevron-right");
+export const ChevronLeft = createIcon(chevronLeft, "chevron-left");
+export const Folder = createIcon(folder, "folder");
+export const FolderOpen = createIcon(folderOpen, "folder-open");
+export const FolderPlus = createIcon(folderPlus, "folder-plus");
+export const FilePlus = createIcon(filePlus, "file-plus");
+export const RefreshCw = createIcon(refreshCw, "refresh-cw");
+export const ChevronsUp = createIcon(chevronsUp, "chevrons-up");
+export const Scissors = createIcon(scissors, "scissors");
+export const Copy = createIcon(copy, "copy");
+export const ClipboardPaste = createIcon(clipboardPaste, "clipboard-paste");
+export const Pencil = createIcon(pencil, "pencil");
+export const Trash2 = createIcon(trash2, "trash-2");
+export const Download = createIcon(download, "download");
+export const Upload = createIcon(upload, "upload");
+export const Move = createIcon(move, "move");
 export const FileText = createIcon(fileText, "file-text");
 export const Monitor = createIcon(monitor, "monitor");
 export const Moon = createIcon(moon, "moon");

@@ -1,0 +1,58 @@
+.file-tree {
+  --uno: "flex min-h-0 min-w-0 flex-1 flex-col bg-surface";
+}
+.tree-region {
+  --uno: "flex min-h-0 flex-1 flex-col";
+}
+.tree-root {
+  --uno: "mx-2 mt-2 flex items-center gap-2 rounded-control px-2 py-2 text-ui-sm";
+}
+.tree-body {
+  --uno: "min-h-36 flex-1 overflow-auto px-2 py-1 outline-none";
+}
+.tree-body:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--color-focus);
+}
+.tree-row {
+  --uno: "flex h-8 cursor-default items-center gap-[6px] rounded-[4px] pr-2 text-ui-sm select-none";
+}
+.tree-row:hover {
+  --uno: "bg-muted";
+}
+.tree-row[data-selected="true"] {
+  background: color-mix(in srgb, var(--color-accent) 17%, var(--color-surface));
+  color: var(--color-foreground);
+}
+.tree-body:focus-within .tree-row[data-focused="true"] {
+  outline: 1px solid var(--color-focus);
+  outline-offset: -1px;
+}
+.tree-row[data-cut="true"] {
+  opacity: 0.5;
+}
+.tree-region[data-drop="true"],
+.tree-body [role="treeitem"][data-drop="true"] {
+  position: relative;
+  isolation: isolate;
+}
+.tree-region[data-drop="true"]::before,
+.tree-body [role="treeitem"][data-drop="true"]::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 0 var(--tree-drop-inset, 0px);
+  z-index: -1;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-surface));
+  box-shadow: inset 0 0 0 2px var(--color-accent);
+  pointer-events: none;
+}
+.tree-region[data-drop="true"] .tree-row:not([data-selected="true"]),
+.tree-body
+  [role="treeitem"][data-drop="true"]
+  .tree-row:not([data-selected="true"]) {
+  background: transparent;
+}
+.tree-chevron {
+  --uno: "flex h-5 w-5 shrink-0 items-center justify-center rounded border-0 bg-transparent p-0 text-secondary hover:bg-background";
+}
