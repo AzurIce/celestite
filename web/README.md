@@ -94,3 +94,50 @@ Solid 2 的 signal 写入默认在下一次微任务提交，因此设置主题�
 ```
 
 组件继续使用 `ui-button`、`ui-menu` 等名称，这些名称由 shortcuts 展开并按需生成。新增通用样式时优先复用主题工具类；组合重复时再添加 shortcut。CSS 中使用 `--uno: "工具类列表";` 复用工具类，由已配置的 `transformerDirectives` 在开发和构建时展开。这是标准 CSS 自定义属性语法，编辑器可以正常校验。入口按全局主题、UnoCSS、组件状态样式的顺序加载，确保状态选择器和减少动态效果的设置覆盖基础样式。
+
+## Vault 文件后端
+
+`src/lib/vault` 提供平台无关的 `VaultBackend` 接口和 Web 的 OPFS 实现。接口绑定一个根目录，包含直接子项遍历、元数据查询、二进制读取、完整内容保存、目录创建、删除、重命名、外部监听和关闭。缓存、业务变化事件、编辑缓冲区及自动保存由后续的 Vault / 文档运行时负责。
+
+```ts
+import { openOpfsVault, ROOT_PATH, vaultPath } from "@/lib/vault";
+
+const backend = await openOpfsVault(); // 恢复或首次创建 OPFS /vaults/default
+try {
+  await backend.mkdir(vaultPath("notes"), { recursive: true });
+  const path = vaultPath("notes/hello.md");
+  const existing = await backend.stat(path);
+  await backend.writeFile(path, new TextEncoder().encode("# Hello\n"), {
+    mode: existing ? "replace" : "create",
+  });
+  for await (const entry of backend.readDir(ROOT_PATH)) {
+    console.log(entry.path, entry.kind);
+  }
+} finally {
+  await backend.close();
+}
+```
+
+路径使用 `/` 分隔的相对路径，空字符串 `ROOT_PATH` 表示根。通过 `vaultPath()` 校验，不接受绝对路径、`.`、`..`、重复或末尾分隔符、反斜杠和 NUL；后端仍在操作时复核路径。`stat()` 仅在不存在时返回 `null`，其他错误通过 `VaultError.code` 区分。
+
+`writeFile()` 的 `create` 不覆盖已有条目，`replace` 要求文件存在，二者都不隐式创建父目录。输入字节在调用时复制；已有文件通过 `createWritable()` 暂存，关闭流后提交，失败时中止流以保留旧内容。创建期间可能暂时出现空条目，创建失败会尝试删除；清理也失败时返回包含两次错误的 `IO`。多步骤操作没有事务或崩溃恢复保证。
+
+`rename(from, to)` 在同一 Vault 内移动文件或整棵目录树，目标路径必须不存在、父目录必须存在。同路径在源存在时不执行修改；不能移动根目录，也不能把目录移入自己的后代。OPFS 使用流式复制再删除源，包含空文件和空目录；复制完整前不删除任何源条目。整次移动持有同一把 Vault 写锁，复制顺序执行，不将附件完整读入内存，也不依赖实验性移动 API。
+
+移动开始后的失败抛出 `VaultRenameError`，保留原错误码，并提供 `from`、`to`、`phase`、`targetComplete` 和可选的 `cleanupError`。`phase === "copy"` 时源尚未删除，后端会尝试清理本次创建的目标；清理失败会报告残留。`phase === "remove-source"` 时目标已经复制完整，源可能部分删除，因此保留目标供上层处理。预检失败仍是普通 `VaultError`。移动不是事务，读操作可能看到复制中的目录；尚无持久化 journal 或重启自动恢复，复制期间也需要源与目标同时占用存储空间。
+
+OPFS 后端要求安全上下文，以及 `getDirectory()`、`createWritable()` 和 Web Locks 支持。所有修改通过按 Vault ID 命名的同源锁协调，覆盖应用自己的不同会话和标签页；直接绕过后端操作 OPFS 的代码不受此约定保护。`close()` 拒绝新操作并等待已接收操作完成，不删除数据；暂停的目录迭代器不会阻塞关闭，关闭后继续迭代会报 `Closed`。
+
+`openOpfsVault("another-id")` 可打开隔离的另一个目录，当前默认仍只有 `default`。这里提供打开工厂，尚未接入应用启动流程。OPFS 的 `watch()` 不发出任何事件，返回可重复调用的空取消订阅函数；后端关闭后订阅会报 `Closed`。应用操作引起的业务变化由上层发布。浏览器配额与持久存储申请属于平台服务，OPFS 数据也仍需要导出或备份。
+
+移动的内存模拟测试验证路径保护、同路径、目标冲突、流式复制、写入/读取/提交故障、清理失败、部分删除、共享写锁和关闭等待：
+
+```sh
+bun run test:vault
+```
+
+浏览器测试覆盖刷新恢复、二进制与空目录、路径和根目录保护、创建/替换规则、跨标签页竞争、关闭时等待写入、移动和真实 OPFS 流的故障处理：
+
+```sh
+bun run test:ui tests/vault.spec.ts
+```
