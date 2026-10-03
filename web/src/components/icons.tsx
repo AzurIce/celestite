@@ -18,6 +18,7 @@ import {
   Upload as upload,
   Move as move,
   Save as save,
+  Settings2 as settings2,
   FileText as fileText,
   Monitor as monitor,
   Moon as moon,
@@ -87,6 +88,7 @@ export const Download = createIcon(download, "download");
 export const Upload = createIcon(upload, "upload");
 export const Move = createIcon(move, "move");
 export const Save = createIcon(save, "save");
+export const Settings2 = createIcon(settings2, "settings-2");
 export const FileText = createIcon(fileText, "file-text");
 export const Monitor = createIcon(monitor, "monitor");
 export const Moon = createIcon(moon, "moon");

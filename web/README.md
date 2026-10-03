@@ -215,10 +215,7 @@ bun run test:ui tests/file-tree.spec.ts  # 真实 OPFS 与浏览器交互测试
 
 ```sh
 bun run test:ui tests/workspace.spec.ts  # 侧边栏宽度、拖动、键盘与持久化
-```
-
-bun run test:ui tests/settings.spec.ts # 设置文件、项目级覆盖与迁移
-
+bun run test:ui tests/settings.spec.ts   # 设置文件、项目级覆盖与迁移
 ```
 
 ## 设置
@@ -237,11 +234,21 @@ bun run test:ui tests/settings.spec.ts # 设置文件、项目级覆盖与迁移
 | `sidebar.width`   | 200–560，越界夹取           | 300      |
 | `editor.wordWrap` | 布尔                        | `false`  |
 
-`src/lib/settings/schema.ts` 是唯一权威：默认值、取值解析与范围、键说明都在那里；新增设置只需加一项，界面读取 `settings().values[...]`，写入用 `setSetting(...)`。`settings()` 在 JSX 里是响应式的；`src/lib/settings/document.ts` 负责解析、合并与来源标记，`snapshot().source[key]` 说明某个键来自 default / app / project，将来的设置面板可以直接使用。
+`src/lib/settings/schema.ts` 是唯一权威：默认值、取值解析与范围、键说明都在那里；新增设置只需加一项，界面读取 `settings().values[...]`，写入用 `setSetting(...)`。`settings()` 在 JSX 里是响应式的；`src/lib/settings/document.ts` 负责解析、合并与来源标记，`snapshot().source[key]` 说明某个键来自 default / app / project，设置面板据此提示当前 Vault 的覆盖值。
 
 坏配置不会让应用不可用：文件不是合法 JSON、顶层不是对象、某个键类型错误，都只让对应键回退到下一层并记录到 `snapshot().problems`；未知键原样保留，回写时不丢。写入失败时保留用户选择的内存态，`snapshot().saveError` 记录原因，之后任意一次成功写入都会带上这些修改。
 
 启动时序：`src/index.tsx` 先 `initSettings()` 再渲染应用，因此第一帧就是正确主题。首次启动会把旧的 `localStorage` 键（`celestite.theme`、`celestite.workspace.sidebarWidth`）迁移进设置文件并删除旧键；写失败时保留旧键，下次启动再迁移。OPFS `watch()` 不产生事件，项目级文件的外部修改要重新打开 vault 才会读到。项目级提供的值在界面上只读（例如自动换行按钮被禁用并提示来源），与 VSCode 的工作区覆盖一致。`tests/unit/settings.test.ts` 覆盖合并、校验、迁移与失败路径。
+
+## 全局设置界面
+
+从底部状态栏的“全局设置”按钮打开。面板展示全局文档中的主题、侧栏宽度和自动换行，未配置的选项展示 schema 默认值；当前 Vault 的覆盖值另行提示，仍可编辑全局默认值，写入只影响全局文件。
+
+主题和换行选择后自动保存；宽度在按 Enter 或离开输入框时校验并保存，范围取自 schema。每项可独立恢复默认值，保存保留其他设置和未知键。底部显示保存状态，失败保留本次会话的修改并提供重试；存储后端只能使用内存时明确说明不会持久保存。无效全局配置也在面板中提示，修正对应选项后清除其问题记录。面板支持深浅主题、键盘和窄屏滚动。
+
+```sh
+bun run test:ui tests/settings-ui.spec.ts
+```
 
 ## 编辑与保存
 
@@ -265,4 +272,3 @@ bun run test:ui tests/settings.spec.ts # 设置文件、项目级覆盖与迁移
 文本内部使用 LF；保存保留打开时的 UTF-8 BOM 和首个换行符形式（LF / CRLF / CR），混合换行文件编辑后统一为首个形式。隐藏页面和关闭工作区时尝试保存全部缓冲区，存在未保存内容时注册浏览器离开提醒。页面终止事件不能保证异步写入完成，仍以界面的“已保存”为准。当前不合并其他窗口或外部程序对同一文件的并发修改，刷新页面也不会恢复尚未落盘的缓冲区。
 
 `tests/unit/editor-documents.test.ts` 覆盖快速切换、保存期间输入、自动保存、写入失败、路径变更、复制/删除协调、编码与换行、关闭时保存等状态与故障情形；`tests/editor.spec.ts` 验证实际编辑器与 OPFS 的保存、重载及交互。
-```

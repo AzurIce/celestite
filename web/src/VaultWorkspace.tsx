@@ -1,4 +1,11 @@
-import { Show, createSignal, onCleanup, onSettled } from "solid-js";
+import {
+  Show,
+  createEffect,
+  createSignal,
+  onCleanup,
+  onSettled,
+} from "solid-js";
+import { GlobalSettings } from "@/components/settings/GlobalSettings";
 import { VaultEditor } from "@/components/editor";
 import { VaultDocuments } from "@/lib/editor/documents";
 import { FileTree } from "@/components/file-tree";
@@ -86,7 +93,11 @@ export default function VaultWorkspace() {
     }
   }
   /** 宽度来自设置层，因此项目级文件也能覆盖它。 */
-  const sidebarWidth = () => settings().values["sidebar.width"];
+  const sidebarWidth = () =>
+    clampSidebarWidth(settings().values["sidebar.width"]);
+  createEffect(sidebarWidth, (width) => {
+    appliedWidth = width;
+  });
   /** 拖动中只改内存态，不落盘。 */
   function previewSidebarWidth(width: number) {
     const next = clampSidebarWidth(width);
@@ -267,6 +278,7 @@ export default function VaultWorkspace() {
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+        <GlobalSettings />
       </footer>
     </main>
   );

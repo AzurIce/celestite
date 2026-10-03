@@ -1,0 +1,75 @@
+.ui-dialog.settings-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+.settings-group {
+  --uno: "mt-6 border-t border-solid border-border pt-5";
+}
+.settings-group > h3 {
+  --uno: "m-0 mb-3 text-ui-sm font-medium text-secondary";
+}
+.settings-row {
+  --uno: "grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-5 gap-y-2 py-3";
+}
+.settings-copy {
+  --uno: "min-w-0";
+}
+.settings-copy label {
+  --uno: "text-ui-sm font-medium";
+}
+.settings-copy p {
+  --uno: "mt-1 text-ui-sm text-secondary";
+}
+.settings-control {
+  --uno: "flex items-center gap-2";
+}
+.settings-select {
+  --uno: "w-32 text-ui-sm";
+}
+.settings-number {
+  --uno: "w-24 text-ui-sm";
+}
+.settings-number[aria-invalid="true"] {
+  --uno: "border-danger";
+}
+.settings-checkbox {
+  --uno: "h-4 w-4 cursor-pointer";
+  accent-color: var(--color-accent);
+}
+.settings-checkbox:disabled {
+  --uno: "cursor-not-allowed opacity-45";
+}
+.settings-override,
+.settings-validation {
+  --uno: "col-span-2 text-ui-sm text-secondary";
+}
+.settings-validation {
+  --uno: "text-danger";
+}
+.settings-notice {
+  --uno: "mt-4 rounded-control bg-muted px-3 py-2 text-ui-sm text-secondary";
+}
+.settings-error {
+  --uno: "mt-4 flex items-center gap-3 text-ui-sm text-danger";
+}
+.settings-error > p {
+  --uno: "min-w-0 flex-1 break-words";
+}
+.settings-footer {
+  --uno: "mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-solid border-border pt-4 text-ui-sm text-secondary";
+}
+@media (max-width: 479px) {
+  .settings-row {
+    --uno: "grid-cols-[minmax(0,1fr)] gap-3";
+  }
+  .settings-override,
+  .settings-validation {
+    --uno: "col-span-1";
+  }
+  .settings-control {
+    --uno: "justify-between";
+  }
+  .settings-select,
+  .settings-number {
+    --uno: "w-full";
+  }
+}

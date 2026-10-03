@@ -1,6 +1,8 @@
 /** 全局设置的存储后端：OPFS `/celestite/settings.json`。 */
 
 export interface SettingsFile {
+  /** False for a session-only backend. Omitted means persistent. */
+  readonly persistent?: boolean;
   /** 文件不存在返回 null；其他 IO 错误抛出。 */
   read(): Promise<string | null>;
   /** 写入整份文档；失败时保留旧内容，错误抛出。 */
@@ -11,6 +13,7 @@ export interface SettingsFile {
 export function createMemoryFile(): SettingsFile {
   let stored: string | null = null;
   return {
+    persistent: false,
     async read() {
       return stored;
     },

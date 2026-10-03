@@ -12,6 +12,7 @@ import {
 } from "../../src/lib/settings/schema";
 import { SettingsStore } from "../../src/lib/settings/store";
 import type { SettingsFile } from "../../src/lib/settings/app-file";
+import { createMemoryFile } from "../../src/lib/settings/app-file";
 import type { SettingsDocument } from "../../src/lib/settings/document";
 
 class MemoryFile implements SettingsFile {
@@ -292,4 +293,29 @@ test("a project file that cannot be read does not break startup", async () => {
     snapshot.problems.some((problem) => problem.source === "project"),
     true,
   );
+});
+
+test("a session-only backend never reports settings as persisted", async () => {
+  const store = new SettingsStore({ file: createMemoryFile() });
+  await store.load();
+  assert.equal(store.snapshot().storage, "memory");
+  await store.set("theme.mode", "dark");
+  assert.equal(store.snapshot().values["theme.mode"], "dark");
+  assert.equal(store.snapshot().storage, "memory");
+  assert.equal(store.snapshot().saveError, undefined);
+});
+
+test("correcting an invalid setting removes its problem and retains unknown keys", async () => {
+  const file = Object.assign(new MemoryFile(), {
+    stored: '{"theme.mode":"invalid","future.option":{"keep":true}}',
+  });
+  const { store } = createStore(file);
+  await store.load();
+  assert.equal(store.snapshot().problems.length, 1);
+  await store.set("theme.mode", "light");
+  assert.deepEqual(store.snapshot().problems, []);
+  assert.deepEqual(JSON.parse(file.stored!), {
+    "theme.mode": "light",
+    "future.option": { keep: true },
+  });
 });

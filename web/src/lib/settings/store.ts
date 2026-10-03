@@ -1,4 +1,5 @@
 import {
+  parseDocument,
   parseSettingsText,
   resolveSettings,
   withSetting,
@@ -46,6 +47,7 @@ export class SettingsStore {
 
   constructor(options: SettingsStoreOptions) {
     this.options = options;
+    if (options.file.persistent === false) this.storage = "memory";
   }
 
   snapshot(): SettingsSnapshot {
@@ -142,18 +144,15 @@ export class SettingsStore {
       const definition = settingDefinition(key);
       const normalized = definition.parse(value, definition.default);
       const document = withSetting(this.app.document, key, normalized);
-      this.app = {
-        ...this.app,
-        values: { ...this.app.values, [key]: normalized } as never,
-        document,
-      };
+      this.app = parseDocument(document, "app");
       this.storage = "memory";
       this.saveError = undefined;
       this.notify();
       if (options?.persist === false) return;
       try {
         await this.options.file.write(document);
-        this.storage = "file";
+        this.storage =
+          this.options.file.persistent === false ? "memory" : "file";
         this.saveError = undefined;
       } catch (error) {
         // 保留用户选择的内存态；磁盘仍是旧文档，后续成功写入会带上这次修改。
@@ -176,7 +175,7 @@ export class SettingsStore {
     this.notify();
     try {
       await this.options.file.write(legacy);
-      this.storage = "file";
+      this.storage = this.options.file.persistent === false ? "memory" : "file";
       this.options.clearLegacy();
     } catch {
       this.storage = "memory";
