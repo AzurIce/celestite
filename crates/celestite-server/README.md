@@ -1,6 +1,6 @@
 # Celestite server MVP
 
-独立 Rust 可执行程序。Vault 由 `config.toml` 注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入，共享目录操作位于 `celestite-core`。
+独立 Rust 可执行程序。Vault 由配置文件或 server 命令行注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入，共享目录操作位于 `celestite-core`。
 
 ## 启动
 
@@ -16,6 +16,45 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 打开 Web 客户端，在底部“管理 Vault”中连接 `http://127.0.0.1:7437/api/v1/vaults/notes`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。
 
 配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免 SSE 长连接阻止退出。名称与目录可修改，保留 ID 即保留 URL。
+
+## 命令行
+
+使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，可以通过 `--vault` 直接启动。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
+
+```sh
+# 完全通过命令行启动，目录必须已经存在
+./target/debug/celestite-server --no-config \
+  --listen 127.0.0.1:7437 \
+  --allowed-origin http://localhost:1420 \
+  --vault notes=./notes --vault-name 'notes=我的笔记' \
+  --vault reference=./reference --vault-read-only reference=true
+
+# 覆盖部分配置；其他 Vault 及设置保留
+./target/debug/celestite-server --config ./config.toml \
+  --listen 127.0.0.1:8080 \
+  --web-dir ./web/dist \
+  --vault notes=./another-directory \
+  --vault-read-only notes=false
+```
+
+| 参数                               | 行为                                                      |
+| ---------------------------------- | --------------------------------------------------------- |
+| `-c, --config FILE`                | 读取指定 TOML 文件                                        |
+| `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                    |
+| `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                   |
+| `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名 |
+| `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                   |
+| `--token-env VARIABLE`             | 覆盖用于读取访问令牌的环境变量名                          |
+| `--no-token`                       | 清除配置中的令牌要求；非回环监听仍会拒绝启动              |
+| `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                     |
+| `--no-web`                         | 禁用配置中的静态 Web 资源目录                             |
+| `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录              |
+| `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                       |
+| `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                       |
+
+命令行目录路径以**当前工作目录**为基准，配置文件中的路径仍以**配置文件所在目录**为基准。新增 Vault 默认名称为 ID、可写；覆盖已有 Vault 目录保留其名称与只读状态，除非另行覆盖。不支持通过命令行移除配置中的 Vault，完全替换注册列表可使用 `--no-config` 加多个 `--vault`。
+
+`ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的名称/只读覆盖都会报错。清除选项与对应设置选项互斥。令牌参数只接受环境变量名称，令牌本身不会进入命令行参数或 URL。
 
 `server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；监听其他地址必须配置 `token_env`，从环境变量读取 Bearer token。前端令牌只保留在当前会话，连接 URL 与本地记录不包含令牌。远端 HTTPS 可由反向代理提供，代理后的客户端来源也需配置。CORS 支持 `Authorization`、`If-Match` 和读取 `ETag`，有 Origin 的 API 请求另行检查来源；CORS 不承担认证。
 

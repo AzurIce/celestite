@@ -1,22 +1,16 @@
 use celestite_server::{build_server, Config};
-use std::path::PathBuf;
+use clap::Parser;
+mod cli;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let path = match args.as_slice() {
-        [] => PathBuf::from("config.toml"),
-        [flag, path] if flag == "--config" => PathBuf::from(path),
-        _ => {
-            eprintln!("Usage: celestite-server [--config config.toml]");
-            std::process::exit(2);
-        }
-    }
-    .canonicalize()?;
-    let config: Config = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    let cwd = std::env::current_dir()?;
+    let config: Config = cli::Cli::parse().load(&cwd)?;
     let listen = config.server.listen;
     let ids: Vec<_> = config.vaults.iter().map(|v| v.id.clone()).collect();
-    let server = build_server(config, path.parent().unwrap())?;
+    let server = build_server(config, &cwd)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    let listen = listener.local_addr()?;
     println!("Celestite server listening on http://{listen}");
     for id in ids {
         println!("Vault URL: http://{listen}/api/v1/vaults/{id}");
