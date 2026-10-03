@@ -1,0 +1,43 @@
+.workspace-statusbar {
+  --uno: "flex shrink-0 items-center gap-2 border-t border-solid border-border bg-background px-2 text-ui-sm text-secondary";
+  height: var(--workspace-status-height);
+}
+.workspace-tree-status {
+  --uno: "min-w-0 flex-1 overflow-hidden";
+}
+.workspace-editor-status {
+  --uno: "shrink-0";
+}
+.workspace-statusbar .tree-footer,
+.workspace-statusbar .editor-statusbar {
+  --uno: "min-h-0 px-1";
+}
+.workspace-sidebar {
+  --uno: "min-w-0 bg-background";
+}
+.workspace-divider {
+  --uno: "relative hidden h-full w-[5px] cursor-col-resize sm:block";
+  background: linear-gradient(
+    to right,
+    var(--color-background) 50%,
+    var(--color-surface) 50%
+  );
+  touch-action: none;
+}
+.workspace-divider-line {
+  --uno: "absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border";
+}
+.workspace-divider:hover .workspace-divider-line,
+.workspace-divider:focus-visible .workspace-divider-line,
+.workspace-divider[data-dragging="true"] .workspace-divider-line {
+  --uno: "w-[2px] bg-accent";
+}
+.workspace-grid[data-resizing="true"] {
+  --uno: "cursor-col-resize select-none";
+}
+.workspace-grid[data-resizing="true"] > * {
+  --uno: "pointer-events-none";
+}
+.workspace-grid[data-resizing="true"] > .workspace-divider {
+  --uno: "pointer-events-auto";
+}

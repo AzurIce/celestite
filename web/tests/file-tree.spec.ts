@@ -1,5 +1,9 @@
-import { expect, test as base } from "@playwright/test";
+import { expect, test as base, type Page } from "@playwright/test";
 type VaultModule = typeof import("../src/lib/vault");
+
+// 打开文件后编辑器也会提供 role="status"，这里只取文件树自己的状态行。
+const treeStatus = (page: Page) =>
+  page.getByRole("status", { name: "文件树状态" });
 
 const test = base.extend<{ runtimeErrors: string[] }>({
   runtimeErrors: [
@@ -58,14 +62,14 @@ test("Ctrl/Shift selection and context menus preserve multi-selection and target
     "aria-disabled",
     "true",
   );
-  await expect(page.getByRole("status")).toHaveText("已选择 2 项");
+  await expect(treeStatus(page)).toHaveText("已选择 2 项");
   await page.keyboard.press("Escape");
   await item("a.md").click();
   await item("c.md").click({ modifiers: ["Shift"] });
   await expect(item("b.md")).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByRole("status")).toHaveText("已选择 3 项");
+  await expect(treeStatus(page)).toHaveText("已选择 3 项");
   await item("Inbox").locator(".tree-row").first().click({ button: "right" });
-  await expect(page.getByRole("status")).toHaveText("已选择 1 项");
+  await expect(treeStatus(page)).toHaveText("已选择 1 项");
   await expect(item("Inbox")).toHaveAttribute("aria-selected", "true");
   await expect(item("a.md")).toHaveAttribute("aria-selected", "false");
 });
@@ -162,6 +166,90 @@ test("create, F2 rename, invalid names and duplicate conflicts update real OPFS 
   ).toBeVisible();
 });
 
+test("single click opens files and toggles folders, modifier clicks only select", async ({
+  page,
+}) => {
+  const item = (name: string) =>
+    page.getByRole("treeitem", { name, exact: true });
+  const row = (name: string) => item(name).locator(".tree-row").first();
+  const pane = page.getByRole("region", { name: "文件编辑器" });
+
+  await item("a.md").click();
+  await expect(pane).toContainText("# a.md");
+
+  // 修饰键点击只改变选择，不打开文件，与 Zed 一致。
+  await item("b.md").click({ modifiers: ["Control"] });
+  await expect(treeStatus(page)).toHaveText("已选择 2 项");
+  await expect(pane).toContainText("# a.md");
+  await expect(pane).not.toContainText("# b.md");
+  await item("c.md").click({ modifiers: ["Shift"] });
+  await expect(pane).not.toContainText("# c.md");
+
+  // 单击文件夹展开，再次单击折叠；展开后的 treeitem 比行高，
+  // 必须点在行上，否则会落在空白处变成清空选择。
+  await row("Inbox").click();
+  await expect(item("Inbox")).toHaveAttribute("aria-expanded", "true");
+  await expect(item("alpha.md")).toBeVisible();
+  await expect(pane).not.toContainText("# Inbox/alpha.md");
+  await row("Inbox").click();
+  await expect(item("Inbox")).toHaveAttribute("aria-expanded", "false");
+  await expect(item("alpha.md")).toBeHidden();
+});
+
+test("a click that follows a pointer drag does not open or expand", async ({
+  page,
+}) => {
+  const item = (name: string) =>
+    page.getByRole("treeitem", { name, exact: true });
+  const row = (name: string) => item(name).locator(".tree-row").first();
+  const pane = page.getByRole("region", { name: "文件编辑器" });
+
+  // 拖拽移动文件：松手后不得再把落点当作单击把文件打开（悬停展开是另一套机制）。
+  const source = (await row("a.md").boundingBox())!;
+  const target = (await row("Archive").boundingBox())!;
+  await page.mouse.move(
+    source.x + source.width / 2,
+    source.y + source.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    target.x + target.width / 2,
+    target.y + target.height / 2,
+    { steps: 8 },
+  );
+  await page.mouse.up();
+  await expect(row("a.md")).toHaveAttribute("data-path", "Archive/a.md");
+  await expect(pane).toContainText("打开一份文件");
+
+  // 浏览器可能在拖动后补发 click；坐标已偏移时按拖动处理，原位点击仍然展开。
+  await row("Inbox").dispatchEvent("pointerdown", {
+    clientX: 120,
+    clientY: 120,
+    button: 0,
+    buttons: 1,
+    isPrimary: true,
+  });
+  await row("Inbox").dispatchEvent("click", {
+    clientX: 260,
+    clientY: 200,
+    button: 0,
+  });
+  await expect(item("Inbox")).toHaveAttribute("aria-expanded", "false");
+  await row("Inbox").dispatchEvent("pointerdown", {
+    clientX: 120,
+    clientY: 120,
+    button: 0,
+    buttons: 1,
+    isPrimary: true,
+  });
+  await row("Inbox").dispatchEvent("click", {
+    clientX: 120,
+    clientY: 120,
+    button: 0,
+  });
+  await expect(item("Inbox")).toHaveAttribute("aria-expanded", "true");
+});
+
 test("multi-item dragging moves to folders and rejects moving a folder inside itself", async ({
   page,
 }) => {
@@ -229,7 +317,7 @@ test("dragging highlights only the destination subtree and clears it on exit", a
     expect(highlight.border).toContain("2px");
     await expect(item("Archive")).toHaveAttribute("data-drop", "false");
     await expect(root).toHaveAttribute("data-drop", "false");
-    await expect(page.getByRole("status")).toHaveText("已选择 2 项");
+    await expect(treeStatus(page)).toHaveText("已选择 2 项");
 
     // A file resolves to its parent subtree, rather than becoming a drop target itself.
     await row("alpha.md").dispatchEvent("dragover", {
@@ -269,7 +357,7 @@ test("dragging highlights only the destination subtree and clears it on exit", a
     await expect(root).toHaveAttribute("data-drop", "true");
     await expect(item("b.md")).toHaveAttribute("data-drop", "false");
     await page
-      .locator(".file-tree > footer")
+      .locator(".tree-toolbar")
       .dispatchEvent("dragover", { dataTransfer });
     await expect(root).toHaveAttribute("data-drop", "false");
     await row("b.md").dispatchEvent("dragover", { dataTransfer });
@@ -285,7 +373,11 @@ test("dragging highlights only the destination subtree and clears it on exit", a
       "none",
     );
     await row("alpha.md").dispatchEvent("dragend", { dataTransfer });
+    // Inbox 处于展开态：单击会折叠并选中，再单击恢复展开，Nested 才能作为落点行。
     await row("Inbox").click();
+    await expect(item("Inbox")).toHaveAttribute("aria-expanded", "false");
+    await row("Inbox").click();
+    await expect(item("Inbox")).toHaveAttribute("aria-expanded", "true");
     await row("Inbox").dispatchEvent("dragstart", { dataTransfer });
     await row("Nested").dispatchEvent("dragover", { dataTransfer });
     await expect(item("Nested")).toHaveAttribute("data-drop", "false");
@@ -304,6 +396,10 @@ test("cut/paste and move dialog provide keyboard alternatives to dragging", asyn
   const tree = page.getByRole("tree", { name: "文件树" });
   const b = page.getByRole("treeitem", { name: "b.md", exact: true });
   await b.click();
+  // 单击会打开文件，焦点随后跟随编辑器（与 Zed 一致）；等编辑器就绪后
+  // 再聚焦文件树，继续使用文件树快捷键才不会落在编辑器里。
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeVisible();
+  await tree.focus();
   await page.keyboard.press("Control+x");
   await expect(b.locator(".tree-row")).toHaveAttribute("data-cut", "true");
   await page.keyboard.press("Control+Home");
@@ -329,12 +425,15 @@ test("cut/paste and move dialog provide keyboard alternatives to dragging", asyn
 test("delete confirmation snapshots the selection, cancels safely, and deletes selected parents once", async ({
   page,
 }) => {
-  await page.getByRole("button", { name: "展开 Inbox", exact: true }).click();
+  // 单击行即展开并选中 Inbox，不必先点折叠箭头；再按会折叠。
   await page
     .getByRole("treeitem", { name: "Inbox", exact: true })
     .locator(".tree-row")
     .first()
     .click();
+  await expect(
+    page.getByRole("treeitem", { name: "Inbox", exact: true }),
+  ).toHaveAttribute("aria-expanded", "true");
   await page
     .getByRole("treeitem", { name: "alpha.md", exact: true })
     .click({ modifiers: ["Control"] });
@@ -362,6 +461,9 @@ test("copy/paste preserves originals and creates unique same-folder copies", asy
   page,
 }) => {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  // 单击打开后焦点可能跟随编辑器，剪贴板快捷键前先聚焦文件树。
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeVisible();
+  await page.getByRole("tree", { name: "文件树" }).focus();
   await page.keyboard.press("Control+c");
   await page.keyboard.press("Control+v");
   await expect(
@@ -376,7 +478,7 @@ test("copy/paste preserves originals and creates unique same-folder copies", asy
   ).toBeVisible();
 });
 
-test("file imports, preview updates and partial move failure reflect actual storage", async ({
+test("file imports, editor contents and partial move failure reflect actual storage", async ({
   page,
 }) => {
   await page.getByLabel("选择要导入的文件").setInputFiles({
@@ -384,10 +486,8 @@ test("file imports, preview updates and partial move failure reflect actual stor
     mimeType: "text/plain",
     buffer: Buffer.from("imported"),
   });
-  await page
-    .getByRole("treeitem", { name: "import.txt", exact: true })
-    .dblclick();
-  await expect(page.getByRole("region", { name: "文件预览" })).toContainText(
+  await page.getByRole("treeitem", { name: "import.txt", exact: true }).click();
+  await expect(page.getByRole("region", { name: "文件编辑器" })).toContainText(
     "imported",
   );
   // 独立注入真实 OPFS 写入失败，第二项出错时第一项必须可见。
@@ -450,7 +550,7 @@ test("mobile tree fits the viewport and theme applies to rows and operation dial
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.getByRole("button", { name: "新建文件", exact: true }).click();
   const surface = await page
-    .locator(".file-tree")
+    .locator(".vault-editor")
     .evaluate((element) => getComputedStyle(element).backgroundColor);
   await expect(page.getByRole("dialog")).toHaveCSS("background-color", surface);
 });

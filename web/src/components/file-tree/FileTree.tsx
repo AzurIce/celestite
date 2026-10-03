@@ -51,10 +51,12 @@ import {
   describeTreeError,
 } from "@/lib/file-tree/model";
 import type { TreeChange } from "@/lib/file-tree/model";
+import { StatusSlot } from "@/components/ui/status-slot";
 import "./file-tree.css";
 
 export interface FileTreeProps {
   backend: VaultBackend;
+  statusMount?: Element;
   label?: string;
   onOpen?: (path: VaultPath) => void;
   onChange?: (change: TreeChange) => void;
@@ -485,6 +487,7 @@ export function FileTree(props: FileTreeProps) {
     const directory = () => row()?.kind === "directory";
     const destination = () =>
       directory() ? rowProps.path : parentPath(rowProps.path);
+    let pointer: { x: number; y: number } | null = null;
     return (
       <ContextMenu
         onOpenChange={(opened) => {
@@ -530,21 +533,34 @@ export function FileTree(props: FileTreeProps) {
             draggable={state().busy ? "false" : "true"}
             onClick={(event) => {
               event.stopPropagation();
+              const modifier = event.ctrlKey || event.metaKey || event.shiftKey;
               model.select(rowProps.path, {
                 toggle: event.ctrlKey || event.metaKey,
                 range: event.shiftKey,
               });
               tree.focus();
-            }}
-            onDblClick={(event) => {
-              event.stopPropagation();
-              if (!model.snapshot().busy) open(rowProps.path);
+              // 单击即打开/折叠，与 Zed 的 project panel 一致；拖动产生的位置
+              // 变化不算单击，避免移动文件后顺带打开或折叠目标。
+              const dragged =
+                pointer !== null &&
+                (Math.abs(event.clientX - pointer.x) > 4 ||
+                  Math.abs(event.clientY - pointer.y) > 4);
+              if (
+                !modifier &&
+                !dragged &&
+                event.button === 0 &&
+                !model.snapshot().busy
+              )
+                open(rowProps.path);
             }}
             onContextMenu={(event) => {
               event.stopPropagation();
               model.contextSelect(rowProps.path);
             }}
-            onPointerDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => {
+              pointer = { x: event.clientX, y: event.clientY };
+              event.stopPropagation();
+            }}
             onPointerMove={(event) => event.stopPropagation()}
             onPointerUp={(event) => event.stopPropagation()}
             onPointerCancel={(event) => event.stopPropagation()}
@@ -595,9 +611,9 @@ export function FileTree(props: FileTreeProps) {
             >
               <Show
                 when={expanded()}
-                fallback={<Folder size={16} class="text-accent" />}
+                fallback={<Folder size={16} class="text-secondary" />}
               >
-                <FolderOpen size={16} class="text-accent" />
+                <FolderOpen size={16} class="text-secondary" />
               </Show>
             </Show>
             <span class="min-w-0 truncate">{entryName(rowProps.path)}</span>
@@ -766,8 +782,8 @@ export function FileTree(props: FileTreeProps) {
           clearDropTarget();
       }}
     >
-      <header class="flex items-center gap-1 border-b border-solid border-border px-2 py-2">
-        <span class="mr-auto truncate px-1 font-semibold text-ui-sm">文件</span>
+      <header class="tree-toolbar">
+        <span class="mr-auto min-w-0 truncate px-1 text-ui-sm">文件</span>
         <IconButton
           aria-label="新建文件"
           title="新建文件"
@@ -894,8 +910,13 @@ export function FileTree(props: FileTreeProps) {
           </Button>
         </div>
       </Show>
-      <footer class="border-t border-solid border-border px-3 py-2 text-ui-sm text-secondary">
-        <p role="status" aria-live="polite" class="truncate">
+      <StatusSlot mount={props.statusMount} class="tree-footer">
+        <p
+          role="status"
+          aria-label="文件树状态"
+          aria-live="polite"
+          class="truncate"
+        >
           {state().busy
             ? state().status
             : state().clipboard.count
@@ -904,10 +925,10 @@ export function FileTree(props: FileTreeProps) {
                 ? `已选择 ${state().selected.size} 项`
                 : state().status}
         </p>
-        <p id={`${id}-help`} class="mt-1 text-[11px]">
-          Ctrl / ⌘ 多选 · Shift 连选 · 拖入文件夹移动
-        </p>
-      </footer>
+      </StatusSlot>
+      <p id={`${id}-help`} class="sr-only">
+        单击打开 · Ctrl / ⌘ 多选 · Shift 连选 · 拖入文件夹移动
+      </p>
       <input
         ref={fileInput}
         type="file"

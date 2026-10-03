@@ -21,7 +21,15 @@
 }
 
 .ui-button[data-variant="danger"] {
-  --uno: "text-danger";
+  --uno: "border-transparent bg-transparent text-danger";
+}
+
+.ui-button[data-variant="danger"]:hover {
+  background: color-mix(in srgb, var(--color-danger) 8%, var(--color-surface));
+}
+
+.ui-button[aria-pressed="true"] {
+  --uno: "bg-muted text-foreground";
 }
 
 .ui-button:disabled,
@@ -44,11 +52,11 @@
 }
 
 .ui-dialog > h2 {
-  --uno: "pr-6 text-ui-heading font-semibold";
+  --uno: "pr-6 text-ui-heading font-medium";
 }
 
 .ui-dialog > p {
-  --uno: "mt-2 text-secondary";
+  --uno: "mt-2 text-ui-sm text-secondary";
 }
 
 .ui-tooltip,
@@ -77,8 +85,27 @@
   --uno: "border-danger";
 }
 
+.ui-input {
+  transition: border-color 120ms ease;
+}
+
+.ui-input:hover {
+  border-color: color-mix(
+    in srgb,
+    var(--color-secondary) 45%,
+    var(--color-border)
+  );
+}
+
+.ui-input:focus-visible {
+  border-color: var(--color-focus);
+  outline: 2px solid color-mix(in srgb, var(--color-focus) 20%, transparent);
+  outline-offset: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .ui-button {
+  .ui-button,
+  .ui-input {
     --uno: "transition-none";
   }
 }

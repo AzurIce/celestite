@@ -17,6 +17,7 @@ import {
   Download as download,
   Upload as upload,
   Move as move,
+  Save as save,
   FileText as fileText,
   Monitor as monitor,
   Moon as moon,
@@ -46,7 +47,7 @@ function createIcon(node: IconNode, name: string) {
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        stroke-width={props.strokeWidth ?? 2}
+        stroke-width={props.strokeWidth ?? 1.75}
         stroke-linecap="round"
         stroke-linejoin="round"
         aria-hidden={
@@ -85,6 +86,7 @@ export const Trash2 = createIcon(trash2, "trash-2");
 export const Download = createIcon(download, "download");
 export const Upload = createIcon(upload, "upload");
 export const Move = createIcon(move, "move");
+export const Save = createIcon(save, "save");
 export const FileText = createIcon(fileText, "file-text");
 export const Monitor = createIcon(monitor, "monitor");
 export const Moon = createIcon(moon, "moon");

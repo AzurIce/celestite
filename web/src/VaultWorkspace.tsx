@@ -1,4 +1,6 @@
 import { Show, createSignal, onCleanup, onSettled } from "solid-js";
+import { VaultEditor } from "@/components/editor";
+import { VaultDocuments } from "@/lib/editor/documents";
 import { FileTree } from "@/components/file-tree";
 import {
   Button,
@@ -8,40 +10,55 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui";
-import {
-  FolderOpen,
-  FileText,
-  Moon,
-  Sun,
-  Monitor,
-  Check,
-  ChevronDown,
-  ChevronLeft,
-} from "@/components/icons";
-import { openOpfsVault, vaultPath } from "@/lib/vault";
-import type { VaultBackend, VaultPath } from "@/lib/vault";
-import { isWithin, describeTreeError } from "@/lib/file-tree/model";
-import type { TreeChange } from "@/lib/file-tree/model";
+import { Moon, Sun, Monitor, Check } from "@/components/icons";
+import { openOpfsVault } from "@/lib/vault";
 import { theme, setTheme } from "@/lib/theme";
+import { SETTINGS_SCHEMA } from "@/lib/settings/schema";
+import {
+  attachProjectSettings,
+  clearProjectSettings,
+  setSetting,
+  settings,
+} from "@/lib/settings";
+import { readProjectSettings } from "@/lib/settings/project";
+import "./workspace.css";
 
-interface Preview {
-  path: VaultPath;
-  content: string;
-  size?: number;
-  loading?: boolean;
-  error?: string;
+/** 侧边栏宽度与 Zed 的左侧 dock 一样可拖动；取值范围由设置 schema 决定。 */
+const SIDEBAR_STEP = 16;
+
+function sidebarLimit() {
+  // schema 的 min/max 之外再受视口宽度约束，编辑器始终保留可用空间。
+  return Math.max(
+    SETTINGS_SCHEMA["sidebar.width"].default,
+    Math.min(
+      SETTINGS_SCHEMA["sidebar.width"].range?.max ?? 560,
+      Math.round(window.innerWidth * 0.6),
+    ),
+  );
+}
+function clampSidebarWidth(value: number) {
+  const range = SETTINGS_SCHEMA["sidebar.width"].range ?? {
+    min: 200,
+    max: 560,
+  };
+  if (!Number.isFinite(value)) return SETTINGS_SCHEMA["sidebar.width"].default;
+  return Math.round(Math.min(sidebarLimit(), Math.max(range.min, value)));
 }
 
 export default function VaultWorkspace() {
-  const [backend, setBackend] = createSignal<VaultBackend | null>(null);
+  const [documents, setDocuments] = createSignal<VaultDocuments | null>(null);
   const [opening, setOpening] = createSignal(true);
   const [openError, setOpenError] = createSignal<string | null>(null);
-  const [preview, setPreview] = createSignal<Preview | null>(null);
-  let currentBackend: VaultBackend | null = null;
-  let activePath: VaultPath | null = null;
-  let generation = 0;
+  const [resizing, setResizing] = createSignal(false);
+  let treeStatusMount!: HTMLDivElement;
+  let editorStatusMount!: HTMLDivElement;
+  let currentDocuments: VaultDocuments | null = null;
   let disposed = false;
   let starting = false;
+  let dragStart = { x: 0, width: clampSidebarWidth(0) };
+  // Solid 的 signal 写入在微任务提交，setter 之后同步读到的仍是旧值；
+  // 夹取结果与持久化都用这个同步镜像。
+  let appliedWidth = clampSidebarWidth(settings().values["sidebar.width"]);
 
   async function start() {
     if (starting || disposed) return;
@@ -54,8 +71,10 @@ export default function VaultWorkspace() {
         await opened.close();
         return;
       }
-      currentBackend = opened;
-      setBackend(opened);
+      currentDocuments = new VaultDocuments(opened);
+      setDocuments(currentDocuments);
+      // vault 打开后载入项目级覆盖；文件缺失或读失败都视为没有覆盖。
+      void attachProjectSettings(() => readProjectSettings(opened));
     } catch {
       if (!disposed)
         setOpenError(
@@ -66,109 +85,91 @@ export default function VaultWorkspace() {
       if (!disposed) setOpening(false);
     }
   }
+  /** 宽度来自设置层，因此项目级文件也能覆盖它。 */
+  const sidebarWidth = () => settings().values["sidebar.width"];
+  /** 拖动中只改内存态，不落盘。 */
+  function previewSidebarWidth(width: number) {
+    const next = clampSidebarWidth(width);
+    appliedWidth = next;
+    void setSetting("sidebar.width", next, { persist: false });
+  }
+  /** 松手、键盘、窗口变化时一次性写入设置文件。 */
+  function commitSidebarWidth(width = appliedWidth) {
+    const next = clampSidebarWidth(width);
+    appliedWidth = next;
+    void setSetting("sidebar.width", next);
+  }
+  function dividerKeyDown(event: KeyboardEvent) {
+    const targets: Record<string, number> = {
+      ArrowLeft: appliedWidth - SIDEBAR_STEP,
+      ArrowRight: appliedWidth + SIDEBAR_STEP,
+      Home: SETTINGS_SCHEMA["sidebar.width"].range?.min ?? sidebarLimit(),
+      End: sidebarLimit(),
+    };
+    const target = targets[event.key];
+    if (target === undefined) return;
+    event.preventDefault();
+    commitSidebarWidth(target);
+  }
+  function dividerPointerDown(
+    event: PointerEvent & { currentTarget: HTMLElement },
+  ) {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    const divider = event.currentTarget;
+    dragStart = { x: event.clientX, width: appliedWidth };
+    const move = (moveEvent: PointerEvent) =>
+      previewSidebarWidth(dragStart.width + moveEvent.clientX - dragStart.x);
+    const stop = () => {
+      setResizing(false);
+      divider.removeEventListener("pointermove", move);
+      divider.removeEventListener("pointerup", stop);
+      divider.removeEventListener("pointercancel", stop);
+      // 拖动过程中只改内存态，松手时一次性落盘。
+      commitSidebarWidth();
+    };
+    divider.setPointerCapture(event.pointerId);
+    setResizing(true);
+    divider.addEventListener("pointermove", move);
+    divider.addEventListener("pointerup", stop);
+    divider.addEventListener("pointercancel", stop);
+  }
+  // onSettled 的返回值即清理函数，效果内部不允许调用 onCleanup。
+  onSettled(() => {
+    const onWindowResize = () => {
+      // 视口变窄时夹取；值没变就不写文件。
+      const next = clampSidebarWidth(appliedWidth);
+      if (next !== appliedWidth || next !== sidebarWidth())
+        commitSidebarWidth(next);
+    };
+    window.addEventListener("resize", onWindowResize);
+    return () => window.removeEventListener("resize", onWindowResize);
+  });
   onSettled(() => {
     void start();
   });
   onCleanup(() => {
     disposed = true;
-    generation++;
-    void currentBackend?.close();
+    clearProjectSettings();
+    void currentDocuments?.close();
   });
 
-  async function openFile(path: VaultPath) {
-    if (!currentBackend) return;
-    const request = ++generation;
-    activePath = path;
-    setPreview({ path, content: "", loading: true });
-    try {
-      const stat = await currentBackend.stat(path);
-      if (!stat) throw new Error("Missing file");
-      let content: string;
-      if ((stat.size ?? 0) > 1024 * 1024)
-        content = "文件较大，请通过右键菜单下载后查看。";
-      else {
-        const bytes = await currentBackend.readFile(path);
-        try {
-          content = bytes.includes(0)
-            ? "这是一个二进制文件，可通过右键菜单下载。"
-            : new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-        } catch {
-          content = "这是一个二进制文件，可通过右键菜单下载。";
-        }
-      }
-      if (!disposed && generation === request)
-        setPreview({ path, content, size: stat.size });
-    } catch (error) {
-      if (!disposed && generation === request)
-        setPreview({ path, content: "", error: describeTreeError(error) });
-    }
-  }
-  function changed(change: TreeChange) {
-    if (!activePath) return;
-    if (change.kind === "rename" && isWithin(activePath, change.from)) {
-      void openFile(
-        vaultPath(change.to + activePath.slice(change.from.length)),
-      );
-    } else if (change.kind === "remove" && isWithin(activePath, change.path)) {
-      activePath = null;
-      generation++;
-      setPreview(null);
-    }
-  }
-
   return (
-    <main class="flex h-dvh min-h-0 flex-col">
-      <header class="flex h-14 shrink-0 items-center gap-3 border-b border-solid border-border bg-surface px-4">
-        <div class="flex h-8 w-8 items-center justify-center rounded-panel bg-accent text-accent-foreground">
-          <FolderOpen size={18} />
-        </div>
-        <h1 class="text-base font-semibold">Celestite</h1>
-        <span class="hidden text-ui-sm text-secondary sm:inline">
-          我的 Vault
-        </span>
-        <div class="ml-auto flex items-center gap-2">
-          <Show when={import.meta.env.DEV}>
-            <a
-              href="/ui"
-              class="hidden text-ui-sm text-secondary no-underline hover:text-foreground sm:inline"
-            >
-              组件预览
-            </a>
-          </Show>
-          <DropdownMenu placement="bottom-end" gutter={6}>
-            <DropdownMenuTrigger as={Button} size="sm">
-              <Monitor size={15} />
-              主题
-              <ChevronDown size={13} />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent>
-              <DropdownMenuItem onSelect={() => setTheme("system")}>
-                <Monitor size={15} />
-                跟随系统
-                <Show when={theme() === "system"}>
-                  <Check size={14} class="ml-auto" />
-                </Show>
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setTheme("light")}>
-                <Sun size={15} />
-                浅色
-                <Show when={theme() === "light"}>
-                  <Check size={14} class="ml-auto" />
-                </Show>
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setTheme("dark")}>
-                <Moon size={15} />
-                深色
-                <Show when={theme() === "dark"}>
-                  <Check size={14} class="ml-auto" />
-                </Show>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      </header>
+    <main
+      class="workspace flex h-dvh min-h-0 flex-col"
+      onKeyDown={(event) => {
+        if (
+          !event.defaultPrevented &&
+          (event.ctrlKey || event.metaKey) &&
+          event.key.toLowerCase() === "s"
+        ) {
+          event.preventDefault();
+          void currentDocuments?.save();
+        }
+      }}
+    >
       <Show
-        when={backend()}
+        when={documents()}
         keyed
         fallback={
           <div class="m-auto max-w-md p-8 text-center">
@@ -183,91 +184,90 @@ export default function VaultWorkspace() {
           </div>
         }
       >
-        {(opened) => (
-          <div class="grid min-h-0 flex-1 grid-cols-1 sm:grid-cols-[300px_minmax(0,1fr)]">
-            <div class="flex min-h-0 flex-col border-r border-solid border-border">
+        {(workspace) => (
+          <div
+            class="workspace-grid grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] sm:grid-cols-[var(--workspace-sidebar-width)_5px_minmax(0,1fr)]"
+            data-resizing={resizing() ? "true" : "false"}
+            style={{
+              "--workspace-sidebar-width": `${sidebarWidth()}px`,
+            }}
+          >
+            <div class="workspace-sidebar flex min-h-0 flex-col">
               <FileTree
-                backend={opened}
+                backend={workspace.treeBackend}
+                statusMount={treeStatusMount}
                 label="我的 Vault"
-                onOpen={(path) => void openFile(path)}
-                onChange={changed}
+                onOpen={(path) => void workspace.open(path)}
               />
             </div>
-            <section
-              aria-label="文件预览"
-              class={
-                preview()
-                  ? "fixed inset-x-0 bottom-0 top-14 z-20 flex min-h-0 min-w-0 flex-col bg-background sm:static sm:z-auto"
-                  : "hidden min-h-0 min-w-0 flex-col bg-background sm:flex"
-              }
+            <div
+              class="workspace-divider"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="调整侧边栏宽度"
+              aria-valuenow={sidebarWidth()}
+              aria-valuemin={SETTINGS_SCHEMA["sidebar.width"].range?.min}
+              aria-valuemax={sidebarLimit()}
+              title="拖动调整侧边栏宽度"
+              tabindex={0}
+              data-dragging={resizing() ? "true" : "false"}
+              onKeyDown={dividerKeyDown}
+              onPointerDown={dividerPointerDown}
             >
-              <Show
-                when={preview()}
-                keyed
-                fallback={
-                  <div class="m-auto max-w-sm p-8 text-center">
-                    <FileText size={36} class="mx-auto mb-4 text-secondary" />
-                    <h2 class="text-ui-heading font-medium">从一份文件开始</h2>
-                    <p class="mt-3 text-secondary">
-                      在左侧新建或导入文件，双击即可预览。
-                    </p>
-                    <p class="mt-6 text-ui-sm text-secondary">
-                      右键打开操作菜单，也可以用键盘选择和移动。
-                    </p>
-                  </div>
-                }
-              >
-                {(file) => (
-                  <>
-                    <header class="flex items-center gap-2 border-b border-solid border-border px-5 py-3">
-                      <IconButton
-                        aria-label="返回文件树"
-                        size="sm"
-                        class="sm:hidden"
-                        onClick={() => {
-                          activePath = null;
-                          generation++;
-                          setPreview(null);
-                          onSettled(() =>
-                            document
-                              .querySelector<HTMLElement>('[role="tree"]')
-                              ?.focus(),
-                          );
-                        }}
-                      >
-                        <ChevronLeft size={16} />
-                      </IconButton>
-                      <FileText size={16} class="text-secondary" />
-                      <span class="min-w-0 truncate text-ui-sm">
-                        {file.path}
-                      </span>
-                      <span class="ml-auto shrink-0 text-ui-sm text-secondary">
-                        {file.size === undefined
-                          ? ""
-                          : `${file.size.toLocaleString()} 字节`}
-                      </span>
-                    </header>
-                    <Show
-                      when={file.error}
-                      fallback={
-                        <pre class="m-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-6 font-mono text-ui-sm leading-relaxed">
-                          {file.loading
-                            ? "正在读取…"
-                            : file.content || "（空文件）"}
-                        </pre>
-                      }
-                    >
-                      <p role="alert" class="p-6 text-danger">
-                        {file.error}
-                      </p>
-                    </Show>
-                  </>
-                )}
-              </Show>
-            </section>
+              <span class="workspace-divider-line" />
+            </div>
+            <VaultEditor
+              documents={workspace}
+              statusMount={editorStatusMount}
+            />
           </div>
         )}
       </Show>
+      <footer class="workspace-statusbar" aria-label="工作区状态栏">
+        <div class="workspace-tree-status" ref={treeStatusMount} />
+        <div class="workspace-editor-status" ref={editorStatusMount} />
+        <Show when={import.meta.env.DEV}>
+          <a
+            href="/ui"
+            class="hidden px-2 text-ui-sm text-secondary no-underline hover:text-foreground sm:inline"
+          >
+            组件预览
+          </a>
+        </Show>
+        <DropdownMenu placement="top-end" gutter={6}>
+          <DropdownMenuTrigger
+            as={IconButton}
+            aria-label="主题"
+            title="主题"
+            size="sm"
+          >
+            <Monitor size={15} />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem onSelect={() => setTheme("system")}>
+              <Monitor size={15} />
+              跟随系统
+              <Show when={theme() === "system"}>
+                <Check size={14} class="ml-auto" />
+              </Show>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setTheme("light")}>
+              <Sun size={15} />
+              浅色
+              <Show when={theme() === "light"}>
+                <Check size={14} class="ml-auto" />
+              </Show>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setTheme("dark")}>
+              <Moon size={15} />
+              深色
+              <Show when={theme() === "dark"}>
+                <Check size={14} class="ml-auto" />
+              </Show>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </footer>
     </main>
   );
 }

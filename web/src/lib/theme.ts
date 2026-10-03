@@ -1,19 +1,17 @@
-import { createSignal } from "solid-js";
+import { settings, setSetting, subscribeSettings } from "./settings";
+import type { ThemeModeSetting } from "./settings/schema";
 
-export type ThemeMode = "system" | "light" | "dark";
-const storageKey = "celestite.theme";
+export type ThemeMode = ThemeModeSetting;
 
-function readTheme(): ThemeMode {
-  try {
-    const value = localStorage.getItem(storageKey);
-    return value === "light" || value === "dark" ? value : "system";
-  } catch {
-    return "system";
-  }
+/** 当前主题模式取自设置层（默认值 < 全局文件 < 项目文件）。 */
+export function theme(): ThemeMode {
+  return settings().values["theme.mode"];
 }
 
-const [theme, updateTheme] = createSignal<ThemeMode>(readTheme());
-export { theme };
+/** 写入设置层；保存失败时内存态保留，界面继续响应用户选择。 */
+export function setTheme(mode: ThemeMode): Promise<void> | undefined {
+  return setSetting("theme.mode", mode);
+}
 
 function applyTheme(mode: ThemeMode) {
   document.documentElement.dataset.theme =
@@ -24,24 +22,25 @@ function applyTheme(mode: ThemeMode) {
       : mode;
 }
 
-export function setTheme(mode: ThemeMode) {
-  updateTheme(mode);
-  // Solid 2 的 signal 写入在微任务提交，直接使用传入值更新 DOM。
-  applyTheme(mode);
-  try {
-    // TODO: 这个在 tauri 下肯定是要保存到编辑器的持久化设置里而不是浏览器 localStorage 里的，结合后面的后端抽象应该要做一些重构与设计
-    localStorage.setItem(storageKey, mode);
-  } catch {
-    // Theme switching still works when storage is unavailable.
-  }
-}
-
+/**
+ * 设置就绪后应用一次主题，并在设置变化或系统配色变化时重新应用。
+ * 返回取消订阅函数，供热更新 dispose 使用。
+ */
 export function initializeTheme() {
-  applyTheme(theme());
+  // 使用通知携带的生效模式，避免同步读到尚未提交的 Solid signal。
+  let mode = theme();
+  applyTheme(mode);
+  const unsubscribe = subscribeSettings((snapshot) => {
+    mode = snapshot.values["theme.mode"];
+    applyTheme(mode);
+  });
   const media = window.matchMedia("(prefers-color-scheme: dark)");
   const onChange = () => {
-    if (theme() === "system") applyTheme("system");
+    if (mode === "system") applyTheme(mode);
   };
   media.addEventListener("change", onChange);
-  return () => media.removeEventListener("change", onChange);
+  return () => {
+    unsubscribe();
+    media.removeEventListener("change", onChange);
+  };
 }

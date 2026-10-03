@@ -1,18 +1,19 @@
 :root {
   color-scheme: light;
-  --color-background: #f6f7f9;
-  --color-surface: #ffffff;
-  --color-muted: #eef0f4;
-  --color-foreground: #20242d;
-  --color-secondary: #616979;
-  --color-border: #dce0e7;
-  --color-accent: #5264cf;
-  --color-accent-hover: #4454b8;
+  --color-background: #f5f5f3;
+  --color-surface: #fdfdfc;
+  --color-muted: #eceeeb;
+  --color-foreground: #272b28;
+  --color-secondary: #69716b;
+  --color-border: #e3e6e1;
+  --color-accent: #354e43;
+  --color-accent-hover: #283e34;
   --color-accent-foreground: #ffffff;
-  --color-danger: #bb3547;
-  --color-focus: #7586eb;
-  --color-overlay: rgb(16 20 30 / 45%);
-  --shadow-floating: 0 8px 28px rgb(16 20 30 / 14%);
+  --color-danger: #b14545;
+  --color-focus: #648578;
+  --color-overlay: rgb(24 30 26 / 28%);
+  --shadow-floating: 0 4px 20px rgb(24 30 26 / 10%);
+  --workspace-status-height: 32px;
   --font-ui:
     Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
     sans-serif;
@@ -21,7 +22,7 @@
   --font-size-ui-heading: 18px;
   --line-height-ui: 1.5;
   --radius-control: 6px;
-  --radius-panel: 10px;
+  --radius-panel: 8px;
   --height-control-sm: 28px;
   --height-control-md: 32px;
   --z-overlay: 40;
@@ -32,23 +33,25 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --color-background: #191b22;
-  --color-surface: #22252e;
-  --color-muted: #2c303c;
-  --color-foreground: #e5e8ef;
-  --color-secondary: #a2aaba;
-  --color-border: #383e4c;
-  --color-accent: #a3afff;
-  --color-accent-hover: #bbc4ff;
-  --color-accent-foreground: #1b2247;
-  --color-danger: #ff96a3;
-  --color-focus: #a3afff;
-  --color-overlay: rgb(0 0 0 / 60%);
-  --shadow-floating: 0 8px 28px rgb(0 0 0 / 32%);
+  --color-background: #1b1e1c;
+  --color-surface: #202421;
+  --color-muted: #2c322d;
+  --color-foreground: #e4e9e3;
+  --color-secondary: #9aa49b;
+  --color-border: #343c35;
+  --color-accent: #bacabd;
+  --color-accent-hover: #d2ddd4;
+  --color-accent-foreground: #202921;
+  --color-danger: #e99b96;
+  --color-focus: #7c9d88;
+  --color-overlay: rgb(0 0 0 / 48%);
+  --shadow-floating: 0 4px 20px rgb(0 0 0 / 24%);
 }
 
 * {
   --uno: "box-border";
+  /* Directional borders must not leave the browser's medium-width borders on other sides. */
+  border-width: 0;
 }
 
 body {
@@ -75,6 +78,12 @@ p {
 }
 svg {
   --uno: "shrink-0";
+}
+
+/* Use unobtrusive scrollbars without changing scroll or keyboard behavior. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
 }
 
 :focus-visible {

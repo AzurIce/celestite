@@ -1,4 +1,6 @@
 import { expect, test as base } from "@playwright/test";
+type SettingsModule = typeof import("../src/lib/settings");
+type VaultModule = typeof import("../src/lib/vault");
 
 const test = base.extend<{ runtimeErrors: string[] }>({
   runtimeErrors: [
@@ -96,9 +98,21 @@ test("theme commits immediately, persists, follows system and reaches portals", 
   };
   await selectTheme("深色");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByRole("button", { name: "主题", exact: true }).click();
+  await expect(
+    page
+      .getByRole("menuitem", { name: "深色", exact: true })
+      .locator(".lucide-check"),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("menuitem", { name: "浅色", exact: true })
+      .locator(".lucide-check"),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "打开弹窗" }).click();
   const surface = await page
-    .locator("section")
+    .getByLabel("基础组件", { exact: true })
     .evaluate((el) => getComputedStyle(el).backgroundColor);
   await expect(page.getByRole("dialog")).toHaveCSS("background-color", surface);
   await page.keyboard.press("Escape");
@@ -106,10 +120,87 @@ test("theme commits immediately, persists, follows system and reaches portals", 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await selectTheme("浅色");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
-  await selectTheme("跟随系统");
   await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await selectTheme("跟随系统");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.emulateMedia({ colorScheme: "light" });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+});
+
+test("theme stays active when writing the settings file fails", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    const original = FileSystemFileHandle.prototype.createWritable;
+    (
+      window as unknown as { restoreSettingsWriter: () => void }
+    ).restoreSettingsWriter = () => {
+      FileSystemFileHandle.prototype.createWritable = original;
+    };
+    FileSystemFileHandle.prototype.createWritable = async function (options) {
+      if (this.name === "settings.json")
+        throw new DOMException("Injected quota failure", "QuotaExceededError");
+      return original.call(this, options);
+    };
+  });
+  try {
+    await page.getByRole("button", { name: "主题", exact: true }).click();
+    await page.getByRole("menuitem", { name: "深色", exact: true }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect
+      .poll(() =>
+        page.evaluate(async () => {
+          const url = "/src/lib/settings/index.ts";
+          const { settings } = (await import(url)) as SettingsModule;
+          return settings().saveError?.key;
+        }),
+      )
+      .toBe("theme.mode");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  } finally {
+    await page.evaluate(() =>
+      (
+        window as unknown as { restoreSettingsWriter: () => void }
+      ).restoreSettingsWriter(),
+    );
+  }
+});
+
+test("opening a Vault applies its theme override and clearing it restores the app theme", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "主题", exact: true }).click();
+  await page.getByRole("menuitem", { name: "浅色", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const url = "/src/lib/settings/index.ts";
+        const { settings } = (await import(url)) as SettingsModule;
+        return settings().storage;
+      }),
+    )
+    .toBe("file");
+  await page.evaluate(async () => {
+    const url = "/src/lib/vault/index.ts";
+    const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;
+    const vault = await openOpfsVault();
+    await vault.mkdir(vaultPath(".celestite"));
+    await vault.writeFile(
+      vaultPath(".celestite/settings.json"),
+      new TextEncoder().encode('{"theme.mode":"dark"}'),
+      { mode: "create" },
+    );
+    await vault.close();
+  });
+  await page.goto("/");
+  await expect(page.getByRole("tree", { name: "文件树" })).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.evaluate(async () => {
+    const url = "/src/lib/settings/index.ts";
+    const { clearProjectSettings } = (await import(url)) as SettingsModule;
+    clearProjectSettings();
+  });
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 });
 

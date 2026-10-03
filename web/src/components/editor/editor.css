@@ -1,0 +1,185 @@
+.code-editor {
+  --uno: "flex min-h-0 min-w-0 flex-1 flex-col bg-surface";
+  --editor-keyword: #786285;
+  --editor-string: #50745c;
+  --editor-number: #956d45;
+  --editor-type: #526f89;
+}
+[data-theme="dark"] .code-editor {
+  --editor-keyword: #bca7c6;
+  --editor-string: #a5bfa6;
+  --editor-number: #ccb294;
+  --editor-type: #a1b6c8;
+}
+.code-editor-host {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.code-editor .cm-editor {
+  height: 100%;
+  background: var(--color-surface);
+  color: var(--color-foreground);
+  font-size: 14px;
+}
+.code-editor .cm-editor.cm-focused {
+  outline: none;
+}
+.code-editor .cm-scroller {
+  overflow: auto;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  line-height: 1.7;
+}
+.code-editor .cm-content {
+  padding: 20px 0;
+  caret-color: var(--color-foreground);
+}
+.code-editor .cm-line {
+  padding: 0 20px;
+}
+.code-editor .cm-gutters {
+  background: var(--color-surface);
+  color: var(--color-secondary);
+  border-right: none;
+}
+.code-editor .cm-gutterElement {
+  padding-left: 16px;
+}
+.code-editor .cm-cursor,
+.code-editor .cm-dropCursor {
+  border-left-color: var(--color-foreground);
+}
+.code-editor .cm-activeLine,
+.code-editor .cm-activeLineGutter {
+  background: color-mix(in srgb, var(--color-accent) 4%, var(--color-surface));
+}
+.code-editor .cm-selectionBackground,
+.code-editor .cm-editor.cm-focused .cm-selectionBackground {
+  background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+}
+.code-editor .cm-selectionMatch {
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+.code-editor .cm-panels,
+.code-editor .cm-tooltip {
+  background: var(--color-surface);
+  color: var(--color-foreground);
+  border-color: var(--color-border);
+}
+.code-editor .cm-search input,
+.code-editor .cm-search button {
+  background: var(--color-surface);
+  color: var(--color-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+}
+.code-editor .cm-search {
+  padding: 10px 16px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-ui-sm);
+}
+.code-editor .cm-search .cm-textfield,
+.code-editor .cm-search .cm-button {
+  min-height: var(--height-control-sm);
+  padding: 3px 8px;
+  background-image: none;
+  font-size: inherit;
+}
+.code-editor .cm-search .cm-button:hover {
+  background: var(--color-muted);
+}
+.code-editor .cm-search input[type="checkbox"] {
+  accent-color: var(--color-accent);
+  vertical-align: middle;
+}
+.code-editor .cm-tooltip {
+  border-radius: var(--radius-control);
+  box-shadow: var(--shadow-floating);
+  overflow: hidden;
+}
+.code-editor .cm-tooltip-autocomplete > ul {
+  padding: 4px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-ui-sm);
+}
+.code-editor .cm-tooltip-autocomplete > ul > li {
+  padding: 4px 8px;
+  border-radius: 3px;
+}
+.code-editor .cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: var(--color-muted);
+  color: var(--color-foreground);
+}
+.code-editor .cm-token-keyword {
+  color: var(--editor-keyword);
+}
+.code-editor .cm-token-string {
+  color: var(--editor-string);
+}
+.code-editor .cm-token-number {
+  color: var(--editor-number);
+}
+.code-editor .cm-token-type {
+  color: var(--editor-type);
+}
+.code-editor .cm-token-comment {
+  color: var(--color-secondary);
+  font-style: italic;
+}
+.code-editor .cm-token-heading {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+.code-editor .cm-token-emphasis {
+  font-style: italic;
+}
+.code-editor .cm-token-link {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+.editor-tabs {
+  --uno: "flex min-h-12 shrink-0 items-center gap-1 overflow-x-auto border-b border-solid border-border bg-surface px-3 py-2";
+}
+.editor-tab {
+  --uno: "flex shrink-0 items-center rounded-control text-ui-sm text-secondary";
+}
+.editor-tab[data-active="true"] {
+  --uno: "bg-muted text-foreground";
+}
+.editor-tab:hover {
+  --uno: "bg-background";
+}
+.editor-tab[data-active="true"]:hover {
+  --uno: "bg-muted";
+}
+.editor-tab-label {
+  --uno: "flex h-8 max-w-52 items-center gap-2 rounded-control border-0 bg-transparent pl-2 pr-1 cursor-pointer";
+}
+.editor-tab-close {
+  --uno: "mx-1 flex h-6 w-6 items-center justify-center rounded border-0 bg-transparent text-secondary hover:bg-muted";
+}
+.editor-dirty {
+  --uno: "h-[6px] w-[6px] shrink-0 rounded-full bg-accent";
+}
+.editor-toolbar {
+  --uno: "flex min-h-11 shrink-0 items-center gap-1 px-4 text-secondary";
+}
+.editor-statusbar {
+  --uno: "flex min-h-8 shrink-0 items-center gap-3 px-4 text-ui-sm text-secondary";
+}
+.editor-empty {
+  --uno: "m-auto max-w-sm px-8 py-12 text-center";
+}
+
+@media (max-width: 639px) {
+  .editor-toolbar,
+  .editor-statusbar {
+    --uno: "gap-2 px-3";
+  }
+  .code-editor .cm-line {
+    padding: 0 12px;
+  }
+  .code-editor .cm-gutterElement {
+    padding-left: 8px;
+  }
+}

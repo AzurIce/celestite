@@ -55,7 +55,7 @@ export default defineConfig({
       "border border-solid border-border bg-surface text-foreground",
     "ui-floating": "ui-surface shadow-floating",
     "ui-button":
-      "ui-surface inline-flex items-center justify-center gap-[6px] h-control-md px-[10px] py-0 rounded-control font-medium whitespace-nowrap [transition-property:background-color,border-color] duration-120 ease-[ease] hover:bg-muted",
+      "ui-surface inline-flex items-center justify-center gap-[6px] h-control-md px-3 py-0 rounded-control text-ui-sm font-medium whitespace-nowrap [transition-property:background-color,border-color,color] duration-120 ease-[ease] hover:bg-muted",
     "ui-icon-button": "w-control-md",
     "ui-dialog-overlay": "fixed inset-0 z-overlay bg-overlay",
     "ui-dialog":
@@ -64,12 +64,12 @@ export default defineConfig({
     "ui-tooltip":
       "ui-floating rounded-control z-tooltip px-2 py-[5px] text-ui-sm",
     "ui-menu":
-      "ui-floating rounded-control z-menu min-w-[180px] overflow-y-auto p-1 [outline:none]",
+      "ui-floating rounded-panel z-menu min-w-[180px] overflow-y-auto p-1 text-ui-sm [outline:none]",
     "ui-menu-item":
-      "flex items-center gap-2 min-h-control-sm px-2 py-1 rounded-[4px] [outline:none] cursor-default select-none",
+      "flex items-center gap-2 min-h-control-md px-2 py-1 rounded-[4px] [outline:none] cursor-default select-none",
     "ui-menu-separator": "h-px m-1 border-0 border-none bg-border",
     "ui-text-field": "flex flex-col gap-[6px]",
-    "ui-field-label": "font-medium",
+    "ui-field-label": "text-ui-sm font-medium",
     "ui-field-description": "text-ui-sm text-secondary",
     "ui-field-error": "text-ui-sm text-danger",
     "ui-input":

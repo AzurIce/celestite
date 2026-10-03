@@ -1,0 +1,34 @@
+.ui-preview {
+  --uno: "mx-auto min-h-dvh max-w-4xl bg-surface px-6 sm:px-12";
+}
+.preview-header {
+  --uno: "flex items-center justify-between gap-4 border-b border-solid border-border py-6";
+}
+.preview-intro {
+  --uno: "py-10 sm:py-14";
+}
+.preview-back {
+  --uno: "mt-5 inline-flex items-center gap-2 text-ui-sm text-secondary no-underline hover:text-foreground";
+}
+.preview-section {
+  --uno: "grid gap-5 border-t border-solid border-border bg-surface py-7 sm:grid-cols-[140px_minmax(0,1fr)] sm:gap-8 sm:py-8";
+}
+.preview-section-label {
+  --uno: "flex items-baseline gap-3 text-ui-sm";
+}
+.preview-section-label > span {
+  --uno: "text-secondary";
+  font-variant-numeric: tabular-nums;
+}
+.preview-section-label > h2 {
+  --uno: "text-ui-sm font-medium";
+}
+.preview-section-content {
+  --uno: "min-w-0";
+}
+.preview-context {
+  --uno: "flex min-h-16 flex-wrap items-center gap-3 rounded-control bg-background px-4 py-3";
+}
+.preview-status {
+  --uno: "border-t border-solid border-border py-5 text-ui-sm text-secondary";
+}
