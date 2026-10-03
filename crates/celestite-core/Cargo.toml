@@ -1,16 +1,18 @@
 [package]
 name = "celestite-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen"]
 
 [dependencies]
-cap-std = "4"
+loro = { version = "=1.16.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
-blake3 = "1"
-uuid = { version = "1", features = ["v4"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["fs"] }
-
-[dev-dependencies]
-tempfile = "3"
+serde_json = "1"
+thiserror = "2"
+wasm-bindgen = { version = "=0.2.129", optional = true }

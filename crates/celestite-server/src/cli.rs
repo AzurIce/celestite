@@ -42,6 +42,9 @@ pub struct Cli {
     /// Serve a built Web UI from this directory
     #[arg(long, value_name = "DIRECTORY", conflicts_with = "no_web")]
     web_dir: Option<PathBuf>,
+    /// Existing state directory outside Vaults; omit for volatile CRDT histories
+    #[arg(long, value_name = "DIRECTORY")]
+    state_dir: Option<PathBuf>,
     /// Disable the configured static Web UI
     #[arg(long)]
     no_web: bool,
@@ -123,6 +126,7 @@ impl Cli {
                 vault.path = base.join(&vault.path);
             }
             config.server.web_dir = config.server.web_dir.map(|path| base.join(path));
+            config.server.state_dir = config.server.state_dir.map(|path| base.join(path));
             config
         } else {
             if self.vault.is_empty() {
@@ -148,6 +152,9 @@ impl Cli {
             config.server.web_dir = None;
         } else if let Some(web_dir) = self.web_dir {
             config.server.web_dir = Some(cwd.join(web_dir));
+        }
+        if let Some(state_dir) = self.state_dir {
+            config.server.state_dir = Some(cwd.join(state_dir));
         }
 
         let mut seen = HashSet::new();
@@ -212,6 +219,7 @@ listen = "127.0.0.1:8000"
 allowed_origins = ["http://old.example"]
 token_env = "OLD_TOKEN"
 web_dir = "assets"
+state_dir = "state"
 [[vaults]]
 id = "notes"
 name = "笔记"
@@ -317,6 +325,7 @@ read_only = true
         );
         assert_eq!(config.server.token_env.as_deref(), Some("NEW_TOKEN"));
         assert_eq!(config.server.web_dir, Some(config_dir.join("assets")));
+        assert_eq!(config.server.state_dir, Some(config_dir.join("state")));
         assert_eq!(config.vaults[0].path, config_dir.join("notes"));
         assert_eq!(config.vaults[0].name, "笔记");
         assert!(!config.vaults[0].read_only);
@@ -328,6 +337,8 @@ read_only = true
             file.to_str().unwrap(),
             "--web-dir",
             "new-assets",
+            "--state-dir",
+            "new-state",
             "--vault",
             "notes=new-notes",
         ])
@@ -335,6 +346,7 @@ read_only = true
         .load(cwd.path())
         .unwrap();
         assert_eq!(config.server.web_dir, Some(cwd.path().join("new-assets")));
+        assert_eq!(config.server.state_dir, Some(cwd.path().join("new-state")));
         assert_eq!(config.vaults[0].path, cwd.path().join("new-notes"));
         assert_eq!(config.vaults[0].name, "笔记");
         assert!(config.vaults[0].read_only);

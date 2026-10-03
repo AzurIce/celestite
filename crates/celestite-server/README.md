@@ -1,6 +1,6 @@
 # Celestite server MVP
 
-独立 Rust 可执行程序。Vault 由配置文件或 server 命令行注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入，共享目录操作位于 `celestite-core`。
+独立 Rust 可执行程序。Vault 由配置文件或 server 命令行注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入。目录操作位于 server 的 `vault/fs.rs`；`celestite-core` 提供独立的 Rust / WASM 文本编辑内核，server 是它的第一个无头宿主。
 
 ## 启动
 
@@ -37,20 +37,21 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
   --vault-read-only notes=false
 ```
 
-| 参数                               | 行为                                                      |
-| ---------------------------------- | --------------------------------------------------------- |
-| `-c, --config FILE`                | 读取指定 TOML 文件                                        |
-| `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                    |
-| `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                   |
-| `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名 |
-| `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                   |
-| `--token-env VARIABLE`             | 覆盖用于读取访问令牌的环境变量名                          |
-| `--no-token`                       | 清除配置中的令牌要求；非回环监听仍会拒绝启动              |
-| `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                     |
-| `--no-web`                         | 禁用配置中的静态 Web 资源目录                             |
-| `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录              |
-| `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                       |
-| `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                       |
+| 参数                               | 行为                                                         |
+| ---------------------------------- | ------------------------------------------------------------ |
+| `-c, --config FILE`                | 读取指定 TOML 文件                                           |
+| `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                       |
+| `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                      |
+| `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名    |
+| `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                      |
+| `--token-env VARIABLE`             | 覆盖用于读取访问令牌的环境变量名                             |
+| `--no-token`                       | 清除配置中的令牌要求；非回环监听仍会拒绝启动                 |
+| `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                        |
+| `--state-dir DIRECTORY`            | 启用持久化 CRDT 历史；目录需存在且不得与 Vault、静态资源重叠 |
+| `--no-web`                         | 禁用配置中的静态 Web 资源目录                                |
+| `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                 |
+| `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                          |
+| `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                          |
 
 命令行目录路径以**当前工作目录**为基准，配置文件中的路径仍以**配置文件所在目录**为基准。新增 Vault 默认名称为 ID、可写；覆盖已有 Vault 目录保留其名称与只读状态，除非另行覆盖。不支持通过命令行移除配置中的 Vault，完全替换注册列表可使用 `--no-config` 加多个 `--vault`。
 
@@ -81,17 +82,84 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 
 不覆盖移动及文件提交当前验证并实现于 **Linux**；其他平台返回 Unsupported。跨挂载点移动返回 Unsupported，不自动复制/删除。符号链接可列出、删除或移动链接本身，正常操作不跟随链接；访问通过受限目录句柄，防止链接逃逸 Vault。对 Vault 内目录的并发替换仍以平台能力和实际错误为准。
 
-notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。已打开编辑器目前保留缓冲区，外部文件变化不自动重载正文；下次保存通过 ETag 检测冲突，保留编辑且不继续自动保存。MVP 尚未提供冲突合并界面。
+notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。现有 Web 编辑器仍通过文件 API 保存并在冲突时提示覆盖、丢弃或取消。新增无头文档 API 使用下面的 CRDT 与文件协调规则；Web 尚未迁入该内核。
 
-文件请求上限 64 MiB；正文整体进出内存。前端编辑上限仍为 5 MiB。请求超时或断网不会自动重放写操作，错误提示核对服务器状态。没有离线同步、协同编辑或断线写请求去重。
+文件请求上限 64 MiB；正文整体进出内存。前端编辑上限仍为 5 MiB。请求超时或断网不会自动重放写操作，错误提示核对服务器状态。现有 Web 文件 API 没有离线同步或协同编辑。无头文档 API 已能交换 CRDT 历史；普通文件写请求仍不提供断线去重。
+
+## 无头编辑器 API
+
+下面路径仍相对于 `/api/v1/vaults/<id>`。正文存于 `celestite-core::Document`，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
+
+| 方法 | 路径                             | 请求 / 行为                                                 |
+| ---- | -------------------------------- | ----------------------------------------------------------- |
+| GET  | `/documents`                     | 扫描整个目录，返回可编辑文本状态，包括未在 UI 打开的文件    |
+| POST | `/documents/open`                | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态      |
+| GET  | `/documents/<document>`          | 正文、因果版本、撤销与保存状态；重新核对磁盘                |
+| GET  | `/documents/<document>/snapshot` | 完整 `SyncPacket`，新副本从这里加入同一历史                 |
+| POST | `/documents/<document>/updates`  | `Version`，返回该版本之后的更新包                           |
+| POST | `/documents/<document>/import`   | `SyncPacket`，验证并合并；返回 `{ result, document }`       |
+| POST | `/documents/<document>/transact` | `Transaction`，UTF-16 范围编辑；返回 `{ result, document }` |
+| POST | `/documents/<document>/undo`     | `UndoContext`，可用 `{}`；撤销 server writer 的本地操作     |
+| POST | `/documents/<document>/redo`     | 同上，重做                                                  |
+| POST | `/documents/<document>/save`     | 当前 `Version`，条件写回文件，返回更新的状态                |
+
+核心类型字段采用 Rust 的 `snake_case`；外层状态字段采用 `camelCase`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
+
+事务示例：
+
+```json
+{
+  "expected_version": {
+    "identity": { "document_id": "来自状态", "history_id": "来自状态" },
+    "clocks": {}
+  },
+  "origin": "headless-client",
+  "edits": [{ "from": 0, "to": 0, "insert": "hello\n" }],
+  "undo_metadata": null,
+  "undo_positions": []
+}
+```
+
+`expected_version` 必须完整使用刚读取的 `snapshot.version`，示例中的空 clocks 不是现有文件的真实版本。`from/to` 是事务之前正文的 UTF-16 半开区间，不能切开 emoji 等字符的代理对；多项编辑必须有序且互不重叠。内核一次验证所有编辑，然后提交一个撤销步。过期事务 / 保存返回 `409 StaleVersion`，非法坐标和更新包返回 `400 InvalidEdit`。不同文档或历史之间的导入被拒绝。
+
+协作客户端各自从完整快照建立 `Document`，使用新的 writer，只发送 CRDT 更新。重复和乱序包按 CRDT 语义处理；依赖未齐的包保留，后续补齐。客户端撤销由自己的内核产生更新，不调用 server writer 的 `/undo` 代替个人撤销。两个 HTTP 客户端直接调用 `/transact` 会共享 server writer 的撤销历史，因此这组接口先用于无头开发与测试。
+
+### 持久化和磁盘保存
+
+```sh
+mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/editor-state
+cargo run -p celestite-server -- --no-config \
+  --vault notes=/tmp/celestite-demo/notes \
+  --state-dir /tmp/celestite-demo/editor-state
+```
+
+`state_dir` 也可写在 TOML `[server]` 中。不指定时，内核历史只驻留内存，重启会建立新身份和历史，状态中 `durableVersion` 为 null。指定后，每个配置 ID 对应一个 redb 文件，记录 Vault 身份、文件 ID、初始快照、追加更新日志与磁盘基线。每次提交成功后才报告 `durableVersion`；目录与 profile 绑定，不能将同一个 profile 静默用于另一目录。
+
+`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是最后磁盘写回时的因果版本；`durableVersion` 是已提交历史的应用版本。持久化历史不等于写回 `.md`，`/save` 是显式动作。没有可见文本变化的导入也可能推进因果版本。等待依赖的包已经写入日志，但不会被虚报为已应用版本。
+
+保存先持久化写回意图，再通过原有哈希条件检查与暂存替换写文件，最后持久化回执。重启后识别已经写完、尚未记录回执的内容，完成基线更新。日志提交失败会使该宿主停止后续写入，并在状态中清除持久化确认、报告 `persistenceError`；应核对状态，不能把失败响应视为已保存。
+
+外部程序修改文件时，正文干净则导入外部变化，使用独立 writer，避免进入 server 本地撤销；已有未保存编辑则保留两份内容，通过 `conflict` 和保存时的 `409 Conflict` 交给后续协调。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持文档 ID；删除保留历史，延迟保存不能重建旧路径。
+
+### 当前范围
+
+已实现独立文本 CRDT 与单个 server 的文件协调。`/documents` 当前扫描并加载全部合格文本，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、日志压缩或网络同步调度。描述接口明确报告 `vaultCrdt: false`。
+
+移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，崩溃窗口仍需后续投影日志处理。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入是拉取 / 提交参考传输，SSE 仍为变化提示；没有自动连接其他副本。Web、OPFS、Vim、Tree-sitter、LSP 尚未接入 Rust 内核。
 
 ## 验证
 
 ```sh
 cargo test -p celestite-core -p celestite-server
+# 只跑监听真实端口、无需浏览器的编辑器集成测试：
+cargo test -p celestite-server --test headless_editor
+# 校验 feature 后面的实际 WASM 绑定：
+cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 cargo build -p celestite-server
 bun run --cwd web test:vault
 bun run --cwd web test:ui tests/multi-vault.spec.ts
 ```
 
 浏览器测试启动临时真实 server，使用临时目录和随机端口。默认寻找 `target/debug/celestite-server`，可以用 `CELESTITE_SERVER_BIN` 指定其他构建产物；自定义 Chromium 路径用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`。覆盖二进制文件、目录操作、版本冲突、外部监听、认证、连接持久化、Vault 切换和撤销历史、只读与移动端。
+
+无头 Rust 测试使用临时目录、随机端口及独立 redb profile，覆盖双副本离线合并、个人撤销、未打开文件发现、过期版本、非法 / 跨历史导入、乱序更新重启补齐、未保存正文恢复、外部修改冲突、移动 / 删除、BOM / CRLF 与只读约束。另有写完文件但回执未写时的恢复契约测试。

@@ -6,6 +6,9 @@ allowed_origins = ["http://localhost:1420", "http://127.0.0.1:1420"]
 # token_env = "CELESTITE_TOKEN"
 # Optional built UI directory, relative to this config file:
 # web_dir = "../../web/dist"
+# Existing private directory outside all Vaults and web_dir.
+# Enable to preserve CRDT history and unsaved edits across restarts:
+# state_dir = "./editor-state"
 
 [[vaults]]
 id = "notes"

@@ -10,7 +10,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use celestite_core::{revision, ChangeHint, FsVault, VaultError};
+mod editor_api;
+pub mod vault;
 use notify::Watcher;
 use serde::Deserialize;
 use std::{
@@ -27,6 +28,8 @@ use tokio_stream::{
     StreamExt,
 };
 use tower_http::{cors::CorsLayer, services::ServeDir};
+use vault::documents::Documents;
+use vault::fs::{revision, ChangeHint, FsVault, VaultError};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +46,8 @@ pub struct ServerConfig {
     /// Environment variable containing a bearer token; the token is never included in URLs.
     pub token_env: Option<String>,
     pub web_dir: Option<PathBuf>,
+    /// Existing directory outside Vaults/static assets for durable editor histories.
+    pub state_dir: Option<PathBuf>,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -51,6 +56,7 @@ impl Default for ServerConfig {
             allowed_origins: vec![],
             token_env: None,
             web_dir: None,
+            state_dir: None,
         }
     }
 }
@@ -68,6 +74,7 @@ struct HostedVault {
     name: String,
     read_only: bool,
     files: Mutex<FsVault>,
+    documents: Mutex<Documents>,
     events: broadcast::Sender<ChangeHint>,
     _watcher: Mutex<notify::RecommendedWatcher>,
 }
@@ -97,7 +104,10 @@ impl IntoResponse for ApiError {
             "InvalidPath" => StatusCode::BAD_REQUEST,
             "NotFound" => StatusCode::NOT_FOUND,
             "PermissionDenied" => StatusCode::FORBIDDEN,
-            "AlreadyExists" | "DirectoryNotEmpty" | "Conflict" => StatusCode::CONFLICT,
+            "AlreadyExists" | "DirectoryNotEmpty" | "Conflict" | "StaleVersion" => {
+                StatusCode::CONFLICT
+            }
+            "InvalidEdit" => StatusCode::BAD_REQUEST,
             "NotDirectory" | "NotFile" => StatusCode::UNPROCESSABLE_ENTITY,
             "Unsupported" => StatusCode::NOT_IMPLEMENTED,
             "QuotaExceeded" => StatusCode::INSUFFICIENT_STORAGE,
@@ -189,6 +199,12 @@ pub fn build_server(
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
     let mut vaults = HashMap::new();
     let mut roots = HashSet::new();
+    let state_dir = config
+        .server
+        .state_dir
+        .as_ref()
+        .map(|path| base.join(path).canonicalize())
+        .transpose()?;
     for vault in config.vaults {
         if vault.id.is_empty()
             || !vault
@@ -209,7 +225,17 @@ pub fn build_server(
             return Err("Vault directories must not overlap".into());
         }
         roots.insert(root.clone());
+        if state_dir
+            .as_ref()
+            .is_some_and(|state| state.starts_with(&root) || root.starts_with(state))
+        {
+            return Err("state_dir must not overlap any Vault directory".into());
+        }
         let files = FsVault::open(&root)?;
+        let history_path = state_dir
+            .as_ref()
+            .map(|state| state.join(format!("{}.redb", vault.id)));
+        let documents = Documents::open(history_path.as_deref(), &root)?;
         let (events, _) = broadcast::channel(128);
         let sender = events.clone();
         // Hints are intentionally coarse. Watch errors and reconnects invalidate the entire tree.
@@ -228,6 +254,7 @@ pub fn build_server(
                 name: vault.name,
                 read_only: vault.read_only,
                 files: Mutex::new(files),
+                documents: Mutex::new(documents),
                 events,
                 _watcher: Mutex::new(watcher),
             }),
@@ -239,6 +266,7 @@ pub fn build_server(
         shutdown: shutdown.clone(),
     });
     let api = Router::new()
+        .merge(editor_api::routes())
         .route("/api/v1/vaults/{id}", get(describe))
         .route("/api/v1/vaults/{id}/stat", get(stat))
         .route("/api/v1/vaults/{id}/directory", get(read_dir).post(mkdir))
@@ -278,6 +306,12 @@ pub fn build_server(
         {
             return Err("web_dir must not overlap any Vault directory".into());
         }
+        if state_dir
+            .as_ref()
+            .is_some_and(|state| state.starts_with(&directory) || directory.starts_with(state))
+        {
+            return Err("state_dir must not overlap web_dir".into());
+        }
         if !directory.join("index.html").is_file() {
             return Err("web_dir must contain a built index.html".into());
         }
@@ -296,7 +330,7 @@ fn get_vault(state: &ServerState, id: &str) -> Result<Arc<HostedVault>, ApiError
 async fn run<T: Send + 'static>(
     vault: Arc<HostedVault>,
     mutation: bool,
-    action: impl FnOnce(&FsVault) -> celestite_core::Result<T> + Send + 'static,
+    action: impl FnOnce(&FsVault) -> vault::fs::Result<T> + Send + 'static,
 ) -> Result<T, ApiError> {
     if mutation && vault.read_only {
         return Err(failure("PermissionDenied", "Vault is read-only"));
@@ -330,15 +364,19 @@ async fn describe(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let vault = get_vault(&state, &id)?;
+    let documents = vault
+        .documents
+        .lock()
+        .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "capabilities": { "watch": true, "conditionalWrite": true } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<Option<celestite_core::Entry>>, ApiError> {
+) -> Result<Json<Option<vault::fs::Entry>>, ApiError> {
     Ok(Json(
         run(get_vault(&state, &id)?, false, move |v| v.stat(&query.path)).await?,
     ))
@@ -347,7 +385,7 @@ async fn read_dir(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<Vec<celestite_core::Entry>>, ApiError> {
+) -> Result<Json<Vec<vault::fs::Entry>>, ApiError> {
     Ok(Json(
         run(get_vault(&state, &id)?, false, move |v| {
             v.read_dir(&query.path)
@@ -401,13 +439,16 @@ async fn write_file(
             "Replace requires the version returned by reading the file",
         ));
     }
-    let version = run(get_vault(&state, &id)?, true, move |v| {
-        v.write_file(
+    let version = editor_api::run_documents(get_vault(&state, &id)?, true, move |v, documents| {
+        documents.before_replace(&query.path)?;
+        let version = v.write_file(
             &query.path,
             &bytes,
             query.mode.as_deref().unwrap_or(""),
             expected.as_deref(),
-        )
+        )?;
+        documents.refresh_path(v, &query.path)?;
+        Ok(version)
     })
     .await?;
     Ok((StatusCode::NO_CONTENT, [(header::ETAG, version)]).into_response())
@@ -428,8 +469,8 @@ async fn remove(
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<StatusCode, ApiError> {
-    run(get_vault(&state, &id)?, true, move |v| {
-        v.remove(&query.path, query.recursive)
+    editor_api::run_documents(get_vault(&state, &id)?, true, move |v, documents| {
+        documents.remove(v, &query.path, query.recursive)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -444,8 +485,8 @@ async fn rename(
     Path(id): Path<String>,
     Json(args): Json<Rename>,
 ) -> Result<StatusCode, ApiError> {
-    run(get_vault(&state, &id)?, true, move |v| {
-        v.rename(&args.from, &args.to)
+    editor_api::run_documents(get_vault(&state, &id)?, true, move |v, documents| {
+        documents.rename(v, &args.from, &args.to)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
