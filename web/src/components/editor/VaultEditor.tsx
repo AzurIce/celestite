@@ -15,6 +15,7 @@ import type { VaultDocuments } from "@/lib/editor/documents";
 import { setSetting, settings } from "@/lib/settings";
 import type { EditorBuffer } from "./CodeEditor";
 import { languageName } from "./languages";
+import { SaveConflict } from "./SaveConflict";
 import "./editor.css";
 
 const CodeEditor = lazy(() => import("./CodeEditor"));
@@ -131,7 +132,7 @@ export function VaultEditor(props: VaultEditorProps) {
           event.key.toLowerCase() === "s"
         ) {
           event.preventDefault();
-          void props.documents.save();
+          void props.documents.requestSave();
         }
       }}
     >
@@ -197,7 +198,9 @@ export function VaultEditor(props: VaultEditorProps) {
                     class="editor-tab-close"
                     aria-label={`关闭 ${file().path}`}
                     disabled={file().locked || file().saving}
-                    onClick={() => void props.documents.closeDocument(id)}
+                    onClick={() =>
+                      void props.documents.requestCloseDocument(id)
+                    }
                   >
                     <X size={13} />
                   </button>
@@ -254,7 +257,7 @@ export function VaultEditor(props: VaultEditorProps) {
                   active()?.locked ||
                   !!active()?.readOnlyReason
                 }
-                onClick={() => void props.documents.save(id)}
+                onClick={() => void props.documents.requestSave(id)}
                 title="Ctrl / ⌘ S"
               >
                 <Save size={14} />
@@ -267,14 +270,16 @@ export function VaultEditor(props: VaultEditorProps) {
                 class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
               >
                 <span class="flex-1">
-                  保存失败，修改仍保留在编辑器中。{active()?.error}
+                  {active()?.conflict
+                    ? "磁盘文件已变化，本地编辑仍保留。"
+                    : `保存失败，修改仍保留在编辑器中。${active()?.error}`}
                 </span>
                 <Button
                   size="sm"
                   disabled={active()?.saving || active()?.locked}
-                  onClick={() => void props.documents.save(id)}
+                  onClick={() => void props.documents.requestSave(id)}
                 >
-                  重试保存
+                  {active()?.conflict ? "处理冲突" : "重试保存"}
                 </Button>
               </div>
             </Show>
@@ -304,19 +309,25 @@ export function VaultEditor(props: VaultEditorProps) {
                     </p>
                   }
                 >
-                  <CodeEditor
-                    document={active()!}
-                    cached={buffers.get(id)}
-                    wrap={wrap()}
-                    onChange={(content) => props.documents.update(id, content)}
-                    onSave={() => {
-                      void props.documents.save(id);
-                    }}
-                    onCursor={(line, column) => setCursor({ line, column })}
-                    onCache={(buffer) => {
-                      if (props.documents.has(id)) buffers.set(id, buffer);
-                    }}
-                  />
+                  <Show when={`${id}:${active()?.reloadVersion}`} keyed>
+                    {(_viewKey) => (
+                      <CodeEditor
+                        document={active()!}
+                        cached={buffers.get(id)}
+                        wrap={wrap()}
+                        onChange={(content) =>
+                          props.documents.update(id, content)
+                        }
+                        onSave={() => {
+                          void props.documents.requestSave(id);
+                        }}
+                        onCursor={(line, column) => setCursor({ line, column })}
+                        onCache={(buffer) => {
+                          if (props.documents.has(id)) buffers.set(id, buffer);
+                        }}
+                      />
+                    )}
+                  </Show>
                 </Loading>
               </Show>
             </div>
@@ -349,6 +360,7 @@ export function VaultEditor(props: VaultEditorProps) {
           </>
         )}
       </Show>
+      <SaveConflict documents={props.documents} state={state()} />
     </section>
   );
 }

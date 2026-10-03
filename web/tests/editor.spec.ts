@@ -12,7 +12,7 @@ const test = base.extend<{ runtimeErrors: string[] }>({
   ],
 });
 test.beforeEach(async ({ page }) => {
-  await page.goto("/ui");
+  await page.goto("/");
   await page.evaluate(async () => {
     const url = "/src/lib/vault/index.ts";
     const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;

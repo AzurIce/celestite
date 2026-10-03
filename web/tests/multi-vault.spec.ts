@@ -100,7 +100,7 @@ async function connect(page: Page, url: string, token: string) {
   await expect(dialog).not.toBeVisible();
 }
 async function seedLocal(page: Page) {
-  await page.goto("/ui");
+  await page.goto("/");
   await page.evaluate(async () => {
     const url = "/src/lib/vault/index.ts";
     const { openOpfsVault, vaultPath } = (await import(
@@ -122,6 +122,105 @@ async function seedLocal(page: Page) {
 }
 const editor = (page: Page) =>
   page.getByRole("textbox", { name: "代码编辑器", exact: true });
+
+for (const intent of ["save", "close"] as const) {
+  for (const action of ["overwrite", "discard"] as const) {
+    test(`external conflict: ${intent} then ${action} preserves the chosen version`, async ({
+      page,
+      api,
+    }) => {
+      const name = `conflict-${intent}-${action}.md`;
+      const disk = join(api.root, "work", name);
+      await writeFile(disk, "original");
+      await page.goto("/");
+      await connect(page, api.url.replace(/notes$/, "work"), api.token);
+      await page.getByRole("treeitem", { name, exact: true }).click();
+      await expect(editor(page)).toHaveText("original");
+      await writeFile(disk, "external version");
+      await editor(page).fill("local draft");
+      if (intent === "save") await page.keyboard.press("Control+s");
+      else
+        await page
+          .getByRole("button", { name: `关闭 ${name}`, exact: true })
+          .click();
+      const dialog = page.getByRole("dialog", { name: "文件已在磁盘上修改" });
+      await expect(dialog).toBeVisible();
+      await expect(
+        dialog.getByRole("button", { name: "取消", exact: true }),
+      ).toBeFocused();
+      await expect(dialog).toContainText(name);
+      await dialog
+        .getByRole("button", {
+          name: action === "overwrite" ? "覆盖保存" : "丢弃编辑",
+          exact: true,
+        })
+        .click();
+      await expect(dialog).not.toBeVisible();
+      const chosen =
+        action === "overwrite" ? "local draft" : "external version";
+      expect(await readFile(disk, "utf8")).toBe(chosen);
+      if (intent === "close") {
+        await expect(page.getByRole("tab", { name, exact: true })).toHaveCount(
+          0,
+        );
+        await page.getByRole("treeitem", { name, exact: true }).click();
+      }
+      await expect(editor(page)).toHaveText(chosen);
+      await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+        "已保存",
+      );
+      if (action === "discard") {
+        await editor(page).focus();
+        await page.keyboard.press("Control+z");
+        await expect(editor(page)).toHaveText(chosen);
+        await page
+          .getByLabel("当前 Vault", { exact: true })
+          .selectOption("opfs:default");
+        await page
+          .getByLabel("当前 Vault", { exact: true })
+          .selectOption(`remote:${api.url.replace(/notes$/, "work")}`);
+        await expect(editor(page)).toHaveText(chosen);
+      }
+      await editor(page).fill("next edit");
+      await page.keyboard.press("Control+s");
+      await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+        "已保存",
+      );
+      expect(await readFile(disk, "utf8")).toBe("next edit");
+    });
+  }
+}
+
+test("autosave conflict stays inline until requested, and Escape preserves edits", async ({
+  page,
+  api,
+}) => {
+  const name = "conflict-autosave.md";
+  const disk = join(api.root, "work", name);
+  await writeFile(disk, "original");
+  await page.goto("/");
+  await connect(page, api.url.replace(/notes$/, "work"), api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  await expect(editor(page)).toHaveText("original");
+  await writeFile(disk, "external");
+  await editor(page).fill("local draft");
+  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+    "保存失败",
+  );
+  const dialog = page.getByRole("dialog", { name: "文件已在磁盘上修改" });
+  await expect(dialog).not.toBeVisible();
+  await page.getByRole("button", { name: "处理冲突", exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(editor(page)).toHaveText("local draft");
+  expect(await readFile(disk, "utf8")).toBe("external");
+  await page.getByRole("button", { name: `关闭 ${name}`, exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.getByRole("tab", { name, exact: true })).toBeVisible();
+  await expect(editor(page)).toHaveText("local draft");
+});
 
 test("remote editing persists to disk; switching preserves independent undo and project settings", async ({
   page,
@@ -227,7 +326,7 @@ test("remote backend implements binary IO, directories, move conflicts, conditio
   page,
   api,
 }) => {
-  await page.goto("/ui");
+  await page.goto("/");
   const result = await page.evaluate(
     async ({ url, token }) => {
       const moduleUrl = "/src/lib/vault/index.ts";
@@ -345,6 +444,9 @@ test("external edits cause a save conflict and removing that connection keeps th
   await download;
   await editor(page).fill("my unsaved version");
   await page.keyboard.press("Control+s");
+  const conflict = page.getByRole("dialog", { name: "文件已在磁盘上修改" });
+  await expect(conflict).toBeVisible();
+  await conflict.getByRole("button", { name: "取消", exact: true }).click();
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "保存失败",
   );

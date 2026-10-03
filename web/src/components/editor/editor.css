@@ -170,6 +170,9 @@
 .editor-empty {
   --uno: "m-auto max-w-sm px-8 py-12 text-center";
 }
+.editor-conflict-dialog {
+  width: min(400px, calc(100vw - 32px));
+}
 
 @media (max-width: 639px) {
   .editor-toolbar,

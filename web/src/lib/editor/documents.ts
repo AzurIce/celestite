@@ -12,6 +12,8 @@ export interface DocumentSnapshot {
   saving: boolean;
   locked: boolean;
   error: string | null;
+  conflict: boolean;
+  reloadVersion: number;
   readOnlyReason: string | null;
   canPreview: boolean;
   lineEnding: "\n" | "\r\n" | "\r";
@@ -23,6 +25,9 @@ export interface DocumentsSnapshot {
   loadingPath: VaultPath | null;
   openError: string | null;
   activation: number;
+  conflictPrompt: { id: string; intent: "save" | "close" } | null;
+  conflictResolving: boolean;
+  conflictError: string | null;
 }
 interface DocumentRecord extends Omit<DocumentSnapshot, "dirty"> {
   revision?: string;
@@ -64,6 +69,9 @@ export class VaultDocuments {
   private loadingPath: VaultPath | null = null;
   private openError: string | null = null;
   private cached?: DocumentsSnapshot;
+  private conflictPrompt: DocumentsSnapshot["conflictPrompt"] = null;
+  private conflictResolving = false;
+  private conflictError: string | null = null;
   private closing = false;
   private closed = false;
   private closePromise?: Promise<void>;
@@ -122,6 +130,9 @@ export class VaultDocuments {
       activation: this.activation,
       loadingPath: this.loadingPath,
       openError: this.openError,
+      conflictPrompt: this.conflictPrompt,
+      conflictResolving: this.conflictResolving,
+      conflictError: this.conflictError,
       documents: [...this.records.values()].map((record) => ({
         id: record.id,
         path: record.path,
@@ -130,6 +141,8 @@ export class VaultDocuments {
         saving: record.saving,
         locked: record.locked,
         error: record.error,
+        conflict: record.conflict,
+        reloadVersion: record.reloadVersion,
         readOnlyReason: record.readOnlyReason,
         canPreview: record.canPreview,
         lineEnding: record.lineEnding,
@@ -257,6 +270,8 @@ export class VaultDocuments {
           saving: false,
           locked: false,
           error: null,
+          conflict: false,
+          reloadVersion: 0,
           readOnlyReason,
           canPreview,
           revision,
@@ -286,6 +301,7 @@ export class VaultDocuments {
     if (record.content === record.savedContent) {
       record.firstDirtyAt = null;
       record.error = null;
+      record.conflict = false;
     }
     this.schedule(record);
     this.notify();
@@ -317,6 +333,103 @@ export class VaultDocuments {
     );
     return results.every(Boolean);
   }
+  /** Only explicit UI actions request a dialog; background saves never interrupt typing. */
+  async requestSave(id = this.activeId): Promise<boolean> {
+    const record = id ? this.records.get(id) : undefined;
+    if (!record || this.closing) return false;
+    if (!record.conflict && (await this.save(record.id))) return true;
+    this.promptConflict(record, "save");
+    return false;
+  }
+  async requestCloseDocument(id: string): Promise<boolean> {
+    if (await this.closeDocument(id)) return true;
+    const record = this.records.get(id);
+    if (record) this.promptConflict(record, "close");
+    return false;
+  }
+  private promptConflict(record: DocumentRecord, intent: "save" | "close") {
+    if (!record.conflict || this.closing || this.conflictPrompt) return;
+    this.activate(record.id);
+    this.conflictPrompt = { id: record.id, intent };
+    this.conflictError = null;
+    this.notify();
+  }
+  async resolveConflict(
+    action: "overwrite" | "discard" | "cancel",
+  ): Promise<boolean> {
+    const prompt = this.conflictPrompt;
+    if (!prompt || this.conflictResolving || this.closing) return false;
+    if (action === "cancel") {
+      this.conflictPrompt = null;
+      this.conflictError = null;
+      this.notify();
+      return false;
+    }
+    const record = this.records.get(prompt.id);
+    if (!record) return false;
+    this.conflictResolving = true;
+    this.conflictError = null;
+    this.notify();
+    try {
+      return await this.enqueue(() =>
+        this.withLocked([record.path], async () => {
+          try {
+            if (action === "discard" && prompt.intent === "close") {
+              this.conflictPrompt = null;
+              this.forget(record.id);
+              this.notify();
+              return true;
+            }
+            const read = this.backend.readFileSnapshot;
+            if (!read)
+              throw new VaultError(
+                "Unsupported",
+                "Versioned reads are required",
+                record.path,
+              );
+            const snapshot = await read.call(this.backend, record.path);
+            if (action === "discard") {
+              if (snapshot.data.length > MAX_EDITABLE_BYTES)
+                throw new VaultError(
+                  "Unsupported",
+                  "File is too large to reload",
+                  record.path,
+                );
+              // Validate before replacing any local text or encoding information.
+              const text = decodeText(snapshot.data);
+              Object.assign(record, text);
+              record.savedContent = text.content;
+              record.revision = snapshot.revision;
+              record.reloadVersion++;
+              record.firstDirtyAt = null;
+              record.error = null;
+              record.conflict = false;
+            } else {
+              record.revision = snapshot.revision;
+              if (!(await this.persist(record))) {
+                this.conflictError = record.conflict
+                  ? "磁盘文件再次发生变化，尚未覆盖。请重新选择操作。"
+                  : record.error;
+                return false;
+              }
+            }
+            this.conflictPrompt = null;
+            if (prompt.intent === "close") this.forget(record.id);
+            this.notify();
+            return true;
+          } catch (error) {
+            record.error = `无法处理冲突，编辑仍保留。${describeTreeError(error)}`;
+            this.conflictError = record.error;
+            this.notify();
+            return false;
+          }
+        }),
+      );
+    } finally {
+      this.conflictResolving = false;
+      this.notify();
+    }
+  }
   private async persist(record: DocumentRecord): Promise<boolean> {
     this.cancelTimer(record);
     if (record.content === record.savedContent) return true;
@@ -340,8 +453,11 @@ export class VaultDocuments {
         this.notify();
       }
       record.firstDirtyAt = null;
+      record.conflict = false;
       return true;
     } catch (error) {
+      record.conflict =
+        error instanceof VaultError && error.code === "Conflict";
       record.error = describeTreeError(error);
       return false;
     } finally {
@@ -387,6 +503,7 @@ export class VaultDocuments {
     if (!record) return;
     this.cancelTimer(record);
     this.records.delete(id);
+    if (this.conflictPrompt?.id === id) this.conflictPrompt = null;
     if (this.activeId === id)
       this.activeId = [...this.records.keys()].slice(-1)[0] ?? null;
   }

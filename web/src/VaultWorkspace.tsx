@@ -183,7 +183,7 @@ export default function VaultWorkspace() {
           event.key.toLowerCase() === "s"
         ) {
           event.preventDefault();
-          void vaults().active?.documents.save();
+          void vaults().active?.documents.requestSave();
         }
       }}
     >
@@ -261,14 +261,6 @@ export default function VaultWorkspace() {
         </Show>
         <div class="workspace-tree-status" ref={treeStatusMount} />
         <div class="workspace-editor-status" ref={editorStatusMount} />
-        <Show when={import.meta.env.DEV}>
-          <a
-            href="/ui"
-            class="hidden px-2 text-ui-sm text-secondary no-underline hover:text-foreground sm:inline"
-          >
-            组件预览
-          </a>
-        </Show>
         <DropdownMenu placement="top-end" gutter={6}>
           <DropdownMenuTrigger
             as={IconButton}

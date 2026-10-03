@@ -125,6 +125,175 @@ const create = () => {
   return { files, documents: new VaultDocuments(files, 60_000) };
 };
 
+function versioned() {
+  const files = new Files();
+  const backend: VaultBackend = files;
+  let version = 0;
+  const written: string[] = [];
+  const originalWrite = files.writeFile.bind(files);
+  backend.readFileSnapshot = async (path) => ({
+    data: await files.readFile(path),
+    revision: String(version),
+  });
+  backend.writeFile = async (path, data, options) => {
+    written.push(options.expectedRevision!);
+    if (options.expectedRevision !== String(version))
+      throw new VaultError("Conflict", "changed", path);
+    await originalWrite(path, data, options);
+    return String(++version);
+  };
+  return {
+    files,
+    backend,
+    written,
+    documents: new VaultDocuments(backend, 60_000),
+    external(text: string | Uint8Array) {
+      files.file("a.md", text);
+      version++;
+    },
+  };
+}
+
+test("background conflicts do not prompt, and cancel preserves disk and draft", async () => {
+  const { files, documents, external } = versioned();
+  await documents.open(path("a.md"));
+  const id = active(documents).id;
+  external("external");
+  documents.update(id, "draft");
+  assert.equal(await documents.save(), false);
+  assert.equal(active(documents).conflict, true);
+  assert.equal(documents.snapshot().conflictPrompt, null);
+  assert.equal(await documents.requestSave(), false);
+  assert.deepEqual(documents.snapshot().conflictPrompt, { id, intent: "save" });
+  await documents.resolveConflict("cancel");
+  assert.equal(active(documents).content, "draft");
+  assert.equal(active(documents).dirty, true);
+  assert.equal(files.text("a.md"), "external");
+  assert.equal(documents.snapshot().conflictPrompt, null);
+  await documents.requestCloseDocument(id);
+  assert.equal(documents.snapshot().conflictPrompt?.intent, "close");
+  await documents.resolveConflict("cancel");
+  assert.equal(documents.has(id), true);
+  await documents.close();
+});
+
+test("overwrite uses the newest disk baseline and subsequent saves use the committed revision", async () => {
+  const { files, documents, external, written } = versioned();
+  await documents.open(path("a.md"));
+  external("external");
+  documents.update(active(documents).id, "draft");
+  await documents.requestSave();
+  assert.equal(await documents.resolveConflict("overwrite"), true);
+  assert.deepEqual(written, ["0", "1"]);
+  assert.equal(files.text("a.md"), "draft");
+  assert.equal(active(documents).dirty, false);
+  assert.equal(active(documents).conflict, false);
+  documents.update(active(documents).id, "next edit");
+  assert.equal(await documents.requestSave(), true);
+  assert.deepEqual(written, ["0", "1", "2"]);
+  await documents.close();
+});
+
+test("discard reloads latest text, encoding and view generation without rewriting disk", async () => {
+  const { files, documents, external, written } = versioned();
+  await documents.open(path("a.md"));
+  external("external one");
+  documents.update(active(documents).id, "draft");
+  await documents.requestSave();
+  external("\ufefflatest\r\nversion\r\n");
+  assert.equal(await documents.resolveConflict("discard"), true);
+  assert.equal(active(documents).content, "latest\nversion\n");
+  assert.equal(active(documents).lineEnding, "\r\n");
+  assert.equal(active(documents).bom, true);
+  assert.equal(active(documents).reloadVersion, 1);
+  assert.equal(active(documents).dirty, false);
+  assert.deepEqual(written, ["0"]);
+  assert.deepEqual(
+    files.files.get(path("a.md")),
+    bytes("\ufefflatest\r\nversion\r\n"),
+  );
+  documents.update(active(documents).id, "after reload\n");
+  assert.equal(await documents.save(), true);
+  assert.equal(written[1], "2");
+  await documents.close();
+});
+
+test("overwrite and discard both finish the original close request", async () => {
+  for (const action of ["overwrite", "discard"] as const) {
+    const { files, documents, external } = versioned();
+    await documents.open(path("a.md"));
+    const id = active(documents).id;
+    external("external");
+    documents.update(id, "draft");
+    assert.equal(await documents.requestCloseDocument(id), false);
+    assert.equal(await documents.resolveConflict(action), true);
+    assert.equal(documents.has(id), false);
+    assert.equal(
+      files.text("a.md"),
+      action === "overwrite" ? "draft" : "external",
+    );
+    await documents.close();
+  }
+});
+
+test("another edit between conflict reread and commit cannot be silently overwritten", async () => {
+  const { files, backend, documents, external } = versioned();
+  await documents.open(path("a.md"));
+  external("external");
+  documents.update(active(documents).id, "draft");
+  await documents.requestSave();
+  const read = backend.readFileSnapshot!;
+  backend.readFileSnapshot = async (path) => {
+    const result = await read(path);
+    external("newer external");
+    return result;
+  };
+  assert.equal(await documents.resolveConflict("overwrite"), false);
+  assert.equal(files.text("a.md"), "newer external");
+  assert.equal(active(documents).content, "draft");
+  assert.equal(active(documents).dirty, true);
+  assert.ok(documents.snapshot().conflictPrompt);
+  assert.match(documents.snapshot().conflictError!, /再次发生变化/);
+  await documents.close();
+});
+
+test("failed or invalid reload keeps local edits and the save request open", async () => {
+  for (const content of [
+    new Uint8Array([255]),
+    new Uint8Array(MAX_EDITABLE_BYTES + 1),
+    null,
+  ]) {
+    const { files, documents, external } = versioned();
+    await documents.open(path("a.md"));
+    external("external");
+    documents.update(active(documents).id, "draft");
+    await documents.requestSave();
+    if (content) external(content);
+    else files.files.delete(path("a.md"));
+    assert.equal(await documents.resolveConflict("discard"), false);
+    assert.equal(active(documents).content, "draft");
+    assert.equal(active(documents).dirty, true);
+    assert.equal(active(documents).reloadVersion, 0);
+    assert.equal(documents.snapshot().conflictPrompt?.intent, "save");
+    assert.ok(documents.snapshot().conflictError);
+    await documents.close();
+  }
+});
+
+test("discard on close never depends on the file still existing or being text", async () => {
+  const { files, documents, external } = versioned();
+  await documents.open(path("a.md"));
+  const id = active(documents).id;
+  external("external");
+  documents.update(id, "draft");
+  await documents.requestCloseDocument(id);
+  files.files.delete(path("a.md"));
+  assert.equal(await documents.resolveConflict("discard"), true);
+  assert.equal(documents.has(id), false);
+  assert.equal(files.files.has(path("a.md")), false);
+  await documents.close();
+});
+
 test("UTF-8 BOM and existing CRLF/CR survive editing, and clean opens do not rewrite files", async () => {
   for (const ending of ["\r\n", "\r", "\n"] as const) {
     const original = bytes(`\ufeffhello${ending}世界${ending}`);

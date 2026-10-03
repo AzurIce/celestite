@@ -148,7 +148,12 @@ export default function CodeEditor(props: CodeEditorProps) {
   }
   onSettled(() => {
     if (disposed) return;
-    buffer = props.cached ?? {
+    const cached =
+      props.cached?.reloadVersion === props.document.reloadVersion
+        ? props.cached
+        : undefined;
+    buffer = cached ?? {
+      reloadVersion: props.document.reloadVersion,
       state: EditorState.create({ doc: props.document.content }),
       language: new Compartment(),
       theme: new Compartment(),
@@ -159,7 +164,7 @@ export default function CodeEditor(props: CodeEditorProps) {
       scrollLeft: 0,
     };
     const wrap = props.wrap ? EditorView.lineWrapping : [];
-    const state = props.cached
+    const state = cached
       ? buffer.state.update({
           effects: [
             buffer.bindings.reconfigure(bindings()),

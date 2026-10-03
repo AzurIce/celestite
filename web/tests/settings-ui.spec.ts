@@ -18,10 +18,8 @@ async function seed(
   app: Record<string, unknown> = {},
   project?: Record<string, unknown>,
 ) {
-  await page.goto("/ui");
-  await expect(
-    page.getByRole("heading", { name: "Celestite", exact: true }),
-  ).toBeVisible();
+  await page.goto("/");
+  await expect(page.getByLabel("工作区状态栏")).toBeVisible();
   await page.evaluate(
     async ({ app, project }) => {
       const root = await navigator.storage.getDirectory();
