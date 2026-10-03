@@ -130,7 +130,7 @@ try {
 
 OPFS 后端要求安全上下文，以及 `getDirectory()`、`createWritable()` 和 Web Locks 支持。所有修改通过按 Vault ID 命名的同源锁协调，覆盖应用自己的不同会话和标签页；直接绕过后端操作 OPFS 的代码不受此约定保护。`close()` 拒绝新操作并等待已接收操作完成，不删除数据；暂停的目录迭代器不会阻塞关闭，关闭后继续迭代会报 `Closed`。
 
-`openOpfsVault("another-id")` 可打开隔离的另一个目录，当前默认仍只有 `default`。主页通过 `VaultWorkspace` 打开后端并在卸载时关闭。OPFS 的 `watch()` 不发出任何事件，返回可重复调用的空取消订阅函数；后端关闭后订阅会报 `Closed`。应用操作引起的业务变化由上层发布。浏览器配额与持久存储申请属于平台服务，OPFS 数据也仍需要导出或备份。
+`openOpfsVault("another-id")` 可打开隔离的另一个目录；当前界面固定提供 `default` 本地 Vault，并支持连接多个远端 Vault。主页通过 `VaultManager` 管理各后端及其生命周期。OPFS 的 `watch()` 不发出任何事件，返回可重复调用的空取消订阅函数；后端关闭后订阅会报 `Closed`。应用操作引起的业务变化由上层发布。浏览器配额与持久存储申请属于平台服务，OPFS 数据也仍需要导出或备份。
 
 移动的内存模拟测试验证路径保护、同路径、目标冲突、流式复制、写入/读取/提交故障、清理失败、部分删除、共享写锁和关闭等待：
 
@@ -196,8 +196,6 @@ import { FileTree } from "@/components/file-tree";
 bun run test:vault                      # 后端与树模型的故障/状态测试
 bun run test:ui tests/file-tree.spec.ts  # 真实 OPFS 与浏览器交互测试
 ```
-
-本次模型测试、类型检查和构建已执行；浏览器测试执行被当前沙箱的 `EPERM: listen` 拦在测试服务启动阶段，尚未完成浏览器验证。
 
 ## 工作区布局
 
@@ -272,3 +270,22 @@ bun run test:ui tests/settings-ui.spec.ts
 文本内部使用 LF；保存保留打开时的 UTF-8 BOM 和首个换行符形式（LF / CRLF / CR），混合换行文件编辑后统一为首个形式。隐藏页面和关闭工作区时尝试保存全部缓冲区，存在未保存内容时注册浏览器离开提醒。页面终止事件不能保证异步写入完成，仍以界面的“已保存”为准。当前不合并其他窗口或外部程序对同一文件的并发修改，刷新页面也不会恢复尚未落盘的缓冲区。
 
 `tests/unit/editor-documents.test.ts` 覆盖快速切换、保存期间输入、自动保存、写入失败、路径变更、复制/删除协调、编码与换行、关闭时保存等状态与故障情形；`tests/editor.spec.ts` 验证实际编辑器与 OPFS 的保存、重载及交互。
+
+## 多 Vault 与远端连接
+
+`src/lib/vault/manager.ts` 的 `VaultManager` 持有连接记录和运行时对象。每个 `Vault` 包含 backend、`VaultDocuments`、文件树模型、编辑器视图缓存和树滚动状态。首页固定打开 `opfs:default`（“我的 Vault”），默认 Vault 不提供移除入口，管理器也拒绝移除；内部文件仍正常管理。
+
+底部“当前 Vault”切换器切换视图，“管理 Vault”打开连接面板。填写 `http(s)://<server>/api/v1/vaults/<id>` 与可选访问令牌，校验描述协议后建立 HTTP backend。URL 去除尾部斜杠并作为连接身份，不接受嵌入凭据、查询参数或片段；重复连接复用原运行时。令牌只在当前会话保留，刷新后可通过同一 URL 重新认证。连接记录位于 OPFS `/celestite/connections.json`，不混入全局 `settings.json`，不自动打开或认证所有已保存的远端连接。
+
+切换保留各自的文档、未保存正文、撤销历史、文件树展开/选择和剪贴板；同路径文件属于不同 Vault。后台文档仍可自动保存，离开页面时检查所有已打开 Vault。项目设置随当前 Vault 重新读取，过时的异步结果不能覆盖新 Vault 的设置。移除远端连接先保存该 Vault 的文档，再释放运行时、删除本地连接记录；失败保留连接和缓冲区，不调用远端删除操作。
+
+HTTP backend 使用字节正文和 SSE 变化提示。版本读取 `readFileSnapshot` 把正文与版本一起交给文档，文档保存显式携带 `expectedRevision`，成功后更新为提交版本；其他下载或复制读取不会推进编辑器的保存基线。OPFS 没有版本写入能力，显式传入预期版本时返回 Unsupported；原有 OPFS 编辑保存不变。远端版本冲突保留本地编辑并显示错误，MVP 尚未提供合并或强制覆盖界面。已打开正文不随监听自动重载；文件树刷新或重连会重新核对目录。
+
+单个远端文件上限 64 MiB，文本编辑上限仍为 5 MiB。断线/超时不自动重放写请求，也没有离线缓存同步。客户端存储不可用时，连接面板明确显示本次会话的存储状态；OPFS 默认 Vault 打不开仍可从底部连接远端。
+
+server 配置、启动和 API 见 [server README](../crates/celestite-server/README.md)。真实 server 端到端测试需要先构建二进制：
+
+```sh
+cargo build -p celestite-server
+bun run --cwd web test:ui tests/multi-vault.spec.ts
+```

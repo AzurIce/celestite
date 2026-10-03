@@ -13,6 +13,7 @@ export interface DocumentSnapshot {
   locked: boolean;
   error: string | null;
   readOnlyReason: string | null;
+  canPreview: boolean;
   lineEnding: "\n" | "\r\n" | "\r";
   bom: boolean;
 }
@@ -24,6 +25,7 @@ export interface DocumentsSnapshot {
   activation: number;
 }
 interface DocumentRecord extends Omit<DocumentSnapshot, "dirty"> {
+  revision?: string;
   savedContent: string;
   firstDirtyAt: number | null;
   timer?: ReturnType<typeof setTimeout>;
@@ -70,6 +72,7 @@ export class VaultDocuments {
   constructor(
     private readonly backend: VaultBackend,
     private readonly autosaveDelay = 800,
+    private readonly readOnly = false,
   ) {
     this.treeBackend = {
       readDir: (path) => backend.readDir(path),
@@ -128,6 +131,7 @@ export class VaultDocuments {
         locked: record.locked,
         error: record.error,
         readOnlyReason: record.readOnlyReason,
+        canPreview: record.canPreview,
         lineEnding: record.lineEnding,
         bom: record.bom,
       })),
@@ -219,16 +223,25 @@ export class VaultDocuments {
           bom: false,
           lineEnding: "\n" as DocumentSnapshot["lineEnding"],
         };
-        let readOnlyReason: string | null = null;
+        let readOnlyReason: string | null = this.readOnly
+          ? "当前 Vault 只读。"
+          : null;
+        let canPreview = false;
+        let revision: string | undefined;
         if ((stat.size ?? 0) > MAX_EDITABLE_BYTES)
           readOnlyReason = "文件超过 5 MiB，请通过文件树下载后编辑。";
         else {
-          const bytes = await this.backend.readFile(path);
+          const snapshot = this.backend.readFileSnapshot
+            ? await this.backend.readFileSnapshot(path)
+            : undefined;
+          const bytes = snapshot?.data ?? (await this.backend.readFile(path));
+          revision = snapshot?.revision;
           if (bytes.length > MAX_EDITABLE_BYTES)
             readOnlyReason = "文件超过 5 MiB，请通过文件树下载后编辑。";
           else {
             try {
               text = decodeText(bytes);
+              canPreview = true;
             } catch {
               readOnlyReason =
                 "这个文件不是 UTF-8 文本，无法在此编辑。可通过文件树下载。";
@@ -245,6 +258,8 @@ export class VaultDocuments {
           locked: false,
           error: null,
           readOnlyReason,
+          canPreview,
+          revision,
           firstDirtyAt: null,
         };
         this.records.set(record.id, record);
@@ -311,13 +326,17 @@ export class VaultDocuments {
     try {
       while (record.content !== record.savedContent) {
         const content = record.content;
-        await this.backend.writeFile(
+        const revision = await this.backend.writeFile(
           record.path,
           encodeText({ ...record, content }),
-          { mode: "replace" },
+          {
+            mode: "replace",
+            ...(record.revision ? { expectedRevision: record.revision } : {}),
+          },
         );
         // 写入期间可能继续输入；只有真正提交的版本才算已保存。
         record.savedContent = content;
+        if (typeof revision === "string") record.revision = revision;
         this.notify();
       }
       record.firstDirtyAt = null;

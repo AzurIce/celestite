@@ -43,16 +43,8 @@ import type { DocumentSnapshot } from "@/lib/editor/documents";
 import { languageSupport } from "./languages";
 import "./editor.css";
 
-export interface EditorBuffer {
-  state: EditorState;
-  language: Compartment;
-  theme: Compartment;
-  bindings: Compartment;
-  editable: Compartment;
-  wrap: Compartment;
-  scrollTop: number;
-  scrollLeft: number;
-}
+import type { EditorBuffer } from "@/lib/editor/buffer";
+export type { EditorBuffer } from "@/lib/editor/buffer";
 interface CodeEditorProps {
   document: DocumentSnapshot;
   wrap: boolean;
@@ -136,8 +128,12 @@ export default function CodeEditor(props: CodeEditorProps) {
     }),
   ];
   const editable = () => [
-    EditorState.readOnly.of(props.document.locked),
-    EditorView.editable.of(!props.document.locked),
+    EditorState.readOnly.of(
+      props.document.locked || !!props.document.readOnlyReason,
+    ),
+    EditorView.editable.of(
+      !props.document.locked && !props.document.readOnlyReason,
+    ),
   ];
   async function configureLanguage(path: string) {
     const request = ++languageRequest;
@@ -245,7 +241,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     },
   );
   createEffect(
-    () => props.document.locked,
+    () => props.document.locked || !!props.document.readOnlyReason,
     () => {
       if (view)
         view.dispatch({ effects: buffer.editable.reconfigure(editable()) });

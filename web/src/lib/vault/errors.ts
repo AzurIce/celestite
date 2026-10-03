@@ -10,6 +10,7 @@ export type VaultErrorCode =
   | "Busy"
   | "Unsupported"
   | "Closed"
+  | "Conflict"
   | "IO";
 
 export class VaultError extends Error {

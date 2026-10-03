@@ -20,6 +20,7 @@ import "./editor.css";
 const CodeEditor = lazy(() => import("./CodeEditor"));
 interface VaultEditorProps {
   documents: VaultDocuments;
+  buffers?: Map<string, EditorBuffer>;
   statusMount?: Element;
 }
 
@@ -32,7 +33,7 @@ export function VaultEditor(props: VaultEditorProps) {
   /** 项目级文件提供时界面不改写，避免“点了没反应”。 */
   const wrapFromProject = () =>
     settings().source["editor.wordWrap"] === "project";
-  const buffers = new Map<string, EditorBuffer>();
+  const buffers = props.buffers ?? new Map<string, EditorBuffer>();
   const panelId = `editor-${crypto.randomUUID()}`;
   const active = () =>
     state().documents.find((document) => document.id === state().activeId);
@@ -48,7 +49,9 @@ export function VaultEditor(props: VaultEditorProps) {
           : file?.dirty
             ? "未保存"
             : file?.readOnlyReason
-              ? "无法编辑"
+              ? file.canPreview
+                ? "只读"
+                : "无法编辑"
               : "已保存";
   };
   createEffect(
@@ -83,7 +86,7 @@ export function VaultEditor(props: VaultEditorProps) {
   });
   onCleanup(() => {
     unsubscribe();
-    buffers.clear();
+    if (!props.buffers) buffers.clear();
     window.removeEventListener("beforeunload", beforeUnload);
     window.removeEventListener("pagehide", pageHide);
     document.removeEventListener("visibilitychange", visibility);
@@ -275,6 +278,11 @@ export function VaultEditor(props: VaultEditorProps) {
                 </Button>
               </div>
             </Show>
+            <Show when={active()?.canPreview && active()?.readOnlyReason}>
+              <p class="border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary">
+                {active()?.readOnlyReason}
+              </p>
+            </Show>
             <div
               id={panelId}
               role="tabpanel"
@@ -282,7 +290,7 @@ export function VaultEditor(props: VaultEditorProps) {
               class="flex min-h-0 min-w-0 flex-1 flex-col"
             >
               <Show
-                when={!active()?.readOnlyReason}
+                when={active()?.canPreview}
                 fallback={
                   <p class="m-auto max-w-md p-6 text-secondary">
                     {active()?.readOnlyReason}

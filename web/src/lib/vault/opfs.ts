@@ -11,6 +11,18 @@ import type {
 
 type OpfsEntry = FileSystemFileHandle | FileSystemDirectoryHandle;
 
+function isFileHandle(
+  handle: FileSystemHandle,
+): handle is FileSystemFileHandle {
+  return handle.kind === "file";
+}
+
+function isDirectoryHandle(
+  handle: FileSystemHandle,
+): handle is FileSystemDirectoryHandle {
+  return handle.kind === "directory";
+}
+
 /**
  * 打开 OPFS /vaults/<id>；首次创建，此后恢复已有文件。
  * 默认 Vault 的身份固定，不会因重开页面而生成新目录。
@@ -119,6 +131,13 @@ class OpfsVaultBackend implements VaultBackend {
     options: WriteFileOptions,
   ): Promise<void> {
     return this.run("writeFile", path, async () => {
+      if (options.expectedRevision !== undefined) {
+        throw new VaultError(
+          "Unsupported",
+          "OPFS does not support conditional writes",
+          path,
+        );
+      }
       const { parent, name } = splitPath(path);
       // 在第一次 await 前复制，排队保存不受调用者之后修改 buffer 的影响。
       const bytes = new Uint8Array(data);
@@ -327,18 +346,18 @@ class OpfsVaultBackend implements VaultBackend {
     return promise;
   }
 
-  private mutate<T>(task: () => Promise<T>): Promise<T> {
+  private async mutate<T>(task: () => Promise<T>): Promise<T> {
     // 所有会话和标签页使用相同锁名，保护检查后创建等复合操作。
-    return this.locks.request(this.lockName, task);
+    return await this.locks.request(this.lockName, task);
   }
 
   /** 只在已持有 Vault 写锁时调用；顺序复制，失败后没有后台复制任务残留。 */
   private async copyEntry(
-    source: OpfsEntry,
+    source: FileSystemHandle,
     target: OpfsEntry,
     path: VaultPath,
   ): Promise<void> {
-    if (source.kind === "file" && target.kind === "file") {
+    if (isFileHandle(source) && target.kind === "file") {
       const file = await source.getFile();
       const reader = file.stream().getReader();
       let writable: FileSystemWritableFileStream | undefined;
@@ -391,7 +410,7 @@ class OpfsVaultBackend implements VaultBackend {
       }
       return;
     }
-    if (source.kind === "directory" && target.kind === "directory") {
+    if (isDirectoryHandle(source) && target.kind === "directory") {
       for await (const [name, entry] of source.entries()) {
         const destination = childPath(path, name);
         const child =

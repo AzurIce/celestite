@@ -376,3 +376,51 @@ test("shutdown flushes outstanding edits before closing the backend and rejects 
   assert.equal(files.closed, true);
   assert.equal(documents.hasUnsaved(), false);
 });
+
+test("a read-only Vault opens text without accepting edits", async () => {
+  const backend = new Files();
+  const documents = new VaultDocuments(backend, 800, true);
+  await documents.open(path("a.md"));
+  const file = documents.snapshot().documents[0];
+  assert.equal(file.content, "alpha");
+  assert.equal(file.readOnlyReason, "当前 Vault 只读。");
+  assert.equal(documents.update(file.id, "changed"), false);
+  assert.equal(documents.hasUnsaved(), false);
+  await documents.close();
+});
+
+test("unrelated reads cannot advance a document save baseline", async () => {
+  const files = new Files();
+  const backend: VaultBackend = files;
+  let version = "initial";
+  backend.readFileSnapshot = async (path) => ({
+    data: await files.readFile(path),
+    revision: version,
+  });
+  const originalWrite = files.writeFile.bind(files);
+  const expected: string[] = [];
+  backend.writeFile = async (path, data, options) => {
+    expected.push(options.expectedRevision!);
+    if (options.expectedRevision !== version)
+      throw new VaultError("Conflict", "changed");
+    await originalWrite(path, data, options);
+    version = "saved";
+    return version;
+  };
+  const documents = new VaultDocuments(backend);
+  await documents.open(path("a.md"));
+  files.file("a.md", "external");
+  version = "external";
+  assert.equal(
+    new TextDecoder().decode(
+      await documents.treeBackend.readFile(path("a.md")),
+    ),
+    "external",
+  );
+  documents.update(documents.snapshot().activeId!, "my changes");
+  assert.equal(await documents.save(), false);
+  assert.deepEqual(expected, ["initial"]);
+  assert.equal(files.text("a.md"), "external");
+  assert.equal(documents.hasUnsaved(), true);
+  await documents.close();
+});

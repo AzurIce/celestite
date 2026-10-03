@@ -319,3 +319,24 @@ test("correcting an invalid setting removes its problem and retains unknown keys
     "future.option": { keep: true },
   });
 });
+
+test("a late project read cannot replace the current Vault settings", async () => {
+  const { store } = createStore(new MemoryFile());
+  await store.load();
+  let finish!: (value: string) => void;
+  store.setProjectReader(
+    () =>
+      new Promise<string>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const oldRead = store.reloadProject();
+  store.clearProject();
+  store.setProjectReader(async () => '{"theme.mode":"dark"}');
+  await store.reloadProject();
+  finish('{"theme.mode":"light"}');
+  await oldRead;
+  assert.equal(store.snapshot().values["theme.mode"], "dark");
+  store.clearProject();
+  assert.equal(store.snapshot().source["theme.mode"], "default");
+});

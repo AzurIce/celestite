@@ -56,6 +56,8 @@ import "./file-tree.css";
 
 export interface FileTreeProps {
   backend: VaultBackend;
+  model?: FileTreeModel;
+  viewState?: { scrollTop: number };
   statusMount?: Element;
   label?: string;
   onOpen?: (path: VaultPath) => void;
@@ -68,11 +70,11 @@ type TreeDialog =
   | { kind: "delete"; paths: VaultPath[] }
   | { kind: "move"; paths: VaultPath[] };
 
-/** 后端由父组件持有并关闭；每个控件拥有独立的展开、选择和剪切状态。 */
+/** 后端由父组件关闭；传入模型时状态由 Vault 持有，否则由控件创建并释放。 */
 export function FileTree(props: FileTreeProps) {
-  const model = new FileTreeModel(props.backend, (change) =>
-    props.onChange?.(change),
-  );
+  const model =
+    props.model ??
+    new FileTreeModel(props.backend, (change) => props.onChange?.(change));
   const [state, setState] = createSignal(model.snapshot());
   const unsubscribe = model.subscribe(setState);
   const [dialog, setDialog] = createSignal<TreeDialog | null>(null);
@@ -148,6 +150,7 @@ export function FileTree(props: FileTreeProps) {
     stopHover();
   };
   onSettled(() => {
+    if (props.viewState) tree.scrollTop = props.viewState.scrollTop;
     void model.refresh();
     void props.backend
       .watch(() => model.invalidate())
@@ -163,7 +166,8 @@ export function FileTree(props: FileTreeProps) {
     disposed = true;
     unwatch?.();
     unsubscribe();
-    model.dispose();
+    if (props.viewState) props.viewState.scrollTop = tree?.scrollTop ?? 0;
+    if (!props.model) model.dispose();
     stopHover();
   });
   createEffect(

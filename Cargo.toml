@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/celestite-core", "crates/celestite-server"]
+resolver = "2"
+
 [package]
 name = "celestite"
 version = "0.1.0"

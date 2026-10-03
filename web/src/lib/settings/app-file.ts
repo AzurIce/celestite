@@ -36,6 +36,16 @@ export async function openAppSettingsFile(
     ? undefined
     : navigator.storage,
 ): Promise<SettingsFile> {
+  return openAppDocument("settings.json", storage);
+}
+
+/** Separate app documents share the same OPFS app directory. */
+export async function openAppDocument(
+  fileName: "settings.json" | "connections.json",
+  storage: OpfsStorage | undefined = typeof navigator === "undefined"
+    ? undefined
+    : navigator.storage,
+): Promise<SettingsFile> {
   if (
     !storage ||
     typeof storage.getDirectory !== "function" ||
@@ -50,7 +60,6 @@ export async function openAppSettingsFile(
   const directory = await root.getDirectoryHandle("celestite", {
     create: true,
   });
-  const fileName = "settings.json";
   return {
     async read() {
       let file: FileSystemFileHandle;
@@ -67,7 +76,7 @@ export async function openAppSettingsFile(
       const bytes = new TextEncoder().encode(
         `${JSON.stringify(document, null, 2)}\n`,
       );
-      await navigator.locks.request("celestite.settings.app", async () => {
+      await navigator.locks.request(`celestite.app.${fileName}`, async () => {
         const file = await directory.getFileHandle(fileName, { create: true });
         let writable: FileSystemWritableFileStream | undefined;
         try {

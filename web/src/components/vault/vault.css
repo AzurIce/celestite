@@ -1,0 +1,16 @@
+.vault-switcher {
+  --uno: "max-w-36 min-w-0 rounded-control border-none bg-transparent px-1 py-1 text-ui-sm text-secondary";
+}
+.vault-switcher:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.ui-dialog.vault-connections-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+.vault-connection-list {
+  --uno: "m-0 mt-5 list-none p-0";
+}
+.vault-connection-list > li {
+  --uno: "flex items-center gap-2 border-b border-solid border-border py-3";
+}

@@ -74,6 +74,8 @@ export function describeTreeError(error: unknown): string {
       PermissionDenied: "无法访问这些文件，请检查存储权限。",
       Busy: "文件正在被占用，请稍后重试。",
       Closed: "Vault 已关闭。",
+      Conflict:
+        "文件已被其他客户端或程序修改。你的编辑仍保留，请核对远端内容后再保存。",
     };
     return messages[error.code] ?? "文件操作失败，请刷新后检查文件状态。";
   }

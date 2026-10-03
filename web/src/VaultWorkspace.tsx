@@ -7,7 +7,9 @@ import {
 } from "solid-js";
 import { GlobalSettings } from "@/components/settings/GlobalSettings";
 import { VaultEditor } from "@/components/editor";
-import { VaultDocuments } from "@/lib/editor/documents";
+import { VaultManager } from "@/lib/vault/manager";
+import { VaultConnections } from "@/components/vault/VaultConnections";
+import "./components/vault/vault.css";
 import { FileTree } from "@/components/file-tree";
 import {
   Button,
@@ -18,7 +20,6 @@ import {
   DropdownMenuItem,
 } from "@/components/ui";
 import { Moon, Sun, Monitor, Check } from "@/components/icons";
-import { openOpfsVault } from "@/lib/vault";
 import { theme, setTheme } from "@/lib/theme";
 import { SETTINGS_SCHEMA } from "@/lib/settings/schema";
 import {
@@ -53,45 +54,31 @@ function clampSidebarWidth(value: number) {
 }
 
 export default function VaultWorkspace() {
-  const [documents, setDocuments] = createSignal<VaultDocuments | null>(null);
-  const [opening, setOpening] = createSignal(true);
-  const [openError, setOpenError] = createSignal<string | null>(null);
+  const manager = new VaultManager();
+  const [vaults, setVaults] = createSignal(manager.snapshot());
+  const unsubscribe = manager.subscribe(setVaults);
+  const documents = () => vaults().active;
+  const opening = () => vaults().opening;
+  const openError = () => vaults().error;
   const [resizing, setResizing] = createSignal(false);
   let treeStatusMount!: HTMLDivElement;
   let editorStatusMount!: HTMLDivElement;
-  let currentDocuments: VaultDocuments | null = null;
-  let disposed = false;
-  let starting = false;
   let dragStart = { x: 0, width: clampSidebarWidth(0) };
   // Solid 的 signal 写入在微任务提交，setter 之后同步读到的仍是旧值；
   // 夹取结果与持久化都用这个同步镜像。
   let appliedWidth = clampSidebarWidth(settings().values["sidebar.width"]);
 
-  async function start() {
-    if (starting || disposed) return;
-    starting = true;
-    setOpening(true);
-    setOpenError(null);
-    try {
-      const opened = await openOpfsVault();
-      if (disposed) {
-        await opened.close();
-        return;
-      }
-      currentDocuments = new VaultDocuments(opened);
-      setDocuments(currentDocuments);
-      // vault 打开后载入项目级覆盖；文件缺失或读失败都视为没有覆盖。
-      void attachProjectSettings(() => readProjectSettings(opened));
-    } catch {
-      if (!disposed)
-        setOpenError(
-          "无法打开文件库。请检查浏览器是否允许保存站点数据，然后重试。",
-        );
-    } finally {
-      starting = false;
-      if (!disposed) setOpening(false);
-    }
-  }
+  let settingsVault: string | null = null;
+  createEffect(
+    () => vaults().active,
+    (vault) => {
+      if (settingsVault === (vault?.id ?? null)) return;
+      settingsVault = vault?.id ?? null;
+      clearProjectSettings();
+      if (vault)
+        void attachProjectSettings(() => readProjectSettings(vault.backend));
+    },
+  );
   /** 宽度来自设置层，因此项目级文件也能覆盖它。 */
   const sidebarWidth = () =>
     clampSidebarWidth(settings().values["sidebar.width"]);
@@ -157,12 +144,33 @@ export default function VaultWorkspace() {
     return () => window.removeEventListener("resize", onWindowResize);
   });
   onSettled(() => {
-    void start();
+    void manager.initialize();
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (manager.snapshot().opened.some((v) => v.documents.hasUnsaved())) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    const flush = () => {
+      for (const vault of manager.snapshot().opened)
+        void vault.documents.saveAll();
+    };
+    const visibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", visibility);
+    return () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", visibility);
+    };
   });
   onCleanup(() => {
-    disposed = true;
+    unsubscribe();
     clearProjectSettings();
-    void currentDocuments?.close();
+    void manager.close();
   });
 
   return (
@@ -175,7 +183,7 @@ export default function VaultWorkspace() {
           event.key.toLowerCase() === "s"
         ) {
           event.preventDefault();
-          void currentDocuments?.save();
+          void vaults().active?.documents.save();
         }
       }}
     >
@@ -188,7 +196,10 @@ export default function VaultWorkspace() {
               {opening() ? "正在打开文件库…" : openError()}
             </p>
             <Show when={openError()}>
-              <Button class="mt-4" onClick={() => void start()}>
+              <Button
+                class="mt-4"
+                onClick={() => void manager.activate("opfs:default")}
+              >
                 重试
               </Button>
             </Show>
@@ -205,10 +216,12 @@ export default function VaultWorkspace() {
           >
             <div class="workspace-sidebar flex min-h-0 flex-col">
               <FileTree
-                backend={workspace.treeBackend}
+                backend={workspace.documents.treeBackend}
+                model={workspace.tree}
+                viewState={workspace.treeView}
                 statusMount={treeStatusMount}
-                label="我的 Vault"
-                onOpen={(path) => void workspace.open(path)}
+                label={workspace.name}
+                onOpen={(path) => void workspace.documents.open(path)}
               />
             </div>
             <div
@@ -228,13 +241,24 @@ export default function VaultWorkspace() {
               <span class="workspace-divider-line" />
             </div>
             <VaultEditor
-              documents={workspace}
+              documents={workspace.documents}
+              buffers={workspace.editorBuffers}
               statusMount={editorStatusMount}
             />
           </div>
         )}
       </Show>
       <footer class="workspace-statusbar" aria-label="工作区状态栏">
+        <VaultConnections manager={manager} state={vaults()} />
+        <Show when={openError()}>
+          <span
+            role="alert"
+            class="max-w-36 truncate text-danger"
+            title={openError()!}
+          >
+            连接失败
+          </span>
+        </Show>
         <div class="workspace-tree-status" ref={treeStatusMount} />
         <div class="workspace-editor-status" ref={editorStatusMount} />
         <Show when={import.meta.env.DEV}>

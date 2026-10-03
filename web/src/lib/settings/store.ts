@@ -44,6 +44,7 @@ export class SettingsStore {
   private readonly listeners = new Set<(snapshot: SettingsSnapshot) => void>();
   private tail: Promise<unknown> = Promise.resolve();
   private loaded = false;
+  private projectGeneration = 0;
 
   constructor(options: SettingsStoreOptions) {
     this.options = options;
@@ -94,14 +95,18 @@ export class SettingsStore {
 
   /** vault 打开或切换后调用；读不到项目文件视为没有项目级覆盖。 */
   async reloadProject() {
+    const generation = ++this.projectGeneration;
     if (!this.projectReader) {
       this.project = emptyDocument();
       this.notify();
       return;
     }
     try {
-      this.project = parseSettingsText(await this.projectReader(), "project");
+      const text = await this.projectReader();
+      if (generation !== this.projectGeneration) return;
+      this.project = parseSettingsText(text, "project");
     } catch (error) {
+      if (generation !== this.projectGeneration) return;
       this.project = {
         values: {},
         document: {},
@@ -119,6 +124,8 @@ export class SettingsStore {
   }
 
   clearProject() {
+    this.projectGeneration++;
+    this.projectReader = undefined;
     this.project = emptyDocument();
     this.notify();
   }

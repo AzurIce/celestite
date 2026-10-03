@@ -41,3 +41,8 @@
 .workspace-grid[data-resizing="true"] > .workspace-divider {
   --uno: "pointer-events-auto";
 }
+@media (max-width: 639px) {
+  .workspace:has(.vault-editor.fixed) .workspace-tree-status {
+    display: none;
+  }
+}

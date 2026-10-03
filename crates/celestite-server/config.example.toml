@@ -1,0 +1,15 @@
+[server]
+listen = "127.0.0.1:7437"
+# Origins of your Web clients. Scheme, host and port must match exactly.
+allowed_origins = ["http://localhost:1420", "http://127.0.0.1:1420"]
+# Set CELESTITE_TOKEN in the server's environment, then uncomment:
+# token_env = "CELESTITE_TOKEN"
+# Optional built UI directory, relative to this config file:
+# web_dir = "../../web/dist"
+
+[[vaults]]
+id = "notes"
+name = "笔记"
+# Existing directory; relative paths are relative to this config file.
+path = "./notes"
+read_only = false
