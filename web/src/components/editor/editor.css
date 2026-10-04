@@ -170,6 +170,23 @@
 .editor-empty {
   --uno: "m-auto max-w-sm px-8 py-12 text-center";
 }
+.editor-loading {
+  --uno: "m-auto flex flex-col items-center gap-3 px-8 py-12 text-secondary";
+}
+.editor-loading-icon {
+  animation: editor-loading-spin 900ms linear infinite;
+}
+@keyframes editor-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .editor-loading-icon {
+    /* 减弱动态效果时只放慢旋转，仍保留可感知的进行中状态。 */
+    animation-duration: 2.4s;
+  }
+}
 .editor-conflict-dialog {
   width: min(400px, calc(100vw - 32px));
 }

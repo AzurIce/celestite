@@ -146,6 +146,22 @@ export default function CodeEditor(props: CodeEditorProps) {
       if (!disposed && request === languageRequest) setLanguageError(true);
     }
   }
+  /**
+   * 打开文件时把焦点交给编辑器（与 Zed 一致）。读取是异步的，视图挂载可能
+   * 晚于用户已经开始的下一步操作；只有焦点仍留在文件树、编辑器内或文档
+   * 空白处时才抢焦点，避免把用户在对话框/输入框里的操作打断。
+   */
+  function focusIfIdle() {
+    const active = document.activeElement;
+    if (
+      active &&
+      active !== document.body &&
+      !active.closest('[role="tree"]') &&
+      !active.closest('[aria-label="文件编辑器"]')
+    )
+      return;
+    view?.focus();
+  }
   onSettled(() => {
     if (disposed) return;
     const cached =
@@ -237,7 +253,7 @@ export default function CodeEditor(props: CodeEditorProps) {
       attributes: true,
       attributeFilter: ["data-theme"],
     });
-    view.focus();
+    focusIfIdle();
   });
   createEffect(
     () => props.document.path,

@@ -40,6 +40,32 @@ test.beforeEach(async ({ page }) => {
   ).toBeVisible();
 });
 
+test("opening a file shows a spinner in the editor area instead of a banner above the tabs", async ({
+  page,
+}) => {
+  // 放慢正文读取，让加载态可被观察；只影响本用例的页面。
+  await page.evaluate(() => {
+    const original = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = async function (
+      this: FileSystemFileHandle,
+    ) {
+      if (this.name === "a.md") await new Promise((r) => setTimeout(r, 1200));
+      return original.call(this);
+    };
+  });
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  const loading = page.locator(".editor-loading");
+  await expect(loading).toBeVisible();
+  await expect(loading).toContainText("正在打开 a.md…");
+  await expect(loading.locator("svg.lucide-loader-circle")).toBeVisible();
+  // 提示不在标签栏上方，而是编辑器区域内。
+  await expect(page.getByRole("tablist", { name: "打开的文件" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeVisible({
+    timeout: 10000,
+  });
+  await expect(loading).toHaveCount(0);
+});
+
 test("editing and Ctrl+S persist UTF-8 content to OPFS and survive reload", async ({
   page,
 }) => {

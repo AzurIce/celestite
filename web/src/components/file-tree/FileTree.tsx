@@ -94,10 +94,18 @@ export function FileTree(props: FileTreeProps) {
   let dialogActive = false;
   let unwatch: (() => void) | undefined;
   const itemId = (path: VaultPath) => `${id}-${encodeURIComponent(path)}`;
-  const focusTree = () =>
-    onSettled(() => {
+  /**
+   * 菜单或弹窗关闭后把焦点还给文件树。Kobalte 的 ContextMenu 在 Esc 关闭时
+   * 不触发 onCloseAutoFocus，且浮层卸载可能把焦点落到 body，因此这里同步聚焦
+   * 一次、再在下一个宏任务补一次，压过浮层清理阶段的焦点变化。
+   */
+  const focusTree = () => {
+    if (disposed || !tree) return;
+    tree.focus();
+    setTimeout(() => {
       if (!disposed) tree?.focus();
-    });
+    }, 0);
+  };
   const closeDialog = () => {
     dialogActive = false;
     setDialog(null);
@@ -496,6 +504,7 @@ export function FileTree(props: FileTreeProps) {
       <ContextMenu
         onOpenChange={(opened) => {
           if (opened) model.contextSelect(rowProps.path);
+          else if (!dialogActive) focusTree();
         }}
       >
         <div
@@ -852,6 +861,7 @@ export function FileTree(props: FileTreeProps) {
         <ContextMenu
           onOpenChange={(opened) => {
             if (opened) model.clearSelection(true);
+            else if (!dialogActive) focusTree();
           }}
         >
           <ContextMenuTrigger

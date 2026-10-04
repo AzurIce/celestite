@@ -4,6 +4,8 @@
 
 实施进展（同日后续）：目录操作已迁入 server，core 已迁入文档内核并接入无头 HTTP 测试与历史持久化，见 [无头 server 实施记录](<2026-10-04 headless-editor-kernel.md>)。本设计中的 Catalog 和 VaultSync 尚未实现，下文保留设计基线。
 
+模型修订（同日后续）：Vault 是逻辑定义，VaultInstance 持有本机资源；存储、普通目录映射、主动连接与对外共享按正交能力组合；Web 使用 WASM，Tauri / server 使用 native core，详见 [Vault 实例模型](<2026-10-04 vault-instance-model.md>)。该文确定部署、身份、保存目标和生命周期；本文的 Catalog / 文本 / Blob 语义继续适用。
+
 ## 已确定的组织方式
 
 Celestite 本身就是编辑器，共享 Rust 库直接命名为 `celestite-core`。WASM 绑定放在同一个 crate 的 `wasm` feature 后面，不再单独建立 editor-core / editor-wasm crate。
@@ -63,13 +65,13 @@ Cargo 采用 `rlib` / `cdylib` 输出，默认不启用 WASM 绑定。`wasm-bind
 
 ```mermaid
 flowchart TD
-  Replica[VaultReplica] --> Catalog[CatalogDocument：目录、身份、引用、删除标记]
-  Replica --> Bodies[TextDocumentStore：每文件独立 CRDT]
-  Replica --> Blobs[BlobStore：不可变附件对象]
-  Replica --> Sync[VaultSync：发现、优先级、补齐与确认]
+  Instance[VaultInstance] --> Catalog[CatalogDocument：目录、身份、引用、删除标记]
+  Instance --> Bodies[TextDocumentStore：每文件独立 CRDT]
+  Instance --> Blobs[BlobStore：不可变附件对象]
+  Instance --> Sync[VaultSync：发现、优先级、补齐与确认]
   Bodies --> View[按需挂载 CM6 / Vim]
   Bodies --> Language[按需 Tree-sitter / LSP]
-  Replica --> Host[宿主：日志、网络、文件系统投影]
+  Instance --> Host[宿主：日志、网络、文件系统投影]
 ```
 
 ## Vault 与文件身份
@@ -211,12 +213,12 @@ Tree-sitter 只为需要高亮 / 分析的文档保留树，不因“全库同�
 
 LSP 工作区读取顺序为：未保存正文 → 已同步的内容缓存 → 远端 / 文件后端补齐。未取得内容是 unavailable / pending，不能伪装成空文件。项目分析可按需获取未打开文件；适用的文件变化通知来自 Vault 领域事件与文件投影事件，不依赖标签打开。
 
-远端已写回的未打开文件可以进入 watched-files 通知；已通过 didChange 提供的缓冲区变化不再重复假装成一次磁盘保存。URI 随目录路径变更，正文身份不变。跨文件语言服务编辑也使用同一 VaultReplica，不另建互不关联的历史。
+远端已写回的未打开文件可以进入 watched-files 通知；已通过 didChange 提供的缓冲区变化不再重复假装成一次磁盘保存。URI 随目录路径变更，正文身份不变。跨文件语言服务编辑也使用同一 VaultInstance，不另建互不关联的历史。
 
 ## 实施顺序与新的验收边界
 
 1. 将现有目录 IO 收入 server，确定 `celestite-core` 与 `wasm` feature 的构建边界；迁移通用文档内核。
-2. 实现 Catalog、EntryId、唯一历史、路径投影及删除 / 冲突规则，建立不依赖 UI 的 VaultReplica 双副本测试。
+2. 实现 Catalog、EntryId、唯一历史、路径投影及删除 / 冲突规则，建立不依赖 UI 的 VaultInstance 双副本测试。
 3. 接入持久化与后台内容存储，分别验证驻留与未驻留文件；再迁移 CM6 与现有保存冲突流程。
 4. 用最小连接验证两个编辑器发现新文件、目录变化和未打开正文更新，建立同步能力协商；逐步扩展后台复制。
 5. 接 Tree-sitter 与 LSP，验证项目读取和跨文件编辑；复杂传输、生产成员管理、完整离线 Blob 镜像及 Tauri 后续推进。

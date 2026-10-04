@@ -6,6 +6,8 @@
 
 实施进展（2026-10-04）：文档内核、WASM feature、无头 server 宿主及文本历史恢复已完成第一轮实现，见 [无头 server 实施记录](<2026-10-04 headless-editor-kernel.md>)。Catalog CRDT、Web 内核迁移、Tree-sitter 和 LSP 仍待实施；下文的“当前基线”保留原调查时点。
 
+模型确定（2026-10-04）：见 [Vault 实例模型](<2026-10-04 vault-instance-model.md>)。Vault 是逻辑定义，VaultInstance 持有本机资源，Vault 列表登记本机实例；存储、目录映射、主动连接和对外共享分别配置。Web 使用 WASM core，Tauri 通过 IPC 访问 native core；独立 server 复用 native 运行时。后续实施按该模型拆分，同时保留本路线图的语言功能验收。
+
 ## 里程碑目标与用户可见结果
 
 将现有“CodeMirror 缓冲区 + 整文件保存”升级为以 Rust 文档内核为基础的编辑系统：CRDT 负责文本历史和协作编辑语义，CodeMirror 负责交互，Tree-sitter 负责语法高亮，LSP 提供语言功能。四者使用同一份版本化内存正文。
@@ -84,7 +86,7 @@ flowchart TD
 
 `VaultDocuments` 管理打开文档的生命周期、路径映射、保存和文件操作协调。每份打开的文档拥有一个 `DocumentSession`，其正文与历史由 Rust 内核维护。CM6 状态中的文本是显示副本，不能与内核形成互不约束的两份正文。
 
-Vault 运行时还拥有 `VaultReplica`：目录 Catalog 管理整个库的身份与结构，文本存储管理独立正文历史，调度器后台补齐未打开文件。打开文档会话是其工作集的一部分，关闭标签不解除 Vault 同步，也不要求所有文件同时驻留内存。
+`VaultInstance` 持有本机运行时资源：目录 Catalog 管理整个库的身份与结构，文本存储管理独立正文历史，调度器后台补齐未打开文件。打开文档会话是其工作集的一部分，关闭标签不解除 Vault 同步，也不要求所有文件同时驻留内存。
 
 文档会话独立于视图：切换标签仅 detach / attach 视图，后台文档仍接收内核变更、诊断和工作区编辑。关闭文档时显式处理保存、日志与语言会话；缓存的 CM6 状态重新挂载前必须追上内核版本。
 

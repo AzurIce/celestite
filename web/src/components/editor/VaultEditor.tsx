@@ -10,7 +10,13 @@ import {
 } from "solid-js";
 import { Button, IconButton } from "@/components/ui";
 import { StatusSlot } from "@/components/ui/status-slot";
-import { ChevronLeft, FileText, Save, X } from "@/components/icons";
+import {
+  ChevronLeft,
+  FileText,
+  LoaderCircle,
+  Save,
+  X,
+} from "@/components/icons";
 import type { VaultDocuments } from "@/lib/editor/documents";
 import { setSetting, settings } from "@/lib/settings";
 import type { EditorBuffer } from "./CodeEditor";
@@ -150,14 +156,6 @@ export function VaultEditor(props: VaultEditorProps) {
           {state().openError}
         </p>
       </Show>
-      <Show when={state().loadingPath}>
-        <p
-          role="status"
-          class="border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary"
-        >
-          正在打开 {state().loadingPath}…
-        </p>
-      </Show>
       <Show when={state().documents.length}>
         <div role="tablist" aria-label="打开的文件" class="editor-tabs">
           <For each={state().documents.map((document) => document.id)}>
@@ -211,154 +209,171 @@ export function VaultEditor(props: VaultEditorProps) {
         </div>
       </Show>
       <Show
-        when={active()?.id}
-        keyed
+        when={!state().loadingPath}
         fallback={
-          <div class="editor-empty">
-            <h2 class="text-ui-heading font-medium">打开一份文件</h2>
-            <p class="mt-2 text-ui-sm text-secondary">
-              从左侧选择，或新建你的第一份笔记。
-            </p>
-            <p class="mt-6 text-ui-sm text-secondary">
-              自动保存 <span aria-hidden="true">·</span> Ctrl / ⌘ S 手动保存
-            </p>
+          <div class="editor-loading" role="status" aria-live="polite">
+            <LoaderCircle
+              size={22}
+              class="editor-loading-icon"
+              aria-hidden="true"
+            />
+            <span class="text-ui-sm">正在打开 {state().loadingPath}…</span>
           </div>
         }
       >
-        {(id) => (
-          <>
-            <header class="editor-toolbar">
-              <span
-                class="min-w-0 flex-1 truncate text-ui-sm text-secondary"
-                title={active()?.path}
-              >
-                {active()?.path}
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                aria-pressed={wrap() ? "true" : "false"}
-                disabled={wrapFromProject() || !!active()?.readOnlyReason}
-                title={
-                  wrapFromProject()
-                    ? "由 .celestite/settings.json 提供，编辑该文件后生效"
-                    : undefined
-                }
-                onClick={() => void setSetting("editor.wordWrap", !wrap())}
-              >
-                自动换行
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={
-                  !active()?.dirty ||
-                  active()?.saving ||
-                  active()?.locked ||
-                  !!active()?.readOnlyReason
-                }
-                onClick={() => void props.documents.requestSave(id)}
-                title="Ctrl / ⌘ S"
-              >
-                <Save size={14} />
-                保存
-              </Button>
-            </header>
-            <Show when={active()?.error}>
-              <div
-                role="alert"
-                class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
-              >
-                <span class="flex-1">
-                  {active()?.conflict
-                    ? "磁盘文件已变化，本地编辑仍保留。"
-                    : `保存失败，修改仍保留在编辑器中。${active()?.error}`}
+        <Show
+          when={active()?.id}
+          keyed
+          fallback={
+            <div class="editor-empty">
+              <h2 class="text-ui-heading font-medium">打开一份文件</h2>
+              <p class="mt-2 text-ui-sm text-secondary">
+                从左侧选择，或新建你的第一份笔记。
+              </p>
+              <p class="mt-6 text-ui-sm text-secondary">
+                自动保存 <span aria-hidden="true">·</span> Ctrl / ⌘ S 手动保存
+              </p>
+            </div>
+          }
+        >
+          {(id) => (
+            <>
+              <header class="editor-toolbar">
+                <span
+                  class="min-w-0 flex-1 truncate text-ui-sm text-secondary"
+                  title={active()?.path}
+                >
+                  {active()?.path}
                 </span>
                 <Button
                   size="sm"
-                  disabled={active()?.saving || active()?.locked}
-                  onClick={() => void props.documents.requestSave(id)}
+                  variant="ghost"
+                  aria-pressed={wrap() ? "true" : "false"}
+                  disabled={wrapFromProject() || !!active()?.readOnlyReason}
+                  title={
+                    wrapFromProject()
+                      ? "由 .celestite/settings.json 提供，编辑该文件后生效"
+                      : undefined
+                  }
+                  onClick={() => void setSetting("editor.wordWrap", !wrap())}
                 >
-                  {active()?.conflict ? "处理冲突" : "重试保存"}
+                  自动换行
                 </Button>
-              </div>
-            </Show>
-            <Show when={active()?.canPreview && active()?.readOnlyReason}>
-              <p class="border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary">
-                {active()?.readOnlyReason}
-              </p>
-            </Show>
-            <div
-              id={panelId}
-              role="tabpanel"
-              aria-labelledby={tabId(id)}
-              class="flex min-h-0 min-w-0 flex-1 flex-col"
-            >
-              <Show
-                when={active()?.canPreview}
-                fallback={
-                  <p class="m-auto max-w-md p-6 text-secondary">
-                    {active()?.readOnlyReason}
-                  </p>
-                }
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={
+                    !active()?.dirty ||
+                    active()?.saving ||
+                    active()?.locked ||
+                    !!active()?.readOnlyReason
+                  }
+                  onClick={() => void props.documents.requestSave(id)}
+                  title="Ctrl / ⌘ S"
+                >
+                  <Save size={14} />
+                  保存
+                </Button>
+              </header>
+              <Show when={active()?.error}>
+                <div
+                  role="alert"
+                  class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
+                >
+                  <span class="flex-1">
+                    {active()?.conflict
+                      ? "磁盘文件已变化，本地编辑仍保留。"
+                      : `保存失败，修改仍保留在编辑器中。${active()?.error}`}
+                  </span>
+                  <Button
+                    size="sm"
+                    disabled={active()?.saving || active()?.locked}
+                    onClick={() => void props.documents.requestSave(id)}
+                  >
+                    {active()?.conflict ? "处理冲突" : "重试保存"}
+                  </Button>
+                </div>
+              </Show>
+              <Show when={active()?.canPreview && active()?.readOnlyReason}>
+                <p class="border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary">
+                  {active()?.readOnlyReason}
+                </p>
+              </Show>
+              <div
+                id={panelId}
+                role="tabpanel"
+                aria-labelledby={tabId(id)}
+                class="flex min-h-0 min-w-0 flex-1 flex-col"
               >
-                <Loading
+                <Show
+                  when={active()?.canPreview}
                   fallback={
-                    <p role="status" class="p-4 text-secondary">
-                      正在加载编辑器…
+                    <p class="m-auto max-w-md p-6 text-secondary">
+                      {active()?.readOnlyReason}
                     </p>
                   }
                 >
-                  <Show when={`${id}:${active()?.reloadVersion}`} keyed>
-                    {(_viewKey) => (
-                      <CodeEditor
-                        document={active()!}
-                        cached={buffers.get(id)}
-                        wrap={wrap()}
-                        onChange={(content) =>
-                          props.documents.update(id, content)
-                        }
-                        onSave={() => {
-                          void props.documents.requestSave(id);
-                        }}
-                        onCursor={(line, column) => setCursor({ line, column })}
-                        onCache={(buffer) => {
-                          if (props.documents.has(id)) buffers.set(id, buffer);
-                        }}
-                      />
-                    )}
-                  </Show>
-                </Loading>
-              </Show>
-            </div>
-            <StatusSlot mount={props.statusMount} class="editor-statusbar">
-              <span
-                role="status"
-                aria-label="保存状态"
-                aria-live="polite"
-                class={active()?.error ? "text-danger" : undefined}
-              >
-                {status()}
-              </span>
-              <span class="hidden sm:inline">
-                {languageName(active()?.path ?? "")}
-              </span>
-              <span class="hidden sm:inline">
-                UTF-8{active()?.bom ? " BOM" : ""} ·{" "}
-                {active()?.lineEnding === "\r\n"
-                  ? "CRLF"
-                  : active()?.lineEnding === "\r"
-                    ? "CR"
-                    : "LF"}
-              </span>
-              <Show when={!active()?.readOnlyReason}>
-                <span class="whitespace-nowrap">
-                  Ln {cursor().line}, Col {cursor().column}
+                  <Loading
+                    fallback={
+                      <p role="status" class="p-4 text-secondary">
+                        正在加载编辑器…
+                      </p>
+                    }
+                  >
+                    <Show when={`${id}:${active()?.reloadVersion}`} keyed>
+                      {(_viewKey) => (
+                        <CodeEditor
+                          document={active()!}
+                          cached={buffers.get(id)}
+                          wrap={wrap()}
+                          onChange={(content) =>
+                            props.documents.update(id, content)
+                          }
+                          onSave={() => {
+                            void props.documents.requestSave(id);
+                          }}
+                          onCursor={(line, column) =>
+                            setCursor({ line, column })
+                          }
+                          onCache={(buffer) => {
+                            if (props.documents.has(id))
+                              buffers.set(id, buffer);
+                          }}
+                        />
+                      )}
+                    </Show>
+                  </Loading>
+                </Show>
+              </div>
+              <StatusSlot mount={props.statusMount} class="editor-statusbar">
+                <span
+                  role="status"
+                  aria-label="保存状态"
+                  aria-live="polite"
+                  class={active()?.error ? "text-danger" : undefined}
+                >
+                  {status()}
                 </span>
-              </Show>
-            </StatusSlot>
-          </>
-        )}
+                <span class="hidden sm:inline">
+                  {languageName(active()?.path ?? "")}
+                </span>
+                <span class="hidden sm:inline">
+                  UTF-8{active()?.bom ? " BOM" : ""} ·{" "}
+                  {active()?.lineEnding === "\r\n"
+                    ? "CRLF"
+                    : active()?.lineEnding === "\r"
+                      ? "CR"
+                      : "LF"}
+                </span>
+                <Show when={!active()?.readOnlyReason}>
+                  <span class="whitespace-nowrap">
+                    Ln {cursor().line}, Col {cursor().column}
+                  </span>
+                </Show>
+              </StatusSlot>
+            </>
+          )}
+        </Show>
       </Show>
       <SaveConflict documents={props.documents} state={state()} />
     </section>
