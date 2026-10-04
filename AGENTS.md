@@ -1,5 +1,12 @@
 docs/_logs 内的文档为“日志文档”以 `yyyy-mm-dd <topic>` 命名，禁止引用外部会变更的文档。
 
+## 文档维护
+
+- `docs/architecture.md` 简洁描述目标架构；`docs/roadmap.md` 维护实施阶段与完成标准。两者不罗列当前实现、迁移历史、调查证据或测试记录。
+- 日常讨论不自动新增日志；确定的设计优先更新上述文档。
+- `docs/_logs` 仅用于有明确记录需求的独立调查或故障记录，不按讨论轮次拆出系列设计日志。
+- 删除被替代的文档时同步修复引用。
+
 ## 格式化（agent 必须遵守）
 
 Web 代码（`.ts .tsx .js .jsx .css .html .json .md`）的统一格式化工具是 **prettier 3.9.9**，与 Zed 内置格式化器同版本、同读 `web/.prettierrc.json`，CLI 与 Zed 输出逐字节一致（已实测验证）。

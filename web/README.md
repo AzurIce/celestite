@@ -16,6 +16,8 @@ bun run typecheck
 bun run build
 ```
 
+`dev`、`build` 和 `typecheck` 会先构建 Rust WASM 内核。需要 Rust 的 `wasm32-unknown-unknown` target（仓库 flake 已提供）。构建脚本使用 wasm-bindgen CLI 0.2.129；系统版本不一致时自动安装到 `web/.cache/wasm-tools`，首次安装需要网络。也可以通过 `WASM_BINDGEN` 指定匹配的 CLI，`CARGO_TARGET_DIR` 指定编译缓存。
+
 首页自动打开默认 Web Vault，显示文件树及代码编辑器。深浅主题通过右下角状态栏的主题菜单切换。
 
 UI 回归测试覆盖输入、弹窗焦点与关闭、菜单键盘操作、主题持久化和 SVG 图标：
@@ -265,11 +267,11 @@ bun run test:ui tests/settings-ui.spec.ts
 | Tab / Shift + Tab          | 缩进 / 减少缩进；CodeMirror 支持 Escape 后用 Tab 移出编辑器 |
 | 标签上的关闭按钮           | 先保存文档再关闭；保存失败时保留标签与缓冲区                |
 
-`lib/editor/documents.ts` 的 `VaultDocuments` 管理已打开文档与保存队列。编辑器只更新内存缓冲区，保存使用后端的 `writeFile(..., { mode: "replace" })`，不把已删除文件自动重新创建。只有后端成功提交的内容才会标记为已保存；保存期间继续输入，会在同一队列里保存更新后的版本。失败显示原因并保留修改，停止自动重试，可使用保存按钮或“重试保存”恢复。
+默认 OPFS 使用 Worker 内的 Rust `EditorCore<OpfsBackend>` 管理文档、历史与保存；`WorkerDocuments` 管理 UI 视图和待确认输入。远端 HTTP 暂由 `lib/editor/documents.ts` 的 `VaultDocuments` 兼容适配。编辑器只更新内存缓冲区，保存使用后端的 `writeFile(..., { mode: "replace" })`，不把已删除文件自动重新创建。只有后端成功提交的内容才会标记为已保存；保存期间继续输入，会在同一队列里保存更新后的版本。失败显示原因并保留修改，停止自动重试，可使用保存按钮或“重试保存”恢复。
 
 文件树接收该运行时的 `treeBackend`。移动、重命名、删除以及复制/下载读取会先保存相关缓冲区，相关文档在操作期间短暂禁止编辑；保存失败则拒绝后续文件操作。文件树原有的目录树与 OPFS 后端仍保持独立，OPFS watch 不产生事件。
 
-文本内部使用 LF；保存保留打开时的 UTF-8 BOM 和首个换行符形式（LF / CRLF / CR），混合换行文件编辑后统一为首个形式。隐藏页面和关闭工作区时尝试保存全部缓冲区，存在未保存内容时注册浏览器离开提醒。页面终止事件不能保证异步写入完成，仍以界面的“已保存”为准。当前不合并其他窗口或外部程序对同一文件的并发修改，刷新页面也不会恢复尚未落盘的缓冲区。
+文本内部使用 LF；保存保留打开时的 UTF-8 BOM 和首个换行符形式（LF / CRLF / CR），混合换行文件编辑后统一为首个形式。隐藏页面和关闭工作区时尝试保存全部缓冲区，存在未保存内容时注册浏览器离开提醒。页面终止事件不能保证异步写入完成，仍以界面的“已保存”为准。当前不合并其他窗口或外部程序对同一文件的并发修改，默认 OPFS 刷新可恢复已提交到私有历史、尚未写回普通文件的草稿；尚未提交的输入仍需保持页面打开。
 
 `tests/unit/editor-documents.test.ts` 覆盖快速切换、保存期间输入、自动保存、写入失败、路径变更、复制/删除协调、编码与换行、关闭时保存等状态与故障情形；`tests/editor.spec.ts` 验证实际编辑器与 OPFS 的保存、重载及交互。
 
@@ -281,7 +283,7 @@ bun run test:ui tests/settings-ui.spec.ts
 
 切换保留各自的文档、未保存正文、撤销历史、文件树展开/选择和剪贴板；同路径文件属于不同 Vault。后台文档仍可自动保存，离开页面时检查所有已打开 Vault。项目设置随当前 Vault 重新读取，过时的异步结果不能覆盖新 Vault 的设置。移除远端连接先保存该 Vault 的文档，再释放运行时、删除本地连接记录；失败保留连接和缓冲区，不调用远端删除操作。
 
-HTTP backend 使用字节正文和 SSE 变化提示。版本读取 `readFileSnapshot` 把正文与版本一起交给文档，文档保存显式携带 `expectedRevision`，成功后更新为提交版本；其他下载或复制读取不会推进编辑器的保存基线。OPFS 没有版本写入能力，显式传入预期版本时返回 Unsupported；原有 OPFS 编辑保存不变。已打开正文不随监听自动重载；文件树刷新或重连会重新核对目录。
+HTTP backend 使用字节正文和 SSE 变化提示。版本读取 `readFileSnapshot` 把正文与版本一起交给文档，文档保存显式携带 `expectedRevision`，成功后更新为提交版本；其他下载或复制读取不会推进编辑器的保存基线。OPFS 同样使用内容版本和条件写入，在文件操作锁内核对基线后提交；外部修改通过打开或保存时的核对发现。已打开正文不随监听自动重载；文件树刷新或重连会重新核对目录。
 
 手动保存或关闭标签遇到远端版本冲突时，弹窗提供“覆盖保存”“丢弃编辑”“取消”，默认焦点为取消。覆盖保存重新读取最新版本后提交本地内容，仍带版本检查；期间再次修改会保留编辑和弹窗。保存时丢弃编辑会读取最新正文与编码、重建编辑器并清除旧撤销历史；读取失败或无法编辑的新正文不会清除本地修改。关闭时丢弃编辑直接关闭标签，不修改磁盘。取消保留编辑与标签。自动保存发现冲突只显示提示并停止重试，用户点击“处理冲突”后再弹窗；页面终止时仍使用浏览器离开提醒，不承诺异步操作完成。目前不提供自动合并或差异比较。
 
@@ -293,3 +295,11 @@ server 配置、启动和 API 见 [server README](../crates/celestite-server/REA
 cargo build -p celestite-server
 bun run --cwd web test:ui tests/multi-vault.spec.ts
 ```
+
+## 默认 OPFS 编辑服务
+
+默认库的 Rust 编辑内核在 Dedicated Worker 中运行。`WorkerDocuments` 保留 UI 视图与待确认输入，`EditorClient` 承载异步请求 / 通知，`OpfsEditorHost` 只适配消息、视图状态与定时任务；Rust `EditorCore<Backend>` 统一执行文档、保存、冲突与目录恢复逻辑，`OpfsBackend` 通过浏览器 IO 桥访问 OPFS。server 的 native 后端使用同一个 core。CodeMirror 输入发送 UTF-16 增量，撤销 / 重做使用 Rust 内核。
+
+普通文件位于 `vaults/default`，稳定身份和 CRDT 历史位于 `editor-instances/default`。每次接受编辑先提交私有增量日志，普通文件另行自动保存；文件写回失败后，已提交历史仍可在刷新时恢复。历史提交失败会暂停编辑，重试保存先提交历史。个人撤销栈只保留在本次 Worker 生命周期。
+
+同一默认库目前只允许一个标签页持有内核；另一标签页会显示占用提示。远端 HTTP Vault 仍使用兼容文件编辑流程，实时 CRDT 同步、Tauri IPC、Catalog CRDT 和日志压缩不在这次实现内。

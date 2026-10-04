@@ -1,3 +1,4 @@
+import { installWorkerHarness, workerEvaluate } from "./worker-harness";
 import { expect, test as base, type Page } from "@playwright/test";
 type VaultModule = typeof import("../src/lib/vault");
 
@@ -17,6 +18,7 @@ const test = base.extend<{ runtimeErrors: string[] }>({
   ],
 });
 test.beforeEach(async ({ page }) => {
+  await installWorkerHarness(page);
   await page.goto("/");
   await page.evaluate(async () => {
     const url = "/src/lib/vault/index.ts";
@@ -491,9 +493,9 @@ test("file imports, editor contents and partial move failure reflect actual stor
     "imported",
   );
   // 独立注入真实 OPFS 写入失败，第二项出错时第一项必须可见。
-  await page.evaluate(() => {
+  await workerEvaluate(page, () => {
     const original = FileSystemFileHandle.prototype.createWritable;
-    (window as unknown as { restoreWriter: () => void }).restoreWriter = () => {
+    (self as unknown as { restoreWriter: () => void }).restoreWriter = () => {
       FileSystemFileHandle.prototype.createWritable = original;
     };
     FileSystemFileHandle.prototype.createWritable = async function (options) {
@@ -531,8 +533,8 @@ test("file imports, editor contents and partial move failure reflect actual stor
         .locator(".tree-row"),
     ).toHaveAttribute("data-path", "b.md");
   } finally {
-    await page.evaluate(() =>
-      (window as unknown as { restoreWriter: () => void }).restoreWriter(),
+    await workerEvaluate(page, () =>
+      (self as unknown as { restoreWriter: () => void }).restoreWriter(),
     );
   }
 });

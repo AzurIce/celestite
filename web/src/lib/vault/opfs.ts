@@ -11,6 +11,13 @@ import type {
 
 type OpfsEntry = FileSystemFileHandle | FileSystemDirectoryHandle;
 
+export async function contentRevision(data: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(data));
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
 function isFileHandle(
   handle: FileSystemHandle,
 ): handle is FileSystemFileHandle {
@@ -125,19 +132,29 @@ class OpfsVaultBackend implements VaultBackend {
     });
   }
 
+  readFileSnapshot(
+    path: VaultPath,
+  ): Promise<{ data: Uint8Array; revision: string }> {
+    return this.run("readFileSnapshot", path, async () => {
+      vaultPath(path);
+      const entry = await this.entry(path);
+      if (entry.kind !== "file")
+        throw new VaultError(
+          "NotFile",
+          "Cannot read a directory as a file",
+          path,
+        );
+      const data = new Uint8Array(await (await entry.getFile()).arrayBuffer());
+      return { data, revision: await contentRevision(data) };
+    });
+  }
+
   writeFile(
     path: VaultPath,
     data: Uint8Array,
     options: WriteFileOptions,
-  ): Promise<void> {
+  ): Promise<string> {
     return this.run("writeFile", path, async () => {
-      if (options.expectedRevision !== undefined) {
-        throw new VaultError(
-          "Unsupported",
-          "OPFS does not support conditional writes",
-          path,
-        );
-      }
       const { parent, name } = splitPath(path);
       // 在第一次 await 前复制，排队保存不受调用者之后修改 buffer 的影响。
       const bytes = new Uint8Array(data);
@@ -145,7 +162,7 @@ class OpfsVaultBackend implements VaultBackend {
       if (mode !== "create" && mode !== "replace") {
         throw new VaultError("Unsupported", "Unknown file write mode", path);
       }
-      await this.mutate(async () => {
+      return await this.mutate(async () => {
         const directory = await this.directory(parent);
         const existing = await this.findEntry(directory, name);
         if (mode === "create" && existing) {
@@ -161,6 +178,20 @@ class OpfsVaultBackend implements VaultBackend {
             path,
           );
         }
+        if (options.expectedRevision !== undefined) {
+          if (
+            !existing ||
+            existing.kind !== "file" ||
+            (await contentRevision(
+              new Uint8Array(await (await existing.getFile()).arrayBuffer()),
+            )) !== options.expectedRevision
+          )
+            throw new VaultError(
+              "Conflict",
+              "文件已被其他客户端或程序修改。",
+              path,
+            );
+        }
 
         const file =
           existing ?? (await directory.getFileHandle(name, { create: true }));
@@ -169,6 +200,7 @@ class OpfsVaultBackend implements VaultBackend {
           writable = await file.createWritable();
           await writable.write(bytes);
           await writable.close();
+          return await contentRevision(bytes);
         } catch (error) {
           // 已有文件通过 abort 保留旧内容；新建失败时清理空条目。
           try {

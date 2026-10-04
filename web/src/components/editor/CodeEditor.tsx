@@ -5,7 +5,14 @@ import {
   onSettled,
   Show,
 } from "solid-js";
-import { Compartment, EditorState, Prec } from "@codemirror/state";
+import {
+  Annotation,
+  Compartment,
+  EditorSelection,
+  EditorState,
+  Prec,
+  Transaction,
+} from "@codemirror/state";
 import {
   EditorView,
   keymap,
@@ -39,14 +46,20 @@ import {
 } from "@codemirror/autocomplete";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { tags } from "@lezer/highlight";
-import type { DocumentSnapshot } from "@/lib/editor/documents";
+import type {
+  EditorDocument,
+  ViewEdit,
+  SelectionContext,
+} from "@/lib/editor/contract";
 import { languageSupport } from "./languages";
 import "./editor.css";
 
 import type { EditorBuffer } from "@/lib/editor/buffer";
 export type { EditorBuffer } from "@/lib/editor/buffer";
 interface CodeEditorProps {
-  document: DocumentSnapshot;
+  document: EditorDocument;
+  onTransaction?: (transaction: ViewEdit) => boolean;
+  onUndo?: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
   cached?: EditorBuffer;
   onChange: (content: string) => boolean;
@@ -54,6 +67,11 @@ interface CodeEditorProps {
   onCursor: (line: number, column: number) => void;
   onCache: (buffer: EditorBuffer) => void;
 }
+const serviceUpdate = Annotation.define<boolean>();
+const selectionContext = (state: EditorState): SelectionContext => ({
+  ranges: state.selection.ranges.map(({ anchor, head }) => ({ anchor, head })),
+  mainIndex: state.selection.mainIndex,
+});
 const highlight = HighlightStyle.define([
   {
     tag: [tags.keyword, tags.modifier, tags.operatorKeyword],
@@ -80,6 +98,7 @@ export default function CodeEditor(props: CodeEditorProps) {
   let buffer: EditorBuffer;
   let disposed = false;
   let languageRequest = 0;
+  let selectionRevision = 0;
   let observer: MutationObserver | undefined;
   const [languageError, setLanguageError] = createSignal(false);
   const darkTheme = () =>
@@ -92,9 +111,21 @@ export default function CodeEditor(props: CodeEditorProps) {
     const line = state.doc.lineAt(head);
     props.onCursor(line.number, head - line.from + 1);
   };
+  const undo = (redo: boolean) => (editor: EditorView) => {
+    if (!props.onUndo) return false;
+    if (!props.document.readOnlyReason && !props.document.core?.historyError)
+      props.onUndo(selectionContext(editor.state), redo);
+    return true;
+  };
   const bindings = () => [
     Prec.highest(
       keymap.of([
+        ...(props.onUndo
+          ? [
+              { key: "Mod-z", run: undo(false), shift: undo(true) },
+              { key: "Mod-y", run: undo(true) },
+            ]
+          : []),
         {
           key: "Mod-s",
           run: () => {
@@ -104,6 +135,18 @@ export default function CodeEditor(props: CodeEditorProps) {
         },
       ]),
     ),
+    // Keep focus during a core command round-trip, but reject text input until
+    // the host has returned the new version. Toggling contenteditable here would
+    // blur the view and swallow a following redo keyboard shortcut.
+    EditorState.transactionFilter.of((transaction) =>
+      transaction.docChanged &&
+      !transaction.annotation(serviceUpdate) &&
+      (props.document.locked ||
+        props.document.readOnlyReason ||
+        props.document.core?.historyError)
+        ? []
+        : transaction,
+    ),
     EditorView.contentAttributes.of({
       "aria-label": "代码编辑器",
       spellcheck: "false",
@@ -111,28 +154,60 @@ export default function CodeEditor(props: CodeEditorProps) {
       autocorrect: "off",
     }),
     EditorView.updateListener.of((update) => {
-      if (update.docChanged && !props.onChange(update.state.doc.toString())) {
-        // 文件树修改期间的保护；禁止把未接收的输入留在视图中。
-        queueMicrotask(() => {
-          if (!disposed && view)
-            view.dispatch({
-              changes: {
-                from: 0,
-                to: view.state.doc.length,
-                insert: props.document.content,
-              },
-            });
-        });
+      if (
+        update.docChanged &&
+        !update.transactions.some((transaction) =>
+          transaction.annotation(serviceUpdate),
+        )
+      ) {
+        const content = update.state.doc.toString();
+        const edits: ViewEdit["edits"] = [];
+        update.changes.iterChanges((from, to, _fromB, _toB, insert) =>
+          edits.push({ from, to, insert: insert.toString() }),
+        );
+        const accepted = props.onTransaction
+          ? props.onTransaction({
+              edits,
+              content,
+              before: selectionContext(update.startState),
+              after: selectionContext(update.state),
+              userEvent:
+                update.transactions
+                  .map((transaction) =>
+                    transaction.annotation(Transaction.userEvent),
+                  )
+                  .find(Boolean) ?? "view",
+            })
+          : props.onChange(content);
+        if (!accepted)
+          queueMicrotask(() => {
+            if (!disposed && view)
+              view.dispatch({
+                changes: {
+                  from: 0,
+                  to: view.state.doc.length,
+                  insert: props.document.content,
+                },
+                annotations: [
+                  serviceUpdate.of(true),
+                  Transaction.addToHistory.of(false),
+                ],
+              });
+          });
       }
       if (update.docChanged || update.selectionSet) cursor(update.state);
     }),
   ];
   const editable = () => [
     EditorState.readOnly.of(
-      props.document.locked || !!props.document.readOnlyReason,
+      props.document.locked ||
+        !!props.document.readOnlyReason ||
+        !!props.document.core?.historyError,
     ),
     EditorView.editable.of(
-      !props.document.locked && !props.document.readOnlyReason,
+      (!props.document.locked || !!props.document.core) &&
+        !props.document.readOnlyReason &&
+        !props.document.core?.historyError,
     ),
   ];
   async function configureLanguage(path: string) {
@@ -164,6 +239,7 @@ export default function CodeEditor(props: CodeEditorProps) {
   }
   onSettled(() => {
     if (disposed) return;
+    selectionRevision = props.document.restoredSelection?.revision ?? 0;
     const cached =
       props.cached?.reloadVersion === props.document.reloadVersion
         ? props.cached
@@ -195,7 +271,7 @@ export default function CodeEditor(props: CodeEditorProps) {
             lineNumbers(),
             highlightActiveLineGutter(),
             highlightSpecialChars(),
-            history(),
+            props.onUndo ? [] : history(),
             drawSelection(),
             dropCursor(),
             rectangularSelection(),
@@ -227,7 +303,7 @@ export default function CodeEditor(props: CodeEditorProps) {
             keymap.of([
               ...closeBracketsKeymap,
               ...defaultKeymap,
-              ...historyKeymap,
+              ...(props.onUndo ? [] : historyKeymap),
               ...searchKeymap,
               ...foldKeymap,
               ...completionKeymap,
@@ -262,7 +338,10 @@ export default function CodeEditor(props: CodeEditorProps) {
     },
   );
   createEffect(
-    () => props.document.locked || !!props.document.readOnlyReason,
+    () =>
+      props.document.locked ||
+      !!props.document.readOnlyReason ||
+      !!props.document.core?.historyError,
     () => {
       if (view)
         view.dispatch({ effects: buffer.editable.reconfigure(editable()) });
@@ -275,6 +354,44 @@ export default function CodeEditor(props: CodeEditorProps) {
         view.dispatch({
           effects: buffer.wrap.reconfigure(wrap ? EditorView.lineWrapping : []),
         });
+    },
+  );
+  createEffect(
+    () => ({
+      content: props.document.content,
+      selection: props.document.restoredSelection,
+    }),
+    ({ content, selection }) => {
+      if (!view) return;
+      const before = view.state.doc.toString();
+      if (
+        before === content &&
+        (!selection || selection.revision === selectionRevision)
+      )
+        return;
+      const changes =
+        before === content
+          ? undefined
+          : { from: 0, to: before.length, insert: content };
+      const restore = selection && selection.revision !== selectionRevision;
+      if (restore) selectionRevision = selection.revision;
+      view.dispatch({
+        changes,
+        ...(restore
+          ? {
+              selection: EditorSelection.create(
+                selection.ranges.map((range) =>
+                  EditorSelection.range(range.anchor, range.head),
+                ),
+                selection.mainIndex,
+              ),
+            }
+          : {}),
+        annotations: [
+          serviceUpdate.of(true),
+          Transaction.addToHistory.of(false),
+        ],
+      });
     },
   );
   onCleanup(() => {

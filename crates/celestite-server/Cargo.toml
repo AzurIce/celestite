@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 celestite-core = { path = "../celestite-core" }
+futures-lite = "2.6.1"
 cap-std = "4"
 blake3 = "1"
 uuid = { version = "1", features = ["v4"] }

@@ -1,6 +1,6 @@
 //! Host-owned journal. A receipt covers only a committed redb transaction.
-use super::documents::{Header, JournalEntry};
 use super::fs::{Result, VaultError};
+use celestite_core::{DirectoryIntent, DocumentHeader as Header, JournalEntry};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -32,6 +32,47 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    pub fn instance_id(&self) -> Result<String> {
+        let tx = self.db.begin_write().map_err(storage_error)?;
+        let id;
+        {
+            let mut meta = tx.open_table(META).map_err(storage_error)?;
+            let existing = meta
+                .get("instance-id")
+                .map_err(storage_error)?
+                .map(|value| value.value().to_vec());
+            id = existing
+                .map(|value| String::from_utf8(value).map_err(storage_error))
+                .transpose()?
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            meta.insert("instance-id", id.as_bytes())
+                .map_err(storage_error)?;
+        }
+        tx.commit().map_err(storage_error)?;
+        Ok(id)
+    }
+    pub fn directory_intent(&self) -> Result<Option<DirectoryIntent>> {
+        let tx = self.db.begin_read().map_err(storage_error)?;
+        let meta = tx.open_table(META).map_err(storage_error)?;
+        meta.get("directory-intent")
+            .map_err(storage_error)?
+            .map(|value| serde_json::from_slice(value.value()).map_err(storage_error))
+            .transpose()
+    }
+    pub fn set_directory_intent(&self, intent: Option<&DirectoryIntent>) -> Result<()> {
+        let tx = self.db.begin_write().map_err(storage_error)?;
+        {
+            let mut meta = tx.open_table(META).map_err(storage_error)?;
+            if let Some(intent) = intent {
+                let bytes = serde_json::to_vec(intent).map_err(storage_error)?;
+                meta.insert("directory-intent", bytes.as_slice())
+                    .map_err(storage_error)?;
+            } else {
+                meta.remove("directory-intent").map_err(storage_error)?;
+            }
+        }
+        tx.commit().map_err(storage_error)
+    }
     pub fn open(path: &Path, root: &Path) -> Result<(Self, VaultIdentity)> {
         let db = Database::create(path).map_err(storage_error)?;
         let tx = db.begin_write().map_err(storage_error)?;
@@ -115,6 +156,21 @@ impl Store {
                     .transpose()
                     .map_err(storage_error)?;
                 let expected = previous.as_ref().map_or(0, |value| value.sequence);
+                // A caller may retry after losing the successful receipt.
+                if previous.as_ref().is_some_and(|value| {
+                    serde_json::to_vec(value).ok() == serde_json::to_vec(header).ok()
+                }) {
+                    if let Some(entry) = entry {
+                        let stored = journal
+                            .get((header.id.as_str(), header.sequence))
+                            .map_err(storage_error)?;
+                        let wanted = serde_json::to_vec(entry).map_err(storage_error)?;
+                        if !stored.is_some_and(|value| value.value() == wanted.as_slice()) {
+                            return Err(storage_error("Retried journal content mismatch"));
+                        }
+                    }
+                    continue;
+                }
                 if header.sequence != expected + u64::from(entry.is_some()) {
                     return Err(storage_error("Journal sequence mismatch"));
                 }

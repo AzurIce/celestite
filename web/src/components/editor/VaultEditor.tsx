@@ -17,7 +17,7 @@ import {
   Save,
   X,
 } from "@/components/icons";
-import type { VaultDocuments } from "@/lib/editor/documents";
+import type { EditorDocuments } from "@/lib/editor/contract";
 import { setSetting, settings } from "@/lib/settings";
 import type { EditorBuffer } from "./CodeEditor";
 import { languageName } from "./languages";
@@ -26,7 +26,7 @@ import "./editor.css";
 
 const CodeEditor = lazy(() => import("./CodeEditor"));
 interface VaultEditorProps {
-  documents: VaultDocuments;
+  documents: EditorDocuments;
   buffers?: Map<string, EditorBuffer>;
   statusMount?: Element;
 }
@@ -53,7 +53,7 @@ export function VaultEditor(props: VaultEditorProps) {
         ? "正在处理文件…"
         : file?.error
           ? "保存失败"
-          : file?.dirty
+          : file?.dirty || file?.pending
             ? "未保存"
             : file?.readOnlyReason
               ? file.canPreview
@@ -263,7 +263,9 @@ export function VaultEditor(props: VaultEditorProps) {
                   size="sm"
                   variant="ghost"
                   disabled={
-                    !active()?.dirty ||
+                    (!active()?.dirty &&
+                      !active()?.pending &&
+                      !active()?.core?.historyError) ||
                     active()?.saving ||
                     active()?.locked ||
                     !!active()?.readOnlyReason
@@ -328,6 +330,19 @@ export function VaultEditor(props: VaultEditorProps) {
                           wrap={wrap()}
                           onChange={(content) =>
                             props.documents.update(id, content)
+                          }
+                          onTransaction={
+                            props.documents.edit
+                              ? (transaction) =>
+                                  props.documents.edit!(id, transaction)
+                              : undefined
+                          }
+                          onUndo={
+                            props.documents.undo
+                              ? (context, redo) => {
+                                  void props.documents.undo!(id, context, redo);
+                                }
+                              : undefined
                           }
                           onSave={() => {
                             void props.documents.requestSave(id);

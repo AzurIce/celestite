@@ -2,6 +2,8 @@
 
 对标 Obsidian 的笔记 / PKM 编辑器。Web 自带 OPFS 默认 Vault，可连接由独立 server 提供的目录 Vault；Tauri 后端暂未接入。
 
+- [项目架构](docs/architecture.md)
+- [里程碑与路线图](docs/roadmap.md)
 - [Web 开发与界面说明](web/README.md)
 - [server 配置、启动与 API](crates/celestite-server/README.md)
 - [server 配置示例](crates/celestite-server/config.example.toml)

@@ -651,11 +651,14 @@ dependencies = [
 name = "celestite-core"
 version = "0.1.0"
 dependencies = [
+ "futures-lite",
+ "js-sys",
  "loro",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -667,6 +670,7 @@ dependencies = [
  "cap-std",
  "celestite-core",
  "clap",
+ "futures-lite",
  "http-body-util",
  "notify",
  "redb",

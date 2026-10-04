@@ -6,10 +6,11 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui";
-import type { DocumentsSnapshot, VaultDocuments } from "@/lib/editor/documents";
+import type { DocumentsSnapshot } from "@/lib/editor/documents";
+import type { EditorDocuments } from "@/lib/editor/contract";
 
 export function SaveConflict(props: {
-  documents: VaultDocuments;
+  documents: EditorDocuments;
   state: DocumentsSnapshot;
 }) {
   let cancel!: HTMLButtonElement;

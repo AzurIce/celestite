@@ -1,8 +1,8 @@
 # Celestite core
 
-Celestite 的宿主无关 Rust 编辑器内核。不依赖 HTTP、磁盘路径、浏览器或 UI。
+Celestite 的统一 Rust 编辑器内核。`EditorCore<Backend>` 注入平台 IO，管理文档身份、CRDT、个人撤销、私有历史、文件保存、外部冲突与目录操作恢复。不依赖 HTTP、Solid 或 CodeMirror。
 
-当前实现一个 `LoroText("source")` 文本文档，固定 `loro = 1.16.2`，从归档 Notist `refactor` 的文档内核与契约测试迁入。它提供：
+下层 `Document` 使用 `LoroText("source")`，固定 `loro = 1.16.2`，提供：
 
 - 先完整验证、再提交的 UTF-16 编辑事务与因果版本检查。
 - 完整快照和增量交换、乱序 / 重复更新、文档和历史身份校验。
@@ -36,6 +36,14 @@ cargo test -p celestite-core
 cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 ```
 
-默认编译纯 Rust 库；`wasm` feature 仅在 `wasm32` target 导出薄 `DocumentBinding`，同一 crate 同时输出 `rlib` / `cdylib`。WASM 使用 JSON 接口、二进制版本辅助接口和显式 `take_events()`，64 位 writer ID 在 JSON 中保持字符串。
+默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding` 和底层 `DocumentBinding`。Web Worker 构造 `EditorCore<OpfsBackend>`，浏览器 IO 桥只提供文件和私有存储读写。server 构造同类型的 `EditorCore<NativeBackend>`，使用普通目录与 redb。64 位 writer ID 在 JSON 中保持字符串。
 
-server 已使用此内核提供真实 HTTP 编辑、同步包交换、redb 日志恢复和文件写回，可运行 `cargo test -p celestite-server --test headless_editor` 验证。目录 Catalog CRDT、Vault 同步调度、Vim、Tree-sitter 和 LSP 仍待实现。
+## Backend 与服务接口
+
+`Backend` 定义身份、时钟、历史加载、幂等提交、目录恢复意图及可选的普通文件 IO。`has_projection()` 决定实例是否映射普通目录；没有映射时，只提交私有历史，不报告普通文件已保存。异步方法不要求 `Send`，OPFS IO 可以留在 Worker 中；native 包装在阻塞任务中执行文件和 redb IO。
+
+core 提供类型化的 `open_file`、`read`、`edit` / `transact`、`undo`、`import`、`save`、`resolve`、`rename`、`remove` 等 Rust 方法，`execute_service(method, params)` 提供 Worker / IPC 可序列化入口。Web 包装只管理请求队列、事件序号、视图投影和定时器；自动保存延迟由 core 返回。
+
+编辑回复保留已接受的正文，即使历史提交失败；`persistenceError` 暂停后续修改，`retry_history` 重试提交。`durableVersion` 只确认本机历史；`savedVersion` 确认普通文件写回。保存按“历史 → 保存意图 → 条件写入 → 回执”执行；移动和删除也先记录恢复意图。恢复保留文档身份并重新分配 writer，个人撤销栈不持久化。
+
+`tests/editor_backend.rs` 验证统一业务的故障恢复与服务契约；server 的 `headless_editor` 测试验证真实 HTTP / redb；Web 的编辑器回归验证 WASM / OPFS，包括旧日志兼容。实时单 host 协作、Catalog CRDT、Vim、Tree-sitter 和 LSP 按项目路线图继续推进。

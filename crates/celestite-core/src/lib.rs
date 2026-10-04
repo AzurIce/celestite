@@ -1,6 +1,14 @@
 //! Shared, host-independent Celestite editing kernel.
 pub mod document;
 pub use document::*;
+pub mod instance;
+pub use instance::*;
+pub mod backend;
+pub mod editor;
+pub use backend::*;
+pub use editor::*;
 
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+mod opfs;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;

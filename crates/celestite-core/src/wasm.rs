@@ -29,6 +29,30 @@ fn peer(value: Option<String>) -> Result<Option<u64>, JsValue> {
         .transpose()
 }
 
+/// Worker-owned shared editor with its concrete OPFS Backend.
+#[wasm_bindgen]
+pub struct EditorBinding {
+    core: EditorCore<crate::opfs::OpfsBackend>,
+}
+#[wasm_bindgen]
+impl EditorBinding {
+    pub async fn open(identity: String, io: js_sys::Function) -> Result<EditorBinding, JsValue> {
+        let backend = crate::opfs::OpfsBackend::new(io, decode(&identity)?);
+        Ok(Self {
+            core: EditorCore::open(backend)
+                .await
+                .map_err(|e| JsValue::from_str(&encode(e)))?,
+        })
+    }
+    pub async fn execute(&mut self, method: String, params: String) -> Result<String, JsValue> {
+        self.core
+            .execute_service(&method, decode(&params)?)
+            .await
+            .map(encode)
+            .map_err(|e| JsValue::from_str(&encode(e)))
+    }
+}
+
 #[wasm_bindgen]
 pub struct DocumentBinding {
     document: Arc<Mutex<Document>>,

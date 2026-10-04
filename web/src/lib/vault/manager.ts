@@ -7,7 +7,8 @@ import {
   normalizeVaultUrl,
   type HttpVaultBackend,
 } from "./http";
-import { openOpfsVault } from "./opfs";
+import { openOpfsEditor } from "../editor/worker-documents";
+import type { EditorDocuments, InstanceIdentity } from "../editor/contract";
 import { VaultError } from "./errors";
 import type { VaultBackend } from "./types";
 
@@ -18,11 +19,12 @@ export interface VaultConnection {
   name: string;
   url?: string;
 }
-export interface Vault {
+export interface VaultInstance {
+  identity?: InstanceIdentity;
   id: string;
   name: string;
   backend: VaultBackend;
-  documents: VaultDocuments;
+  documents: EditorDocuments;
   tree: FileTreeModel;
   editorBuffers: Map<string, EditorBuffer>;
   treeView: { scrollTop: number };
@@ -30,8 +32,8 @@ export interface Vault {
 }
 export interface VaultManagerSnapshot {
   connections: readonly VaultConnection[];
-  opened: readonly Vault[];
-  active: Vault | null;
+  opened: readonly VaultInstance[];
+  active: VaultInstance | null;
   opening: boolean;
   error: string | null;
   persistenceError: string | null;
@@ -50,9 +52,9 @@ const defaultConnection = (): VaultConnection => ({
 /** Owns runtime lifetimes. Switching views never closes or shares editing buffers. */
 export class VaultManager {
   private connections: VaultConnection[] = [defaultConnection()];
-  private runtimes = new Map<string, Vault>();
-  private inflight = new Map<string, Promise<Vault>>();
-  private active: Vault | null = null;
+  private runtimes = new Map<string, VaultInstance>();
+  private inflight = new Map<string, Promise<VaultInstance>>();
+  private active: VaultInstance | null = null;
   private opening = false;
   private error: string | null = null;
   private persistenceError: string | null = null;
@@ -130,7 +132,7 @@ export class VaultManager {
     connection: VaultConnection,
     backend: VaultBackend,
     readOnly = false,
-  ): Vault {
+  ): VaultInstance {
     const documents = new VaultDocuments(backend, 800, readOnly);
     return {
       id: connection.id,
@@ -143,19 +145,31 @@ export class VaultManager {
       readOnly,
     };
   }
-  private open(connection: VaultConnection): Promise<Vault> {
+  private open(connection: VaultConnection): Promise<VaultInstance> {
     const existing = this.runtimes.get(connection.id);
     if (existing) return Promise.resolve(existing);
     const pending = this.inflight.get(connection.id);
     if (pending) return pending;
     const operation = (async () => {
-      let vault: Vault;
-      if (connection.kind === "opfs")
-        vault = this.build(
-          connection,
-          await (this.options.openLocal ?? openOpfsVault)(),
-        );
-      else {
+      let vault: VaultInstance;
+      if (connection.kind === "opfs") {
+        if (this.options.openLocal)
+          vault = this.build(connection, await this.options.openLocal());
+        else {
+          const { identity, backend, documents } = await openOpfsEditor();
+          vault = {
+            id: connection.id,
+            name: connection.name,
+            identity,
+            backend,
+            documents,
+            tree: new FileTreeModel(backend),
+            editorBuffers: new Map(),
+            treeView: { scrollTop: 0 },
+            readOnly: false,
+          };
+        }
+      } else {
         const { backend, descriptor } = await (
           this.options.openRemote ?? openHttpVault
         )(connection.url!);
