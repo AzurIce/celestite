@@ -12,6 +12,7 @@ use axum::{
 };
 mod editor_api;
 mod profiles;
+mod reconcile;
 pub mod vault;
 use notify::Watcher;
 use serde::Deserialize;
@@ -101,10 +102,25 @@ struct HostedVault {
     documents: Mutex<Documents>,
     events: broadcast::Sender<ChangeHint>,
     _watcher: Mutex<notify::RecommendedWatcher>,
+    reconcile_trigger: reconcile::Trigger,
+    reconciler: Mutex<Option<reconcile::Reconciler>>,
 }
 struct ServerState {
     vaults: HashMap<String, Arc<HostedVault>>,
     shutdown: watch::Sender<bool>,
+}
+impl Drop for ServerState {
+    fn drop(&mut self) {
+        // Join while all Vaults are still strongly owned: shutdown/restart must not
+        // race a late history commit or leave a database temporarily locked.
+        for vault in self.vaults.values() {
+            if let Ok(mut worker) = vault.reconciler.lock() {
+                if let Some(worker) = worker.as_mut() {
+                    worker.stop();
+                }
+            }
+        }
+    }
 }
 pub struct Server {
     pub router: Router,
@@ -240,7 +256,9 @@ pub fn build_server(
     } in prepared
     {
         let files = FsVault::open(&root)?;
-        let documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
+        let mut documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
+        let (trigger, observations) = reconcile::channel();
+        let reconcile_signal = trigger.clone();
         let (events, _) = broadcast::channel(128);
         let sender = events.clone();
         let watched_vault = vault.id.clone();
@@ -252,24 +270,30 @@ pub fn build_server(
                 }
                 // Reads produce access events too; forwarding them causes refresh loops.
                 if !matches!(event, Ok(ref event) if event.kind.is_access()) {
+                    reconcile_signal.request();
                     let _ = sender.send(ChangeHint::all());
                 }
             },
         )?;
         watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+        // Watch before discovering files so changes during the initial scan are queued.
+        documents.reconcile()?;
+        documents.publish_changes()?;
         tracing::info!(vault_id = %vault.id, root = %root.display(), read_only = vault.read_only, persistent_history = documents.persistent(), "Vault initialized");
-        vaults.insert(
-            vault.id.clone(),
-            Arc::new(HostedVault {
-                id: vault.id,
-                name: vault.name,
-                read_only: vault.read_only,
-                files: Mutex::new(files),
-                documents: Mutex::new(documents),
-                events,
-                _watcher: Mutex::new(watcher),
-            }),
-        );
+        let hosted = Arc::new(HostedVault {
+            id: vault.id.clone(),
+            name: vault.name,
+            read_only: vault.read_only,
+            files: Mutex::new(files),
+            documents: Mutex::new(documents),
+            events,
+            _watcher: Mutex::new(watcher),
+            reconcile_trigger: trigger.clone(),
+            reconciler: Mutex::new(None),
+        });
+        let worker = reconcile::Reconciler::start(Arc::downgrade(&hosted), trigger, observations)?;
+        *hosted.reconciler.lock().unwrap() = Some(worker);
+        vaults.insert(vault.id, hosted);
     }
     let (shutdown, _) = watch::channel(false);
     let state = Arc::new(ServerState {
@@ -371,6 +395,7 @@ async fn run<T: Send + 'static>(
         let result = action(&files);
         // Failed recursive operations can partially complete, so invalidate on failure too.
         if mutation {
+            vault.reconcile_trigger.request();
             let _ = vault.events.send(ChangeHint::all());
         }
         result
@@ -397,7 +422,7 @@ async fn describe(
         .lock()
         .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(

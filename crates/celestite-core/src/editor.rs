@@ -680,6 +680,65 @@ impl<B: Backend> EditorCore<B> {
         self.persist(&identity.document_id).await?;
         Ok(identity.document_id)
     }
+    /// Inspect already loaded documents without filesystem IO or accepting new changes.
+    pub fn resident(&self) -> EditorResult<Vec<EditorDocument>> {
+        self.records.keys().map(|id| self.read(id)).collect()
+    }
+
+    /// Best-effort full observation. One unreadable/invalid file must not starve
+    /// unrelated documents. A history failure freezes the instance until explicit retry.
+    pub async fn reconcile_files(&mut self) -> Vec<EditorError> {
+        let mut errors = vec![];
+        if !self.backend.has_projection() {
+            return errors;
+        }
+        if let Some(error) = &self.failure {
+            errors.push(EditorError::new("IO", error, ""));
+            return errors;
+        }
+        let ids: Vec<_> = self.records.keys().cloned().collect();
+        for id in ids {
+            if let Err(error) = self.refresh(&id).await {
+                errors.push(error);
+            }
+            if self.failure.is_some() {
+                return errors;
+            }
+        }
+        let mut known_paths: std::collections::BTreeSet<_> = self
+            .records
+            .values()
+            .filter(|record| !record.header.deleted)
+            .map(|record| record.header.path.clone())
+            .collect();
+        let mut directories = vec![String::new()];
+        while let Some(directory) = directories.pop() {
+            let entries = match self.backend.read_dir(&directory).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            for entry in entries {
+                if entry.kind == "directory" {
+                    directories.push(entry.path);
+                } else if entry.kind == "file" && known_paths.insert(entry.path.clone()) {
+                    match self.open_file(&entry.path).await {
+                        Ok(_) => {}
+                        Err(error) if matches!(error.code.as_str(), "Unsupported" | "NotFound") => {
+                        }
+                        Err(error) => errors.push(error),
+                    }
+                    if self.failure.is_some() {
+                        return errors;
+                    }
+                }
+            }
+        }
+        errors
+    }
+
     pub async fn list(&mut self) -> EditorResult<Vec<EditorDocument>> {
         let mut pending = vec![String::new()];
         while let Some(directory) = pending.pop() {
@@ -1949,12 +2008,7 @@ impl<B: Backend> EditorCore<B> {
                 to_value(self.read(&id)?)
             }
             "read" => to_value(self.read(id)?),
-            "resident" => to_value(
-                self.records
-                    .keys()
-                    .map(|id| self.read(id))
-                    .collect::<EditorResult<Vec<_>>>()?,
-            ),
+            "resident" => to_value(self.resident()?),
             "edit" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]

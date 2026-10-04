@@ -177,7 +177,15 @@ just serve-notist
 
 保存先持久化 Prepared 意图，再持久化 Started 阶段，随后通过哈希条件检查与暂存替换写文件，最后持久化回执。恢复 Prepared 时可以确定该次文件 IO 尚未开始；Started / 旧格式意图仅在磁盘字节匹配目标时完成回执，否则保留意图并暂停自动处理，包括磁盘仍为旧内容的情况。后端能证明失败发生在投影写入前时，core 先持久化回退至 Prepared，允许安全重试。目标匹配属于普通文件协调的恢复契约，不提供外部写入来源证明或跨程序 CAS。日志提交失败会使该宿主停止后续写入，并在状态中保留最后成功提交的版本、报告 `persistenceError`；应核对状态，不能把失败响应视为已保存。
 
-host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改合并，存储 Backend 只负责 IO。core 保留磁盘的精确字节和历史版本；外部变化从该版本 fork，以独立 writer 生成有时间预算的 Unicode 细粒度 diff，再合入当前正文。连续观察沿磁盘分支推进；操作 journal 与新磁盘基线在同一事务中提交，提交成功后才更新活动文档，保留其 writer、个人撤销和订阅。重复提示及自身写回不生成额外文本操作，格式变化仅更新基线；超时、非法正文与不确定写回不会退化为整篇替换。文件监听仍提供粗粒度提示，主动核对当前由文档读取与保存请求触发；监听后台核对在后续接入。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持文档 ID；删除保留历史，延迟保存不能重建旧路径。
+host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改合并，存储 Backend 只负责 IO。core 保留磁盘的精确字节和历史版本；外部变化从该版本 fork，以独立 writer 生成有时间预算的 Unicode 细粒度 diff，再合入当前正文。连续观察沿磁盘分支推进；操作 journal 与新磁盘基线在同一事务中提交，提交成功后才更新活动文档，保留其 writer、个人撤销和订阅。重复提示及自身写回不生成额外文本操作，格式变化仅更新基线；超时、非法正文与不确定写回不会退化为整篇替换。启动时先注册递归监听，再发现全库文本；运行时由有界合并的监听唤醒后台串行核对，每 30 秒全库观察兜底漏报。访问事件不触发协调，重复提示及自身写回不会产生新文本操作。单个无效 / 不可读文件不会阻止其他文件；历史提交失败仍冻结 core，监听不自动重试历史。外部删除保留原文档、未保存正文和历史并报告缺失；外部移动不按相同内容推断身份，稳定移动通过 host API 完成。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持文档 ID；删除保留历史，延迟保存不能重建旧路径。
+
+### 文档变化通知
+
+`GET /api/v1/vaults/{id}/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全量文档元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已提交 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文。
+
+初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全量状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId`，保留 Vault / 文档历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容；私有历史提交失败不会把未提交正文版本宣布为已确认版本；此时 `/snapshot` 与 `/updates` 暂停导出，避免通知后的一次失败提交被后续拉取当作已确认历史。
+
+描述接口报告 `documentEvents: true`。此通道是状态核对提示，不确认编辑请求，也不提供会话有效性、重发去重或在线租约；这些由后续协作协议实现。原 `/events` 继续提供文件树提示。
 
 ### 当前范围
 

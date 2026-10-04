@@ -1,21 +1,28 @@
 //! HTTP is a headless reference host/transport, not part of the core.
 use crate::vault::{
+    changes::DocumentEvent,
     documents::{DocumentState, Documents},
     fs::{ChangeHint, FsVault, Result, VaultError},
 };
 use crate::{failure, get_vault, ApiError, HostedVault, ServerState};
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use celestite_core::{ChangeEvent, ImportResult, SyncPacket, Transaction, UndoContext, Version};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio_stream::StreamExt;
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/api/v1/vaults/{id}/documents", get(list))
+        .route("/api/v1/vaults/{id}/documents/events", get(events))
         .route("/api/v1/vaults/{id}/documents/open", post(open))
         .route("/api/v1/vaults/{id}/documents/{document}", get(state))
         .route(
@@ -79,10 +86,11 @@ pub(crate) async fn run_documents<T: Send + 'static>(
             .lock()
             .map_err(|_| VaultError::new("IO", "Document lock failed", ""))?;
         let result = action(&files, &mut documents);
-        if mutation {
+        let published = documents.publish_changes();
+        if mutation || published.as_ref().is_ok_and(|changed| *changed) {
             let _ = vault.events.send(ChangeHint::all());
         }
-        result
+        result.and_then(|value| published.map(|_| value))
     })
     .await
     .map_err(|_| failure("IO", "Document operation failed"))?
@@ -276,4 +284,196 @@ async fn client_commit(
         docs.commit_replica(&document, body.packet, &body.expected_revision, &body.action)?;
         Ok(serde_json::json!({"document": docs.state(files, &document)?, "packet": docs.snapshot(&document)?}))
     }).await?))
+}
+
+fn event_frame(event: DocumentEvent) -> Event {
+    Event::default()
+        .event("documents")
+        .id(format!("{}:{}", event.stream_id, event.sequence))
+        .json_data(event)
+        .expect("document metadata serializes")
+}
+
+async fn events(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    let vault = get_vault(&state, &id)?;
+    let subscription = run_documents(vault.clone(), false, |_, docs| docs.subscribe()).await?;
+    let first = tokio_stream::once(Ok::<_, Infallible>(event_frame(subscription.initial)));
+    let stopping = state.shutdown.subscribe();
+    let changes = futures_lite::stream::unfold(
+        (vault, subscription.receiver, stopping),
+        |(vault, mut receiver, mut stopping)| async move {
+            if *stopping.borrow() {
+                return None;
+            }
+            let event = tokio::select! {
+                _ = stopping.changed() => return None,
+                event = receiver.recv() => event,
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Atomically take a new state and a new receiver, rather than
+                    // replaying an incomplete suffix after a dropped notification.
+                    let subscription =
+                        match run_documents(vault.clone(), false, |_, docs| docs.subscribe()).await
+                        {
+                            Ok(subscription) => subscription,
+                            Err(_) => return None,
+                        };
+                    receiver = subscription.receiver;
+                    subscription.initial
+                }
+            };
+            Some((
+                Ok::<_, Infallible>(event_frame(event)),
+                (vault, receiver, stopping),
+            ))
+        },
+    );
+    Ok(Sse::new(first.chain(changes))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    async fn request(router: &Router, method: &str, path: &str, body: Value) -> Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(format!("/api/v1/vaults/notes{path}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            status.is_success(),
+            "{status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    async fn next(body: &mut Body) -> Value {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let frame = std::str::from_utf8(&bytes).unwrap();
+        serde_json::from_str(
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn snapshot_subscription_and_lag_recovery_do_not_lose_updates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "base").unwrap();
+        let server = crate::build_server(
+            crate::Config {
+                server: crate::ServerConfig::default(),
+                vaults: vec![crate::VaultConfig {
+                    id: "notes".into(),
+                    name: "Notes".into(),
+                    path: root.path().into(),
+                    ephemeral: true,
+                    ..Default::default()
+                }],
+            },
+            root.path(),
+        )
+        .unwrap();
+        let router = server.router;
+        let docs = request(&router, "GET", "/documents", Value::Null).await;
+        let mut state = docs[0].clone();
+        let id = state["id"].as_str().unwrap().to_owned();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/vaults/notes/documents/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let initial = next(&mut body).await;
+        assert_eq!(initial["kind"], "resync");
+        // The receiver is already subscribed, even though the consumer has not
+        // requested any snapshot or polled the next frame.
+        for _ in 0..140 {
+            let end = state["snapshot"]["text"].as_str().unwrap().len();
+            let transaction = json!({
+                "expected_version":state["snapshot"]["version"],"origin":"test",
+                "edits":[{"from":end,"to":end,"insert":"x"}]
+            });
+            state = request(
+                &router,
+                "POST",
+                &format!("/documents/{id}/transact"),
+                transaction,
+            )
+            .await["document"]
+                .clone();
+        }
+        let recovered = next(&mut body).await;
+        assert_eq!(recovered["kind"], "resync");
+        assert_eq!(recovered["streamId"], initial["streamId"]);
+        assert_eq!(
+            recovered["documents"][0]["version"],
+            state["snapshot"]["version"]
+        );
+        assert!(
+            recovered["sequence"].as_u64().unwrap() > initial["sequence"].as_u64().unwrap() + 128
+        );
+        let end = state["snapshot"]["text"].as_str().unwrap().len();
+        state = request(
+            &router,
+            "POST",
+            &format!("/documents/{id}/transact"),
+            json!({
+                "expected_version":state["snapshot"]["version"],"origin":"test",
+                "edits":[{"from":end,"to":end,"insert":"y"}]
+            }),
+        )
+        .await["document"]
+            .clone();
+        let changed = next(&mut body).await;
+        assert_eq!(changed["kind"], "changed");
+        assert_eq!(
+            changed["sequence"].as_u64().unwrap(),
+            recovered["sequence"].as_u64().unwrap() + 1
+        );
+        assert_eq!(
+            changed["documents"][0]["version"],
+            state["snapshot"]["version"]
+        );
+        server.shutdown.send_replace(true);
+        assert!(tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

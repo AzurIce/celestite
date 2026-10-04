@@ -12,6 +12,7 @@ pub type DocumentState = EditorDocument;
 pub(crate) struct Documents {
     pub identity: VaultIdentity,
     core: EditorCore<NativeBackend>,
+    feed: super::changes::DocumentFeed,
 }
 impl Documents {
     pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> Result<Self> {
@@ -23,13 +24,43 @@ impl Documents {
         ))
         .map_err(vault_error)?;
         let vault = &core.identity().vault;
+        let identity = VaultIdentity {
+            id: vault.vault_id.clone(),
+            history_id: vault.history_id.clone(),
+        };
+        let feed = super::changes::DocumentFeed::new(identity.clone(), core.persistent());
         Ok(Self {
-            identity: VaultIdentity {
-                id: vault.vault_id.clone(),
-                history_id: vault.history_id.clone(),
-            },
+            identity,
             core,
+            feed,
         })
+    }
+    pub fn reconcile(&mut self) -> Result<()> {
+        for error in block_on(self.core.reconcile_files()) {
+            tracing::warn!(path = %error.path, code = %error.code, message = %error.message, "File observation failed; preserving history and continuing other files");
+        }
+        // History failures stay frozen; a filesystem hint is not permission to retry.
+        if let Some(error) = self
+            .core
+            .resident()
+            .map_err(vault_error)?
+            .iter()
+            .find_map(|state| state.persistence_error.as_ref())
+        {
+            return Err(super::fs::VaultError::new("IO", error, ""));
+        }
+        Ok(())
+    }
+    pub fn resident(&self) -> Result<Vec<DocumentState>> {
+        self.core.resident().map_err(vault_error)
+    }
+    pub fn publish_changes(&mut self) -> Result<bool> {
+        let states = self.resident()?;
+        self.feed.publish(states)
+    }
+    pub fn subscribe(&mut self) -> Result<super::changes::Subscription> {
+        self.publish_changes()?;
+        Ok(self.feed.subscribe())
     }
     pub fn persistent(&self) -> bool {
         self.core.persistent()
@@ -63,10 +94,23 @@ impl Documents {
     ) -> Result<Option<ChangeEvent>> {
         block_on(self.core.undo(id, context, redo)).map_err(vault_error)
     }
+    fn require_committed(&self, id: &str) -> Result<()> {
+        let state = self.core.read(id).map_err(vault_error)?;
+        if !super::changes::exportable(&state, self.persistent()) {
+            return Err(super::fs::VaultError::new(
+                "IO",
+                "Host history is not committed; synchronization is paused",
+                &state.path,
+            ));
+        }
+        Ok(())
+    }
     pub fn snapshot(&self, id: &str) -> Result<SyncPacket> {
+        self.require_committed(id)?;
         self.core.snapshot(id).map_err(vault_error)
     }
     pub fn updates(&self, id: &str, version: &Version) -> Result<SyncPacket> {
+        self.require_committed(id)?;
         self.core.updates(id, version).map_err(vault_error)
     }
     pub fn save(&mut self, _files: &FsVault, id: &str, expected: Version) -> Result<()> {
