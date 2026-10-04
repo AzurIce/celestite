@@ -684,6 +684,8 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tower",
  "tower-http",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -5210,6 +5212,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

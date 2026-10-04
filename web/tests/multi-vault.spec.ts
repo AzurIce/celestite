@@ -540,3 +540,174 @@ test("remote file-tree creation, folder rename and deletion coordinate editor bu
     page.getByRole("tab", { name: "renamed/new.md", exact: true }),
   ).toHaveCount(0);
 });
+
+async function openSyncDebug(
+  page: Page,
+  api: Api,
+  path: string,
+  token = api.token,
+) {
+  await page.goto("/debug/sync");
+  await page.getByLabel("Vault URL", { exact: true }).fill(api.url);
+  await page.getByLabel("访问令牌", { exact: true }).fill(token);
+  await page.getByRole("button", { name: "连接 server", exact: true }).click();
+  await page.getByLabel("调试文档", { exact: true }).selectOption(path);
+  await page
+    .getByRole("button", { name: "打开并重建实例", exact: true })
+    .click();
+  await expect(
+    page
+      .getByRole("region", { name: "实例 A", exact: true })
+      .getByRole("textbox"),
+  ).toHaveValue("A😀B");
+  await expect(
+    page.getByRole("button", { name: "同步全部", exact: true }),
+  ).toBeEnabled();
+}
+
+test("sync debug runs three independent WASM cores, merges through host, and preserves personal undo", async ({
+  page,
+  api,
+}) => {
+  const path = `debug-${crypto.randomUUID()}.md`;
+  await writeFile(join(api.root, "notes", path), "A😀B");
+  await openSyncDebug(page, api, path);
+  await page.getByRole("button", { name: "添加实例", exact: true }).click();
+  const a = page.getByRole("region", { name: "实例 A", exact: true });
+  const b = page.getByRole("region", { name: "实例 B", exact: true });
+  const c = page.getByRole("region", { name: "实例 C", exact: true });
+  await expect(c.getByRole("textbox")).toHaveValue("A😀B");
+  await expect(
+    page.getByRole("button", { name: "同步全部", exact: true }),
+  ).toBeEnabled();
+  await a.getByRole("textbox").fill("A😀aB");
+  await b.getByRole("textbox").fill("A😀bB");
+  await expect(
+    page.getByRole("button", { name: "同步全部", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "同步全部", exact: true }).click();
+  await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
+    "因果版本已收敛",
+  );
+  const merged = await a.getByRole("textbox").inputValue();
+  expect(merged).toContain("a");
+  expect(merged).toContain("b");
+  for (const region of [b, c])
+    await expect(region.getByRole("textbox")).toHaveValue(merged);
+  expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀B");
+  await a.getByRole("button", { name: "撤销", exact: true }).click();
+  await expect(a.getByRole("textbox")).toHaveValue("A😀bB");
+  await page.getByRole("button", { name: "同步全部", exact: true }).click();
+  await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
+    "因果版本已收敛",
+  );
+  for (const region of [a, b, c])
+    await expect(region.getByRole("textbox")).toHaveValue("A😀bB");
+  await page.getByRole("button", { name: "保存到文件", exact: true }).click();
+  await expect(page.getByRole("status", { name: "Host 保存状态" })).toHaveText(
+    "文件与正文一致",
+  );
+  expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀bB");
+  await expect(page.getByRole("region", { name: "同步日志" })).toContainText(
+    "host 历史仅驻留内存",
+  );
+});
+
+test("sync debug keeps paused and failed transfers in memory and resumes explicit synchronization", async ({
+  page,
+  api,
+}) => {
+  const path = `debug-fault-${crypto.randomUUID()}.md`;
+  await writeFile(join(api.root, "notes", path), "A😀B");
+  await openSyncDebug(page, api, path);
+  const a = page.getByRole("region", { name: "实例 A", exact: true });
+  const b = page.getByRole("region", { name: "实例 B", exact: true });
+  await b.getByRole("button", { name: "暂停传输", exact: true }).click();
+  await a.getByRole("textbox").fill("A😀oneB");
+  await page.getByRole("button", { name: "同步全部", exact: true }).click();
+  await expect(
+    page
+      .getByRole("region", { name: "Host", exact: true })
+      .getByRole("textbox"),
+  ).toHaveValue("A😀oneB");
+  await expect(b.getByRole("textbox")).toHaveValue("A😀B");
+  await b.getByRole("textbox").fill("A😀twoB");
+  await b.getByRole("button", { name: "恢复传输", exact: true }).click();
+  const pattern = `${api.url}/documents/**`;
+  await page.route(pattern, (route) => route.abort());
+  await b.getByRole("button", { name: "推送", exact: true }).click();
+  await expect(page.getByRole("alert")).toBeVisible();
+  await expect(b.getByRole("textbox")).toHaveValue("A😀twoB");
+  await page.unroute(pattern);
+  await page.getByRole("button", { name: "同步全部", exact: true }).click();
+  await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
+    "因果版本已收敛",
+  );
+  const merged = await a.getByRole("textbox").inputValue();
+  expect(merged).toContain("one");
+  expect(merged).toContain("two");
+  await expect(b.getByRole("textbox")).toHaveValue(merged);
+});
+
+test("sync debug honors bearer authentication and read-only vaults", async ({
+  page,
+  api,
+}) => {
+  const path = `debug-readonly-${crypto.randomUUID()}.md`;
+  await writeFile(join(api.root, "readonly", path), "A😀B");
+  await page.goto("/debug/sync");
+  await page
+    .getByLabel("Vault URL", { exact: true })
+    .fill(api.url.replace("/notes", "/readonly"));
+  await page.getByRole("button", { name: "连接 server", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("PermissionDenied");
+  await page.getByLabel("访问令牌", { exact: true }).fill(api.token);
+  await page.getByRole("button", { name: "连接 server", exact: true }).click();
+  await page.getByLabel("调试文档", { exact: true }).selectOption(path);
+  await page
+    .getByRole("button", { name: "打开并重建实例", exact: true })
+    .click();
+  const a = page.getByRole("region", { name: "实例 A", exact: true });
+  await expect(a.getByRole("textbox")).toHaveValue("A😀B");
+  await expect(a.getByRole("textbox")).not.toBeEditable();
+  await expect(
+    a.getByRole("button", { name: "推送", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "保存到文件", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    a.getByRole("button", { name: "拉取", exact: true }),
+  ).toBeEnabled();
+});
+
+test("sync debug retains textarea focus during rapid input and automatically converges without saving files", async ({
+  page,
+  api,
+}) => {
+  const path = `debug-auto-${crypto.randomUUID()}.md`;
+  await writeFile(join(api.root, "notes", path), "A😀B");
+  await openSyncDebug(page, api, path);
+  const a = page
+    .getByRole("region", { name: "实例 A", exact: true })
+    .getByRole("textbox");
+  const b = page
+    .getByRole("region", { name: "实例 B", exact: true })
+    .getByRole("textbox");
+  await a.focus();
+  await page.keyboard.press("End");
+  await a.pressSequentially("+stream", { delay: 20 });
+  await expect(a).toBeFocused();
+  await expect(a).toHaveValue("A😀B+stream");
+  const automatic = page.getByRole("checkbox", {
+    name: "每秒同步",
+    exact: true,
+  });
+  await automatic.check();
+  await expect(b).toHaveValue("A😀B+stream", { timeout: 10000 });
+  await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
+    "因果版本已收敛",
+  );
+  await automatic.uncheck();
+  expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀B");
+});

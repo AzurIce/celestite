@@ -53,6 +53,30 @@ impl EditorBinding {
     }
 }
 
+/// A real EditorCore with volatile private history for independent debug replicas.
+#[wasm_bindgen]
+pub struct MemoryEditorBinding {
+    core: EditorCore<MemoryBackend>,
+}
+#[wasm_bindgen]
+impl MemoryEditorBinding {
+    pub async fn open(identity: String) -> Result<MemoryEditorBinding, JsValue> {
+        let backend = MemoryBackend::new(decode(&identity)?, || js_sys::Date::now() as u64);
+        Ok(Self {
+            core: EditorCore::open(backend)
+                .await
+                .map_err(|e| JsValue::from_str(&encode(e)))?,
+        })
+    }
+    pub async fn execute(&mut self, method: String, params: String) -> Result<String, JsValue> {
+        self.core
+            .execute_service(&method, decode(&params)?)
+            .await
+            .map(encode)
+            .map_err(|e| JsValue::from_str(&encode(e)))
+    }
+}
+
 #[wasm_bindgen]
 pub struct DocumentBinding {
     document: Arc<Mutex<Document>>,

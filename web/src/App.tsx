@@ -1,6 +1,10 @@
 import { lazy, Loading } from "solid-js";
 
-const Page = lazy(() => import("./VaultWorkspace"));
+const Page = lazy(() =>
+  window.location.pathname === "/debug/sync"
+    ? import("./debug/SyncDebug")
+    : import("./VaultWorkspace"),
+);
 
 function App() {
   return (

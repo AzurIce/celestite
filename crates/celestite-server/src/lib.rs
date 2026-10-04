@@ -19,7 +19,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::sync::{broadcast, watch};
@@ -27,7 +30,11 @@ use tokio_stream::{
     wrappers::{BroadcastStream, WatchStream},
     StreamExt,
 };
-use tower_http::{cors::CorsLayer, services::ServeDir};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use vault::documents::Documents;
 use vault::fs::{revision, ChangeHint, FsVault, VaultError};
 
@@ -113,6 +120,11 @@ impl IntoResponse for ApiError {
             "QuotaExceeded" => StatusCode::INSUFFICIENT_STORAGE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        if status.is_server_error() {
+            tracing::error!(code = self.0.code, message = %self.0.message, path = %self.0.path, "Vault operation failed");
+        } else {
+            tracing::debug!(code = self.0.code, message = %self.0.message, path = %self.0.path, "Vault operation rejected");
+        }
         (status, Json(self.0)).into_response()
     }
 }
@@ -238,15 +250,21 @@ pub fn build_server(
         let documents = Documents::open(history_path.as_deref(), &root)?;
         let (events, _) = broadcast::channel(128);
         let sender = events.clone();
+        let watched_vault = vault.id.clone();
         // Hints are intentionally coarse. Watch errors and reconnects invalidate the entire tree.
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let mut watcher = notify::recommended_watcher(
+            move |event: notify::Result<notify::Event>| {
+                if let Err(error) = &event {
+                    tracing::warn!(vault_id = %watched_vault, %error, "Vault watcher failed; invalidating file tree");
+                }
                 // Reads produce access events too; forwarding them causes refresh loops.
                 if !matches!(event, Ok(ref event) if event.kind.is_access()) {
                     let _ = sender.send(ChangeHint::all());
                 }
-            })?;
+            },
+        )?;
         watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+        tracing::info!(vault_id = %vault.id, root = %root.display(), read_only = vault.read_only, persistent_history = documents.persistent(), "Vault initialized");
         vaults.insert(
             vault.id.clone(),
             Arc::new(HostedVault {
@@ -315,9 +333,39 @@ pub fn build_server(
         if !directory.join("index.html").is_file() {
             return Err("web_dir must contain a built index.html".into());
         }
+        tracing::info!(directory = %directory.display(), "Serving Web UI");
         // Only assets from the configured UI directory, never files from Vault roots.
-        router = router.fallback_service(ServeDir::new(directory));
+        router = router
+            .route_service("/debug/sync", ServeFile::new(directory.join("index.html")))
+            .fallback_service(ServeDir::new(directory));
     }
+    // Deliberately omit query strings, headers and bodies from request logs.
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    let router = router.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &axum::extract::Request| {
+                tracing::info_span!(
+                    "http.request",
+                    request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+                    method = %request.method(),
+                    path = request.uri().path(),
+                )
+            })
+            .on_response(
+                |response: &Response, latency: Duration, _span: &tracing::Span| {
+                    let status = response.status().as_u16();
+                    let latency_ms = latency.as_secs_f64() * 1000.0;
+                    if response.status().is_server_error() {
+                        tracing::error!(status, latency_ms, "HTTP response");
+                    } else if response.status().is_client_error() {
+                        tracing::warn!(status, latency_ms, "HTTP response");
+                    } else {
+                        tracing::debug!(status, latency_ms, "HTTP response");
+                    }
+                },
+            )
+            .on_failure(()),
+    );
     Ok(Server { router, shutdown })
 }
 fn get_vault(state: &ServerState, id: &str) -> Result<Arc<HostedVault>, ApiError> {
@@ -335,7 +383,10 @@ async fn run<T: Send + 'static>(
     if mutation && vault.read_only {
         return Err(failure("PermissionDenied", "Vault is read-only"));
     }
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        tracing::debug!(vault_id = %vault.id, mutation, "Running file operation");
         let files = vault
             .files
             .lock()
@@ -922,7 +973,22 @@ mod tests {
             ui.into_body().collect().await.unwrap().to_bytes(),
             "<h1>UI</h1>"
         );
-        for uri in ["/private.md", "/../vault/private.md"] {
+        let debug = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(debug.status(), StatusCode::OK);
+        assert_eq!(
+            debug.into_body().collect().await.unwrap().to_bytes(),
+            "<h1>UI</h1>"
+        );
+        for uri in ["/private.md", "/../vault/private.md", "/api/v1/unknown"] {
             let response = router
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())

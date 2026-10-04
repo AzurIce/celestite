@@ -303,3 +303,13 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 普通文件位于 `vaults/default`，稳定身份和 CRDT 历史位于 `editor-instances/default`。每次接受编辑先提交私有增量日志，普通文件另行自动保存；文件写回失败后，已提交历史仍可在刷新时恢复。历史提交失败会暂停编辑，重试保存先提交历史。个人撤销栈只保留在本次 Worker 生命周期。
 
 同一默认库目前只允许一个标签页持有内核；另一标签页会显示占用提示。远端 HTTP Vault 仍使用兼容文件编辑流程，实时 CRDT 同步、Tauri IPC、Catalog CRDT 和日志压缩不在这次实现内。
+
+## 同步调试页
+
+运行 `bun run dev`，打开 `http://localhost:1420/debug/sync`。server 可由仓库根目录的 `just serve-notist` 启动；在页面连接 `http://127.0.0.1:7437/api/v1/vaults/notist`，选择文本并点击“打开并重建实例”。使用其他 Vault 时填写对应 URL；访问令牌只在当前页面内存中保留。
+
+默认创建 A / B 两个独立 Worker 与 WASM `EditorCore<MemoryBackend>`，可增加至 6 个。分别修改正文，再点击“同步全部”；也可逐个推送、拉取、暂停传输，以及切换每秒同步。个人撤销由各自 core 产生 CRDT 更新。“保存到文件”只写 host 当前正文，未推送的客户端修改不会被保存。
+
+界面显示 host、实例 / writer 身份、正文版本、历史提交与文件写回版本，以及最近 100 条传输日志。实例只保留在页面内存中，结束会话或重建实例会释放它们。暂停传输允许继续编辑以构造并发测试；这是调试控制，不代表生产客户端离线编辑策略已经实现。
+
+server 的 `--state-dir` 启用 host 历史持久化；未配置时，界面显示 host 历史仅驻留内存。server 配置 `--web-dir web/dist` 后，也可直接打开其 `/debug/sync`。调试页复用已有认证和文档 API，不新增服务端成员注册或调试权限旁路。

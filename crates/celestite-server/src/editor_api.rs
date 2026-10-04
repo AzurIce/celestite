@@ -60,7 +60,10 @@ pub(crate) async fn run_documents<T: Send + 'static>(
     if mutation && vault.read_only {
         return Err(failure("PermissionDenied", "Vault is read-only"));
     }
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        tracing::debug!(vault_id = %vault.id, mutation, "Running document operation");
         // Same order for every document/file operation.
         let files = vault
             .files
@@ -151,7 +154,9 @@ async fn updates(
     Ok(Json(
         run_documents(get_vault(&state, &id)?, false, move |files, docs| {
             docs.refresh(files, &document)?;
-            docs.updates(&document, &version)
+            let packet = docs.updates(&document, &version)?;
+            tracing::debug!(document_id = %document, bytes = packet.data.len(), "CRDT updates exported");
+            Ok(packet)
         })
         .await?,
     ))
@@ -183,10 +188,15 @@ async fn import(
     Ok(Json(
         run_documents(get_vault(&state, &id)?, true, move |files, docs| {
             docs.refresh(files, &document)?;
+            let bytes = packet.data.len();
+            let kind = packet.kind;
             let result = docs.import(&document, packet)?;
+            let state = docs.state(files, &document)?;
+            tracing::info!(document_id = %document, ?kind, bytes, pending = result.pending, changed = result.event.is_some(), persistent_history = docs.persistent(), durable = state.durable_version.as_ref() == Some(&state.snapshot.version), "CRDT packet imported");
+            tracing::debug!(document_id = %document, version = ?state.snapshot.version, durable_version = ?state.durable_version, "CRDT import receipt");
             Ok(Reply {
                 result,
-                document: docs.state(files, &document)?,
+                document: state,
             })
         })
         .await?,
@@ -236,7 +246,10 @@ async fn save(
         run_documents(get_vault(&state, &id)?, true, move |files, docs| {
             docs.refresh(files, &document)?;
             docs.save(files, &document, version)?;
-            docs.state(files, &document)
+            let state = docs.state(files, &document)?;
+            tracing::info!(document_id = %document, path = %state.path, dirty = state.dirty, "Document saved to disk");
+            tracing::debug!(document_id = %document, saved_version = ?state.saved_version, "Document save receipt");
+            Ok(state)
         })
         .await?,
     ))

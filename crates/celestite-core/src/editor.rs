@@ -334,6 +334,82 @@ impl<B: Backend> EditorCore<B> {
         self.failure = None;
         Ok(())
     }
+    /// Join an existing history in a private replica, without creating a file projection.
+    /// The host supplies the logical path and full snapshot; never seed from plain text.
+    pub async fn join(&mut self, path: &str, packet: SyncPacket) -> EditorResult<String> {
+        self.writable()?;
+        validate_editor_path(path)?;
+        if self.backend.has_projection() || path.is_empty() {
+            return Err(EditorError::new(
+                "Unsupported",
+                "Joining requires a private replica and a file path",
+                path,
+            ));
+        }
+        if packet.data.len() > 16 * 1024 * 1024 {
+            return Err(EditorError::new(
+                "Unsupported",
+                "CRDT snapshot exceeds 16 MiB",
+                path,
+            ));
+        }
+        let id = packet.identity.document_id.clone();
+        if let Some(record) = self.records.get(&id) {
+            if record.header.path != path || record.document.identity() != &packet.identity {
+                return Err(EditorError::new(
+                    "Conflict",
+                    "Joined document identity/path mismatch",
+                    path,
+                ));
+            }
+            return Ok(id);
+        }
+        if self
+            .records
+            .values()
+            .any(|record| !record.header.deleted && record.header.path == path)
+        {
+            return Err(EditorError::new(
+                "Conflict",
+                "Path belongs to another document history",
+                path,
+            ));
+        }
+        let document = Document::from_snapshot(&packet, None)?;
+        let snapshot = document.snapshot();
+        validate_text(&snapshot.text, path)?;
+        let header = DocumentHeader {
+            id: id.clone(),
+            path: path.into(),
+            seed: packet,
+            sequence: 0,
+            applied: snapshot.version,
+            saved_text: snapshot.text,
+            disk_revision: String::new(),
+            saved_version: None,
+            pending_write: None,
+            deleted: false,
+            bom: false,
+            line_ending: "\n".into(),
+        };
+        self.records.insert(
+            id.clone(),
+            Record {
+                header,
+                document,
+                pending_packets: vec![],
+                uncommitted: vec![],
+                durable: None,
+                conflict: false,
+                error: None,
+                last_group: String::new(),
+                last_edit: 0,
+                first_dirty: None,
+            },
+        );
+        self.persist(&id).await?;
+        Ok(id)
+    }
     pub async fn open_file(&mut self, path: &str) -> EditorResult<String> {
         validate_editor_path(path)?;
         if let Some(id) = self
@@ -1092,6 +1168,45 @@ impl<B: Backend> EditorCore<B> {
         use serde_json::{Value, to_value};
         let id = params["id"].as_str().unwrap_or("");
         let value = match method {
+            "join" => {
+                let path = params["path"]
+                    .as_str()
+                    .ok_or_else(|| EditorError::new("InvalidPath", "Missing file path", ""))?;
+                let packet = serde_json::from_value(params["packet"].clone())
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
+                let id = self.join(path, packet).await?;
+                to_value(self.read(&id)?)
+            }
+            "export_snapshot" => to_value(self.snapshot(id)?),
+            "export_updates" => {
+                let version = serde_json::from_value(params["version"].clone())
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
+                to_value(self.updates(id, &version)?)
+            }
+            "import" => {
+                let packet = serde_json::from_value(params["packet"].clone())
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
+                let result = self.import(id, packet).await?;
+                to_value(serde_json::json!({"result":result,"document":self.read(id)?}))
+            }
+            "replace_text" => {
+                let text = params["text"]
+                    .as_str()
+                    .ok_or_else(|| EditorError::new("InvalidEdit", "Missing text", id))?;
+                let version = serde_json::from_value(params["version"].clone())
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
+                let edits = text_difference(&self.read(id)?.snapshot.text, text);
+                to_value(
+                    self.edit(
+                        id,
+                        version,
+                        edits,
+                        SelectionContext::default(),
+                        "input.replace".into(),
+                    )
+                    .await?,
+                )
+            }
             "open" => {
                 let path = params["path"]
                     .as_str()

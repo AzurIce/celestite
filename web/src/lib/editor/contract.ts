@@ -159,3 +159,9 @@ export interface ServiceMethods {
   };
   close: { params: Record<string, never>; result: void };
 }
+
+export interface SyncPacket {
+  identity: DocumentIdentity;
+  kind: "snapshot" | "updates";
+  data: number[];
+}

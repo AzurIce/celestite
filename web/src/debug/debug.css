@@ -1,0 +1,217 @@
+.sync-debug {
+  max-width: 1800px;
+  margin: 0 auto;
+  padding: 28px;
+}
+.debug-heading,
+.debug-pane-heading,
+.debug-connect,
+.debug-controls,
+.debug-network,
+.debug-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.debug-heading {
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+.debug-heading h1 {
+  font-size: 26px;
+  font-weight: 600;
+  margin: 4px 0;
+}
+.debug-heading p,
+.debug-meta,
+.debug-pane-heading > span,
+.debug-log th {
+  color: var(--color-secondary);
+}
+.debug-heading a {
+  color: var(--color-accent);
+}
+.debug-eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+}
+.debug-connect,
+.debug-controls {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--color-border);
+  align-items: flex-end;
+}
+.debug-connect label,
+.debug-controls label:not(.debug-check) {
+  display: grid;
+  gap: 6px;
+}
+.debug-connect label:first-child {
+  flex: 1;
+  min-width: 250px;
+}
+.debug-connect input,
+.debug-controls select {
+  padding: 7px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-surface);
+}
+.debug-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+}
+.debug-check input {
+  appearance: auto;
+}
+.debug-network {
+  padding: 24px 0;
+}
+.debug-node {
+  background: var(--color-muted);
+  padding: 7px 12px;
+  border: 1px solid var(--color-border);
+  font-family: monospace;
+}
+.debug-node[data-paused="true"] {
+  opacity: 0.55;
+  border-style: dashed;
+}
+.debug-wire {
+  color: var(--color-secondary);
+}
+.debug-network strong {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--color-accent);
+}
+.debug-panes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+.debug-pane {
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  min-width: 0;
+}
+.debug-pane-heading {
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.debug-pane h2,
+.debug-log h2 {
+  font-size: 16px;
+  font-weight: 600;
+}
+.debug-pane-heading > span {
+  font-size: 12px;
+}
+.debug-meta {
+  font-family: monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  margin-bottom: 6px;
+}
+.debug-pane textarea {
+  display: block;
+  background: var(--color-background);
+  width: 100%;
+  min-height: 210px;
+  padding: 12px;
+  resize: vertical;
+  border: 1px solid var(--color-border);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 12px 0;
+}
+.debug-host textarea {
+  background: var(--color-muted);
+}
+.debug-actions {
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.debug-pane [role="status"] {
+  font-size: 12px;
+  margin-bottom: 12px;
+  color: var(--color-accent);
+}
+.debug-version {
+  border-top: 1px solid var(--color-border);
+  font-size: 12px;
+  padding: 8px 0;
+}
+.debug-version summary {
+  display: flex;
+  justify-content: space-between;
+  cursor: pointer;
+  gap: 8px;
+}
+.debug-version summary span {
+  color: var(--color-secondary);
+}
+.debug-version pre {
+  margin: 8px 0 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.debug-baseline {
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow: auto;
+}
+.debug-error {
+  color: var(--color-danger);
+  margin: 12px 0;
+  overflow-wrap: anywhere;
+}
+.debug-log {
+  margin-top: 26px;
+  overflow-x: auto;
+}
+.debug-log table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+.debug-log th,
+.debug-log td {
+  border-bottom: 1px solid var(--color-border);
+  padding: 9px 12px 9px 0;
+  text-align: left;
+  vertical-align: top;
+}
+.debug-log th {
+  font-weight: 500;
+}
+.debug-log td:first-child {
+  white-space: nowrap;
+}
+.debug-log tr[data-failed="true"] {
+  color: var(--color-danger);
+}
+.debug-empty {
+  padding: 20px 0;
+  color: var(--color-secondary);
+}
+@media (max-width: 640px) {
+  .sync-debug {
+    padding: 16px;
+  }
+  .debug-connect label,
+  .debug-controls label:not(.debug-check) {
+    width: 100%;
+  }
+  .debug-network strong {
+    width: 100%;
+    margin-left: 0;
+  }
+}

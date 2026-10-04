@@ -1,6 +1,6 @@
 # Celestite server MVP
 
-独立 Rust 可执行程序。Vault 由配置文件或 server 命令行注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入。目录操作位于 server 的 `vault/fs.rs`；`celestite-core` 提供独立的 Rust / WASM 文本编辑内核，server 是它的第一个无头宿主。
+独立 Rust 可执行程序。Vault 由配置文件或 server 命令行注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入。目录操作位于 server 的 `vault/fs.rs`；`celestite-core::EditorCore<Backend>` 提供统一 Rust / WASM 编辑内核，server 使用 native 后端，默认 Web Vault 使用 OPFS 后端。
 
 ## 启动
 
@@ -59,7 +59,20 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 
 `server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；监听其他地址必须配置 `token_env`，从环境变量读取 Bearer token。前端令牌只保留在当前会话，连接 URL 与本地记录不包含令牌。远端 HTTPS 可由反向代理提供，代理后的客户端来源也需配置。CORS 支持 `Authorization`、`If-Match` 和读取 `ETag`，有 Origin 的 API 请求另行检查来源；CORS 不承担认证。
 
+## 日志
+
+server 使用 `tracing`，二进制通过 `tracing-subscriber` 输出到 stderr，默认级别 `info`。`RUST_LOG` 可覆盖过滤规则；无效规则会使启动失败。
+
+```sh
+RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
+```
+
+`info` 记录启动、Vault 初始化、CRDT 导入结果、磁盘保存与关闭；`debug` 增加 HTTP 请求状态码和耗时、线程池操作、更新包大小与因果版本回执。4xx 请求记为 `warn`，5xx 和内部操作失败记为 `error`。每个 HTTP 请求有独立 `request_id`，线程池日志沿用请求上下文。SSE 的响应耗时表示建立响应所需时间。
+
+请求日志不包含查询串、请求头或正文；同步日志只记录包大小和状态。作为 library 使用时，由调用者初始化 subscriber。
+
 ## API v1
+
 
 下面路径均相对于 `/api/v1/vaults/<id>`，文件路径通过查询参数传递，使用 Vault 内相对路径与 `/` 分隔。空路径表示根目录。
 
@@ -82,13 +95,13 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 
 不覆盖移动及文件提交当前验证并实现于 **Linux**；其他平台返回 Unsupported。跨挂载点移动返回 Unsupported，不自动复制/删除。符号链接可列出、删除或移动链接本身，正常操作不跟随链接；访问通过受限目录句柄，防止链接逃逸 Vault。对 Vault 内目录的并发替换仍以平台能力和实际错误为准。
 
-notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。现有 Web 编辑器仍通过文件 API 保存并在冲突时提示覆盖、丢弃或取消。新增无头文档 API 使用下面的 CRDT 与文件协调规则；Web 尚未迁入该内核。
+notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。现有 Web 编辑器仍通过文件 API 保存并在冲突时提示覆盖、丢弃或取消。新增无头文档 API 使用下面的 CRDT 与文件协调规则；远端 Web 文件编辑流程尚未迁入客户端 CRDT core。
 
 文件请求上限 64 MiB；正文整体进出内存。前端编辑上限仍为 5 MiB。请求超时或断网不会自动重放写操作，错误提示核对服务器状态。现有 Web 文件 API 没有离线同步或协同编辑。无头文档 API 已能交换 CRDT 历史；普通文件写请求仍不提供断线去重。
 
 ## 无头编辑器 API
 
-下面路径仍相对于 `/api/v1/vaults/<id>`。正文存于 `celestite-core::Document`，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
+下面路径仍相对于 `/api/v1/vaults/<id>`。正文与文档业务由 `celestite-core::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
 
 | 方法 | 路径                             | 请求 / 行为                                                 |
 | ---- | -------------------------------- | ----------------------------------------------------------- |
@@ -137,7 +150,7 @@ cargo run -p celestite-server -- --no-config \
 
 `dirty` 表示正文与最后已保存文本不同；`savedVersion` 是最后磁盘写回时的因果版本；`durableVersion` 是已提交历史的应用版本。持久化历史不等于写回 `.md`，`/save` 是显式动作。没有可见文本变化的导入也可能推进因果版本。等待依赖的包已经写入日志，但不会被虚报为已应用版本。
 
-保存先持久化写回意图，再通过原有哈希条件检查与暂存替换写文件，最后持久化回执。重启后识别已经写完、尚未记录回执的内容，完成基线更新。日志提交失败会使该宿主停止后续写入，并在状态中清除持久化确认、报告 `persistenceError`；应核对状态，不能把失败响应视为已保存。
+保存先持久化写回意图，再通过原有哈希条件检查与暂存替换写文件，最后持久化回执。重启后识别已经写完、尚未记录回执的内容，完成基线更新。日志提交失败会使该宿主停止后续写入，并在状态中保留最后成功提交的版本、报告 `persistenceError`；应核对状态，不能把失败响应视为已保存。
 
 外部程序修改文件时，正文干净则导入外部变化，使用独立 writer，避免进入 server 本地撤销；已有未保存编辑则保留两份内容，通过 `conflict` 和保存时的 `409 Conflict` 交给后续协调。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持文档 ID；删除保留历史，延迟保存不能重建旧路径。
 
@@ -145,7 +158,13 @@ cargo run -p celestite-server -- --no-config \
 
 已实现独立文本 CRDT 与单个 server 的文件协调。`/documents` 当前扫描并加载全部合格文本，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、日志压缩或网络同步调度。描述接口明确报告 `vaultCrdt: false`。
 
-移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，崩溃窗口仍需后续投影日志处理。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入是拉取 / 提交参考传输，SSE 仍为变化提示；没有自动连接其他副本。Web、OPFS、Vim、Tree-sitter、LSP 尚未接入 Rust 内核。
+移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，core 先记录目录操作意图以恢复崩溃窗口；存在源 / 目标歧义时停止恢复并保留文件与历史。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入是拉取 / 提交参考传输，SSE 仍为变化提示；没有自动连接其他副本。默认 Web / OPFS 已接入统一 Rust core；普通远端编辑器仍走文件适配。Vim、Tree-sitter、LSP 尚未接入。
+
+## 多实例与可视化调试
+
+多个独立客户端可从同一快照加入，通过 `/updates` 与 `/import` 交换各自 writer 的历史。服务端没有实例注册、在线成员列表、心跳或自动推送调度；SSE 是变化提示，参考客户端主动拉取。客户端个人撤销在自己的 core 上执行，不能用服务端 `/undo` 替代。
+
+Web 提供 `/debug/sync` 调试页，显示 host 与最多 6 个独立 WASM core，支持手动 / 每秒同步、暂停传输、个人撤销、显式保存、版本与提交回执检查。开发时使用 `http://localhost:1420/debug/sync`；构建后配置 `--web-dir web/dist`，也可从 server 的同一路径打开。详见 [Web 调试说明](../../web/README.md#同步调试页)。调试页用现有文档 API，沿用令牌、来源和只读检查。
 
 ## 验证
 

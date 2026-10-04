@@ -7,6 +7,8 @@ pub mod backend;
 pub mod editor;
 pub use backend::*;
 pub use editor::*;
+pub mod memory;
+pub use memory::MemoryBackend;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod opfs;
