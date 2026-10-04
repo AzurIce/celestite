@@ -397,7 +397,7 @@ async fn pending_packets_and_unsaved_history_survive_server_restart() {
 }
 
 #[tokio::test]
-async fn external_changes_are_imported_only_when_clean_and_never_overwritten_when_dirty() {
+async fn external_changes_merge_with_dirty_history_and_are_preserved_across_restart() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "old").unwrap();
@@ -411,14 +411,14 @@ async fn external_changes_are_imported_only_when_clean_and_never_overwritten_whe
     server.ok("POST", &route(&id, "/transact"), json!({"expected_version": snapshot(&clean).version, "origin": "test", "edits": [{"from": 8, "to": 8, "insert": " local"}]})).await;
     std::fs::write(root.path().join("a.md"), "other editor").unwrap();
     let dirty = server.ok("GET", &route(&id, ""), Value::Null).await;
-    assert_eq!(snapshot(&dirty).text, "external local");
-    assert_eq!(dirty["conflict"], true);
+    assert_eq!(snapshot(&dirty).text, "other editor local");
+    assert_eq!(dirty["conflict"], false);
     assert_eq!(
         server
             .request(
                 "POST",
                 &route(&id, "/save"),
-                serde_json::to_value(snapshot(&dirty).version).unwrap()
+                serde_json::to_value(snapshot(&clean).version).unwrap()
             )
             .await
             .0,
@@ -445,11 +445,22 @@ async fn external_changes_are_imported_only_when_clean_and_never_overwritten_whe
     server.stop().await;
     let server = Server::start(root.path(), Some(state.path()), false).await;
     let recovered = server.open("a.md").await;
-    assert_eq!(snapshot(&recovered).text, "external local");
-    assert_eq!(recovered["conflict"], true);
+    assert_eq!(snapshot(&recovered).text, "other editor local");
+    assert_eq!(recovered["conflict"], false);
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),
         "other editor"
+    );
+    server
+        .ok(
+            "POST",
+            &route(&id, "/save"),
+            serde_json::to_value(snapshot(&recovered).version).unwrap(),
+        )
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
+        "other editor local"
     );
     server.stop().await;
 }

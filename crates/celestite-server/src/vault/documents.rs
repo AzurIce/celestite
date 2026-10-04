@@ -15,8 +15,13 @@ pub(crate) struct Documents {
 }
 impl Documents {
     pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> Result<Self> {
-        let core = block_on(EditorCore::open(NativeBackend::open(state, root, mode)?))
-            .map_err(vault_error)?;
+        let core = block_on(EditorCore::open_with_options(
+            NativeBackend::open(state, root, mode)?,
+            EditorOptions {
+                external_changes: ExternalChangePolicy::Merge,
+            },
+        ))
+        .map_err(vault_error)?;
         let vault = &core.identity().vault;
         Ok(Self {
             identity: VaultIdentity {

@@ -202,6 +202,17 @@ class OpfsVaultBackend implements VaultBackend {
           await writable.close();
           return await contentRevision(bytes);
         } catch (error) {
+          // createWritable rejected before opening a stream: the existing file is untouched.
+          if (existing && writable === undefined) {
+            const failure = opfsError(error, "writeFile", path);
+            throw new VaultError(
+              failure.code,
+              failure.message,
+              path,
+              error,
+              true,
+            );
+          }
           // 已有文件通过 abort 保留旧内容；新建失败时清理空条目。
           try {
             await writable?.abort();

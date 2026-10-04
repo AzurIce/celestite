@@ -33,6 +33,9 @@ export function encodeError(error: unknown): RpcError {
       },
     };
   return {
+    ...(error instanceof VaultError && error.writeNotStarted
+      ? { writeNotStarted: true }
+      : {}),
     code: error instanceof VaultError ? error.code : "IO",
     message: error instanceof Error ? error.message : String(error),
     ...(error instanceof VaultError && error.path !== undefined
@@ -45,6 +48,8 @@ export function decodeError(error: RpcError): VaultError {
     error.code as VaultError["code"],
     error.message,
     error.path,
+    undefined,
+    error.writeNotStarted,
   );
   return error.rename
     ? new VaultRenameError(

@@ -21,6 +21,8 @@ export class VaultError extends Error {
     message: string,
     readonly path?: string,
     readonly cause?: unknown,
+    /** Platform proof that a failed write never changed the projected file. */
+    readonly writeNotStarted = false,
   ) {
     super(message);
   }

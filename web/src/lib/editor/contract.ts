@@ -106,6 +106,7 @@ export interface ServiceEvent {
   document: ServiceDocument;
 }
 export interface RpcError {
+  writeNotStarted?: boolean;
   code: string;
   message: string;
   path?: string;

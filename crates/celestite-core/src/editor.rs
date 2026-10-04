@@ -5,10 +5,22 @@ use std::collections::BTreeMap;
 
 pub const MAX_TEXT_BYTES: usize = 5 * 1024 * 1024;
 
+#[derive(Clone, Copy, Default)]
+pub enum ExternalChangePolicy {
+    #[default]
+    Conflict,
+    Merge,
+}
+#[derive(Clone, Copy, Default)]
+pub struct EditorOptions {
+    pub external_changes: ExternalChangePolicy,
+}
+
 struct Record {
     header: DocumentHeader,
     document: Document,
     pending_packets: Vec<SyncPacket>,
+    pending_observation: Option<ObservationCommit>,
     uncommitted: Vec<JournalEntry>,
     durable: Option<Version>,
     conflict: bool,
@@ -16,6 +28,12 @@ struct Record {
     last_group: String,
     last_edit: u64,
     first_dirty: Option<u64>,
+}
+
+#[derive(Clone)]
+struct ObservationCommit {
+    header: DocumentHeader,
+    entry: Option<JournalEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +80,8 @@ pub struct EditorCore<B: Backend> {
     backend: B,
     records: BTreeMap<String, Record>,
     failure: Option<String>,
+    requires_reopen: bool,
+    options: EditorOptions,
 }
 
 pub fn validate_editor_path(path: &str) -> EditorResult<()> {
@@ -143,7 +163,10 @@ fn encode(header: &DocumentHeader, text: &str) -> Vec<u8> {
 }
 
 impl<B: Backend> EditorCore<B> {
-    pub async fn open(mut backend: B) -> EditorResult<Self> {
+    pub async fn open(backend: B) -> EditorResult<Self> {
+        Self::open_with_options(backend, EditorOptions::default()).await
+    }
+    pub async fn open_with_options(mut backend: B, options: EditorOptions) -> EditorResult<Self> {
         let identity = backend.identity();
         if identity.instance_id.is_empty()
             || identity.vault.vault_id.is_empty()
@@ -190,6 +213,46 @@ impl<B: Backend> EditorCore<B> {
                     &header.path,
                 ));
             }
+            if let Some(cursor) = &header.disk_cursor {
+                let (disk_text, bom, ending) = decode(&cursor.bytes, &header.path)?;
+                if disk_text != header.saved_text
+                    || bom != header.bom
+                    || ending != header.line_ending
+                    || header.saved_version.as_ref() != Some(&cursor.version)
+                    || document.historical_text(&cursor.version)? != header.saved_text
+                {
+                    return Err(EditorError::new(
+                        "IO",
+                        "Invalid disk history cursor",
+                        &header.path,
+                    ));
+                }
+            } else if matches!(options.external_changes, ExternalChangePolicy::Merge) {
+                let version = header.saved_version.as_ref().ok_or_else(|| {
+                    EditorError::new(
+                        "Conflict",
+                        "Missing historical disk baseline; explicit recovery required",
+                        &header.path,
+                    )
+                })?;
+                if document.historical_text(version)? != header.saved_text {
+                    return Err(EditorError::new(
+                        "IO",
+                        "Historical disk baseline text mismatch",
+                        &header.path,
+                    ));
+                }
+            }
+            if let Some(pending) = &header.pending_write
+                && let Some(version) = &pending.version
+                && document.historical_text(version)? != pending.text
+            {
+                return Err(EditorError::new(
+                    "IO",
+                    "Invalid pending write version",
+                    &header.path,
+                ));
+            }
             let durable = backend.persistent().then(|| header.applied.clone());
             records.insert(
                 header.id.clone(),
@@ -197,6 +260,7 @@ impl<B: Backend> EditorCore<B> {
                     header,
                     document,
                     pending_packets,
+                    pending_observation: None,
                     uncommitted: vec![],
                     durable,
                     conflict: false,
@@ -211,6 +275,8 @@ impl<B: Backend> EditorCore<B> {
             backend,
             records,
             failure: None,
+            requires_reopen: false,
+            options,
         };
         core.recover_directory().await?;
         Ok(core)
@@ -327,8 +393,16 @@ impl<B: Backend> EditorCore<B> {
         Ok(())
     }
     pub async fn retry_history(&mut self) -> EditorResult<()> {
+        if self.requires_reopen {
+            return Err(EditorError::new(
+                "IO",
+                "Committed history requires reopening the core",
+                "",
+            ));
+        }
         let ids: Vec<_> = self.records.keys().cloned().collect();
         for id in ids {
+            self.finish_observation(&id).await?;
             self.persist(&id).await?;
         }
         self.failure = None;
@@ -388,6 +462,7 @@ impl<B: Backend> EditorCore<B> {
             disk_revision: String::new(),
             saved_version: None,
             pending_write: None,
+            disk_cursor: None,
             deleted: false,
             bom: false,
             line_ending: "\n".into(),
@@ -398,6 +473,7 @@ impl<B: Backend> EditorCore<B> {
                 header,
                 document,
                 pending_packets: vec![],
+                pending_observation: None,
                 uncommitted: vec![],
                 durable: None,
                 conflict: false,
@@ -442,6 +518,13 @@ impl<B: Backend> EditorCore<B> {
             disk_revision: disk.revision,
             saved_version: Some(document.version()),
             pending_write: None,
+            disk_cursor: matches!(self.options.external_changes, ExternalChangePolicy::Merge).then(
+                || DiskCursor {
+                    version: document.version(),
+                    observation: 0,
+                    bytes: disk.data.clone(),
+                },
+            ),
             deleted: false,
             bom,
             line_ending,
@@ -453,6 +536,7 @@ impl<B: Backend> EditorCore<B> {
                 document,
                 uncommitted: vec![],
                 pending_packets: vec![],
+                pending_observation: None,
                 durable: None,
                 conflict: false,
                 error: None,
@@ -521,11 +605,17 @@ impl<B: Backend> EditorCore<B> {
             }
             Err(error) => return Err(error),
         };
-        self.recover_completed_write(id, &disk).await?;
+        if !self.recover_completed_write(id, &disk).await? {
+            return Ok(());
+        }
+        if matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
+            return self.merge_disk(id, disk).await;
+        }
         let record = self.record(id)?;
         if disk.revision == record.header.disk_revision {
             let record = self.records.get_mut(id).unwrap();
             record.conflict = false;
+            record.error = None;
             return Ok(());
         }
         if record.document.snapshot().text != record.header.saved_text {
@@ -535,37 +625,218 @@ impl<B: Backend> EditorCore<B> {
             return Ok(());
         }
         let (text, bom, ending) = decode(&disk.data, &record.header.path)?;
-        self.adopt_disk(id, text, bom, ending, disk.revision, false)
-            .await
+        self.adopt_disk(id, (text, bom, ending), disk, false).await
     }
-    async fn recover_completed_write(&mut self, id: &str, disk: &FileSnapshot) -> EditorResult<()> {
-        if let Some(pending) = &self.record(id)?.header.pending_write
-            && encode(&self.record(id)?.header, &pending.text) == disk.data
+
+    fn cursor(
+        &self,
+        id: &str,
+        version: Version,
+        bytes: Vec<u8>,
+    ) -> EditorResult<Option<DiskCursor>> {
+        if !matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
+            return Ok(None);
+        }
+        let observation = self
+            .record(id)?
+            .header
+            .disk_cursor
+            .as_ref()
+            .map_or(0, |c| c.observation)
+            .checked_add(1)
+            .ok_or_else(|| EditorError::new("IO", "Disk observation counter exhausted", id))?;
+        Ok(Some(DiskCursor {
+            version,
+            observation,
+            bytes,
+        }))
+    }
+
+    /// Commit a previously validated candidate before importing into the live Document.
+    /// Retrying uses the exact same header and packet even when the receipt was lost.
+    async fn finish_observation(&mut self, id: &str) -> EditorResult<()> {
+        let Some(candidate) = self.record(id)?.pending_observation.clone() else {
+            return Ok(());
+        };
+        if let Err(error) = self
+            .backend
+            .commit(&candidate.header, candidate.entry.as_ref())
+            .await
         {
-            let pending = pending.clone();
-            let record = self.records.get_mut(id).unwrap();
-            record.header.saved_text = pending.text;
-            record.header.saved_version = pending.version;
-            record.header.disk_revision = disk.revision.clone();
-            record.header.pending_write = None;
-            record.conflict = false;
-            record.error = None;
-            if record.document.snapshot().text == record.header.saved_text {
-                record.first_dirty = None;
+            self.failure = Some(format!("文件协调尚未持久化：{}", error.message));
+            return Err(error);
+        }
+        if let Some(entry) = &candidate.entry {
+            let result = self
+                .records
+                .get_mut(id)
+                .unwrap()
+                .document
+                .import(&entry.packet, "filesystem".into());
+            if result.is_err() || self.record(id)?.document.version() != candidate.header.applied {
+                self.requires_reopen = true;
+                self.failure = Some("文件协调已提交，但活动 core 未能应用；必须重新打开。".into());
+                return Err(EditorError::new("IO", self.failure.clone().unwrap(), id));
             }
-            self.persist(id).await?;
+        }
+        let record = self.records.get_mut(id).unwrap();
+        record.header = candidate.header;
+        record.durable = self
+            .backend
+            .persistent()
+            .then(|| record.header.applied.clone());
+        record.pending_observation = None;
+        record.conflict = false;
+        record.error = None;
+        if record.document.snapshot().text == record.header.saved_text {
+            record.first_dirty = None;
+        } else if record.first_dirty.is_none() {
+            record.first_dirty = Some(self.backend.now_ms());
+        }
+        if let Some(entry) = candidate.entry {
+            // Reuse the existing accepted-change notification path (including previews).
+            // This entry has already been committed; do not enqueue a second journal write.
+            self.queue_packet(id, entry.packet);
+            self.records.get_mut(id).unwrap().uncommitted.pop();
         }
         Ok(())
+    }
+
+    async fn stage_observation(
+        &mut self,
+        id: &str,
+        header: DocumentHeader,
+        entry: Option<JournalEntry>,
+    ) -> EditorResult<()> {
+        if !self.record(id)?.uncommitted.is_empty()
+            || self.record(id)?.pending_observation.is_some()
+        {
+            return Err(EditorError::new(
+                "IO",
+                "History must be committed before observing disk",
+                id,
+            ));
+        }
+        self.records.get_mut(id).unwrap().pending_observation =
+            Some(ObservationCommit { header, entry });
+        self.finish_observation(id).await
+    }
+
+    async fn merge_disk(&mut self, id: &str, disk: FileSnapshot) -> EditorResult<()> {
+        let record = self.record(id)?;
+        if disk.revision == record.header.disk_revision && record.header.disk_cursor.is_some() {
+            let record = self.records.get_mut(id).unwrap();
+            record.conflict = false;
+            record.error = None;
+            return Ok(());
+        }
+        let (text, bom, ending) = match decode(&disk.data, &record.header.path) {
+            Ok(value) => value,
+            Err(error) => {
+                let record = self.records.get_mut(id).unwrap();
+                record.conflict = true;
+                record.error = Some(error.message.clone());
+                return Err(error);
+            }
+        };
+        let record = self.record(id)?;
+        let base = record
+            .header
+            .disk_cursor
+            .as_ref()
+            .map(|c| &c.version)
+            .or(record.header.saved_version.as_ref())
+            .ok_or_else(|| EditorError::new("Conflict", "Missing historical disk baseline", id))?;
+        // A format-only change advances the physical cursor without creating text operations.
+        let (packet, disk_version) = if text == record.header.saved_text {
+            if record.document.historical_text(base)? != text {
+                return Err(EditorError::new(
+                    "IO",
+                    "Historical disk baseline text mismatch",
+                    id,
+                ));
+            }
+            (None, base.clone())
+        } else {
+            let (packet, version) =
+                record
+                    .document
+                    .filesystem_change(base, &record.header.saved_text, &text)?;
+            (Some(packet), version)
+        };
+        let mut header = record.header.clone();
+        let entry = if let Some(packet) = packet {
+            let mut trial = Document::from_snapshot(&record.document.export_snapshot()?, None)?;
+            for waiting in &record.pending_packets {
+                trial.import(waiting, "validation".into())?;
+            }
+            trial.import(&packet, "filesystem-validation".into())?;
+            validate_text(&trial.snapshot().text, &header.path)?;
+            header.sequence = header
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| EditorError::new("IO", "Journal counter exhausted", id))?;
+            header.applied = trial.version();
+            Some(JournalEntry {
+                packet,
+                applied: header.applied.clone(),
+            })
+        } else {
+            None
+        };
+        header.saved_text = text;
+        header.saved_version = Some(disk_version.clone());
+        header.disk_revision = disk.revision;
+        header.bom = bom;
+        header.line_ending = ending;
+        header.disk_cursor = self.cursor(id, disk_version, disk.data)?;
+        self.stage_observation(id, header, entry).await
+    }
+
+    async fn recover_completed_write(
+        &mut self,
+        id: &str,
+        disk: &FileSnapshot,
+    ) -> EditorResult<bool> {
+        let Some(pending) = self.record(id)?.header.pending_write.clone() else {
+            return Ok(true);
+        };
+        if pending.phase == WritePhase::Prepared {
+            // A durable Prepared record proves that this attempt had not started file IO.
+            let mut header = self.record(id)?.header.clone();
+            header.pending_write = None;
+            self.stage_observation(id, header, None).await?;
+            return Ok(true);
+        }
+        if encode(&self.record(id)?.header, &pending.text) == disk.data {
+            let mut header = self.record(id)?.header.clone();
+            header.saved_text = pending.text;
+            header.saved_version = pending.version.clone();
+            header.disk_revision = disk.revision.clone();
+            header.pending_write = None;
+            if let Some(version) = pending.version {
+                header.disk_cursor = self.cursor(id, version, disk.data.clone())?;
+            }
+            self.stage_observation(id, header, None).await?;
+            return Ok(true);
+        }
+        // Even seeing the old bytes cannot distinguish no write from write + external ABA.
+        let record = self.records.get_mut(id).unwrap();
+        record.conflict = true;
+        record.error =
+            Some("上次文件写回结果不确定，历史、磁盘基线和写回意图已保留；请核对后恢复。".into());
+        Ok(false)
     }
     async fn adopt_disk(
         &mut self,
         id: &str,
-        text: String,
-        bom: bool,
-        ending: String,
-        revision: String,
+        decoded: (String, bool, String),
+        disk: FileSnapshot,
         clear_undo: bool,
     ) -> EditorResult<()> {
+        let (text, bom, ending) = decoded;
+        let revision = disk.revision;
+        let bytes = disk.data;
         let record = self.record(id)?;
         let before = record.document.version();
         let mut external = Document::from_snapshot(&record.document.export_snapshot()?, None)?;
@@ -577,6 +848,7 @@ impl<B: Backend> EditorCore<B> {
             undo_positions: vec![],
         })?;
         let packet = external.export_updates_since(&before)?;
+        let cursor = self.cursor(id, external.version(), bytes)?;
         let record = self.records.get_mut(id).unwrap();
         record.document.import(&packet, "filesystem".into())?;
         if clear_undo {
@@ -590,6 +862,7 @@ impl<B: Backend> EditorCore<B> {
         record.header.bom = bom;
         record.header.line_ending = ending;
         record.header.pending_write = None;
+        record.header.disk_cursor = cursor;
         record.conflict = false;
         record.error = None;
         record.first_dirty = None;
@@ -821,30 +1094,47 @@ impl<B: Backend> EditorCore<B> {
         }
         self.live(id)?;
         let record = self.record(id)?;
-        if expected.is_some_and(|version| version != record.document.version()) {
+        if expected
+            .as_ref()
+            .is_some_and(|version| version != &record.document.version())
+        {
             return Err(CoreError::StaleVersion.into());
         }
         if !self.backend.has_projection() {
             return self.persist(id).await;
         }
-        let snapshot = record.document.snapshot();
         let path = record.header.path.clone();
-        // Even a clean save verifies the external baseline.
         let disk = self
             .backend
             .read_file(&path, Some(MAX_TEXT_BYTES as u64))
             .await?;
-        self.recover_completed_write(id, &disk).await?;
+        if !self.recover_completed_write(id, &disk).await? {
+            return Err(EditorError::new(
+                "Conflict",
+                "Uncertain file write requires recovery",
+                &path,
+            ));
+        }
+        if matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
+            self.merge_disk(id, disk.clone()).await?;
+        }
         let record = self.record(id)?;
         if disk.revision != record.header.disk_revision {
-            let record = self.records.get_mut(id).unwrap();
-            record.conflict = true;
+            self.records.get_mut(id).unwrap().conflict = true;
             return Err(EditorError::new(
                 "Conflict",
                 "文件已被其他客户端或程序修改。",
                 &path,
             ));
         }
+        // Reconciliation may have accepted a new version after the client's save request.
+        if expected
+            .as_ref()
+            .is_some_and(|version| version != &record.document.version())
+        {
+            return Err(CoreError::StaleVersion.into());
+        }
+        let snapshot = record.document.snapshot();
         if snapshot.text == record.header.saved_text {
             let record = self.records.get_mut(id).unwrap();
             record.error = None;
@@ -857,8 +1147,32 @@ impl<B: Backend> EditorCore<B> {
         self.records.get_mut(id).unwrap().header.pending_write = Some(PendingWrite {
             text: snapshot.text.clone(),
             version: Some(snapshot.version.clone()),
+            phase: WritePhase::Prepared,
+            id: Some(self.backend.new_id()?),
+            expected_revision: Some(baseline.clone()),
         });
         self.persist(id).await?;
+        self.records
+            .get_mut(id)
+            .unwrap()
+            .header
+            .pending_write
+            .as_mut()
+            .unwrap()
+            .phase = WritePhase::Started;
+        if let Err(error) = self.persist(id).await {
+            // In this running instance we know that write_file was never called.
+            // A restart which only sees Started still must treat it as uncertain.
+            self.records
+                .get_mut(id)
+                .unwrap()
+                .header
+                .pending_write
+                .as_mut()
+                .unwrap()
+                .phase = WritePhase::Prepared;
+            return Err(error);
+        }
         let revision = match self
             .backend
             .write_file(&path, &bytes, "replace", Some(&baseline))
@@ -866,21 +1180,32 @@ impl<B: Backend> EditorCore<B> {
         {
             Ok(revision) => revision,
             Err(error) => {
+                if error.write_not_started {
+                    // A platform-specific failure proves that no projected bytes changed.
+                    // Persist that proof before permitting another attempt or a restart.
+                    self.records
+                        .get_mut(id)
+                        .unwrap()
+                        .header
+                        .pending_write
+                        .as_mut()
+                        .unwrap()
+                        .phase = WritePhase::Prepared;
+                    self.persist(id).await?;
+                }
                 let record = self.records.get_mut(id).unwrap();
                 record.error = Some(error.message.clone());
                 record.conflict = error.code == "Conflict";
                 return Err(error);
             }
         };
-        let record = self.records.get_mut(id).unwrap();
-        record.header.saved_text = snapshot.text;
-        record.header.saved_version = Some(snapshot.version);
-        record.header.disk_revision = revision;
-        record.header.pending_write = None;
-        record.conflict = false;
-        record.error = None;
-        record.first_dirty = None;
-        self.persist(id).await
+        let mut header = self.record(id)?.header.clone();
+        header.saved_text = snapshot.text;
+        header.saved_version = Some(snapshot.version.clone());
+        header.disk_revision = revision;
+        header.pending_write = None;
+        header.disk_cursor = self.cursor(id, snapshot.version, bytes)?;
+        self.stage_observation(id, header, None).await
     }
     pub async fn resolve(&mut self, id: &str, action: &str) -> EditorResult<()> {
         if self.failure.is_some() {
@@ -892,14 +1217,39 @@ impl<B: Backend> EditorCore<B> {
             .backend
             .read_file(&path, Some(MAX_TEXT_BYTES as u64))
             .await?;
+        if matches!(self.options.external_changes, ExternalChangePolicy::Merge)
+            && !self.recover_completed_write(id, &disk).await?
+        {
+            return Err(EditorError::new(
+                "Conflict",
+                "Uncertain file write requires evidence-aware recovery",
+                &path,
+            ));
+        }
         match action {
             "discard" => {
                 let (text, bom, ending) = decode(&disk.data, &path)?;
-                self.adopt_disk(id, text, bom, ending, disk.revision, true)
-                    .await
+                self.adopt_disk(id, (text, bom, ending), disk, true).await
             }
             "overwrite" => {
-                self.records.get_mut(id).unwrap().header.disk_revision = disk.revision;
+                if matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
+                    let desired = self.record(id)?.document.snapshot().text;
+                    self.merge_disk(id, disk).await?;
+                    let snapshot = self.record(id)?.document.snapshot();
+                    self.transact(
+                        id,
+                        Transaction {
+                            expected_version: snapshot.version,
+                            edits: text_difference(&snapshot.text, &desired),
+                            origin: "filesystem-overwrite".into(),
+                            undo_metadata: None,
+                            undo_positions: vec![],
+                        },
+                    )
+                    .await?;
+                } else {
+                    self.records.get_mut(id).unwrap().header.disk_revision = disk.revision;
+                }
                 self.save(id, None).await
             }
             _ => Err(EditorError::new(

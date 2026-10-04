@@ -12,6 +12,9 @@ pub struct EditorError {
     pub message: String,
     #[serde(default)]
     pub path: String,
+    /// Backend proof that this write attempt never changed the projected file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write_not_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rename: Option<Box<RenameFailure>>,
 }
@@ -30,6 +33,7 @@ impl EditorError {
             message: message.into(),
             path: path.into(),
             rename: None,
+            write_not_started: false,
         }
     }
 }
@@ -52,10 +56,32 @@ pub struct JournalEntry {
     pub applied: Version,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct DiskCursor {
+    pub version: Version,
+    pub observation: u64,
+    /// Exact bytes, including mixed line endings; normalized text is saved_text.
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritePhase {
+    /// Old receipts cannot prove that file IO had not begun.
+    #[default]
+    Legacy,
+    Prepared,
+    Started,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PendingWrite {
     pub text: String,
     // Older OPFS receipts did not record a saved causal version.
     pub version: Option<Version>,
+    #[serde(default)]
+    pub phase: WritePhase,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DocumentHeader {
@@ -68,6 +94,8 @@ pub struct DocumentHeader {
     pub disk_revision: String,
     pub saved_version: Option<Version>,
     pub pending_write: Option<PendingWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_cursor: Option<DiskCursor>,
     pub deleted: bool,
     pub bom: bool,
     pub line_ending: String,
@@ -125,6 +153,8 @@ pub trait Backend {
     async fn read_file(&self, path: &str, _limit: Option<u64>) -> EditorResult<FileSnapshot> {
         Err(no_projection(path))
     }
+    /// Set error.write_not_started only when this attempt provably left the
+    /// projected file untouched. An ordinary error carries no such guarantee.
     async fn write_file(
         &self,
         path: &str,

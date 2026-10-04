@@ -6,6 +6,8 @@
 //! Keep full history: this API never exposes checkout, raw Loro containers or
 //! shallow snapshots. Undo is local to the lifetime of one fixed writer.
 
+#[cfg(test)]
+mod filesystem_tests;
 mod text;
 mod types;
 pub use text::{difference as text_difference, utf16_to_byte};
@@ -375,6 +377,80 @@ impl Document {
             kind: PacketKind::Snapshot,
             data: self.doc.export(ExportMode::Snapshot).map_err(crdt_error)?,
         })
+    }
+
+    fn historical_branch(&self, version: &Version) -> Result<LoroDoc, CoreError> {
+        self.check_identity(&version.identity)?;
+        let wanted = version_vector(version)?;
+        let frontiers = self.doc.vv_to_frontiers(&wanted);
+        // vv_to_frontiers can omit unknown clocks; require an exact, closed state.
+        if self.doc.frontiers_to_vv(&frontiers).as_ref() != Some(&wanted) {
+            return Err(CoreError::InvalidVersion);
+        }
+        let branch = self.doc.fork_at(&frontiers).map_err(crdt_error)?;
+        if branch.state_vv() != wanted {
+            return Err(CoreError::InvalidVersion);
+        }
+        Ok(branch)
+    }
+
+    pub(crate) fn historical_text(&self, version: &Version) -> Result<String, CoreError> {
+        Ok(self
+            .historical_branch(version)?
+            .get_text("source")
+            .to_string())
+    }
+
+    /// Produce operations without touching the live writer, undo stack or subscriptions.
+    pub(crate) fn filesystem_change(
+        &self,
+        base: &Version,
+        expected: &str,
+        new_text: &str,
+    ) -> Result<(SyncPacket, Version), CoreError> {
+        let branch = self.historical_branch(base)?;
+        if branch.get_text("source").to_string() != expected {
+            return Err(CoreError::InvalidVersion);
+        }
+        // A historical branch omits future writers; allocate against the entire live history.
+        loop {
+            let writer = LoroDoc::new().peer_id();
+            if writer != self.doc.peer_id() && self.doc.oplog_vv().get(&writer).is_none() {
+                branch.set_peer_id(writer).map_err(crdt_error)?;
+                break;
+            }
+        }
+        branch
+            .get_text("source")
+            .update(
+                new_text,
+                loro::UpdateOptions {
+                    timeout_ms: Some(100.0),
+                    use_refined_diff: true,
+                },
+            )
+            .map_err(|_| {
+                crdt_error("Filesystem diff exceeded its time budget; no operations accepted")
+            })?;
+        branch.set_next_commit_origin("filesystem");
+        branch.commit();
+        let version = Version {
+            identity: self.identity.clone(),
+            clocks: branch
+                .state_vv()
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(peer, count)| (peer.to_string(), *count))
+                .collect(),
+        };
+        let packet = SyncPacket {
+            identity: self.identity.clone(),
+            kind: PacketKind::Updates,
+            data: branch
+                .export(ExportMode::updates(&version_vector(base)?))
+                .map_err(crdt_error)?,
+        };
+        Ok((packet, version))
     }
 
     /// A peer may know edits absent locally; Loro sends only locally available

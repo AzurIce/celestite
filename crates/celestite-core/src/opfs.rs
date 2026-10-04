@@ -216,7 +216,11 @@ impl Backend for OpfsBackend {
                     pending_write: intent.map(|i| PendingWrite {
                         text: i.saved_content,
                         version: None,
+                        phase: WritePhase::Legacy,
+                        id: None,
+                        expected_revision: None,
                     }),
+                    disk_cursor: None,
                     deleted: entry.deleted,
                     bom: receipt.bom,
                     line_ending: receipt.line_ending,
