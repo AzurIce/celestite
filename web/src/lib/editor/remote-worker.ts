@@ -16,7 +16,7 @@ self.addEventListener("message", (event) => {
       if (
         !vault?.id ||
         !vault.historyId ||
-        !descriptor.capabilities.clientReplicaCommit
+        !descriptor.capabilities.websocketSync
       )
         throw new VaultError(
           "Unsupported",
@@ -28,17 +28,20 @@ self.addEventListener("message", (event) => {
       };
       await init();
       const binding = await MemoryEditorBinding.open(JSON.stringify(identity));
-      return {
-        identity,
-        host: new RemoteEditorHost(
-          binding,
-          backend,
-          descriptor,
-          emit,
-          schedule,
-        ),
-        dispose: () => binding.free(),
-      };
+      const host = new RemoteEditorHost(
+        binding,
+        backend,
+        descriptor,
+        emit,
+        schedule,
+      );
+      try {
+        await host.connect(token);
+      } catch (error) {
+        binding.free();
+        throw error;
+      }
+      return { identity, host, dispose: () => binding.free() };
     } catch (error) {
       await backend.close();
       throw error;

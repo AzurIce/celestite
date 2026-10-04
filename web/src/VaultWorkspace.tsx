@@ -8,6 +8,7 @@ import {
 import { GlobalSettings } from "@/components/settings/GlobalSettings";
 import { VaultEditor } from "@/components/editor";
 import { VaultManager } from "@/lib/vault/manager";
+import { VaultConnectionBoundary } from "@/components/vault/VaultConnectionBoundary";
 import { VaultConnections } from "@/components/vault/VaultConnections";
 import "./components/vault/vault.css";
 import { FileTree } from "@/components/file-tree";
@@ -207,45 +208,50 @@ export default function VaultWorkspace() {
         }
       >
         {(workspace) => (
-          <div
-            class="workspace-grid grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] sm:grid-cols-[var(--workspace-sidebar-width)_5px_minmax(0,1fr)]"
-            data-resizing={resizing() ? "true" : "false"}
-            style={{
-              "--workspace-sidebar-width": `${sidebarWidth()}px`,
-            }}
-          >
-            <div class="workspace-sidebar flex min-h-0 flex-col">
-              <FileTree
-                backend={workspace.documents.treeBackend}
-                model={workspace.tree}
-                viewState={workspace.treeView}
-                statusMount={treeStatusMount}
-                label={workspace.name}
-                onOpen={(path) => void workspace.documents.open(path)}
-              />
-            </div>
-            <div
-              class="workspace-divider"
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="调整侧边栏宽度"
-              aria-valuenow={sidebarWidth()}
-              aria-valuemin={SETTINGS_SCHEMA["sidebar.width"].range?.min}
-              aria-valuemax={sidebarLimit()}
-              title="拖动调整侧边栏宽度"
-              tabindex={0}
-              data-dragging={resizing() ? "true" : "false"}
-              onKeyDown={dividerKeyDown}
-              onPointerDown={dividerPointerDown}
-            >
-              <span class="workspace-divider-line" />
-            </div>
-            <VaultEditor
-              documents={workspace.documents}
-              buffers={workspace.editorBuffers}
-              statusMount={editorStatusMount}
-            />
-          </div>
+          <VaultConnectionBoundary documents={workspace.documents}>
+            {(disabled) => (
+              <div
+                class="workspace-grid grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] sm:grid-cols-[var(--workspace-sidebar-width)_5px_minmax(0,1fr)]"
+                data-resizing={resizing() ? "true" : "false"}
+                style={{
+                  "--workspace-sidebar-width": `${sidebarWidth()}px`,
+                }}
+              >
+                <div class="workspace-sidebar flex min-h-0 flex-col">
+                  <FileTree
+                    disabled={disabled()}
+                    backend={workspace.documents.treeBackend}
+                    model={workspace.tree}
+                    viewState={workspace.treeView}
+                    statusMount={treeStatusMount}
+                    label={workspace.name}
+                    onOpen={(path) => void workspace.documents.open(path)}
+                  />
+                </div>
+                <div
+                  class="workspace-divider"
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="调整侧边栏宽度"
+                  aria-valuenow={sidebarWidth()}
+                  aria-valuemin={SETTINGS_SCHEMA["sidebar.width"].range?.min}
+                  aria-valuemax={sidebarLimit()}
+                  title="拖动调整侧边栏宽度"
+                  tabindex={0}
+                  data-dragging={resizing() ? "true" : "false"}
+                  onKeyDown={dividerKeyDown}
+                  onPointerDown={dividerPointerDown}
+                >
+                  <span class="workspace-divider-line" />
+                </div>
+                <VaultEditor
+                  documents={workspace.documents}
+                  buffers={workspace.editorBuffers}
+                  statusMount={editorStatusMount}
+                />
+              </div>
+            )}
+          </VaultConnectionBoundary>
         )}
       </Show>
       <footer class="workspace-statusbar" aria-label="工作区状态栏">

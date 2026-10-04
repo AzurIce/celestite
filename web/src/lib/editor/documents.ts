@@ -2,7 +2,11 @@ import { isWithin, describeTreeError } from "../file-tree/model";
 import { vaultPath, VaultError } from "../vault";
 import type { VaultBackend, VaultPath } from "../vault";
 
-import type { EditorProjection, SelectionContext } from "./contract";
+import type {
+  ConnectionState,
+  EditorProjection,
+  SelectionContext,
+} from "./contract";
 
 export interface DocumentSnapshot {
   core?: EditorProjection;
@@ -23,6 +27,7 @@ export interface DocumentSnapshot {
   bom: boolean;
 }
 export interface DocumentsSnapshot {
+  connection?: ConnectionState;
   documents: readonly DocumentSnapshot[];
   activeId: string | null;
   loadingPath: VaultPath | null;

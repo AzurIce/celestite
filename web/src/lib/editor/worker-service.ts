@@ -11,9 +11,11 @@ import type {
   WorkerMessage,
   WorkerRequest,
   ServiceEvent,
+  ServiceDocument,
 } from "./contract";
 export type EditorWorkerHost = Pick<
   OpfsEditorHost,
+  | "composition"
   | "executePreview"
   | "open"
   | "edit"
@@ -24,7 +26,7 @@ export type EditorWorkerHost = Pick<
   | "flush"
   | "fileOperation"
   | "close"
-> & { authorize?: (token: string) => Promise<void> };
+> & { authorize?: (token: string) => Promise<ServiceDocument[]> };
 export async function serveEditorWorker(
   create: (
     emit: (event: ServiceEvent) => void,
@@ -89,6 +91,8 @@ export async function serveEditorWorker(
             taskId: String(p.taskId),
             target: String(p.target),
           });
+        case "composition":
+          return host.composition(String(p.id), Boolean(p.active));
         case "open":
           return host.open(vaultPath(String(p.path)));
         case "edit":
@@ -104,6 +108,7 @@ export async function serveEditorWorker(
             String(p.id),
             p.context as SelectionContext,
             Boolean(p.redo),
+            p.version as Version | undefined,
           );
         case "retry_history":
           return host.retryHistory(String(p.id));

@@ -69,6 +69,14 @@ pub(crate) async fn run_documents<T: Send + 'static>(
     mutation: bool,
     action: impl FnOnce(&FsVault, &mut Documents) -> Result<T> + Send + 'static,
 ) -> std::result::Result<T, ApiError> {
+    run_documents_with_tree(vault, mutation, true, action).await
+}
+pub(crate) async fn run_documents_with_tree<T: Send + 'static>(
+    vault: Arc<HostedVault>,
+    mutation: bool,
+    notify_tree: bool,
+    action: impl FnOnce(&FsVault, &mut Documents) -> Result<T> + Send + 'static,
+) -> std::result::Result<T, ApiError> {
     if mutation && vault.read_only {
         return Err(failure("PermissionDenied", "Vault is read-only"));
     }
@@ -87,7 +95,7 @@ pub(crate) async fn run_documents<T: Send + 'static>(
             .map_err(|_| VaultError::new("IO", "Document lock failed", ""))?;
         let result = action(&files, &mut documents);
         let published = documents.publish_changes();
-        if mutation || published.as_ref().is_ok_and(|changed| *changed) {
+        if notify_tree && (mutation || published.as_ref().is_ok_and(|changed| *changed)) {
             let _ = vault.events.send(ChangeHint::all());
         }
         result.and_then(|value| published.map(|_| value))

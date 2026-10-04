@@ -539,6 +539,14 @@ impl<B: Backend> EditorCore<B> {
     /// Join an existing history in a private replica, without creating a file projection.
     /// The host supplies the logical path and full snapshot; never seed from plain text.
     pub async fn join(&mut self, path: &str, packet: SyncPacket) -> EditorResult<String> {
+        self.join_with_writer(path, packet, None).await
+    }
+    pub async fn join_with_writer(
+        &mut self,
+        path: &str,
+        packet: SyncPacket,
+        writer: Option<u64>,
+    ) -> EditorResult<String> {
         self.writable()?;
         validate_editor_path(path)?;
         if self.backend.has_projection() || path.is_empty() {
@@ -577,7 +585,7 @@ impl<B: Backend> EditorCore<B> {
                 path,
             ));
         }
-        let document = Document::from_snapshot(&packet, None)?;
+        let document = Document::from_snapshot(&packet, writer)?;
         let snapshot = document.snapshot();
         validate_text(&snapshot.text, path)?;
         let header = DocumentHeader {
@@ -1326,6 +1334,14 @@ impl<B: Backend> EditorCore<B> {
         Ok(())
     }
     pub async fn reset_replica(&mut self, path: &str, packet: SyncPacket) -> EditorResult<String> {
+        self.reset_replica_with_writer(path, packet, None).await
+    }
+    pub async fn reset_replica_with_writer(
+        &mut self,
+        path: &str,
+        packet: SyncPacket,
+        writer: Option<u64>,
+    ) -> EditorResult<String> {
         if self.backend.has_projection() || self.backend.persistent() {
             return Err(EditorError::new(
                 "Unsupported",
@@ -1360,7 +1376,7 @@ impl<B: Backend> EditorCore<B> {
                 path,
             ));
         }
-        let document = Document::from_snapshot(&packet, None)?;
+        let document = Document::from_snapshot(&packet, writer)?;
         let snapshot = document.snapshot();
         validate_text(&snapshot.text, path)?;
         let header = DocumentHeader {
@@ -1954,14 +1970,24 @@ impl<B: Backend> EditorCore<B> {
                     .ok_or_else(|| EditorError::new("InvalidPath", "Missing file path", ""))?;
                 let packet = serde_json::from_value(params["packet"].clone())
                     .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
-                let id = self.join(path, packet).await?;
+                let writer = params["writerId"]
+                    .as_str()
+                    .map(str::parse::<u64>)
+                    .transpose()
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
+                let id = self.join_with_writer(path, packet, writer).await?;
                 to_value(self.read(&id)?)
             }
             "replica_reset" => {
                 let path = params["path"].as_str().unwrap_or("");
                 let packet = serde_json::from_value(params["packet"].clone())
                     .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
-                let id = self.reset_replica(path, packet).await?;
+                let writer = params["writerId"]
+                    .as_str()
+                    .map(str::parse::<u64>)
+                    .transpose()
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
+                let id = self.reset_replica_with_writer(path, packet, writer).await?;
                 to_value(self.read(&id)?)
             }
             "replica_host_state" => {

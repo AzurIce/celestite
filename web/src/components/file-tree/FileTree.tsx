@@ -55,6 +55,7 @@ import { StatusSlot } from "@/components/ui/status-slot";
 import "./file-tree.css";
 
 export interface FileTreeProps {
+  disabled?: boolean;
   backend: VaultBackend;
   model?: FileTreeModel;
   viewState?: { scrollTop: number };
@@ -91,6 +92,7 @@ export function FileTree(props: FileTreeProps) {
   let search = "";
   let searchAt = 0;
   let disposed = false;
+  let previousDisabled: boolean | undefined;
   let dialogActive = false;
   let unwatch: (() => void) | undefined;
   const itemId = (path: VaultPath) => `${id}-${encodeURIComponent(path)}`;
@@ -100,10 +102,10 @@ export function FileTree(props: FileTreeProps) {
    * 一次、再在下一个宏任务补一次，压过浮层清理阶段的焦点变化。
    */
   const focusTree = () => {
-    if (disposed || !tree) return;
+    if (disposed || props.disabled || !tree) return;
     tree.focus();
     setTimeout(() => {
-      if (!disposed) tree?.focus();
+      if (!disposed && !props.disabled) tree?.focus();
     }, 0);
   };
   const closeDialog = () => {
@@ -111,7 +113,7 @@ export function FileTree(props: FileTreeProps) {
     setDialog(null);
   };
   const requestDialog = (value: TreeDialog) => {
-    if (!model.snapshot().busy) {
+    if (!props.disabled && !model.snapshot().busy) {
       model.clearError();
       setLocalError(null);
       dialogActive = true;
@@ -157,6 +159,28 @@ export function FileTree(props: FileTreeProps) {
     setDropTarget(null);
     stopHover();
   };
+  createEffect(
+    () => props.disabled,
+    (disabled) => {
+      const nextDisabled = !!disabled;
+      if (nextDisabled === previousDisabled) return;
+      const changed = previousDisabled !== undefined;
+      previousDisabled = nextDisabled;
+      // Context-menu portals live outside the inert workspace. Recreate their
+      // owner on connection changes to close them, retaining the tree viewport.
+      if (changed) {
+        const scrollTop = tree?.scrollTop ?? 0;
+        setTimeout(() => {
+          if (!disposed && tree) tree.scrollTop = scrollTop;
+        }, 0);
+      }
+      if (disabled) {
+        closeDialog();
+        clearDropTarget();
+        dragPaths = [];
+      }
+    },
+  );
   onSettled(() => {
     if (props.viewState) tree.scrollTop = props.viewState.scrollTop;
     void model.refresh();
@@ -202,7 +226,7 @@ export function FileTree(props: FileTreeProps) {
     }
   }
   function keyboard(event: KeyboardEvent) {
-    if (event.target !== tree) return;
+    if (props.disabled || event.target !== tree) return;
     const snapshot = model.snapshot();
     const paths = snapshot.rows.map((row) => row.path);
     const index = paths.indexOf(snapshot.focused ?? ROOT_PATH);
@@ -326,7 +350,7 @@ export function FileTree(props: FileTreeProps) {
     }
   }
   function accepts(event: DragEvent, parent: VaultPath) {
-    if (model.snapshot().busy) return false;
+    if (props.disabled || model.snapshot().busy) return false;
     if (dragPaths.length) return model.canMove(dragPaths, parent);
     return Array.from(event.dataTransfer?.types ?? []).includes("Files");
   }
@@ -503,7 +527,7 @@ export function FileTree(props: FileTreeProps) {
     return (
       <ContextMenu
         onOpenChange={(opened) => {
-          if (opened) model.contextSelect(rowProps.path);
+          if (opened && !props.disabled) model.contextSelect(rowProps.path);
           else if (!dialogActive) focusTree();
         }}
       >
@@ -526,6 +550,7 @@ export function FileTree(props: FileTreeProps) {
           }}
         >
           <ContextMenuTrigger
+            disabled={props.disabled}
             as="div"
             class="tree-row"
             title={rowProps.path}
@@ -684,6 +709,7 @@ export function FileTree(props: FileTreeProps) {
     });
     const submit = async (event: SubmitEvent) => {
       event.preventDefault();
+      if (props.disabled) return;
       setLocalError(null);
       const name = input?.value ?? "";
       let result = false;
@@ -858,51 +884,56 @@ export function FileTree(props: FileTreeProps) {
             {state().rows.filter((row) => row.parent === ROOT_PATH).length}
           </span>
         </div>
-        <ContextMenu
-          onOpenChange={(opened) => {
-            if (opened) model.clearSelection(true);
-            else if (!dialogActive) focusTree();
-          }}
-        >
-          <ContextMenuTrigger
-            as="div"
-            role="tree"
-            aria-label="文件树"
-            aria-multiselectable="true"
-            aria-busy={state().busy ? "true" : "false"}
-            aria-activedescendant={
-              state().focused ? itemId(state().focused!) : undefined
-            }
-            aria-describedby={`${id}-help`}
-            ref={tree}
-            tabindex={0}
-            class="tree-body"
-            onKeyDown={keyboard}
-            onClick={() => {
-              model.clearSelection(true);
-              tree.focus();
-            }}
-            onContextMenu={() => model.clearSelection(true)}
-            onDragOver={(event: DragEvent) => dragOver(event, ROOT_PATH)}
-            onDrop={(event: DragEvent) => drop(event, ROOT_PATH)}
-          >
-            <Branch parent={ROOT_PATH} />
-            <Show when={!state().rows.length}>
-              <div class="px-5 py-8 text-center text-ui-sm text-secondary">
-                {state().busy ? "正在读取…" : "这里还没有文件"}
-                <p class="mt-2">新建文件，或把文件拖到这里</p>
-              </div>
-            </Show>
-          </ContextMenuTrigger>
-          <ContextMenuContent
-            onCloseAutoFocus={(event) => {
-              event.preventDefault();
-              if (!dialogActive) focusTree();
-            }}
-          >
-            <MenuItems />
-          </ContextMenuContent>
-        </ContextMenu>
+        <Show when={props.disabled ? "disabled" : "enabled"} keyed>
+          {(_connectionState) => (
+            <ContextMenu
+              onOpenChange={(opened) => {
+                if (opened && !props.disabled) model.clearSelection(true);
+                else if (!dialogActive) focusTree();
+              }}
+            >
+              <ContextMenuTrigger
+                disabled={props.disabled}
+                as="div"
+                role="tree"
+                aria-label="文件树"
+                aria-multiselectable="true"
+                aria-busy={state().busy ? "true" : "false"}
+                aria-activedescendant={
+                  state().focused ? itemId(state().focused!) : undefined
+                }
+                aria-describedby={`${id}-help`}
+                ref={tree}
+                tabindex={0}
+                class="tree-body"
+                onKeyDown={keyboard}
+                onClick={() => {
+                  model.clearSelection(true);
+                  tree.focus();
+                }}
+                onContextMenu={() => model.clearSelection(true)}
+                onDragOver={(event: DragEvent) => dragOver(event, ROOT_PATH)}
+                onDrop={(event: DragEvent) => drop(event, ROOT_PATH)}
+              >
+                <Branch parent={ROOT_PATH} />
+                <Show when={!state().rows.length}>
+                  <div class="px-5 py-8 text-center text-ui-sm text-secondary">
+                    {state().busy ? "正在读取…" : "这里还没有文件"}
+                    <p class="mt-2">新建文件，或把文件拖到这里</p>
+                  </div>
+                </Show>
+              </ContextMenuTrigger>
+              <ContextMenuContent
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault();
+                  if (!dialogActive) focusTree();
+                }}
+              >
+                <MenuItems />
+              </ContextMenuContent>
+            </ContextMenu>
+          )}
+        </Show>
       </div>
       <Show when={!dialog() && (state().error || localError())}>
         <div
@@ -952,7 +983,7 @@ export function FileTree(props: FileTreeProps) {
         onChange={(event) => {
           const files = Array.from(event.currentTarget.files ?? []);
           event.currentTarget.value = "";
-          if (files.length)
+          if (files.length && !props.disabled)
             void model.importFiles(files, importParent).then(focusTree);
         }}
       />

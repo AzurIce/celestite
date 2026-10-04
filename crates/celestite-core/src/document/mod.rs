@@ -577,6 +577,64 @@ impl Document {
         }
     }
 
+    /// Causal display delta keeps unchanged islands (and selections anchored
+    /// there) intact, even when a remote packet edits distant regions.
+    fn display_delta(&self, before: &TextSnapshot) -> Option<Vec<TextEdit>> {
+        let from = self
+            .doc
+            .vv_to_frontiers(&version_vector(&before.version).ok()?);
+        let batch = self.doc.diff(&from, &self.doc.state_frontiers()).ok()?;
+        let mut characters = before.text.chars();
+        let mut offset = 0usize;
+        let mut edits: Vec<TextEdit> = vec![];
+        for (id, diff) in batch.iter() {
+            if *id != self.doc.get_text("source").id() {
+                continue;
+            }
+            let loro::event::Diff::Text(delta) = diff else {
+                return None;
+            };
+            for part in delta {
+                match part {
+                    loro::TextDelta::Retain { retain, .. } => {
+                        for _ in 0..*retain {
+                            offset += characters.next()?.len_utf16();
+                        }
+                    }
+                    loro::TextDelta::Insert { insert, .. } => {
+                        let pos = offset;
+                        if let Some(edit) = edits.last_mut().filter(|e| e.to == pos) {
+                            edit.insert.push_str(insert);
+                        } else {
+                            edits.push(TextEdit {
+                                from: pos,
+                                to: pos,
+                                insert: insert.clone(),
+                            });
+                        }
+                    }
+                    loro::TextDelta::Delete { delete } => {
+                        let from = offset;
+                        for _ in 0..*delete {
+                            offset += characters.next()?.len_utf16();
+                        }
+                        let to = offset;
+                        if let Some(edit) = edits.last_mut().filter(|e| e.to == from) {
+                            edit.to = to;
+                        } else {
+                            edits.push(TextEdit {
+                                from,
+                                to,
+                                insert: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Some(edits)
+    }
+
     fn publish(
         &mut self,
         before: TextSnapshot,
@@ -605,7 +663,10 @@ impl Document {
             vec![]
         };
         let event = ChangeEvent {
-            edits: edits.unwrap_or_else(|| difference(&before.text, &after.text)),
+            edits: edits.unwrap_or_else(|| {
+                self.display_delta(&before)
+                    .unwrap_or_else(|| difference(&before.text, &after.text))
+            }),
             before,
             after,
             cause,

@@ -185,8 +185,8 @@ export function VaultEditor(props: VaultEditorProps) {
       class={
         (active() || state().loadingPath || state().openError) &&
         mobileVisible()
-          ? "vault-editor fixed inset-x-0 top-0 bottom-[var(--workspace-status-height)] z-20 flex min-h-0 min-w-0 flex-col bg-surface sm:static sm:z-auto"
-          : "vault-editor hidden min-h-0 min-w-0 flex-col bg-surface sm:flex"
+          ? "vault-editor relative fixed inset-x-0 top-0 bottom-[var(--workspace-status-height)] z-20 flex min-h-0 min-w-0 flex-col bg-surface sm:relative sm:z-auto"
+          : "vault-editor relative hidden min-h-0 min-w-0 flex-col bg-surface sm:flex"
       }
       onKeyDown={(event) => {
         if (
@@ -199,347 +199,363 @@ export function VaultEditor(props: VaultEditorProps) {
         }
       }}
     >
-      <div class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-3 py-2 sm:hidden">
-        <IconButton aria-label="返回文件树" size="sm" onClick={backToTree}>
-          <ChevronLeft size={16} />
-        </IconButton>
-        <span class="text-ui-sm text-secondary">文件编辑器</span>
-      </div>
-      <Show when={state().openError}>
-        <p
-          role="alert"
-          class="border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
-        >
-          {state().openError}
-        </p>
-      </Show>
-      <Show when={state().documents.length}>
-        <div role="tablist" aria-label="打开的文件" class="editor-tabs">
-          <For each={state().documents.map((document) => document.id)}>
-            {(id) => {
-              const file = () =>
-                state().documents.find((document) => document.id === id)!;
-              return (
-                <div
-                  class="editor-tab"
-                  data-active={state().activeId === id ? "true" : "false"}
-                >
-                  <button
-                    id={tabId(id)}
-                    type="button"
-                    role="tab"
-                    class="editor-tab-label"
-                    aria-label={file().path}
-                    aria-controls={panelId}
-                    aria-selected={state().activeId === id ? "true" : "false"}
-                    tabindex={state().activeId === id ? 0 : -1}
-                    title={file().path}
-                    onClick={() => {
-                      props.documents.activate(id);
-                      setMobileVisible(true);
-                    }}
-                    onKeyDown={(event) => tabKeyboard(event, id)}
-                  >
-                    <FileText size={14} class="shrink-0 text-secondary" />
-                    <span class="min-w-0 truncate">
-                      {file().path.split("/").pop()}
-                    </span>
-                    <Show when={file().dirty}>
-                      <span class="editor-dirty" aria-label="未保存" />
-                    </Show>
-                  </button>
-                  <button
-                    type="button"
-                    class="editor-tab-close"
-                    aria-label={`关闭 ${file().path}`}
-                    disabled={file().locked || file().saving}
-                    onClick={() =>
-                      void props.documents.requestCloseDocument(id)
-                    }
-                  >
-                    <X size={13} />
-                  </button>
-                </div>
-              );
-            }}
-          </For>
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-3 py-2 sm:hidden">
+          <IconButton aria-label="返回文件树" size="sm" onClick={backToTree}>
+            <ChevronLeft size={16} />
+          </IconButton>
+          <span class="text-ui-sm text-secondary">文件编辑器</span>
         </div>
-      </Show>
-      <Show
-        when={!state().loadingPath}
-        fallback={
-          <div class="editor-loading" role="status" aria-live="polite">
-            <LoaderCircle
-              size={22}
-              class="editor-loading-icon"
-              aria-hidden="true"
-            />
-            <span class="text-ui-sm">正在打开 {state().loadingPath}…</span>
+        <Show when={state().openError}>
+          <p
+            role="alert"
+            class="border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
+          >
+            {state().openError}
+          </p>
+        </Show>
+        <Show when={state().documents.length}>
+          <div role="tablist" aria-label="打开的文件" class="editor-tabs">
+            <For each={state().documents.map((document) => document.id)}>
+              {(id) => {
+                const file = () =>
+                  state().documents.find((document) => document.id === id)!;
+                return (
+                  <div
+                    class="editor-tab"
+                    data-active={state().activeId === id ? "true" : "false"}
+                  >
+                    <button
+                      id={tabId(id)}
+                      type="button"
+                      role="tab"
+                      class="editor-tab-label"
+                      aria-label={file().path}
+                      aria-controls={panelId}
+                      aria-selected={state().activeId === id ? "true" : "false"}
+                      tabindex={state().activeId === id ? 0 : -1}
+                      title={file().path}
+                      onClick={() => {
+                        props.documents.activate(id);
+                        setMobileVisible(true);
+                      }}
+                      onKeyDown={(event) => tabKeyboard(event, id)}
+                    >
+                      <FileText size={14} class="shrink-0 text-secondary" />
+                      <span class="min-w-0 truncate">
+                        {file().path.split("/").pop()}
+                      </span>
+                      <Show when={file().dirty}>
+                        <span class="editor-dirty" aria-label="未保存" />
+                      </Show>
+                    </button>
+                    <button
+                      type="button"
+                      class="editor-tab-close"
+                      aria-label={`关闭 ${file().path}`}
+                      disabled={file().locked || file().saving}
+                      onClick={() =>
+                        void props.documents.requestCloseDocument(id)
+                      }
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                );
+              }}
+            </For>
           </div>
-        }
-      >
+        </Show>
         <Show
-          when={active()?.id}
-          keyed
+          when={!state().loadingPath}
           fallback={
-            <div class="editor-empty">
-              <h2 class="text-ui-heading font-medium">打开一份文件</h2>
-              <p class="mt-2 text-ui-sm text-secondary">
-                从左侧选择，或新建你的第一份笔记。
-              </p>
-              <p class="mt-6 text-ui-sm text-secondary">
-                自动保存 <span aria-hidden="true">·</span> Ctrl / ⌘ S 手动保存
-              </p>
+            <div class="editor-loading" role="status" aria-live="polite">
+              <LoaderCircle
+                size={22}
+                class="editor-loading-icon"
+                aria-hidden="true"
+              />
+              <span class="text-ui-sm">正在打开 {state().loadingPath}…</span>
             </div>
           }
         >
-          {(id) => (
-            <>
-              <header class="editor-toolbar">
-                <span
-                  class="min-w-0 flex-1 truncate text-ui-sm text-secondary"
-                  title={active()?.path}
-                >
-                  {active()?.path}
-                </span>
-                <Show when={canRender()}>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    aria-pressed={displayMode() === "source" ? "true" : "false"}
-                    onClick={() => chooseMode("source")}
+          <Show
+            when={active()?.id}
+            keyed
+            fallback={
+              <div class="editor-empty">
+                <h2 class="text-ui-heading font-medium">打开一份文件</h2>
+                <p class="mt-2 text-ui-sm text-secondary">
+                  从左侧选择，或新建你的第一份笔记。
+                </p>
+                <p class="mt-6 text-ui-sm text-secondary">
+                  自动保存 <span aria-hidden="true">·</span> Ctrl / ⌘ S 手动保存
+                </p>
+              </div>
+            }
+          >
+            {(id) => (
+              <>
+                <header class="editor-toolbar">
+                  <span
+                    class="min-w-0 flex-1 truncate text-ui-sm text-secondary"
+                    title={active()?.path}
                   >
-                    源码
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    class="hidden sm:inline-flex"
-                    aria-pressed={displayMode() === "split" ? "true" : "false"}
-                    onClick={() => chooseMode("split")}
-                  >
-                    分栏
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    aria-pressed={
-                      displayMode() === "preview" ? "true" : "false"
-                    }
-                    onClick={() => chooseMode("preview")}
-                  >
-                    预览
-                  </Button>
-                  <Show when={displayMode() === "split"}>
+                    {active()?.path}
+                  </span>
+                  <Show when={canRender()}>
                     <Button
                       size="sm"
                       variant="ghost"
-                      aria-pressed={scrollSync() ? "true" : "false"}
-                      onClick={() => setScrollSync((value) => !value)}
-                      title="按对应内容同步两侧滚动"
+                      aria-pressed={
+                        displayMode() === "source" ? "true" : "false"
+                      }
+                      onClick={() => chooseMode("source")}
                     >
-                      滚动同步
+                      源码
                     </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      class="hidden sm:inline-flex"
+                      aria-pressed={
+                        displayMode() === "split" ? "true" : "false"
+                      }
+                      onClick={() => chooseMode("split")}
+                    >
+                      分栏
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-pressed={
+                        displayMode() === "preview" ? "true" : "false"
+                      }
+                      onClick={() => chooseMode("preview")}
+                    >
+                      预览
+                    </Button>
+                    <Show when={displayMode() === "split"}>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        aria-pressed={scrollSync() ? "true" : "false"}
+                        onClick={() => setScrollSync((value) => !value)}
+                        title="按对应内容同步两侧滚动"
+                      >
+                        滚动同步
+                      </Button>
+                    </Show>
                   </Show>
-                </Show>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  aria-pressed={wrap() ? "true" : "false"}
-                  disabled={wrapFromProject() || !!active()?.readOnlyReason}
-                  title={
-                    wrapFromProject()
-                      ? "由 .celestite/settings.json 提供，编辑该文件后生效"
-                      : undefined
-                  }
-                  onClick={() => void setSetting("editor.wordWrap", !wrap())}
-                >
-                  自动换行
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={
-                    (!active()?.dirty &&
-                      !active()?.pending &&
-                      !active()?.core?.historyError) ||
-                    active()?.saving ||
-                    active()?.locked ||
-                    !!active()?.readOnlyReason
-                  }
-                  onClick={() => void props.documents.requestSave(id)}
-                  title="Ctrl / ⌘ S"
-                >
-                  <Save size={14} />
-                  保存
-                </Button>
-              </header>
-              <Show when={active()?.error}>
-                <div
-                  role="alert"
-                  class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
-                >
-                  <span class="flex-1">
-                    {active()?.conflict
-                      ? "磁盘文件已变化，本地编辑仍保留。"
-                      : `保存失败，修改仍保留在编辑器中。${active()?.error}`}
-                  </span>
                   <Button
                     size="sm"
-                    disabled={active()?.saving || active()?.locked}
-                    onClick={() => void props.documents.requestSave(id)}
+                    variant="ghost"
+                    aria-pressed={wrap() ? "true" : "false"}
+                    disabled={wrapFromProject() || !!active()?.readOnlyReason}
+                    title={
+                      wrapFromProject()
+                        ? "由 .celestite/settings.json 提供，编辑该文件后生效"
+                        : undefined
+                    }
+                    onClick={() => void setSetting("editor.wordWrap", !wrap())}
                   >
-                    {active()?.conflict ? "处理冲突" : "重试保存"}
+                    自动换行
                   </Button>
-                </div>
-              </Show>
-              <Show when={active()?.canPreview && active()?.readOnlyReason}>
-                <p class="border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary">
-                  {active()?.readOnlyReason}
-                </p>
-              </Show>
-              <div
-                id={panelId}
-                role="tabpanel"
-                aria-labelledby={tabId(id)}
-                class="flex min-h-0 min-w-0 flex-1 flex-col"
-              >
-                <Show
-                  when={active()?.canPreview}
-                  fallback={
-                    <p class="m-auto max-w-md p-6 text-secondary">
-                      {active()?.readOnlyReason}
-                    </p>
-                  }
-                >
-                  <div class="editor-layout" data-mode={displayMode()}>
-                    <div class="editor-source-pane">
-                      <Loading
-                        fallback={
-                          <p role="status" class="p-4 text-secondary">
-                            正在加载编辑器…
-                          </p>
-                        }
-                      >
-                        <Show when={`${id}:${active()?.reloadVersion}`} keyed>
-                          {(_viewKey) => (
-                            <CodeEditor
-                              previewSync={previewSync}
-                              reveal={reveal()}
-                              document={active()!}
-                              cached={buffers.get(id)}
-                              wrap={wrap()}
-                              onChange={(content) =>
-                                props.documents.update(id, content)
-                              }
-                              onTransaction={
-                                props.documents.edit
-                                  ? (transaction) =>
-                                      props.documents.edit!(id, transaction)
-                                  : undefined
-                              }
-                              onUndo={
-                                props.documents.undo
-                                  ? (context, redo) => {
-                                      void props.documents.undo!(
-                                        id,
-                                        context,
-                                        redo,
-                                      );
-                                    }
-                                  : undefined
-                              }
-                              onSave={() => {
-                                void props.documents.requestSave(id);
-                              }}
-                              onCursor={(line, column) =>
-                                setCursor({ line, column })
-                              }
-                              onCache={(buffer) => {
-                                if (props.documents.has(id))
-                                  buffers.set(id, buffer);
-                              }}
-                            />
-                          )}
-                        </Show>
-                      </Loading>
-                    </div>
-                    <Show when={canRender() && displayMode() !== "source"}>
-                      <DocumentPreview
-                        sync={previewSync}
-                        document={active()!}
-                        documents={props.documents}
-                        scrollTop={views.get(id)?.scrollTop ?? 0}
-                        fragment={
-                          fragment()?.id === id ? fragment()?.value : undefined
-                        }
-                        onScroll={(scrollTop) =>
-                          views.set(id, { mode: mode(), scrollTop })
-                        }
-                        onReveal={(from, to, keepSplit) => {
-                          if (!keepSplit || displayMode() !== "split")
-                            chooseMode("source");
-                          setReveal({
-                            from,
-                            to,
-                            requestId: crypto.randomUUID(),
-                          });
-                        }}
-                        onNavigate={async (path, anchor) => {
-                          const targetMode = untrack(mode);
-                          if (!(await props.documents.open(vaultPath(path))))
-                            return false;
-                          const targetId = props.documents.snapshot().activeId;
-                          if (targetId) {
-                            views.set(targetId, {
-                              mode: targetMode,
-                              scrollTop: views.get(targetId)?.scrollTop ?? 0,
-                            });
-                            setMode(targetMode);
-                            setFragment(
-                              anchor === null
-                                ? undefined
-                                : { id: targetId, value: anchor },
-                            );
-                          }
-                          return true;
-                        }}
-                      />
-                    </Show>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={
+                      (!active()?.dirty &&
+                        !active()?.pending &&
+                        !active()?.core?.historyError) ||
+                      active()?.saving ||
+                      active()?.locked ||
+                      !!active()?.readOnlyReason
+                    }
+                    onClick={() => void props.documents.requestSave(id)}
+                    title="Ctrl / ⌘ S"
+                  >
+                    <Save size={14} />
+                    保存
+                  </Button>
+                </header>
+                <Show when={active()?.error}>
+                  <div
+                    role="alert"
+                    class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"
+                  >
+                    <span class="flex-1">
+                      {active()?.conflict
+                        ? "磁盘文件已变化，本地编辑仍保留。"
+                        : `保存失败，修改仍保留在编辑器中。${active()?.error}`}
+                    </span>
+                    <Button
+                      size="sm"
+                      disabled={active()?.saving || active()?.locked}
+                      onClick={() => void props.documents.requestSave(id)}
+                    >
+                      {active()?.conflict ? "处理冲突" : "重试保存"}
+                    </Button>
                   </div>
                 </Show>
-              </div>
-              <StatusSlot mount={props.statusMount} class="editor-statusbar">
-                <span
-                  role="status"
-                  aria-label="保存状态"
-                  aria-live="polite"
-                  class={active()?.error ? "text-danger" : undefined}
-                >
-                  {status()}
-                </span>
-                <span class="hidden sm:inline">
-                  {languageName(active()?.path ?? "")}
-                </span>
-                <span class="hidden sm:inline">
-                  UTF-8{active()?.bom ? " BOM" : ""} ·{" "}
-                  {active()?.lineEnding === "\r\n"
-                    ? "CRLF"
-                    : active()?.lineEnding === "\r"
-                      ? "CR"
-                      : "LF"}
-                </span>
-                <Show when={!active()?.readOnlyReason}>
-                  <span class="whitespace-nowrap">
-                    Ln {cursor().line}, Col {cursor().column}
-                  </span>
+                <Show when={active()?.canPreview && active()?.readOnlyReason}>
+                  <p class="border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary">
+                    {active()?.readOnlyReason}
+                  </p>
                 </Show>
-              </StatusSlot>
-            </>
-          )}
+                <div
+                  id={panelId}
+                  role="tabpanel"
+                  aria-labelledby={tabId(id)}
+                  class="flex min-h-0 min-w-0 flex-1 flex-col"
+                >
+                  <Show
+                    when={active()?.canPreview}
+                    fallback={
+                      <p class="m-auto max-w-md p-6 text-secondary">
+                        {active()?.readOnlyReason}
+                      </p>
+                    }
+                  >
+                    <div class="editor-layout" data-mode={displayMode()}>
+                      <div class="editor-source-pane">
+                        <Loading
+                          fallback={
+                            <p role="status" class="p-4 text-secondary">
+                              正在加载编辑器…
+                            </p>
+                          }
+                        >
+                          <Show when={`${id}:${active()?.reloadVersion}`} keyed>
+                            {(_viewKey) => (
+                              <CodeEditor
+                                previewSync={previewSync}
+                                reveal={reveal()}
+                                document={active()!}
+                                cached={buffers.get(id)}
+                                wrap={wrap()}
+                                onChange={(content) =>
+                                  props.documents.update(id, content)
+                                }
+                                onComposition={(active) =>
+                                  props.documents.composition?.(id, active)
+                                }
+                                onTransaction={
+                                  props.documents.edit
+                                    ? (transaction) =>
+                                        props.documents.edit!(id, transaction)
+                                    : undefined
+                                }
+                                onUndo={
+                                  props.documents.undo
+                                    ? (context, redo) => {
+                                        void props.documents.undo!(
+                                          id,
+                                          context,
+                                          redo,
+                                        );
+                                      }
+                                    : undefined
+                                }
+                                onSave={() => {
+                                  void props.documents.requestSave(id);
+                                }}
+                                onCursor={(line, column) =>
+                                  setCursor({ line, column })
+                                }
+                                onCache={(buffer) => {
+                                  if (props.documents.has(id))
+                                    buffers.set(id, buffer);
+                                }}
+                              />
+                            )}
+                          </Show>
+                        </Loading>
+                      </div>
+                      <Show when={canRender() && displayMode() !== "source"}>
+                        <DocumentPreview
+                          sync={previewSync}
+                          document={active()!}
+                          documents={props.documents}
+                          scrollTop={views.get(id)?.scrollTop ?? 0}
+                          fragment={
+                            fragment()?.id === id
+                              ? fragment()?.value
+                              : undefined
+                          }
+                          onScroll={(scrollTop) =>
+                            views.set(id, { mode: mode(), scrollTop })
+                          }
+                          onReveal={(from, to, keepSplit) => {
+                            if (!keepSplit || displayMode() !== "split")
+                              chooseMode("source");
+                            setReveal({
+                              from,
+                              to,
+                              requestId: crypto.randomUUID(),
+                            });
+                          }}
+                          onNavigate={async (path, anchor) => {
+                            const targetMode = untrack(mode);
+                            if (!(await props.documents.open(vaultPath(path))))
+                              return false;
+                            const targetId =
+                              props.documents.snapshot().activeId;
+                            if (targetId) {
+                              views.set(targetId, {
+                                mode: targetMode,
+                                scrollTop: views.get(targetId)?.scrollTop ?? 0,
+                              });
+                              setMode(targetMode);
+                              setFragment(
+                                anchor === null
+                                  ? undefined
+                                  : { id: targetId, value: anchor },
+                              );
+                            }
+                            return true;
+                          }}
+                        />
+                      </Show>
+                    </div>
+                  </Show>
+                </div>
+                <StatusSlot mount={props.statusMount} class="editor-statusbar">
+                  <span
+                    role="status"
+                    aria-label="保存状态"
+                    aria-live="polite"
+                    class={active()?.error ? "text-danger" : undefined}
+                  >
+                    {status()}
+                  </span>
+                  <span class="hidden sm:inline">
+                    {languageName(active()?.path ?? "")}
+                  </span>
+                  <span class="hidden sm:inline">
+                    UTF-8{active()?.bom ? " BOM" : ""} ·{" "}
+                    {active()?.lineEnding === "\r\n"
+                      ? "CRLF"
+                      : active()?.lineEnding === "\r"
+                        ? "CR"
+                        : "LF"}
+                  </span>
+                  <Show when={!active()?.readOnlyReason}>
+                    <span class="whitespace-nowrap">
+                      Ln {cursor().line}, Col {cursor().column}
+                    </span>
+                  </Show>
+                </StatusSlot>
+              </>
+            )}
+          </Show>
         </Show>
-      </Show>
-      <SaveConflict documents={props.documents} state={state()} />
+        <Show
+          when={!state().connection || state().connection?.status === "online"}
+        >
+          <SaveConflict documents={props.documents} state={state()} />
+        </Show>
+      </div>
     </section>
   );
 }

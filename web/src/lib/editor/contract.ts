@@ -60,12 +60,19 @@ export interface EditorProjection {
 }
 /** UI consumes this service contract, never a WASM Document or an IO handle. */
 export interface EditorDocument extends DocumentSnapshot {
+  remoteChange?: { before: string; edits: TextEdit[] };
   core?: EditorProjection;
   pending?: number;
   restoredSelection?: SelectionContext & { revision: number };
 }
 /** View facade common to local service and the transitional HTTP adapter. */
+export interface ConnectionState {
+  status: "online" | "offline" | "reconnecting";
+  error: string | null;
+  unconfirmed?: boolean;
+}
 export interface EditorDocuments {
+  reconnect?(discardUnconfirmed?: boolean): Promise<void>;
   readonly previews?: DocumentPreviews;
   readonly treeBackend: VaultBackend;
   snapshot(): DocumentsSnapshot;
@@ -74,6 +81,7 @@ export interface EditorDocuments {
   activate(id: string): void;
   update(id: string, content: string): boolean;
   edit?(id: string, transaction: ViewEdit): boolean;
+  composition?(id: string, active: boolean): void;
   undo?(
     id: string,
     context: SelectionContext,
@@ -90,6 +98,7 @@ export interface EditorDocuments {
   close(): Promise<void>;
 }
 export interface ServiceDocument {
+  change?: { before: string; edits: TextEdit[] };
   id: string;
   path: VaultPath;
   content?: string;
@@ -108,11 +117,10 @@ export interface EditResult {
   edits: TextEdit[];
   restoredSelection?: SelectionContext;
 }
-export interface ServiceEvent {
-  kind: "document";
-  sequence: number;
-  document: ServiceDocument;
-}
+export type ServiceEvent =
+  | { kind: "document"; sequence: number; document: ServiceDocument }
+  | { kind: "tree"; sequence: number }
+  | { kind: "connection"; sequence: number; connection: ConnectionState };
 export interface RpcError {
   writeNotStarted?: boolean;
   code: string;
@@ -141,7 +149,8 @@ export interface WorkerRequest {
 
 /** Async host operations: identical envelope over Worker messages or native IPC. */
 export interface ServiceMethods {
-  authorize: { params: { token: string }; result: void };
+  composition: { params: { id: string; active: boolean }; result: void };
+  authorize: { params: { token: string }; result: ServiceDocument[] };
   preview_subscribe: { params: { id: string }; result: PreviewSubscription };
   preview_unsubscribe: { params: { subscriptionId: string }; result: boolean };
   preview_retry: { params: { id: string }; result: PreviewState };
@@ -161,7 +170,12 @@ export interface ServiceMethods {
     result: EditResult;
   };
   undo: {
-    params: { id: string; context: SelectionContext; redo: boolean };
+    params: {
+      id: string;
+      context: SelectionContext;
+      redo: boolean;
+      version?: Version;
+    };
     result: EditResult;
   };
   save: { params: { id: string }; result: ServiceDocument };

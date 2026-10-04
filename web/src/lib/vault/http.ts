@@ -20,6 +20,7 @@ export interface RemoteVaultDescriptor {
     conditionalWrite: boolean;
     documentEditing?: boolean;
     clientReplicaCommit?: boolean;
+    websocketSync?: boolean;
   };
 }
 export function normalizeVaultUrl(value: string): string {

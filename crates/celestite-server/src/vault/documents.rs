@@ -13,6 +13,7 @@ pub(crate) struct Documents {
     pub identity: VaultIdentity,
     core: EditorCore<NativeBackend>,
     feed: super::changes::DocumentFeed,
+    writers: std::collections::HashSet<String>,
 }
 impl Documents {
     pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> Result<Self> {
@@ -33,6 +34,7 @@ impl Documents {
             identity,
             core,
             feed,
+            writers: Default::default(),
         })
     }
     pub fn reconcile(&mut self) -> Result<()> {
@@ -112,6 +114,60 @@ impl Documents {
     pub fn updates(&self, id: &str, version: &Version) -> Result<SyncPacket> {
         self.require_committed(id)?;
         self.core.updates(id, version).map_err(vault_error)
+    }
+    /// Writers are reserved for the lifetime of this host, even before their
+    /// first operation. A reconnect always receives a new writer.
+    pub fn allocate_writer(&mut self, id: &str) -> Result<String> {
+        let snapshot = self.snapshot(id)?;
+        loop {
+            let replica =
+                Document::from_snapshot(&snapshot, None).map_err(|e| vault_error(e.into()))?;
+            let writer = replica.writer_id();
+            if self.writers.insert(writer.clone()) {
+                return Ok(writer);
+            }
+        }
+    }
+    /// Validate on an isolated history before touching live state or undo.
+    /// Clients may only advance their assigned writer, with complete causal
+    /// dependencies; an old session's unsent writer cannot be smuggled in.
+    pub fn import_session(
+        &mut self,
+        id: &str,
+        packet: SyncPacket,
+        writer: &str,
+        claimed: &Version,
+    ) -> Result<()> {
+        if packet.kind != PacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
+            return Err(super::fs::VaultError::new(
+                "InvalidEdit",
+                "Expected bounded CRDT updates",
+                id,
+            ));
+        }
+        let snapshot = self.snapshot(id)?;
+        let mut trial =
+            Document::from_snapshot(&snapshot, None).map_err(|e| vault_error(e.into()))?;
+        let before = trial.version();
+        let result = trial
+            .import(&packet, "session-validation".into())
+            .map_err(|e| vault_error(e.into()))?;
+        let after = trial.version();
+        if result.pending
+            || !super::super::sync::contains(&after, claimed)
+            || after.clocks.iter().any(|(peer, clock)| {
+                peer != writer && *clock > before.clocks.get(peer).copied().unwrap_or(0)
+            })
+            || claimed.clocks.get(writer) != after.clocks.get(writer)
+        {
+            return Err(super::fs::VaultError::new(
+                "InvalidEdit",
+                "Invalid session writer or causal dependencies",
+                id,
+            ));
+        }
+        self.import(id, packet)?;
+        self.require_committed(id)
     }
     pub fn save(&mut self, _files: &FsVault, id: &str, expected: Version) -> Result<()> {
         block_on(self.core.save(id, Some(expected))).map_err(vault_error)

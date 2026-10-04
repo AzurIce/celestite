@@ -4,6 +4,7 @@ import type { VaultBackend } from "../vault/types";
 import { decodeError } from "./rpc";
 import type { PreviewCoreMethods } from "./preview-contract";
 import type {
+  ConnectionState,
   EditResult,
   ServiceDocument,
   ServiceEvent,
@@ -35,7 +36,7 @@ export interface CoreDocument {
   autosaveDelay: number | null;
   backendRevision: string;
 }
-interface CoreEdit {
+export interface CoreEdit {
   document: CoreDocument;
   edits: TextEdit[];
   restoredSelection: SelectionContext | null;
@@ -97,7 +98,11 @@ export class OpfsEditorHost {
       },
     };
   }
-  protected publish(raw: CoreDocument, content = false) {
+  protected publish(
+    raw: CoreDocument,
+    content = false,
+    change?: ServiceDocument["change"],
+  ) {
     clearTimeout(this.timers.get(raw.id));
     this.timers.delete(raw.id);
     if (raw.deleted) return;
@@ -113,13 +118,27 @@ export class OpfsEditorHost {
     this.emit({
       kind: "document",
       sequence: ++this.eventSequence,
-      document: this.document(raw, content),
+      document: {
+        ...this.document(raw, content),
+        ...(change ? { change } : {}),
+      },
     });
+  }
+  protected publishConnection(connection: ConnectionState) {
+    this.emit({
+      kind: "connection",
+      sequence: ++this.eventSequence,
+      connection,
+    });
+  }
+  protected publishTree() {
+    this.emit({ kind: "tree", sequence: ++this.eventSequence });
   }
   protected async refreshViews(content = true) {
     for (const raw of await this.execute<CoreDocument[]>("resident"))
       this.publish(raw, content);
   }
+  async composition(_id: string, _active: boolean) {}
   async open(path: VaultPath): Promise<ServiceDocument> {
     try {
       const raw = await this.execute<CoreDocument>("open", { path });
@@ -174,6 +193,7 @@ export class OpfsEditorHost {
     id: string,
     context: SelectionContext,
     redo: boolean,
+    _version?: Version,
   ): Promise<EditResult> {
     const result = await this.execute<CoreEdit>("undo", { id, context, redo });
     this.publish(result.document);

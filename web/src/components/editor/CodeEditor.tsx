@@ -63,6 +63,7 @@ interface CodeEditorProps {
   reveal?: { from: number; to: number; requestId: string };
   document: EditorDocument;
   onTransaction?: (transaction: ViewEdit) => boolean;
+  onComposition?: (active: boolean) => void;
   onUndo?: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
   cached?: EditorBuffer;
@@ -70,6 +71,32 @@ interface CodeEditorProps {
   onSave: () => void;
   onCursor: (line: number, column: number) => void;
   onCache: (buffer: EditorBuffer) => void;
+}
+function minimalChange(before: string, after: string) {
+  const oldChars = Array.from(before),
+    newChars = Array.from(after);
+  let prefix = 0,
+    suffix = 0;
+  while (
+    prefix < oldChars.length &&
+    prefix < newChars.length &&
+    oldChars[prefix] === newChars[prefix]
+  )
+    prefix++;
+  while (
+    suffix < oldChars.length - prefix &&
+    suffix < newChars.length - prefix &&
+    oldChars[oldChars.length - suffix - 1] ===
+      newChars[newChars.length - suffix - 1]
+  )
+    suffix++;
+  const from = oldChars.slice(0, prefix).join("").length;
+  return {
+    from,
+    to:
+      before.length - oldChars.slice(oldChars.length - suffix).join("").length,
+    insert: newChars.slice(prefix, newChars.length - suffix).join(""),
+  };
 }
 const serviceUpdate = Annotation.define<boolean>();
 const selectionContext = (state: EditorState): SelectionContext => ({
@@ -154,6 +181,14 @@ export default function CodeEditor(props: CodeEditorProps) {
         ? []
         : transaction,
     ),
+    EditorView.domEventHandlers({
+      compositionstart: () => {
+        props.onComposition?.(true);
+      },
+      compositionend: () => {
+        setTimeout(() => props.onComposition?.(false), 0);
+      },
+    }),
     EditorView.contentAttributes.of({
       "aria-label": "代码编辑器",
       spellcheck: "false",
@@ -371,8 +406,9 @@ export default function CodeEditor(props: CodeEditorProps) {
     () => ({
       content: props.document.content,
       selection: props.document.restoredSelection,
+      remote: props.document.remoteChange,
     }),
-    ({ content, selection }) => {
+    ({ content, selection, remote }) => {
       if (!view) return;
       const before = view.state.doc.toString();
       if (
@@ -383,7 +419,9 @@ export default function CodeEditor(props: CodeEditorProps) {
       const changes =
         before === content
           ? undefined
-          : { from: 0, to: before.length, insert: content };
+          : remote?.before === before
+            ? remote.edits
+            : minimalChange(before, content);
       const restore = selection && selection.revision !== selectionRevision;
       if (restore) selectionRevision = selection.revision;
       view.dispatch({

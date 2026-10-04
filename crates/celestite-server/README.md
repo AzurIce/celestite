@@ -16,7 +16,7 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 
 打开 Web 客户端，在底部“管理 Vault”中连接 `http://127.0.0.1:7437/api/v1/vaults/notes`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。
 
-配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免 SSE 长连接阻止退出。名称与目录可修改，保留 ID 即保留 URL。
+配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。名称与目录可修改，保留 ID 即保留 URL。
 
 ## 命令行
 
@@ -100,9 +100,40 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
 
 不覆盖移动及文件提交当前验证并实现于 **Linux**；其他平台返回 Unsupported。跨挂载点移动返回 Unsupported，不自动复制/删除。符号链接可列出、删除或移动链接本身，正常操作不跟随链接；访问通过受限目录句柄，防止链接逃逸 Vault。对 Vault 内目录的并发替换仍以平台能力和实际错误为准。
 
-notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。远端 Web 编辑器运行自己的客户端 core，通过文档 API 加入历史、提交保存，在冲突时提示覆盖、丢弃或取消。
+notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。远端 Web 编辑器通过 WebSocket 加入历史、发送实时 CRDT 增量与显式保存命令。外部文件修改经 host bridge 合入历史并主动推送。
 
-文件请求上限 64 MiB；正文整体进出内存。前端编辑上限仍为 5 MiB。请求超时或断网不会自动重放写操作，错误提示核对服务器状态。现有 Web 文件 API 没有离线同步或协同编辑。无头文档 API 已能交换 CRDT 历史；普通文件写请求仍不提供断线去重。
+文件请求上限 64 MiB；正文整体进出内存。前端编辑上限仍为 5 MiB。请求超时或断网不会自动重放写操作，错误提示核对服务器状态。普通文件 API 不承担协作；在线文本协作使用下述 WebSocket 会话，离线编辑暂不支持。普通文件写请求仍不提供断线去重。
+
+## 在线协作 WebSocket
+
+描述接口报告 `websocketSync: true`。每个客户端 VaultInstance 建立一条 `/api/v1/vaults/<id>/sync` 连接；HTTPS 使用 WSS，反向代理需转发 WebSocket upgrade。来源检查发生在升级前，认证通过首个 JSON 消息完成，不把令牌写入 URL：
+
+```json
+{
+  "protocolVersion": 1,
+  "token": "本次会话令牌",
+  "vaultIdentity": {
+    "id": "描述接口的 id",
+    "historyId": "描述接口的 historyId"
+  }
+}
+```
+
+host 返回 `hello`（`sessionId`），然后按文档发送 `document`（元数据、`packet`、分配的十进制 `writerId`、递增 `sequence`），在快照补齐屏障后发送 `ready`。文本来自 CRDT 包；元数据不重复发送正文，`savedContent` 仅在磁盘基线改变时发送。首次传快照，之后主动广播增量，覆盖未打开文件。慢消费者丢失提示后重新补齐；无法导出已提交历史时结束会话，客户端冻结并保留正文。
+
+请求均为 `{ sessionId, requestId, method, ...参数 }`，响应为 `{ kind: "reply", requestId, result }` 或 `error`：
+
+| method  | 参数                           | 行为                                                                             |
+| ------- | ------------------------------ | -------------------------------------------------------------------------------- |
+| open    | path                           | 取得文档完整历史及元数据；非文本通过普通文件 API 下载                            |
+| updates | id, packet, version, operation | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后持久提交并确认 |
+| save    | id, version                    | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                     |
+| probe   | id, version                    | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                             |
+| ping    | —                              | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                             |
+
+`document`、`tree` 和 `heartbeat` 为主动通知；`tree` 使文件树失效，实际目录仍通过 HTTP 查询。会话缓存最近 256 条操作回执，同序号同包重发返回原回执，变更载荷或跳号被拒绝；回执过期用因果检查点核对。重连分配新会话与 writer，拒绝旧 writer 的未提交操作，不自动重放。已确认操作的恢复依据持久 CRDT 历史，临时测试 Vault 的回执仅代表内存提交。
+
+客户端的个人撤销也生成自己的 CRDT 增量。输入同步不隐式保存普通文件；保存可能写回已经合入的其他 writer 修改。外部文件变化按磁盘历史分支合并，客户端不能用“丢弃”清除所有人的共享未保存历史。客户端导入保留当前 writer / 撤销，UI 映射待确认输入和选区，IME 期间暂缓导入；断线时整个 Vault 工作区（文件树与编辑区）显示遮罩并禁止交互，重新认证核对历史身份并从 host 重建会话；未确认输入可导出正文或明确丢弃，不自动重放。`probe` 保留为调试与因果检查接口，首期 Web 重连流程不使用它恢复旧输入。
 
 ## 无头编辑器 API
 
@@ -124,7 +155,7 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 核心类型字段采用 Rust 的 `snake_case`；外层状态字段采用 `camelCase`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
 
-描述接口的 `clientReplicaCommit: true` 表示支持远端 Web 客户端副本保存。`client-commit` 的 `action` 为 `save`、`overwrite` 或 `discard`：保存先核对 `expectedRevision`，基线不符时拒绝导入客户端操作；覆盖明确选择客户端正文；丢弃不发送客户端包，重新取得 host 最新文件。返回的完整快照用于补齐客户端历史，文档状态确认实际文件基线。快照限制为 16 MiB，文档请求 JSON 上限为 80 MiB 以容纳字节数组编码；仍使用既有认证、只读约束和 Vault 操作锁。
+`clientReplicaCommit: true` 保留旧 HTTP 客户端副本提交能力；正常 Web 编辑使用 WebSocket。`client-commit` 的 `action` 为 `save`、`overwrite` 或 `discard`：保存先核对 `expectedRevision`，基线不符时拒绝导入客户端操作；覆盖明确选择客户端正文；丢弃不发送客户端包，重新取得 host 最新文件。返回的完整快照用于补齐客户端历史，文档状态确认实际文件基线。快照限制为 16 MiB，文档请求 JSON 上限为 80 MiB 以容纳字节数组编码；仍使用既有认证、只读约束和 Vault 操作锁。
 
 host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修改；先处理 host 保存，再重试客户端丢弃。
 
@@ -185,17 +216,17 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全量状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId`，保留 Vault / 文档历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容；私有历史提交失败不会把未提交正文版本宣布为已确认版本；此时 `/snapshot` 与 `/updates` 暂停导出，避免通知后的一次失败提交被后续拉取当作已确认历史。
 
-描述接口报告 `documentEvents: true`。此通道是状态核对提示，不确认编辑请求，也不提供会话有效性、重发去重或在线租约；这些由后续协作协议实现。原 `/events` 继续提供文件树提示。
+描述接口报告 `documentEvents: true`。此通道是状态核对提示，不确认编辑请求，也不提供会话有效性、重发去重或在线租约；在线编辑由 WebSocket 会话协议提供这些约束。原 `/events` 继续提供文件树提示。
 
 ### 当前范围
 
-已实现独立文本 CRDT 与单个 server 的文件协调。`/documents` 当前扫描并加载全部合格文本，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、日志压缩或网络同步调度。描述接口明确报告 `vaultCrdt: false`。
+已实现独立文本 CRDT 与单个 server 的文件协调。`/documents` 当前扫描并加载全部合格文本，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、日志压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
 
-移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，core 先记录目录操作意图以恢复崩溃窗口；存在源 / 目标歧义时停止恢复并保留文件与历史。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入是拉取 / 提交参考传输，SSE 仍为变化提示；没有自动连接其他副本。本地与远端 Web 均使用统一 Rust core，远端普通编辑在保存时交换完整快照，尚未接入实时多客户端同步。Vim、Tree-sitter、LSP 尚未接入。
+移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，core 先记录目录操作意图以恢复崩溃窗口；存在源 / 目标歧义时停止恢复并保留文件与历史。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入保留为无头 / 调试传输，SSE 保留为变化提示；远端 Web 使用自己的 Rust WASM core 和实时 WebSocket 会话。Vim、Tree-sitter、LSP 尚未接入。
 
 ## 多实例与可视化调试
 
-多个独立客户端可从同一快照加入，通过 `/updates` 与 `/import` 交换各自 writer 的历史。服务端没有实例注册、在线成员列表、心跳或自动推送调度；SSE 是变化提示，参考客户端主动拉取。客户端个人撤销在自己的 core 上执行，不能用服务端 `/undo` 替代。
+多个独立客户端可从同一快照加入，通过 `/updates` 与 `/import` 交换各自 writer 的历史。生产连接使用 WebSocket 会话、心跳和主动广播；调试页保留 HTTP 主动拉取，不提供在线成员 / presence 列表。客户端个人撤销在自己的 core 上执行，不能用服务端 `/undo` 替代。
 
 Web 提供 `/debug/sync` 调试页，显示 host 与最多 6 个独立 WASM core，支持手动 / 每秒同步、暂停传输、个人撤销、显式保存、版本与提交回执检查。开发时使用 `http://localhost:1420/debug/sync`；构建后配置 `--web-dir web/dist`，也可从 server 的同一路径打开。详见 [Web 调试说明](../../web/README.md#同步调试页)。调试页用现有文档 API，沿用令牌、来源和只读检查。
 
@@ -205,6 +236,7 @@ Web 提供 `/debug/sync` 调试页，显示 host 与最多 6 个独立 WASM core
 cargo test -p celestite-core -p celestite-server
 # 只跑监听真实端口、无需浏览器的编辑器集成测试：
 cargo test -p celestite-server --test headless_editor
+cargo test -p celestite-server --test websocket_sync
 # 校验 feature 后面的实际 WASM 绑定：
 cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 cargo build -p celestite-server

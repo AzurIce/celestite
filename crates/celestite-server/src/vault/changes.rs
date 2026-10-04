@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DocumentNotice {
-    id: String,
+    pub id: String,
     path: String,
     version: Option<Version>,
     saved_version: Option<Version>,

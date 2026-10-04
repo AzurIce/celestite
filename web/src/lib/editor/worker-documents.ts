@@ -8,8 +8,10 @@ import type {
 } from "../vault/types";
 import type { DocumentsSnapshot } from "./documents";
 import { EditorClient } from "./rpc";
+import { rebaseInputs } from "./view-changes";
 import type { DocumentPreviews, PreviewState } from "./preview-contract";
 import type {
+  ConnectionState,
   EditorDocument,
   InstanceIdentity,
   SelectionContext,
@@ -19,6 +21,7 @@ import type {
 
 interface ViewRecord extends EditorDocument {
   savedContent: string;
+  acceptedContent: string;
   inputs: ViewEdit[];
   blocked: boolean;
 }
@@ -45,7 +48,11 @@ export class WorkerDocuments {
     link: (id, taskId, target) =>
       this.client.request("preview_link", { id, taskId, target }),
   };
+  reconnect?: (discardUnconfirmed?: boolean) => Promise<void>;
+  private connection?: ConnectionState;
+  private replacingSession = false;
   private records = new Map<string, ViewRecord>();
+  private treeListeners = new Set<Parameters<VaultBackend["watch"]>[0]>();
   private listeners = new Set<(state: DocumentsSnapshot) => void>();
   private queue: Promise<unknown> = Promise.resolve();
   private activeId: string | null = null;
@@ -66,13 +73,29 @@ export class WorkerDocuments {
     private client: EditorClient,
     private terminate: () => void,
     watch: VaultBackend["watch"] = async () => () => {},
+    remote = false,
   ) {
+    if (remote) this.connection = { status: "online", error: null };
     this.unsubscribe = client.subscribe((event) => {
-      this.merge(event.document);
+      if (event.kind === "connection") {
+        if (!this.replacingSession || event.connection.status !== "online")
+          this.connection = event.connection;
+        this.notify();
+        return;
+      }
+      if (event.kind === "tree") {
+        if (this.connection && this.connection.status !== "online") return;
+        for (const listener of this.treeListeners)
+          listener({ paths: [vaultPath("")], recursive: true });
+        return;
+      }
+      if (!this.replacingSession) this.merge(event.document);
       this.notify();
     });
     this.unsubscribeFailure = client.onFailure((error) => {
       this.openError = error.message;
+      if (this.connection)
+        this.connection = { status: "offline", error: error.message };
       for (const record of this.records.values()) {
         record.blocked = true;
         record.locked = true;
@@ -97,7 +120,14 @@ export class WorkerDocuments {
       rename: (from, to) => this.file("rename", { from, to }) as Promise<void>,
       remove: (path, options) =>
         this.file("remove", { path, options }) as Promise<void>,
-      watch,
+      watch: async (listener) => {
+        this.treeListeners.add(listener);
+        const detach = await watch(listener);
+        return () => {
+          this.treeListeners.delete(listener);
+          detach();
+        };
+      },
       close: () => this.close(),
     };
   }
@@ -108,6 +138,16 @@ export class WorkerDocuments {
   }
   snapshot(): DocumentsSnapshot {
     return {
+      connection: this.connection
+        ? {
+            ...this.connection,
+            unconfirmed:
+              this.connection.unconfirmed ||
+              [...this.records.values()].some(
+                (record) => record.inputs.length || record.blocked,
+              ),
+          }
+        : undefined,
       activeId: this.activeId,
       activation: this.activation,
       loadingPath: this.loadingPath,
@@ -116,10 +156,15 @@ export class WorkerDocuments {
       conflictResolving: this.conflictResolving,
       conflictError: this.conflictError,
       documents: [...this.records.values()].map((record) => {
-        const { inputs, savedContent, blocked, ...document } = record;
+        const { inputs, savedContent, acceptedContent, blocked, ...document } =
+          record;
         return {
           ...document,
           locked: document.locked || blocked,
+          readOnlyReason:
+            this.connection && this.connection.status !== "online"
+              ? "远端连接已断开，请重新连接。"
+              : document.readOnlyReason,
           dirty: document.content !== savedContent,
           pending: inputs.length,
         };
@@ -173,13 +218,77 @@ export class WorkerDocuments {
   private merge(document: ServiceDocument, replace = false) {
     const record = this.records.get(document.id);
     if (!record) return;
-    const { content, savedContent, ...metadata } = document;
+    const { content, savedContent, change, ...metadata } = document;
+    if (change && content !== undefined) {
+      if (record.acceptedContent !== change.before) {
+        record.blocked = true;
+        record.error = "远端投影版本不连续，输入仍保留。请复制正文后重新连接。";
+        return;
+      }
+      const beforeProjection = record.content;
+      const rebased = rebaseInputs(change.before, change.edits, record.inputs);
+      record.acceptedContent = content;
+      record.content = rebased.content;
+      record.remoteChange = { before: beforeProjection, edits: rebased.edits };
+    } else if (
+      content !== undefined &&
+      (replace || record.inputs.length === 0)
+    ) {
+      record.content = content;
+      record.acceptedContent = content;
+    }
     Object.assign(record, metadata);
     if (savedContent !== undefined) record.savedContent = savedContent;
-    if (content !== undefined && (replace || record.inputs.length === 0))
-      record.content = content;
     if (document.core?.historyError) record.error = document.core.historyError;
   }
+  async authorize(token: string, discardUnconfirmed = false) {
+    if (this.replacingSession) throw new VaultError("Busy", "正在重新连接。");
+    this.replacingSession = true;
+    this.connection = {
+      ...this.connection,
+      status: "reconnecting",
+      error: null,
+    };
+    this.notify();
+    try {
+      // Let in-flight RPCs settle first; their outcome decides whether input
+      // needs explicit discard. Queued edits see reconnecting and do not run.
+      await this.queue;
+      if (!discardUnconfirmed && this.snapshot().connection?.unconfirmed)
+        throw new VaultError(
+          "Conflict",
+          "存在未确认输入。重新连接将采用远端历史，请先导出正文或确认丢弃。",
+        );
+      const documents = await this.client.request("authorize", { token });
+      for (const document of documents) {
+        const record = this.records.get(document.id);
+        if (!record) continue;
+        record.inputs = [];
+        record.blocked = false;
+        record.locked = false;
+        delete record.remoteChange;
+        delete record.restoredSelection;
+        this.merge(document, true);
+        record.reloadVersion++;
+      }
+      this.openError = null;
+      this.connection = { status: "online", error: null };
+      this.conflictPrompt = null;
+      for (const listener of this.treeListeners)
+        listener({ paths: [vaultPath("")], recursive: true });
+    } catch (error) {
+      this.connection = {
+        ...this.connection,
+        status: "offline",
+        error: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    } finally {
+      this.replacingSession = false;
+      this.notify();
+    }
+  }
+
   has(id: string) {
     return this.records.has(id);
   }
@@ -192,8 +301,15 @@ export class WorkerDocuments {
         record.core?.historyError,
     );
   }
+  private online() {
+    return !this.connection || this.connection.status === "online";
+  }
+  private requireOnline() {
+    if (!this.online())
+      throw new VaultError("Closed", "远端连接已断开，请重新连接后操作。");
+  }
   activate(id: string) {
-    if (this.closing || !this.records.has(id)) return;
+    if (!this.online() || this.closing || !this.records.has(id)) return;
     this.openRequest++;
     this.loadingPath = null;
     this.openError = null;
@@ -202,7 +318,7 @@ export class WorkerDocuments {
     this.notify();
   }
   async open(path: VaultPath): Promise<boolean> {
-    if (this.closing) return false;
+    if (!this.online() || this.closing) return false;
     const existing = [...this.records.values()].find(
       (record) => record.path === path,
     );
@@ -225,6 +341,7 @@ export class WorkerDocuments {
         this.records.set(document.id, {
           ...document,
           content: document.content ?? "",
+          acceptedContent: document.content ?? "",
           savedContent: document.savedContent ?? "",
           dirty: false,
           locked: false,
@@ -247,6 +364,13 @@ export class WorkerDocuments {
       }
     });
   }
+  composition(id: string, active: boolean) {
+    if (!this.online()) return;
+    const send = () => this.client.request("composition", { id, active });
+    // Start precedes the first IME transaction; end follows all of its queued
+    // inputs, so held remote updates cannot split a composition.
+    void (active ? send() : this.enqueue(send)).catch(() => {});
+  }
   /** Full-text writes are deliberately unavailable on the worker edit path. */
   update(_id: string, _content: string) {
     return false;
@@ -259,7 +383,8 @@ export class WorkerDocuments {
       record.readOnlyReason ||
       record.blocked ||
       record.core.historyError ||
-      this.closing
+      this.closing ||
+      (this.connection && this.connection.status !== "online")
     )
       return false;
     record.content = input.content;
@@ -277,7 +402,12 @@ export class WorkerDocuments {
     input: ViewEdit,
   ): Promise<boolean> {
     if (!record.inputs.includes(input)) return true;
-    if (record.core?.historyError || record.blocked) return false;
+    if (
+      record.core?.historyError ||
+      record.blocked ||
+      (this.connection && this.connection.status !== "online")
+    )
+      return false;
     if (record.inputs[0] !== input)
       throw new VaultError("IO", "待确认输入顺序不连续。");
     const result = await this.client.request("edit", {
@@ -288,6 +418,7 @@ export class WorkerDocuments {
       userEvent: input.userEvent,
     });
     record.inputs.shift();
+    record.acceptedContent = result.document.content ?? input.content;
     this.merge(result.document);
     this.notify();
     return !record.core?.historyError;
@@ -315,7 +446,8 @@ export class WorkerDocuments {
       !record?.core ||
       (record.locked && !this.undoRequests.has(id)) ||
       record.readOnlyReason ||
-      this.closing
+      this.closing ||
+      (this.connection && this.connection.status !== "online")
     )
       return false;
     const queued = this.undoRequests.has(id);
@@ -332,6 +464,7 @@ export class WorkerDocuments {
               ? record.restoredSelection
               : context,
           redo,
+          version: record.core!.version,
         });
         record.content = applyEdits(record.content, result.edits);
         this.merge(result.document);
@@ -355,10 +488,11 @@ export class WorkerDocuments {
   }
   async save(id = this.activeId): Promise<boolean> {
     const record = id ? this.records.get(id) : undefined;
-    if (!record || record.readOnlyReason) return false;
+    if (!this.online() || !record || record.readOnlyReason) return false;
     return this.enqueue(() => this.saveRecord(record));
   }
   private async saveRecord(record: ViewRecord) {
+    if (!this.online()) return false;
     try {
       if (!(await this.flushInputs(record))) return false;
       const result = await this.client.request("save", {
@@ -374,6 +508,7 @@ export class WorkerDocuments {
     }
   }
   async saveAll() {
+    if (!this.online()) return false;
     if (
       [...this.records.values()].some(
         (record) =>
@@ -404,6 +539,7 @@ export class WorkerDocuments {
     this.notify();
   }
   async closeDocument(id: string) {
+    if (!this.online()) return false;
     const record = this.records.get(id);
     if (!record || this.closing) return false;
     if (record.readOnlyReason && record.content !== record.savedContent)
@@ -429,6 +565,7 @@ export class WorkerDocuments {
     return false;
   }
   async resolveConflict(action: "overwrite" | "discard" | "cancel") {
+    if (!this.online()) return false;
     const prompt = this.conflictPrompt;
     if (!prompt || this.conflictResolving || this.closing) return false;
     if (action === "cancel") {
@@ -489,6 +626,7 @@ export class WorkerDocuments {
     },
   ) {
     if (this.closing) throw new VaultError("Closed", "Vault is closing");
+    this.requireOnline();
     const path = params.path ?? params.from ?? vaultPath("");
     const changes = ["rename", "remove", "writeFile", "readFile"].includes(
       method,
@@ -500,6 +638,7 @@ export class WorkerDocuments {
     if (affected.length) this.notify();
     try {
       return await this.enqueue(async () => {
+        this.requireOnline();
         for (const record of affected)
           if (!record.readOnlyReason && !(await this.flushInputs(record)))
             throw new VaultError("IO", "编辑历史尚未提交。", path);
@@ -596,14 +735,20 @@ export async function openRemoteEditor(
         worker.terminate();
         void backend.close();
       },
-      (listener) => backend.watch(listener),
+      undefined,
+      true,
     );
+    let currentToken = token;
+    documents.reconnect = async (discardUnconfirmed = false) => {
+      await documents.authorize(currentToken, discardUnconfirmed);
+    };
     return {
       identity,
       documents,
       backend: documents.treeBackend,
       authorize: async (token) => {
-        await client.request("authorize", { token });
+        await documents.authorize(token);
+        currentToken = token;
         (backend as import("../vault/http").HttpVaultBackend).authorize(token);
       },
     };

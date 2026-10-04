@@ -122,7 +122,11 @@ export class EditorClient {
       }
       this.previewSequence = message.event.sequence;
       for (const listener of this.previewListeners) listener(message.event);
-    } else if (message.kind === "document") {
+    } else if (
+      message.kind === "document" ||
+      message.kind === "tree" ||
+      message.kind === "connection"
+    ) {
       if (message.sequence !== this.sequence + 1) {
         this.fail(
           new VaultError("IO", "编辑服务通知不连续，请重新打开工作区。"),

@@ -13,6 +13,7 @@ use axum::{
 mod editor_api;
 mod profiles;
 mod reconcile;
+mod sync;
 pub mod vault;
 use notify::Watcher;
 use serde::Deserialize;
@@ -177,7 +178,7 @@ fn authorized(headers: &HeaderMap, access: &Access) -> bool {
 }
 async fn access_check(
     State(access): State<Access>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     if let Some(origin) = request.headers().get(header::ORIGIN) {
@@ -190,7 +191,23 @@ async fn access_check(
                 .into_response();
         }
     }
-    if !authorized(request.headers(), &access) {
+    // Browser WebSocket authentication is the first protocol message. Origin
+    // policy still applies before upgrading; ordinary HTTP keeps bearer auth.
+    let socket = request.method() == Method::GET
+        && request
+            .uri()
+            .path()
+            .strip_prefix("/api/v1/vaults/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(id, tail)| !id.is_empty() && tail == "sync")
+        && request
+            .headers()
+            .get(header::UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if socket {
+        request.extensions_mut().insert(access.clone());
+    }
+    if !socket && !authorized(request.headers(), &access) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(VaultError::new(
@@ -302,6 +319,7 @@ pub fn build_server(
     });
     let api = Router::new()
         .merge(editor_api::routes())
+        .merge(sync::routes())
         .route("/api/v1/vaults/{id}", get(describe))
         .route("/api/v1/vaults/{id}/stat", get(stat))
         .route("/api/v1/vaults/{id}/directory", get(read_dir).post(mkdir))
@@ -422,7 +440,7 @@ async fn describe(
         .lock()
         .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(
