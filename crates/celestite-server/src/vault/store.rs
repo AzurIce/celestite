@@ -3,7 +3,7 @@ use super::fs::{Result, VaultError};
 use celestite_core::{DirectoryIntent, DocumentHeader as Header, JournalEntry};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{fs, path::Path};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("editor_metadata");
 const HEADERS: TableDefinition<&str, &[u8]> = TableDefinition::new("editor_documents");
@@ -33,22 +33,16 @@ pub(crate) struct Store {
 
 impl Store {
     pub fn instance_id(&self) -> Result<String> {
-        let tx = self.db.begin_write().map_err(storage_error)?;
-        let id;
-        {
-            let mut meta = tx.open_table(META).map_err(storage_error)?;
-            let existing = meta
-                .get("instance-id")
-                .map_err(storage_error)?
-                .map(|value| value.value().to_vec());
-            id = existing
-                .map(|value| String::from_utf8(value).map_err(storage_error))
-                .transpose()?
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            meta.insert("instance-id", id.as_bytes())
-                .map_err(storage_error)?;
+        let tx = self.db.begin_read().map_err(storage_error)?;
+        let meta = tx.open_table(META).map_err(storage_error)?;
+        let value = meta
+            .get("instance-id")
+            .map_err(storage_error)?
+            .ok_or_else(|| storage_error("Missing host instance identity"))?;
+        let id = String::from_utf8(value.value().to_vec()).map_err(storage_error)?;
+        if uuid::Uuid::parse_str(&id).is_err() {
+            return Err(storage_error("Invalid host instance identity"));
         }
-        tx.commit().map_err(storage_error)?;
         Ok(id)
     }
     pub fn directory_intent(&self) -> Result<Option<DirectoryIntent>> {
@@ -73,46 +67,106 @@ impl Store {
         }
         tx.commit().map_err(storage_error)
     }
+    /// Normal startup never creates a file, table or identity.
     pub fn open(path: &Path, root: &Path) -> Result<(Self, VaultIdentity)> {
-        let db = Database::create(path).map_err(storage_error)?;
-        let tx = db.begin_write().map_err(storage_error)?;
-        let identity;
-        {
-            let mut meta = tx.open_table(META).map_err(storage_error)?;
-            let existing = meta
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            storage_error(format!(
+            "Cannot recover {}: {error}; initialize a new profile explicitly with --init-vault ID",
+            path.display()
+        ))
+        })?;
+        if !metadata.is_file() {
+            return Err(storage_error(
+                "History must be a regular file, not a symlink or directory",
+            ));
+        }
+        let db = Database::open(path).map_err(storage_error)?;
+        let identity = {
+            let tx = db.begin_read().map_err(storage_error)?;
+            let meta = tx.open_table(META).map_err(storage_error)?;
+            let bytes = meta
                 .get("vault")
                 .map_err(storage_error)?
-                .map(|bytes| bytes.value().to_vec());
-            let root = root
-                .to_str()
-                .ok_or_else(|| storage_error("Vault root must be UTF-8"))?;
-            let record: Metadata = if let Some(bytes) = existing {
-                let record: Metadata = serde_json::from_slice(&bytes).map_err(storage_error)?;
-                if record.schema != 1 || record.root != root {
-                    return Err(storage_error(
-                        "State belongs to another Vault directory or schema",
-                    ));
-                }
-                record
-            } else {
-                Metadata {
-                    schema: 1,
-                    root: root.into(),
-                    identity: VaultIdentity {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        history_id: uuid::Uuid::new_v4().to_string(),
-                    },
-                }
+                .ok_or_else(|| storage_error("Missing Vault metadata"))?;
+            let record: Metadata = serde_json::from_slice(bytes.value()).map_err(storage_error)?;
+            if record.schema != 1 || Some(record.root.as_str()) != root.to_str() {
+                return Err(storage_error(
+                    "State belongs to another Vault directory or schema",
+                ));
+            }
+            if uuid::Uuid::parse_str(&record.identity.id).is_err()
+                || uuid::Uuid::parse_str(&record.identity.history_id).is_err()
+            {
+                return Err(storage_error("Invalid Vault/history identity"));
+            }
+            tx.open_table(HEADERS).map_err(storage_error)?;
+            tx.open_table(JOURNAL).map_err(storage_error)?;
+            record.identity
+        };
+        let store = Self { db };
+        store.instance_id()?;
+        Ok((store, identity))
+    }
+
+    /// Exclusive creation: repeating initialization cannot overwrite an existing profile.
+    pub fn initialize(path: &Path, root: &Path) -> Result<(Self, VaultIdentity)> {
+        let root = root
+            .to_str()
+            .ok_or_else(|| storage_error("Vault root must be UTF-8"))?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(storage_error)?;
+        let db = Database::create(path).map_err(storage_error)?;
+        let tx = db.begin_write().map_err(storage_error)?;
+        let identity = VaultIdentity {
+            id: uuid::Uuid::new_v4().to_string(),
+            history_id: uuid::Uuid::new_v4().to_string(),
+        };
+        {
+            let record = Metadata {
+                schema: 1,
+                root: root.into(),
+                identity: identity.clone(),
             };
             let bytes = serde_json::to_vec(&record).map_err(storage_error)?;
+            let mut meta = tx.open_table(META).map_err(storage_error)?;
             meta.insert("vault", bytes.as_slice())
                 .map_err(storage_error)?;
-            identity = record.identity;
+            let instance = uuid::Uuid::new_v4().to_string();
+            meta.insert("instance-id", instance.as_bytes())
+                .map_err(storage_error)?;
             tx.open_table(HEADERS).map_err(storage_error)?;
             tx.open_table(JOURNAL).map_err(storage_error)?;
         }
         tx.commit().map_err(storage_error)?;
+        sync_directory(
+            path.parent()
+                .ok_or_else(|| storage_error("History has no parent"))?,
+        )?;
+        tracing::info!(path = %path.display(), vault_identity = %identity.id, history_id = %identity.history_id, "Initialized Vault history");
         Ok((Self { db }, identity))
+    }
+
+    /// Reset an exclusively owned, validated profile; retain its complete history as an archive.
+    pub fn reset(path: &Path, root: &Path) -> Result<(Self, VaultIdentity)> {
+        let (old, _) = Self::open(path, root)?;
+        old.load()?;
+        old.directory_intent()?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| storage_error("History has no parent"))?;
+        let archive = parent.join(format!("reset-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&archive).map_err(storage_error)?;
+        fs::rename(path, archive.join("history.redb")).map_err(storage_error)?;
+        sync_directory(&archive)?;
+        sync_directory(parent)?;
+        tracing::warn!(archive = %archive.display(), "Archived old Vault history for explicit reset");
+        // Keep the old database's owner lock until the new identity is committed.
+        let result = Self::initialize(path, root);
+        drop(old);
+        result
     }
 
     pub fn load(&self) -> Result<Vec<(Header, Vec<JournalEntry>)>> {
@@ -193,4 +247,14 @@ impl Store {
         }
         tx.commit().map_err(storage_error)
     }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(storage_error)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }

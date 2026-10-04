@@ -40,9 +40,13 @@ pub(crate) struct NativeBackend {
     intent: Option<DirectoryIntent>,
 }
 impl NativeBackend {
-    pub fn open(state: Option<&Path>, root: &Path) -> fs::Result<Self> {
+    pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> fs::Result<Self> {
         let (store, identity) = if let Some(path) = state {
-            let (store, identity) = Store::open(path, root)?;
+            let (store, identity) = match mode {
+                crate::HistoryMode::Recover => Store::open(path, root)?,
+                crate::HistoryMode::Initialize => Store::initialize(path, root)?,
+                crate::HistoryMode::Reset => Store::reset(path, root)?,
+            };
             (Some(store), identity)
         } else {
             (

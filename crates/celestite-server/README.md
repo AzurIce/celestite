@@ -8,8 +8,9 @@
 
 ```sh
 cargo build -p celestite-server
-mkdir -p /tmp/celestite-demo/notes
+mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
 cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
+./target/debug/celestite-server --config /tmp/celestite-demo/config.toml --init-vault notes
 ./target/debug/celestite-server --config /tmp/celestite-demo/config.toml
 ```
 
@@ -27,7 +28,8 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
   --listen 127.0.0.1:7437 \
   --allowed-origin http://localhost:1420 \
   --vault notes=./notes --vault-name 'notes=我的笔记' \
-  --vault reference=./reference --vault-read-only reference=true
+  --vault reference=./reference --vault-read-only reference=true \
+  --ephemeral-vault notes --ephemeral-vault reference
 
 # 覆盖部分配置；其他 Vault 及设置保留
 ./target/debug/celestite-server --config ./config.toml \
@@ -37,25 +39,29 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
   --vault-read-only notes=false
 ```
 
-| 参数                               | 行为                                                         |
-| ---------------------------------- | ------------------------------------------------------------ |
-| `-c, --config FILE`                | 读取指定 TOML 文件                                           |
-| `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                       |
-| `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                      |
-| `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名    |
-| `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                      |
-| `--token-env VARIABLE`             | 覆盖用于读取访问令牌的环境变量名                             |
-| `--no-token`                       | 清除配置中的令牌要求；非回环监听仍会拒绝启动                 |
-| `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                        |
-| `--state-dir DIRECTORY`            | 启用持久化 CRDT 历史；目录需存在且不得与 Vault、静态资源重叠 |
-| `--no-web`                         | 禁用配置中的静态 Web 资源目录                                |
-| `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                 |
-| `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                          |
-| `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                          |
+| 参数                               | 行为                                                            |
+| ---------------------------------- | --------------------------------------------------------------- |
+| `-c, --config FILE`                | 读取指定 TOML 文件                                              |
+| `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                          |
+| `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                         |
+| `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名       |
+| `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                         |
+| `--token-env VARIABLE`             | 覆盖用于读取访问令牌的环境变量名                                |
+| `--no-token`                       | 清除配置中的令牌要求；非回环监听仍会拒绝启动                    |
+| `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                           |
+| `--state-dir DIRECTORY`            | 兼容旧的共享状态目录布局 `<id>.redb`                            |
+| `--vault-state-dir ID=DIRECTORY`   | 可重复；覆盖指定 Vault 的私有状态目录，使用 `history.redb`      |
+| `--ephemeral-vault ID`             | 可重复；明确使用临时内存历史，禁用该 Vault 的持久化             |
+| `--init-vault ID`                  | 可重复；首次初始化指定 Vault 的历史，完成后退出；已有数据库报错 |
+| `--reset-vault ID`                 | 可重复；归档指定 Vault 的旧历史，创建新身份，完成后退出         |
+| `--no-web`                         | 禁用配置中的静态 Web 资源目录                                   |
+| `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                    |
+| `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                             |
+| `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                             |
 
 命令行目录路径以**当前工作目录**为基准，配置文件中的路径仍以**配置文件所在目录**为基准。新增 Vault 默认名称为 ID、可写；覆盖已有 Vault 目录保留其名称与只读状态，除非另行覆盖。不支持通过命令行移除配置中的 Vault，完全替换注册列表可使用 `--no-config` 加多个 `--vault`。
 
-`ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的名称/只读覆盖都会报错。清除选项与对应设置选项互斥。令牌参数只接受环境变量名称，令牌本身不会进入命令行参数或 URL。
+`ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。令牌参数只接受环境变量名称，令牌本身不会进入命令行参数或 URL。
 
 `server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；监听其他地址必须配置 `token_env`，从环境变量读取 Bearer token。前端令牌只保留在当前会话，连接 URL 与本地记录不包含令牌。远端 HTTPS 可由反向代理提供，代理后的客户端来源也需配置。CORS 支持 `Authorization`、`If-Match` 和读取 `ETag`，有 Origin 的 API 请求另行检查来源；CORS 不承担认证。
 
@@ -72,7 +78,6 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
 请求日志不包含查询串、请求头或正文；同步日志只记录包大小和状态。作为 library 使用时，由调用者初始化 subscriber。
 
 ## API v1
-
 
 下面路径均相对于 `/api/v1/vaults/<id>`，文件路径通过查询参数传递，使用 Vault 内相对路径与 `/` 分隔。空路径表示根目录。
 
@@ -139,14 +144,29 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 ### 持久化和磁盘保存
 
+每个正式 Vault 在 `[[vaults]]` 中配置 `state_dir`；正常启动仅打开已有历史。以下两条命令分别初始化和运行：
+
 ```sh
-mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/editor-state
+mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
 cargo run -p celestite-server -- --no-config \
   --vault notes=/tmp/celestite-demo/notes \
-  --state-dir /tmp/celestite-demo/editor-state
+  --vault-state-dir notes=/tmp/celestite-demo/state/notes --init-vault notes
+cargo run -p celestite-server -- --no-config \
+  --vault notes=/tmp/celestite-demo/notes \
+  --vault-state-dir notes=/tmp/celestite-demo/state/notes
+
+# 仓库内 ../notist/docs 的开发入口：
+just init-notist  # 首次执行，已有历史时拒绝覆盖
+just serve-notist
 ```
 
-`state_dir` 也可写在 TOML `[server]` 中。不指定时，内核历史只驻留内存，重启会建立新身份和历史，状态中 `durableVersion` 为 null。指定后，每个配置 ID 对应一个 redb 文件，记录 Vault 身份、文件 ID、初始快照、追加更新日志与磁盘基线。每次提交成功后才报告 `durableVersion`；目录与 profile 绑定，不能将同一个 profile 静默用于另一目录。
+状态目录必须存在，不能与任何 Vault、其他私有状态目录或静态资源目录重叠；符号链接别名按实际路径校验。一个 profile 同时只允许一个 host 打开。状态库包含稳定 Vault / 文档 / host 实例身份、初始快照、追加更新日志、pending 依赖包、磁盘基线和恢复意图；每次历史事务提交成功后才报告 `durableVersion`。更改名称或 URL 配置 ID，保留相同物理目录与私有状态目录时保留内部身份。更改物理目录则拒绝恢复，需要另行迁移。
+
+未指定状态目录时拒绝启动。临时测试可显式配置 `ephemeral = true` 或 `--ephemeral-vault ID`：重启建立新身份和历史，`durableVersion` 为 null。初始化 / 重置是一次性 CLI 操作，不能配置为每次启动执行。多个 Vault 的配置会在操作前统一校验，但历史初始化 / 重置按 Vault 执行，不提供跨 Vault 事务；发生失败后核对各 profile，再仅初始化尚未完成的 Vault。
+
+正常恢复遇到数据库缺失、损坏、身份 / schema / 根目录不匹配时失败，不从普通文件静默重建。`--init-vault ID` 使用独占创建，不覆盖任何已有文件。`--reset-vault ID` 要求原 profile 可校验且没有其他 owner，先将完整旧数据库移入同一状态目录的 `reset-<uuid>/history.redb`，同步归档目录后创建新身份；普通文件保持原样，未写回的旧正文仍在归档内。重置中断或失败时保留归档和任何已创建文件，不自动推断恢复；损坏库应先单独保留并处理，不通过 reset 忽略损坏。
+
+兼容旧 `[server].state_dir` / `--state-dir`：没有私有 `state_dir` 的持久化 Vault 继续打开其下的 `<配置 id>.redb`，不改名或重新 seed。私有配置优先。迁移布局时停止 host，保留备份，将该数据库迁入私有目录并命名为 `history.redb`，再修改配置；旧布局更改 URL ID 需要同时明确迁移对应文件。
 
 `dirty` 表示正文与最后已保存文本不同；`savedVersion` 是最后磁盘写回时的因果版本；`durableVersion` 是已提交历史的应用版本。持久化历史不等于写回 `.md`，`/save` 是显式动作。没有可见文本变化的导入也可能推进因果版本。等待依赖的包已经写入日志，但不会被虚报为已应用版本。
 

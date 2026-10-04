@@ -1,4 +1,4 @@
-use celestite_server::{Config, ServerConfig, VaultConfig};
+use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig};
 use clap::Parser;
 use std::{
     collections::HashSet,
@@ -42,9 +42,21 @@ pub struct Cli {
     /// Serve a built Web UI from this directory
     #[arg(long, value_name = "DIRECTORY", conflicts_with = "no_web")]
     web_dir: Option<PathBuf>,
-    /// Existing state directory outside Vaults; omit for volatile CRDT histories
+    /// Legacy shared state directory containing ID.redb (prefer --vault-state-dir)
     #[arg(long, value_name = "DIRECTORY")]
     state_dir: Option<PathBuf>,
+    /// Set a Vault's private state directory (must exist); repeat for multiple Vaults
+    #[arg(long, value_name = "ID=DIRECTORY", value_parser = parse_assignment)]
+    vault_state_dir: Vec<Assignment>,
+    /// Use a temporary in-memory history for this Vault; repeat for multiple Vaults
+    #[arg(long, value_name = "ID", value_parser = parse_vault_id)]
+    ephemeral_vault: Vec<String>,
+    /// Initialize a new history without overwriting an existing one, then exit
+    #[arg(long, value_name = "ID", value_parser = parse_vault_id)]
+    init_vault: Vec<String>,
+    /// Archive a stopped Vault's history and create a new identity, then exit
+    #[arg(long, value_name = "ID", value_parser = parse_vault_id)]
+    reset_vault: Vec<String>,
     /// Disable the configured static Web UI
     #[arg(long)]
     no_web: bool,
@@ -72,13 +84,7 @@ struct ReadOnly {
 
 fn parse_assignment(value: &str) -> Result<Assignment, String> {
     let (id, value) = value.split_once('=').ok_or("Expected ID=VALUE")?;
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err("Vault IDs must contain only ASCII letters, digits, - or _".into());
-    }
+    parse_vault_id(id)?;
     if value.trim().is_empty() {
         return Err("The value after = must not be empty".into());
     }
@@ -86,6 +92,16 @@ fn parse_assignment(value: &str) -> Result<Assignment, String> {
         id: id.into(),
         value: value.into(),
     })
+}
+fn parse_vault_id(id: &str) -> Result<String, String> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Vault IDs must contain only ASCII letters, digits, - or _".into());
+    }
+    Ok(id.into())
 }
 fn parse_read_only(value: &str) -> Result<ReadOnly, String> {
     let assignment = parse_assignment(value)?;
@@ -124,6 +140,7 @@ impl Cli {
                 .ok_or("Configuration has no parent directory")?;
             for vault in &mut config.vaults {
                 vault.path = base.join(&vault.path);
+                vault.state_dir = vault.state_dir.take().map(|path| base.join(path));
             }
             config.server.web_dir = config.server.web_dir.map(|path| base.join(path));
             config.server.state_dir = config.server.state_dir.map(|path| base.join(path));
@@ -171,6 +188,7 @@ impl Cli {
                     id,
                     path,
                     read_only: false,
+                    ..Default::default()
                 });
             }
         }
@@ -187,6 +205,48 @@ impl Cli {
                 return Err(format!("Duplicate --vault-read-only ID: {id}").into());
             }
             find_vault(&mut config, &id)?.read_only = value;
+        }
+        let mut seen = HashSet::new();
+        for Assignment { id, value } in self.vault_state_dir {
+            if !seen.insert(id.clone()) {
+                return Err(format!("Duplicate --vault-state-dir ID: {id}").into());
+            }
+            let vault = find_vault(&mut config, &id)?;
+            vault.state_dir = Some(cwd.join(value));
+            vault.ephemeral = false;
+        }
+        let mut temporary = HashSet::new();
+        for id in self.ephemeral_vault {
+            if !temporary.insert(id.clone()) || seen.contains(&id) {
+                return Err(
+                    format!("Duplicate or conflicting history settings for Vault {id}").into(),
+                );
+            }
+            let vault = find_vault(&mut config, &id)?;
+            vault.state_dir = None;
+            vault.ephemeral = true;
+        }
+        let mut lifecycle = HashSet::new();
+        for (ids, mode) in [
+            (self.init_vault, HistoryMode::Initialize),
+            (self.reset_vault, HistoryMode::Reset),
+        ] {
+            for id in ids {
+                if !lifecycle.insert(id.clone()) {
+                    return Err(format!(
+                        "Duplicate or conflicting initialization/reset for Vault {id}"
+                    )
+                    .into());
+                }
+                let vault = find_vault(&mut config, &id)?;
+                if vault.ephemeral {
+                    return Err(format!(
+                        "Vault {id}: initialization/reset requires persistent history"
+                    )
+                    .into());
+                }
+                vault.history_mode = mode;
+            }
         }
         Ok(config)
     }
@@ -379,6 +439,83 @@ read_only = true
             .unwrap();
         assert_eq!(config.vaults.len(), 1);
         assert_eq!(config.vaults[0].id, "work");
+    }
+
+    #[test]
+    fn per_vault_state_paths_and_lifecycle_preserve_their_path_bases() {
+        let cwd = tempfile::tempdir().unwrap();
+        let base = cwd.path().join("config");
+        std::fs::create_dir(&base).unwrap();
+        config_file(&base);
+        let file = base.join("config.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, text + "state_dir = \"private\"\n").unwrap();
+        let load = |extra: &[&str]| {
+            let mut args = vec!["server", "--config", file.to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).unwrap().load(cwd.path()).unwrap()
+        };
+        assert_eq!(load(&[]).vaults[0].state_dir, Some(base.join("private")));
+        let config = load(&[
+            "--vault-state-dir",
+            "notes=override",
+            "--init-vault",
+            "notes",
+        ]);
+        assert_eq!(
+            config.vaults[0].state_dir,
+            Some(cwd.path().join("override"))
+        );
+        assert_eq!(config.vaults[0].history_mode, HistoryMode::Initialize);
+        assert_eq!(
+            load(&["--reset-vault", "notes"]).vaults[0].history_mode,
+            HistoryMode::Reset
+        );
+        let config = load(&["--ephemeral-vault", "notes"]);
+        assert!(config.vaults[0].ephemeral);
+        assert_eq!(config.vaults[0].state_dir, None);
+        let config = load(&[
+            "--vault",
+            "work=work",
+            "--vault-state-dir",
+            "work=state-work",
+        ]);
+        assert_eq!(
+            config.vaults[1].state_dir,
+            Some(cwd.path().join("state-work"))
+        );
+    }
+
+    #[test]
+    fn history_arguments_reject_unknown_duplicate_and_conflicting_ids() {
+        let cwd = tempfile::tempdir().unwrap();
+        for extra in [
+            vec!["--vault-state-dir", "other=state"],
+            vec!["--ephemeral-vault", "other"],
+            vec!["--init-vault", "other"],
+            vec!["--reset-vault", "other"],
+            vec![
+                "--vault-state-dir",
+                "notes=one",
+                "--vault-state-dir",
+                "notes=two",
+            ],
+            vec!["--ephemeral-vault", "notes", "--ephemeral-vault", "notes"],
+            vec!["--init-vault", "notes", "--init-vault", "notes"],
+            vec!["--init-vault", "notes", "--reset-vault", "notes"],
+            vec!["--ephemeral-vault", "notes", "--init-vault", "notes"],
+            vec![
+                "--ephemeral-vault",
+                "notes",
+                "--vault-state-dir",
+                "notes=state",
+            ],
+        ] {
+            let mut args = vec!["server", "--no-config", "--vault", "notes=notes"];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).unwrap().load(cwd.path()).is_err());
+        }
+        assert!(Cli::try_parse_from(["server", "--init-vault", "bad/id"]).is_err());
     }
 
     #[test]

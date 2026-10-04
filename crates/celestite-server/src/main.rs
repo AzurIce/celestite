@@ -1,4 +1,4 @@
-use celestite_server::{build_server, Config};
+use celestite_server::{build_server, Config, HistoryMode};
 use clap::Parser;
 use std::{io::IsTerminal, process::ExitCode};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
@@ -37,7 +37,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = cli::Cli::parse().load(&cwd)?;
     let listen = config.server.listen;
     let ids: Vec<_> = config.vaults.iter().map(|v| v.id.clone()).collect();
+    let setup = config
+        .vaults
+        .iter()
+        .any(|v| v.history_mode != HistoryMode::Recover);
     let server = build_server(config, &cwd)?;
+    if setup {
+        tracing::info!(
+            "Vault history setup complete; restart without --init-vault / --reset-vault to serve"
+        );
+        return Ok(());
+    }
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let listen = listener.local_addr()?;
     tracing::info!(address = %listen, "Celestite server listening");

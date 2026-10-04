@@ -1,6 +1,6 @@
 //! Real HTTP clients and a listening server. No browser or editor view involved.
 use celestite_core::*;
-use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
+use celestite_server::{build_server, Config, HistoryMode, ServerConfig, VaultConfig};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
@@ -21,7 +21,6 @@ impl Server {
             Config {
                 server: ServerConfig {
                     listen: address,
-                    state_dir: state.map(Path::to_owned),
                     ..Default::default()
                 },
                 vaults: vec![VaultConfig {
@@ -29,6 +28,13 @@ impl Server {
                     name: "Notes".into(),
                     path: root.into(),
                     read_only,
+                    state_dir: state.map(Path::to_owned),
+                    ephemeral: state.is_none(),
+                    history_mode: if state.is_some_and(|dir| !dir.join("history.redb").exists()) {
+                        HistoryMode::Initialize
+                    } else {
+                        HistoryMode::Recover
+                    },
                 }],
             },
             root,

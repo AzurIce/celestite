@@ -11,11 +11,12 @@ use axum::{
     Json, Router,
 };
 mod editor_api;
+mod profiles;
 pub mod vault;
 use notify::Watcher;
 use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -53,7 +54,7 @@ pub struct ServerConfig {
     /// Environment variable containing a bearer token; the token is never included in URLs.
     pub token_env: Option<String>,
     pub web_dir: Option<PathBuf>,
-    /// Existing directory outside Vaults/static assets for durable editor histories.
+    /// Legacy shared directory containing <configured-vault-id>.redb files.
     pub state_dir: Option<PathBuf>,
 }
 impl Default for ServerConfig {
@@ -67,7 +68,7 @@ impl Default for ServerConfig {
         }
     }
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     pub id: String,
@@ -75,6 +76,22 @@ pub struct VaultConfig {
     pub path: PathBuf,
     #[serde(default)]
     pub read_only: bool,
+    /// Private directory containing this Vault's history.redb.
+    pub state_dir: Option<PathBuf>,
+    /// Explicitly discard history on shutdown; intended for temporary tests.
+    #[serde(default)]
+    pub ephemeral: bool,
+    /// Initialization/reset is a one-shot CLI action, never a startup policy in TOML.
+    #[serde(skip)]
+    pub history_mode: HistoryMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryMode {
+    #[default]
+    Recover,
+    Initialize,
+    Reset,
 }
 struct HostedVault {
     id: String,
@@ -210,44 +227,20 @@ pub fn build_server(
         })
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
     let mut vaults = HashMap::new();
-    let mut roots = HashSet::new();
-    let state_dir = config
-        .server
-        .state_dir
-        .as_ref()
-        .map(|path| base.join(path).canonicalize())
-        .transpose()?;
-    for vault in config.vaults {
-        if vault.id.is_empty()
-            || !vault
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err("Vault IDs must contain only ASCII letters, digits, - or _".into());
-        }
-        if vault.name.trim().is_empty() || vaults.contains_key(&vault.id) {
-            return Err("Vault names must not be empty and IDs must be unique".into());
-        }
-        let root = base.join(&vault.path).canonicalize()?;
-        if roots
-            .iter()
-            .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
-        {
-            return Err("Vault directories must not overlap".into());
-        }
-        roots.insert(root.clone());
-        if state_dir
-            .as_ref()
-            .is_some_and(|state| state.starts_with(&root) || root.starts_with(state))
-        {
-            return Err("state_dir must not overlap any Vault directory".into());
-        }
+    let (prepared, web_dir) = profiles::prepare(
+        config.vaults,
+        config.server.state_dir.as_deref(),
+        config.server.web_dir.as_deref(),
+        base,
+    )?;
+    for profiles::PreparedVault {
+        config: vault,
+        root,
+        history_path,
+    } in prepared
+    {
         let files = FsVault::open(&root)?;
-        let history_path = state_dir
-            .as_ref()
-            .map(|state| state.join(format!("{}.redb", vault.id)));
-        let documents = Documents::open(history_path.as_deref(), &root)?;
+        let documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
         let (events, _) = broadcast::channel(128);
         let sender = events.clone();
         let watched_vault = vault.id.clone();
@@ -316,23 +309,7 @@ pub fn build_server(
         )
         .with_state(state);
     let mut router = Router::new().merge(api);
-    if let Some(directory) = config.server.web_dir {
-        let directory = base.join(directory).canonicalize()?;
-        if roots
-            .iter()
-            .any(|root| root.starts_with(&directory) || directory.starts_with(root))
-        {
-            return Err("web_dir must not overlap any Vault directory".into());
-        }
-        if state_dir
-            .as_ref()
-            .is_some_and(|state| state.starts_with(&directory) || directory.starts_with(state))
-        {
-            return Err("state_dir must not overlap web_dir".into());
-        }
-        if !directory.join("index.html").is_file() {
-            return Err("web_dir must contain a built index.html".into());
-        }
+    if let Some(directory) = web_dir {
         tracing::info!(directory = %directory.display(), "Serving Web UI");
         // Only assets from the configured UI directory, never files from Vault roots.
         router = router
@@ -582,6 +559,8 @@ mod tests {
                 name: "Notes".into(),
                 path: root.path().into(),
                 read_only,
+                ephemeral: true,
+                ..Default::default()
             }],
         };
         let router = app(config, root.path()).unwrap();
@@ -838,6 +817,8 @@ mod tests {
                     name: "N".into(),
                     path: root.path().into(),
                     read_only: false,
+                    ephemeral: true,
+                    ..Default::default()
                 }],
             },
             root.path(),
@@ -928,6 +909,8 @@ mod tests {
                     name: "N".into(),
                     path: root.path().into(),
                     read_only: false,
+                    ephemeral: true,
+                    ..Default::default()
                 }],
             },
             root.path(),
@@ -960,6 +943,8 @@ mod tests {
                 name: "N".into(),
                 path: "vault".into(),
                 read_only: false,
+                ephemeral: true,
+                ..Default::default()
             }],
         };
         let router = app(config("web"), root.path()).unwrap();
@@ -1009,6 +994,8 @@ mod tests {
             name: "N".into(),
             path,
             read_only: false,
+            ephemeral: true,
+            ..Default::default()
         };
         assert!(app(
             Config {

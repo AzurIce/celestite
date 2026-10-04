@@ -9,3 +9,4 @@
 /gen/schemas
 /web/.cache/
 /web/src/lib/editor/generated/
+/.celestite-state/

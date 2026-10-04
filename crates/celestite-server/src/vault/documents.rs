@@ -14,9 +14,9 @@ pub(crate) struct Documents {
     core: EditorCore<NativeBackend>,
 }
 impl Documents {
-    pub fn open(state: Option<&Path>, root: &Path) -> Result<Self> {
-        let core =
-            block_on(EditorCore::open(NativeBackend::open(state, root)?)).map_err(vault_error)?;
+    pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> Result<Self> {
+        let core = block_on(EditorCore::open(NativeBackend::open(state, root, mode)?))
+            .map_err(vault_error)?;
         let vault = &core.identity().vault;
         Ok(Self {
             identity: VaultIdentity {
@@ -87,7 +87,7 @@ mod tests {
         let second = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let db = state.path().join("notes.redb");
-        drop(Documents::open(Some(&db), first.path()).unwrap());
-        assert!(Documents::open(Some(&db), second.path()).is_err());
+        drop(Documents::open(Some(&db), first.path(), crate::HistoryMode::Initialize).unwrap());
+        assert!(Documents::open(Some(&db), second.path(), crate::HistoryMode::Recover).is_err());
     }
 }

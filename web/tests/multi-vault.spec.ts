@@ -52,7 +52,7 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
           ["notes", "work", "readonly"]
             .map(
               (id) =>
-                `[[vaults]]\nid = "${id}"\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\n`,
+                `[[vaults]]\nid = "${id}"\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\nephemeral = true\n`,
             )
             .join("\n"),
       );
