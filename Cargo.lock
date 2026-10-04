@@ -3110,18 +3110,15 @@ dependencies = [
 [[package]]
 name = "notist"
 version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=532fab6c170522a40f2c71ebd3d32988117b2ed2#532fab6c170522a40f2c71ebd3d32988117b2ed2"
 dependencies = [
  "clap",
  "codespan-reporting",
  "notist-core",
- "notist-html",
  "notist-md",
  "notist-syntax",
  "rowan",
- "serde",
- "serde_json",
  "tokio",
- "toml 0.8.2",
  "tower-lsp",
  "wasm-bindgen",
 ]
@@ -3129,6 +3126,7 @@ dependencies = [
 [[package]]
 name = "notist-core"
 version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=532fab6c170522a40f2c71ebd3d32988117b2ed2#532fab6c170522a40f2c71ebd3d32988117b2ed2"
 dependencies = [
  "rowan",
 ]
@@ -3136,14 +3134,15 @@ dependencies = [
 [[package]]
 name = "notist-html"
 version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=532fab6c170522a40f2c71ebd3d32988117b2ed2#532fab6c170522a40f2c71ebd3d32988117b2ed2"
 dependencies = [
  "notist-core",
- "serde_json",
 ]
 
 [[package]]
 name = "notist-md"
 version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=532fab6c170522a40f2c71ebd3d32988117b2ed2#532fab6c170522a40f2c71ebd3d32988117b2ed2"
 dependencies = [
  "notist-core",
  "rowan",
@@ -3153,6 +3152,7 @@ dependencies = [
 [[package]]
 name = "notist-syntax"
 version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=532fab6c170522a40f2c71ebd3d32988117b2ed2#532fab6c170522a40f2c71ebd3d32988117b2ed2"
 dependencies = [
  "rowan",
 ]

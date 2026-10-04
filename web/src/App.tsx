@@ -1,7 +1,8 @@
 import { lazy, Loading } from "solid-js";
 
 const Page = lazy(() =>
-  window.location.pathname === "/debug/sync"
+  window.location.pathname.replace(/\/+$/, "") ===
+  `${import.meta.env.BASE_URL}debug/sync`
     ? import("./debug/SyncDebug")
     : import("./VaultWorkspace"),
 );

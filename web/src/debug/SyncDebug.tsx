@@ -90,7 +90,7 @@ export default function SyncDebug() {
             更新。调试实例只保留在本次页面内存中。
           </p>
         </div>
-        <a href="/">返回编辑器</a>
+        <a href={import.meta.env.BASE_URL}>返回编辑器</a>
       </header>
       <form
         class="debug-connect"

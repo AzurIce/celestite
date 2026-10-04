@@ -1,15 +1,34 @@
-# Celestite
+<div align="center">
+  <img src="icons/128x128@2x.png" width="128" height="128" alt="Celestite 图标" />
+  <h1>Celestite</h1>
+  <p>WIP</p>
+</div>
 
-对标 Obsidian 的笔记 / PKM 编辑器。Web 自带 OPFS 默认 Vault，可连接由独立 server 提供的目录 Vault；Tauri 后端暂未接入。
+---
 
-- [项目架构](docs/architecture.md)
-- [里程碑与路线图](docs/roadmap.md)
-- [Web 开发与界面说明](web/README.md)
-- [server 配置、启动与 API](crates/celestite-server/README.md)
-- [server 配置示例](crates/celestite-server/config.example.toml)
+## 功能
 
-```sh
-bun run --cwd web dev
-cargo build -p celestite-server
-./target/debug/celestite-server --config /path/to/config.toml
-```
+**notist 语言内核**
+
+通过 [AzurIce/notist](https://github.com/AzurIce/notist) 的统一 IR 与多前端实现支持多种文档语言（目前仅支持 `.md` 和 `.not`）的解析与预览。
+
+基于 notist package（基于 Web Components）的文档元素拓展。
+
+**多平台支持 & 多后端存储实现抽象**
+
+- Web App
+  OPFS 后端，在本仓库 Github Pages 开箱可用
+- Tauri App（WIP）
+  Tauri 后端
+- Native Headless Server
+  Native 后端
+
+**实时协作**
+
+CRDT 单 Host 多人协作
+
+- Web App（Client）
+- Tauri App（WIP, Client, Host）
+- Headless Server（Host）
+
+**And More...**

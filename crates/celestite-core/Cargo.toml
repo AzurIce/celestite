@@ -19,8 +19,8 @@ thiserror = "2"
 wasm-bindgen = { version = "=0.2.129", optional = true }
 wasm-bindgen-futures = { version = "=0.4.79", optional = true }
 js-sys = { version = "=0.3.106", optional = true }
-notist = { path = "../../../notist", optional = true }
-notist-html = { path = "../../../notist/crates/notist-html", optional = true }
+notist = { git = "https://github.com/AzurIce/notist.git", rev = "532fab6c170522a40f2c71ebd3d32988117b2ed2", optional = true }
+notist-html = { git = "https://github.com/AzurIce/notist.git", rev = "532fab6c170522a40f2c71ebd3d32988117b2ed2", optional = true }
 
 [dev-dependencies]
 futures-lite = "2.6.1"

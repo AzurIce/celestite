@@ -54,7 +54,7 @@ host 的 `commit_replica` 在导入客户端快照前核对磁盘版本，再通
 
 ## 预览计算与会话
 
-`preview` feature 提供纯 Rust 的 `compute_preview(&PreviewTask)`，复用 Notist / notist-html 输出 HTML 片段和源码、渲染诊断。依赖暂用同级目录 `../notist` 中的源码；构建此仓库时需要该 checkout。默认编译不启用预览计算依赖，core 的会话和任务契约始终可用。Web 构建启用 `wasm,preview`，额外导出 `render_preview(taskJson)`；该入口不创建 EditorCore、不打开 OPFS。
+`preview` feature 提供纯 Rust 的 `compute_preview(&PreviewTask)`，复用 Notist / notist-html 输出 HTML 片段和源码、渲染诊断。两个 crate 使用 `https://github.com/AzurIce/notist.git` 的同一固定提交，由 Cargo 获取并通过 `Cargo.lock` 锁定；无需同级源码目录。默认编译不启用预览计算依赖，core 的会话和任务契约始终可用。Web 构建启用 `wasm,preview`，额外导出 `render_preview(taskJson)`；该入口不创建 EditorCore、不打开 OPFS。
 
 平台按以下顺序承载预览：
 

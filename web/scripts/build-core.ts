@@ -45,6 +45,7 @@ const out = resolve(web, "src/lib/editor/generated");
 mkdirSync(out, { recursive: true });
 run("cargo", [
   "build",
+  "--locked",
   "-p",
   "celestite-core",
   "--features",

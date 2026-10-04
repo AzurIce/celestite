@@ -18,7 +18,7 @@ bun run build
 
 `dev`、`build` 和 `typecheck` 会先构建 Rust WASM 内核。需要 Rust 的 `wasm32-unknown-unknown` target（仓库 flake 已提供）。构建脚本使用 wasm-bindgen CLI 0.2.129；系统版本不一致时自动安装到 `web/.cache/wasm-tools`，首次安装需要网络。也可以通过 `WASM_BINDGEN` 指定匹配的 CLI，`CARGO_TARGET_DIR` 指定编译缓存。
 
-WASM 构建启用 core 的 `preview` feature，Notist 与 notist-html 暂以同级目录 `../notist` 的本地源码为依赖；需要将该仓库放在 Celestite 旁边。预览计算与任务契约见 [core README](../crates/celestite-core/README.md#预览计算与会话)。
+WASM 构建启用 core 的 `preview` feature，Notist 与 notist-html 通过 Cargo git 依赖自动获取，使用 `celestite-core/Cargo.toml` 固定的提交；不需要单独检出 Notist 仓库。构建使用 `--locked`，升级依赖时同步更新提交与 `Cargo.lock`。预览计算与任务契约见 [core README](../crates/celestite-core/README.md#预览计算与会话)。
 
 首页自动打开默认 Web Vault，显示文件树及代码编辑器。深浅主题通过右下角状态栏的主题菜单切换。
 
@@ -30,6 +30,16 @@ bun run test:ui
 ```
 
 测试自动启动端口 1430 的开发服务。如果使用系统 Chromium，可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定可执行文件路径。
+
+## GitHub Pages
+
+仓库的 [.github/workflows/pages.yml](../.github/workflows/pages.yml) 在推送到 `main` 或手动运行时构建 Web，部署默认分支到 GitHub Pages。首次使用需在仓库 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。
+
+CI 只检出 Celestite，Cargo 按固定提交获取 Notist。Bun 使用 1.4.2，Node 使用 24，Rust 使用与 flake 相同的 `nightly-2026-08-01` 及 WASM target；构建脚本自动安装匹配的 wasm-bindgen CLI。安装使用冻结的 Bun lockfile，Rust 构建核对 `Cargo.lock`，类型与格式检查通过后上传 `web/dist`，由独立部署 job 发布。
+
+构建的 `base` 使用 Pages 返回的路径，兼容仓库子路径、用户主页与自定义域名。`/debug/sync/` 有独立静态入口，可以直接访问或刷新；返回编辑器链接使用同一站点路径。本地可用 `bun run build --base /celestite/` 验证子路径构建。
+
+Pages 部署浏览器应用，默认 Vault 存于访问者浏览器的 OPFS。远端 Vault 仍需独立运行 celestite-server；从 Pages 连接时使用 HTTPS，并将 Pages 的来源（如 `https://azurice.github.io`，不含仓库路径）加入服务端 `allowed_origins`。
 
 ## UI 约定
 
