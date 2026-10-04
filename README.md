@@ -17,11 +17,13 @@
 **多平台支持 & 多后端存储实现抽象**
 
 - Web App
-  OPFS 后端，在本仓库 Github Pages 开箱可用
+  在本仓库 Github Pages 开箱可用
+  - OPFS 存储实现
+  - File System Access API 存储实现（WIP）
 - Tauri App（WIP）
-  Tauri 后端
+  - Tauri API 存储实现
 - Native Headless Server
-  Native 后端
+  - Native 存储实现
 
 **实时协作**
 

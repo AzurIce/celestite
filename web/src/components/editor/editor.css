@@ -51,11 +51,22 @@
 }
 .code-editor .cm-activeLine,
 .code-editor .cm-activeLineGutter {
-  background: color-mix(in srgb, var(--color-accent) 4%, var(--color-surface));
+  background: color-mix(in srgb, var(--color-accent) 4%, transparent);
 }
-.code-editor .cm-selectionBackground,
-.code-editor .cm-editor.cm-focused .cm-selectionBackground {
-  background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+.code-editor .cm-editor .cm-selectionBackground {
+  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
+.code-editor
+  .cm-editor.cm-focused
+  > .cm-scroller
+  > .cm-selectionLayer
+  .cm-selectionBackground {
+  background: color-mix(in srgb, var(--color-accent) 32%, transparent);
+}
+/* CodeMirror draws the selection background separately; keep the text colors. */
+.code-editor .cm-content::selection,
+.code-editor .cm-content ::selection {
+  color: currentColor;
 }
 .code-editor .cm-selectionMatch {
   background: color-mix(in srgb, var(--color-accent) 14%, transparent);
