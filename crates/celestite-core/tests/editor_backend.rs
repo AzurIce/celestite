@@ -40,6 +40,115 @@ impl MemoryBackend {
 fn io() -> EditorError {
     EditorError::new("IO", "injected commit failure", "")
 }
+
+fn preview_result(task: &PreviewTask) -> PreviewCompletion {
+    PreviewCompletion {
+        task_id: task.ticket.task_id.clone(),
+        outcome: PreviewOutcome::Success {
+            output: PreviewOutput {
+                html: "<p>result</p>".into(),
+                diagnostics: vec![],
+                source_map: vec![],
+            },
+        },
+    }
+}
+
+#[test]
+fn preview_rename_and_deletion_revoke_tasks_even_without_a_text_change() {
+    block_on(async {
+        let backend = MemoryBackend::new(b"body");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        core.subscribe_preview(&id, "client").unwrap();
+        let old = core.take_preview_task(&id).unwrap().unwrap();
+        core.rename("a.md", "moved.md").await.unwrap();
+        let state = core.preview_state(&id).unwrap();
+        assert_eq!(state.target.version, old.ticket.version);
+        assert_eq!(state.target.path, "moved.md");
+        assert!(!core.complete_preview(preview_result(&old)));
+        core.retry_preview(&id).unwrap();
+        let moved = core.take_preview_task(&id).unwrap().unwrap();
+        assert_eq!(moved.ticket.path, "moved.md");
+        core.remove("moved.md", false).await.unwrap();
+        assert!(!core.complete_preview(preview_result(&moved)));
+        assert!(core.preview_state(&id).is_err());
+        assert!(core.read(&id).unwrap().deleted);
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "body");
+        backend
+            .storage
+            .borrow_mut()
+            .files
+            .insert("moved.md".into(), b"new file".into());
+        let new_id = core.open_file("moved.md").await.unwrap();
+        assert_ne!(id, new_id);
+        core.subscribe_preview(&new_id, "client").unwrap();
+        assert!(!core.complete_preview(preview_result(&moved)));
+        assert_eq!(
+            core.take_preview_task(&new_id).unwrap().unwrap().source,
+            "new file"
+        );
+    });
+}
+
+#[test]
+fn external_reload_and_runtime_reopen_cannot_accept_old_preview_tickets() {
+    block_on(async {
+        let backend = MemoryBackend::new(b"old");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        core.subscribe_preview(&id, "client").unwrap();
+        let old = core.take_preview_task(&id).unwrap().unwrap();
+        backend
+            .storage
+            .borrow_mut()
+            .files
+            .insert("a.md".into(), b"external".into());
+        core.refresh(&id).await.unwrap();
+        assert!(!core.complete_preview(preview_result(&old)));
+        core.retry_preview(&id).unwrap();
+        let external = core.take_preview_task(&id).unwrap().unwrap();
+        assert_eq!(external.source, "external");
+        drop(core);
+        let mut reopened = EditorCore::open(backend).await.unwrap();
+        reopened.subscribe_preview(&id, "client").unwrap();
+        let current = reopened.take_preview_task(&id).unwrap().unwrap();
+        assert_ne!(current.ticket.task_id, external.ticket.task_id);
+        assert!(!reopened.complete_preview(preview_result(&external)));
+        assert!(reopened.complete_preview(preview_result(&current)));
+    });
+}
+
+#[test]
+fn accepted_draft_remains_previewable_when_history_commit_fails() {
+    block_on(async {
+        let backend = MemoryBackend::new(b"saved");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        let version = core.read(&id).unwrap().snapshot.version;
+        backend.storage.borrow_mut().fail_commit = true;
+        core.edit(
+            &id,
+            version,
+            vec![TextEdit {
+                from: 0,
+                to: 5,
+                insert: "accepted draft".into(),
+            }],
+            SelectionContext::default(),
+            "input.replace".into(),
+        )
+        .await
+        .unwrap();
+        assert!(core.read(&id).unwrap().persistence_error.is_some());
+        core.subscribe_preview(&id, "client").unwrap();
+        let task = core.take_preview_task(&id).unwrap().unwrap();
+        assert_eq!(task.source, "accepted draft");
+        assert!(core.complete_preview(preview_result(&task)));
+        assert_eq!(backend.storage.borrow().files["a.md"], b"saved");
+        assert!(core.read(&id).unwrap().dirty);
+    });
+}
 fn revision(data: &[u8]) -> String {
     format!("{data:?}")
 }

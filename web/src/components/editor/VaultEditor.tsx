@@ -7,6 +7,7 @@ import {
   lazy,
   onCleanup,
   onSettled,
+  untrack,
 } from "solid-js";
 import { Button, IconButton } from "@/components/ui";
 import { StatusSlot } from "@/components/ui/status-slot";
@@ -22,9 +23,17 @@ import { setSetting, settings } from "@/lib/settings";
 import type { EditorBuffer } from "./CodeEditor";
 import { languageName } from "./languages";
 import { SaveConflict } from "./SaveConflict";
+import { DocumentPreview } from "./DocumentPreview";
+import { PreviewSync } from "./preview-sync";
+import { vaultPath } from "@/lib/vault/path";
 import "./editor.css";
 
 const CodeEditor = lazy(() => import("./CodeEditor"));
+type PreviewMode = "source" | "split" | "preview";
+const previewViews = new WeakMap<
+  EditorDocuments,
+  Map<string, { mode: PreviewMode; scrollTop: number }>
+>();
 interface VaultEditorProps {
   documents: EditorDocuments;
   buffers?: Map<string, EditorBuffer>;
@@ -32,10 +41,26 @@ interface VaultEditorProps {
 }
 
 export function VaultEditor(props: VaultEditorProps) {
+  const previewSync = new PreviewSync();
+  const [scrollSync, setScrollSync] = createSignal(true);
   const [state, setState] = createSignal(props.documents.snapshot());
   const unsubscribe = props.documents.subscribe(setState);
   const [mobileVisible, setMobileVisible] = createSignal(false);
   const [cursor, setCursor] = createSignal({ line: 1, column: 1 });
+  const [mode, setMode] = createSignal<PreviewMode>("source");
+  const previewMedia = window.matchMedia("(max-width: 639px)");
+  const [narrowScreen, setNarrowScreen] = createSignal(previewMedia.matches);
+  const onPreviewResize = () => setNarrowScreen(previewMedia.matches);
+  const [reveal, setReveal] = createSignal<{
+    from: number;
+    to: number;
+    requestId: string;
+  }>();
+  const [fragment, setFragment] = createSignal<{ id: string; value: string }>();
+  const views =
+    previewViews.get(props.documents) ??
+    new Map<string, { mode: PreviewMode; scrollTop: number }>();
+  previewViews.set(props.documents, views);
   const wrap = () => settings().values["editor.wordWrap"];
   /** 项目级文件提供时界面不改写，避免“点了没反应”。 */
   const wrapFromProject = () =>
@@ -44,6 +69,33 @@ export function VaultEditor(props: VaultEditorProps) {
   const panelId = `editor-${crypto.randomUUID()}`;
   const active = () =>
     state().documents.find((document) => document.id === state().activeId);
+  const canRender = () =>
+    !!props.documents.previews &&
+    !!active()?.canPreview &&
+    /\.(not|md|markdown)$/i.test(active()?.path ?? "");
+  const displayMode = () =>
+    !canRender()
+      ? "source"
+      : mode() === "split" && narrowScreen()
+        ? "preview"
+        : mode();
+  createEffect(
+    () => displayMode() === "split" && scrollSync(),
+    (enabled) => previewSync.setEnabled(enabled),
+  );
+  function chooseMode(value: PreviewMode) {
+    const id = state().activeId;
+    if (id)
+      views.set(id, { mode: value, scrollTop: views.get(id)?.scrollTop ?? 0 });
+    setMode(value);
+  }
+  createEffect(
+    () => state().activeId,
+    (id) => {
+      setMode(id ? (views.get(id)?.mode ?? "source") : "source");
+      setReveal(undefined);
+    },
+  );
   const tabId = (id: string) => `${panelId}-${id}`;
   const status = () => {
     const file = active();
@@ -72,6 +124,7 @@ export function VaultEditor(props: VaultEditorProps) {
     (ids) => {
       for (const id of buffers.keys())
         if (!ids.includes(id)) buffers.delete(id);
+      for (const id of views.keys()) if (!ids.includes(id)) views.delete(id);
     },
   );
   const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -87,11 +140,15 @@ export function VaultEditor(props: VaultEditorProps) {
     void props.documents.saveAll();
   };
   onSettled(() => {
+    previewMedia.addEventListener("change", onPreviewResize);
+    onPreviewResize();
     window.addEventListener("beforeunload", beforeUnload);
     window.addEventListener("pagehide", pageHide);
     document.addEventListener("visibilitychange", visibility);
   });
   onCleanup(() => {
+    previewSync.dispose();
+    previewMedia.removeEventListener("change", onPreviewResize);
     unsubscribe();
     if (!props.buffers) buffers.clear();
     window.removeEventListener("beforeunload", beforeUnload);
@@ -245,6 +302,46 @@ export function VaultEditor(props: VaultEditorProps) {
                 >
                   {active()?.path}
                 </span>
+                <Show when={canRender()}>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-pressed={displayMode() === "source" ? "true" : "false"}
+                    onClick={() => chooseMode("source")}
+                  >
+                    源码
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    class="hidden sm:inline-flex"
+                    aria-pressed={displayMode() === "split" ? "true" : "false"}
+                    onClick={() => chooseMode("split")}
+                  >
+                    分栏
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-pressed={
+                      displayMode() === "preview" ? "true" : "false"
+                    }
+                    onClick={() => chooseMode("preview")}
+                  >
+                    预览
+                  </Button>
+                  <Show when={displayMode() === "split"}>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-pressed={scrollSync() ? "true" : "false"}
+                      onClick={() => setScrollSync((value) => !value)}
+                      title="按对应内容同步两侧滚动"
+                    >
+                      滚动同步
+                    </Button>
+                  </Show>
+                </Show>
                 <Button
                   size="sm"
                   variant="ghost"
@@ -315,49 +412,101 @@ export function VaultEditor(props: VaultEditorProps) {
                     </p>
                   }
                 >
-                  <Loading
-                    fallback={
-                      <p role="status" class="p-4 text-secondary">
-                        正在加载编辑器…
-                      </p>
-                    }
-                  >
-                    <Show when={`${id}:${active()?.reloadVersion}`} keyed>
-                      {(_viewKey) => (
-                        <CodeEditor
-                          document={active()!}
-                          cached={buffers.get(id)}
-                          wrap={wrap()}
-                          onChange={(content) =>
-                            props.documents.update(id, content)
+                  <div class="editor-layout" data-mode={displayMode()}>
+                    <div class="editor-source-pane">
+                      <Loading
+                        fallback={
+                          <p role="status" class="p-4 text-secondary">
+                            正在加载编辑器…
+                          </p>
+                        }
+                      >
+                        <Show when={`${id}:${active()?.reloadVersion}`} keyed>
+                          {(_viewKey) => (
+                            <CodeEditor
+                              previewSync={previewSync}
+                              reveal={reveal()}
+                              document={active()!}
+                              cached={buffers.get(id)}
+                              wrap={wrap()}
+                              onChange={(content) =>
+                                props.documents.update(id, content)
+                              }
+                              onTransaction={
+                                props.documents.edit
+                                  ? (transaction) =>
+                                      props.documents.edit!(id, transaction)
+                                  : undefined
+                              }
+                              onUndo={
+                                props.documents.undo
+                                  ? (context, redo) => {
+                                      void props.documents.undo!(
+                                        id,
+                                        context,
+                                        redo,
+                                      );
+                                    }
+                                  : undefined
+                              }
+                              onSave={() => {
+                                void props.documents.requestSave(id);
+                              }}
+                              onCursor={(line, column) =>
+                                setCursor({ line, column })
+                              }
+                              onCache={(buffer) => {
+                                if (props.documents.has(id))
+                                  buffers.set(id, buffer);
+                              }}
+                            />
+                          )}
+                        </Show>
+                      </Loading>
+                    </div>
+                    <Show when={canRender() && displayMode() !== "source"}>
+                      <DocumentPreview
+                        sync={previewSync}
+                        document={active()!}
+                        documents={props.documents}
+                        scrollTop={views.get(id)?.scrollTop ?? 0}
+                        fragment={
+                          fragment()?.id === id ? fragment()?.value : undefined
+                        }
+                        onScroll={(scrollTop) =>
+                          views.set(id, { mode: mode(), scrollTop })
+                        }
+                        onReveal={(from, to, keepSplit) => {
+                          if (!keepSplit || displayMode() !== "split")
+                            chooseMode("source");
+                          setReveal({
+                            from,
+                            to,
+                            requestId: crypto.randomUUID(),
+                          });
+                        }}
+                        onNavigate={async (path, anchor) => {
+                          const targetMode = untrack(mode);
+                          if (!(await props.documents.open(vaultPath(path))))
+                            return false;
+                          const targetId = props.documents.snapshot().activeId;
+                          if (targetId) {
+                            views.set(targetId, {
+                              mode: targetMode,
+                              scrollTop: views.get(targetId)?.scrollTop ?? 0,
+                            });
+                            setMode(targetMode);
+                            setFragment(
+                              anchor === null
+                                ? undefined
+                                : { id: targetId, value: anchor },
+                            );
                           }
-                          onTransaction={
-                            props.documents.edit
-                              ? (transaction) =>
-                                  props.documents.edit!(id, transaction)
-                              : undefined
-                          }
-                          onUndo={
-                            props.documents.undo
-                              ? (context, redo) => {
-                                  void props.documents.undo!(id, context, redo);
-                                }
-                              : undefined
-                          }
-                          onSave={() => {
-                            void props.documents.requestSave(id);
-                          }}
-                          onCursor={(line, column) =>
-                            setCursor({ line, column })
-                          }
-                          onCache={(buffer) => {
-                            if (props.documents.has(id))
-                              buffers.set(id, buffer);
-                          }}
-                        />
-                      )}
+                          return true;
+                        }}
+                      />
                     </Show>
-                  </Loading>
+                  </div>
                 </Show>
               </div>
               <StatusSlot mount={props.statusMount} class="editor-statusbar">

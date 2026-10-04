@@ -48,7 +48,7 @@ run("cargo", [
   "-p",
   "celestite-core",
   "--features",
-  "wasm",
+  "wasm,preview",
   "--target",
   "wasm32-unknown-unknown",
   "--release",

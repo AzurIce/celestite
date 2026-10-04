@@ -5,7 +5,7 @@ use crate::vault::{
 };
 use crate::{failure, get_vault, ApiError, HostedVault, ServerState};
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     routing::{get, post},
     Json, Router,
 };
@@ -37,6 +37,11 @@ pub(crate) fn routes() -> Router<Arc<ServerState>> {
         .route("/api/v1/vaults/{id}/documents/{document}/undo", post(undo))
         .route("/api/v1/vaults/{id}/documents/{document}/redo", post(redo))
         .route("/api/v1/vaults/{id}/documents/{document}/save", post(save))
+        .route(
+            "/api/v1/vaults/{id}/documents/{document}/client-commit",
+            post(client_commit),
+        )
+        .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
         .layer(axum::middleware::from_fn(no_cache))
 }
 
@@ -253,4 +258,22 @@ async fn save(
         })
         .await?,
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientCommit {
+    packet: Option<SyncPacket>,
+    expected_revision: String,
+    action: String,
+}
+async fn client_commit(
+    State(state): State<Arc<ServerState>>,
+    Path((id, document)): Path<(String, String)>,
+    Json(body): Json<ClientCommit>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(run_documents(get_vault(&state, &id)?, true, move |files, docs| {
+        docs.commit_replica(&document, body.packet, &body.expected_revision, &body.action)?;
+        Ok(serde_json::json!({"document": docs.state(files, &document)?, "packet": docs.snapshot(&document)?}))
+    }).await?))
 }

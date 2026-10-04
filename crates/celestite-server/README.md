@@ -100,7 +100,7 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
 
 不覆盖移动及文件提交当前验证并实现于 **Linux**；其他平台返回 Unsupported。跨挂载点移动返回 Unsupported，不自动复制/删除。符号链接可列出、删除或移动链接本身，正常操作不跟随链接；访问通过受限目录句柄，防止链接逃逸 Vault。对 Vault 内目录的并发替换仍以平台能力和实际错误为准。
 
-notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。现有 Web 编辑器仍通过文件 API 保存并在冲突时提示覆盖、丢弃或取消。新增无头文档 API 使用下面的 CRDT 与文件协调规则；远端 Web 文件编辑流程尚未迁入客户端 CRDT core。
+notify 提供粗粒度提示，服务写操作也主动发送提示。监听不是可靠操作日志，事件溢出会发送全树失效，可能重复通知。网络挂载的外部变化未必能被系统监听捕获，可手动刷新。远端 Web 编辑器运行自己的客户端 core，通过文档 API 加入历史、提交保存，在冲突时提示覆盖、丢弃或取消。
 
 文件请求上限 64 MiB；正文整体进出内存。前端编辑上限仍为 5 MiB。请求超时或断网不会自动重放写操作，错误提示核对服务器状态。现有 Web 文件 API 没有离线同步或协同编辑。无头文档 API 已能交换 CRDT 历史；普通文件写请求仍不提供断线去重。
 
@@ -108,20 +108,25 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 下面路径仍相对于 `/api/v1/vaults/<id>`。正文与文档业务由 `celestite-core::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
 
-| 方法 | 路径                             | 请求 / 行为                                                 |
-| ---- | -------------------------------- | ----------------------------------------------------------- |
-| GET  | `/documents`                     | 扫描整个目录，返回可编辑文本状态，包括未在 UI 打开的文件    |
-| POST | `/documents/open`                | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态      |
-| GET  | `/documents/<document>`          | 正文、因果版本、撤销与保存状态；重新核对磁盘                |
-| GET  | `/documents/<document>/snapshot` | 完整 `SyncPacket`，新副本从这里加入同一历史                 |
-| POST | `/documents/<document>/updates`  | `Version`，返回该版本之后的更新包                           |
-| POST | `/documents/<document>/import`   | `SyncPacket`，验证并合并；返回 `{ result, document }`       |
-| POST | `/documents/<document>/transact` | `Transaction`，UTF-16 范围编辑；返回 `{ result, document }` |
-| POST | `/documents/<document>/undo`     | `UndoContext`，可用 `{}`；撤销 server writer 的本地操作     |
-| POST | `/documents/<document>/redo`     | 同上，重做                                                  |
-| POST | `/documents/<document>/save`     | 当前 `Version`，条件写回文件，返回更新的状态                |
+| 方法 | 路径                                  | 请求 / 行为                                                                             |
+| ---- | ------------------------------------- | --------------------------------------------------------------------------------------- |
+| GET  | `/documents`                          | 扫描整个目录，返回可编辑文本状态，包括未在 UI 打开的文件                                |
+| POST | `/documents/open`                     | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态                                  |
+| GET  | `/documents/<document>`               | 正文、因果版本、撤销与保存状态；重新核对磁盘                                            |
+| GET  | `/documents/<document>/snapshot`      | 完整 `SyncPacket`，新副本从这里加入同一历史                                             |
+| POST | `/documents/<document>/updates`       | `Version`，返回该版本之后的更新包                                                       |
+| POST | `/documents/<document>/import`        | `SyncPacket`，验证并合并；返回 `{ result, document }`                                   |
+| POST | `/documents/<document>/transact`      | `Transaction`，UTF-16 范围编辑；返回 `{ result, document }`                             |
+| POST | `/documents/<document>/undo`          | `UndoContext`，可用 `{}`；撤销 server writer 的本地操作                                 |
+| POST | `/documents/<document>/redo`          | 同上，重做                                                                              |
+| POST | `/documents/<document>/save`          | 当前 `Version`，条件写回文件，返回更新的状态                                            |
+| POST | `/documents/<document>/client-commit` | `{ packet, expectedRevision, action }`，客户端副本条件提交，返回 `{ document, packet }` |
 
 核心类型字段采用 Rust 的 `snake_case`；外层状态字段采用 `camelCase`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
+
+描述接口的 `clientReplicaCommit: true` 表示支持远端 Web 客户端副本保存。`client-commit` 的 `action` 为 `save`、`overwrite` 或 `discard`：保存先核对 `expectedRevision`，基线不符时拒绝导入客户端操作；覆盖明确选择客户端正文；丢弃不发送客户端包，重新取得 host 最新文件。返回的完整快照用于补齐客户端历史，文档状态确认实际文件基线。快照限制为 16 MiB，文档请求 JSON 上限为 80 MiB 以容纳字节数组编码；仍使用既有认证、只读约束和 Vault 操作锁。
+
+host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修改；先处理 host 保存，再重试客户端丢弃。
 
 事务示例：
 
@@ -178,7 +183,7 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 已实现独立文本 CRDT 与单个 server 的文件协调。`/documents` 当前扫描并加载全部合格文本，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、日志压缩或网络同步调度。描述接口明确报告 `vaultCrdt: false`。
 
-移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，core 先记录目录操作意图以恢复崩溃窗口；存在源 / 目标歧义时停止恢复并保留文件与历史。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入是拉取 / 提交参考传输，SSE 仍为变化提示；没有自动连接其他副本。默认 Web / OPFS 已接入统一 Rust core；普通远端编辑器仍走文件适配。Vim、Tree-sitter、LSP 尚未接入。
+移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，core 先记录目录操作意图以恢复崩溃窗口；存在源 / 目标歧义时停止恢复并保留文件与历史。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入是拉取 / 提交参考传输，SSE 仍为变化提示；没有自动连接其他副本。本地与远端 Web 均使用统一 Rust core，远端普通编辑在保存时交换完整快照，尚未接入实时多客户端同步。Vim、Tree-sitter、LSP 尚未接入。
 
 ## 多实例与可视化调试
 

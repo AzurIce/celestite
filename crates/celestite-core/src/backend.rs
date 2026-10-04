@@ -144,6 +144,15 @@ pub trait Backend {
     ) -> EditorResult<()>;
     async fn directory_intent(&mut self) -> EditorResult<Option<DirectoryIntent>>;
     async fn set_directory_intent(&mut self, intent: Option<&DirectoryIntent>) -> EditorResult<()>;
+    /// Replace a volatile replica after explicitly discarding its local changes.
+    /// Durable stores and file projections do not support this operation.
+    async fn replace_volatile_record(&mut self, _header: &DocumentHeader) -> EditorResult<()> {
+        Err(EditorError::new(
+            "Unsupported",
+            "Replica reset is unavailable",
+            "",
+        ))
+    }
     async fn stat(&self, path: &str) -> EditorResult<Option<FileEntry>> {
         Err(no_projection(path))
     }

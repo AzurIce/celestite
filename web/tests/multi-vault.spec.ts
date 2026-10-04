@@ -276,6 +276,111 @@ test("remote editing persists to disk; switching preserves independent undo and 
   );
 });
 
+test("remote core previews unsaved Markdown and Notist with split mapping, scrolling and relative links", async ({
+  page,
+  api,
+}, testInfo) => {
+  const name = "remote-preview.md";
+  const source =
+    "# Remote initial\n\n[go to Notist](remote-note.not#dest)\n\n" +
+    Array.from(
+      { length: 60 },
+      (_, i) =>
+        `## Remote Section ${i}\n\n😀 中文 &amp; **bold** ${"paragraph ".repeat(30)}\n\n` +
+        (i % 4 === 0
+          ? '| X | Y |\n| --- | --- |\n| a | b |\n\n```rust\nprintln!("remote");\n```\n\n'
+          : ""),
+    ).join("");
+  await writeFile(join(api.root, "notes", name), source);
+  await writeFile(
+    join(api.root, "notes", "remote-note.not"),
+    '@(id: "dest")\n= 远端 Notist\n\n😀中文 #unknown[ok]',
+  );
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  const preview = page.getByRole("region", { name: "文档预览" });
+  await expect(preview.locator("h1")).toHaveText("Remote initial");
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page
+    .context()
+    .route(api.url + "/documents/*/client-commit", async (route) => {
+      await blocked;
+      await route.continue();
+    });
+  try {
+    await editor(page).focus();
+    await page.keyboard.press("Control+Home");
+    await page.keyboard.press("Home");
+    await page.keyboard.press("Shift+End");
+    await page.keyboard.insertText("# Remote draft");
+    await expect(preview.locator("h1")).toHaveText("Remote draft");
+    expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(source);
+    await preview.locator("h2").first().click();
+    await expect(editor(page)).toBeFocused();
+    await expect
+      .poll(() => page.evaluate(() => window.getSelection()?.toString()))
+      .toContain("Remote Section 0");
+    await expect(
+      page.getByRole("button", { name: "分栏", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await page
+      .locator(".cm-line")
+      .filter({ hasText: /^## Remote Section 0$/ })
+      .click({ position: { x: 70, y: 8 } });
+    await expect(preview.locator("[data-notist-sync-target]")).toContainText(
+      "Remote Section 0",
+    );
+    await page.locator(".cm-scroller").evaluate((element) => {
+      element.dispatchEvent(new WheelEvent("wheel", { deltaY: 1500 }));
+      element.scrollTop += 1500;
+    });
+    await expect
+      .poll(() =>
+        preview
+          .locator(".preview-scroller")
+          .evaluate((element) => element.scrollTop),
+      )
+      .toBeGreaterThan(500);
+    const previous = await page
+      .locator(".cm-scroller")
+      .evaluate((element) => element.scrollTop);
+    await preview.locator(".preview-scroller").evaluate((element) => {
+      element.dispatchEvent(new WheelEvent("wheel", { deltaY: 2000 }));
+      element.scrollTop += 2000;
+    });
+    await expect
+      .poll(() =>
+        page.locator(".cm-scroller").evaluate((element) => element.scrollTop),
+      )
+      .toBeGreaterThan(previous + 500);
+    await page.screenshot({
+      path: testInfo.outputPath("remote-split-preview.png"),
+    });
+  } finally {
+    release();
+  }
+  await page.keyboard.press("Control+s");
+  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+    "已保存",
+  );
+  expect(await readFile(join(api.root, "notes", name), "utf8")).toContain(
+    "# Remote draft",
+  );
+  await preview.getByRole("link", { name: "go to Notist" }).click();
+  await expect(preview.locator("h1")).toHaveText("远端 Notist");
+  await expect(preview.locator(".notist-custom")).toContainText("ok");
+  await preview.locator(".notist-custom").click();
+  await expect(editor(page)).toBeFocused();
+  await expect
+    .poll(() => page.evaluate(() => window.getSelection()?.toString()))
+    .toContain("ok");
+});
+
 test("connection records survive reload without storing tokens; removing a connection keeps server files", async ({
   page,
   api,
@@ -422,6 +527,108 @@ test("watch refreshes the tree after an external disk change, and read-only Vaul
   await expect(
     page.getByText("当前 Vault 只读。", { exact: true }),
   ).toBeVisible();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "文档预览" }).locator("h1"),
+  ).toHaveText("readonly original");
+  await expect(editor(page)).toHaveAttribute("contenteditable", "false");
+});
+
+test("remote save failure retains the preview and draft, pauses editing and can be reauthenticated", async ({
+  page,
+  api,
+}) => {
+  const name = "offline-preview.md";
+  await writeFile(join(api.root, "notes", name), "# Original\n\nbody");
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  const preview = page.getByRole("region", { name: "文档预览" });
+  await expect(preview.locator("h1")).toHaveText("Original");
+  const route = api.url + "/documents/*/client-commit";
+  await page.context().route(route, (handler) => handler.abort());
+  await editor(page).fill("# Preserved draft\n\n😀 中文");
+  await expect(preview.locator("h1")).toHaveText("Preserved draft");
+  await page.keyboard.press("Control+s");
+  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+    "保存失败",
+  );
+  await expect(editor(page)).toHaveAttribute("contenteditable", "false");
+  await expect(editor(page)).toContainText("Preserved draft");
+  await expect(preview.locator("h1")).toHaveText("Preserved draft");
+  expect(await readFile(join(api.root, "notes", name), "utf8")).toContain(
+    "Original",
+  );
+  await page.getByRole("button", { name: `关闭 ${name}`, exact: true }).click();
+  await expect(page.getByRole("tab", { name, exact: true })).toBeVisible();
+  await expect(editor(page)).toContainText("Preserved draft");
+  await page.context().unroute(route);
+  await connect(page, api.url, api.token);
+  await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+  await editor(page).focus();
+  await page.keyboard.press("Control+s");
+  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+    "已保存",
+  );
+  expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
+    "# Preserved draft\n\n😀 中文",
+  );
+});
+
+test("reauthentication rejects a changed host history and retains the client draft", async ({
+  page,
+  api,
+}) => {
+  const name = "history-check.md";
+  await writeFile(join(api.root, "notes", name), "# Original");
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  const commitRoute = api.url + "/documents/*/client-commit";
+  await page.context().route(commitRoute, (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ code: "Conflict", message: "Hold draft" }),
+    }),
+  );
+  await editor(page).fill("# Keep this draft");
+  await page.keyboard.press("Control+s");
+  const conflict = page.getByRole("dialog", { name: "文件已在磁盘上修改" });
+  await expect(conflict).toBeVisible();
+  await conflict.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+  await page.context().route(api.url, async (route) => {
+    const response = await route.fetch();
+    const descriptor = await response.json();
+    descriptor.vaultIdentity.historyId = "another-host-history";
+    await route.fulfill({ response, json: descriptor });
+  });
+  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "管理 Vault", exact: true });
+  await dialog.getByLabel("连接远端 Vault", { exact: true }).fill(api.url);
+  await dialog.getByLabel("访问令牌（可选）", { exact: true }).fill(api.token);
+  await dialog.getByRole("button", { name: "连接", exact: true }).click();
+  await expect(dialog).toContainText("远端 Vault 历史已改变");
+  await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
+  await expect(editor(page)).toHaveAttribute("contenteditable", "false");
+  await expect(editor(page)).toHaveText("# Keep this draft");
+  expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
+    "# Original",
+  );
+  await page.context().unroute(api.url);
+  await page.context().unroute(commitRoute);
+  await connect(page, api.url, api.token);
+  await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+  await editor(page).focus();
+  await page.keyboard.press("Control+s");
+  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+    "已保存",
+  );
+  expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
+    "# Keep this draft",
+  );
 });
 
 test("external edits cause a save conflict and removing that connection keeps the dirty buffer", async ({

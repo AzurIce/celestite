@@ -29,6 +29,15 @@ fn peer(value: Option<String>) -> Result<Option<u64>, JsValue> {
         .transpose()
 }
 
+/// Pure preview computation for the dedicated analysis Worker. Creating an
+/// EditorBinding, opening OPFS, or joining a CRDT history is unnecessary.
+#[cfg(feature = "preview")]
+#[wasm_bindgen]
+pub fn render_preview(task: &str) -> Result<String, JsValue> {
+    let task: PreviewTask = decode(task)?;
+    Ok(encode(compute_preview(&task)))
+}
+
 /// Worker-owned shared editor with its concrete OPFS Backend.
 #[wasm_bindgen]
 pub struct EditorBinding {

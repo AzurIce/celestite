@@ -9,6 +9,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys"]
+preview = ["dep:notist", "dep:notist-html"]
 
 [dependencies]
 loro = { version = "=1.16.2", default-features = false }
@@ -18,6 +19,8 @@ thiserror = "2"
 wasm-bindgen = { version = "=0.2.129", optional = true }
 wasm-bindgen-futures = { version = "=0.4.79", optional = true }
 js-sys = { version = "=0.3.106", optional = true }
+notist = { path = "../../../notist", optional = true }
+notist-html = { path = "../../../notist/crates/notist-html", optional = true }
 
 [dev-dependencies]
 futures-lite = "2.6.1"

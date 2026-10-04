@@ -127,6 +127,86 @@ fn route(id: &str, action: &str) -> String {
 }
 
 #[tokio::test]
+async fn replica_commit_checks_file_revision_before_import_and_returns_saved_history() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
+    let server = Server::start(root.path(), None, false).await;
+    let initial = server.open("a.md").await;
+    let id = initial["id"].as_str().unwrap();
+    let seed: SyncPacket =
+        serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
+            .unwrap();
+    let mut client = Document::from_snapshot(&seed, None).unwrap();
+    client.transact(transaction(&client, 3, 3, "中文")).unwrap();
+    std::fs::write(root.path().join("a.md"), "external").unwrap();
+    let body = json!({"packet":client.export_snapshot().unwrap(),"expectedRevision":initial["backendRevision"],"action":"save"});
+    assert_eq!(
+        server
+            .request("POST", &route(id, "/client-commit"), body.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    // Rejected local changes never entered the host history.
+    let retained: SyncPacket =
+        serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
+            .unwrap();
+    assert!(!Document::from_snapshot(&retained, None)
+        .unwrap()
+        .snapshot()
+        .text
+        .contains("中文"));
+    let mut overwrite = body;
+    overwrite["action"] = json!("overwrite");
+    let receipt = server
+        .ok("POST", &route(id, "/client-commit"), overwrite)
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
+        "A😀中文B"
+    );
+    assert_eq!(receipt["document"]["savedContent"], "A😀中文B");
+    let committed: SyncPacket = serde_json::from_value(receipt["packet"].clone()).unwrap();
+    client.import(&committed, "receipt".into()).unwrap();
+    assert_eq!(client.snapshot().text, "A😀中文B");
+    std::fs::write(root.path().join("a.md"), "discard target").unwrap();
+    let discarded = server
+        .ok(
+            "POST",
+            &route(id, "/client-commit"),
+            json!({"packet":null,"expectedRevision":"ignored","action":"discard"}),
+        )
+        .await;
+    assert_eq!(discarded["document"]["savedContent"], "discard target");
+    let seed: SyncPacket = serde_json::from_value(discarded["packet"].clone()).unwrap();
+    let mut other_client = Document::from_snapshot(&seed, None).unwrap();
+    other_client
+        .transact(transaction(&other_client, 0, 0, "other draft "))
+        .unwrap();
+    server
+        .ok(
+            "POST",
+            &route(id, "/import"),
+            serde_json::to_value(other_client.export_snapshot().unwrap()).unwrap(),
+        )
+        .await;
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                &route(id, "/client-commit"),
+                json!({"packet":null,"expectedRevision":"ignored","action":"discard"}),
+            )
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let retained = server.ok("GET", &route(id, ""), Value::Null).await;
+    assert_eq!(retained["snapshot"]["text"], "other draft discard target");
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn rejected_imports_leave_the_document_and_history_unchanged() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "base").unwrap();

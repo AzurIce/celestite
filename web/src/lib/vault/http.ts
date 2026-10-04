@@ -14,7 +14,13 @@ export interface RemoteVaultDescriptor {
   id: string;
   name: string;
   readOnly: boolean;
-  capabilities: { watch: boolean; conditionalWrite: boolean };
+  vaultIdentity?: { id: string; historyId: string };
+  capabilities: {
+    watch: boolean;
+    conditionalWrite: boolean;
+    documentEditing?: boolean;
+    clientReplicaCommit?: boolean;
+  };
 }
 export function normalizeVaultUrl(value: string): string {
   let url: URL;
@@ -101,6 +107,22 @@ export class HttpVaultBackend implements VaultBackend {
     this.watcher?.abort();
     this.watcher = undefined;
     this.startWatcher();
+  }
+  documentRequest<T>(route: string, body?: unknown): Promise<T> {
+    return this.run(async () => {
+      const response = await this.request(
+        route,
+        {},
+        body === undefined
+          ? {}
+          : {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            },
+      );
+      return response.json() as Promise<T>;
+    });
   }
   private headers(): Record<string, string> {
     return this.token ? { Authorization: `Bearer ${this.token}` } : {};

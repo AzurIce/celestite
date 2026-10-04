@@ -72,6 +72,15 @@ impl Documents {
     pub fn save(&mut self, _files: &FsVault, id: &str, expected: Version) -> Result<()> {
         block_on(self.core.save(id, Some(expected))).map_err(vault_error)
     }
+    pub fn commit_replica(
+        &mut self,
+        id: &str,
+        packet: Option<SyncPacket>,
+        expected: &str,
+        action: &str,
+    ) -> Result<()> {
+        block_on(self.core.commit_replica(id, packet, expected, action)).map_err(vault_error)
+    }
     pub fn before_replace(&self, path: &str) -> Result<()> {
         self.core.before_replace(path).map_err(vault_error)
     }

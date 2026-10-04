@@ -5,6 +5,23 @@ import { vaultPath, ROOT_PATH, VaultError } from "../../src/lib/vault";
 import type { VaultBackend, VaultPath } from "../../src/lib/vault";
 import type { SettingsFile } from "../../src/lib/settings/app-file";
 import type { HttpVaultBackend } from "../../src/lib/vault/http";
+import { VaultDocuments } from "../../src/lib/editor/documents";
+import type { openRemoteEditor } from "../../src/lib/editor/worker-documents";
+const fakeRemoteEditor: typeof openRemoteEditor = async (
+  _url,
+  _token,
+  backend,
+) => {
+  const documents = new VaultDocuments(backend);
+  return {
+    identity: {
+      instanceId: "test",
+      vault: { vaultId: "test", historyId: "test" },
+    },
+    documents,
+    backend: documents.treeBackend,
+  };
+};
 function files() {
   const contents = new Map<VaultPath, Uint8Array>([
     [vaultPath("a.md"), new TextEncoder().encode("old")],
@@ -68,6 +85,7 @@ function setup(registry = new Registry()) {
   const manager = new VaultManager({
     file: registry,
     openLocal: async () => local.backend,
+    openRemoteEditor: fakeRemoteEditor,
     openRemote: async () => {
       calls++;
       return {
@@ -161,6 +179,7 @@ test("an obsolete open cannot activate after a more recent selection", async () 
   const manager = new VaultManager({
     file: registry,
     openLocal: async () => local.backend,
+    openRemoteEditor: fakeRemoteEditor,
     openRemote: async () => {
       await pending;
       return {

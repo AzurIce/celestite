@@ -82,6 +82,11 @@ impl Backend for MemoryBackend {
     async fn directory_intent(&mut self) -> EditorResult<Option<DirectoryIntent>> {
         Ok(self.intent.clone())
     }
+    async fn replace_volatile_record(&mut self, header: &DocumentHeader) -> EditorResult<()> {
+        self.documents
+            .insert(header.id.clone(), (header.clone(), vec![]));
+        Ok(())
+    }
     async fn set_directory_intent(&mut self, intent: Option<&DirectoryIntent>) -> EditorResult<()> {
         self.intent = intent.cloned();
         Ok(())

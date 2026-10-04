@@ -2,6 +2,7 @@ import { VaultError } from "../vault/errors";
 import { vaultPath, type VaultPath } from "../vault/path";
 import type { VaultBackend } from "../vault/types";
 import { decodeError } from "./rpc";
+import type { PreviewCoreMethods } from "./preview-contract";
 import type {
   EditResult,
   ServiceDocument,
@@ -14,10 +15,10 @@ import type {
   RpcError,
 } from "./contract";
 
-interface CorePort {
+export interface CorePort {
   execute(method: string, params: string): Promise<string>;
 }
-interface CoreDocument {
+export interface CoreDocument {
   id: string;
   path: string;
   snapshot: TextSnapshot;
@@ -32,6 +33,7 @@ interface CoreDocument {
   persistenceError: string | null;
   error: string | null;
   autosaveDelay: number | null;
+  backendRevision: string;
 }
 interface CoreEdit {
   document: CoreDocument;
@@ -44,12 +46,12 @@ export class OpfsEditorHost {
   private previews = new Map<string, ServiceDocument>();
   private eventSequence = 0;
   constructor(
-    private core: CorePort,
-    private backend: VaultBackend,
+    protected core: CorePort,
+    protected backend: VaultBackend,
     private emit: (event: ServiceEvent) => void,
     private schedule: (task: () => Promise<unknown>) => void,
   ) {}
-  private async execute<T>(
+  protected async execute<T>(
     method: string,
     params: Record<string, unknown> = {},
   ): Promise<T> {
@@ -67,7 +69,13 @@ export class OpfsEditorHost {
       throw decodeError(decoded);
     }
   }
-  private document(raw: CoreDocument, content = true): ServiceDocument {
+  executePreview<K extends keyof PreviewCoreMethods>(
+    method: K,
+    params: PreviewCoreMethods[K]["params"],
+  ): Promise<PreviewCoreMethods[K]["result"]> {
+    return this.execute(method, params);
+  }
+  protected document(raw: CoreDocument, content = true): ServiceDocument {
     return {
       id: raw.id,
       path: vaultPath(raw.path),
@@ -89,7 +97,7 @@ export class OpfsEditorHost {
       },
     };
   }
-  private publish(raw: CoreDocument, content = false) {
+  protected publish(raw: CoreDocument, content = false) {
     clearTimeout(this.timers.get(raw.id));
     this.timers.delete(raw.id);
     if (raw.deleted) return;
@@ -108,7 +116,7 @@ export class OpfsEditorHost {
       document: this.document(raw, content),
     });
   }
-  private async refreshViews(content = true) {
+  protected async refreshViews(content = true) {
     for (const raw of await this.execute<CoreDocument[]>("resident"))
       this.publish(raw, content);
   }

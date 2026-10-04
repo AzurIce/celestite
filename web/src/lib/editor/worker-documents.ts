@@ -8,6 +8,7 @@ import type {
 } from "../vault/types";
 import type { DocumentsSnapshot } from "./documents";
 import { EditorClient } from "./rpc";
+import type { DocumentPreviews, PreviewState } from "./preview-contract";
 import type {
   EditorDocument,
   InstanceIdentity,
@@ -36,6 +37,14 @@ export function applyEdits(
 }
 /** Main-thread view controller. Accepted history/undo/IO live only in the host. */
 export class WorkerDocuments {
+  readonly previews: DocumentPreviews = {
+    subscribe: (id, listener) => this.subscribePreview(id, listener),
+    retry: async (id) => {
+      await this.client.request("preview_retry", { id });
+    },
+    link: (id, taskId, target) =>
+      this.client.request("preview_link", { id, taskId, target }),
+  };
   private records = new Map<string, ViewRecord>();
   private listeners = new Set<(state: DocumentsSnapshot) => void>();
   private queue: Promise<unknown> = Promise.resolve();
@@ -56,6 +65,7 @@ export class WorkerDocuments {
   constructor(
     private client: EditorClient,
     private terminate: () => void,
+    watch: VaultBackend["watch"] = async () => () => {},
   ) {
     this.unsubscribe = client.subscribe((event) => {
       this.merge(event.document);
@@ -87,7 +97,7 @@ export class WorkerDocuments {
       rename: (from, to) => this.file("rename", { from, to }) as Promise<void>,
       remove: (path, options) =>
         this.file("remove", { path, options }) as Promise<void>,
-      watch: async () => () => {},
+      watch,
       close: () => this.close(),
     };
   }
@@ -124,6 +134,41 @@ export class WorkerDocuments {
   }
   private notify() {
     for (const listener of this.listeners) listener(this.snapshot());
+  }
+  private subscribePreview(
+    id: string,
+    listener: (state: PreviewState | null) => void,
+  ) {
+    let active = true;
+    let seenEvent = false;
+    let subscriptionId: string | undefined;
+    const detach = this.client.subscribePreview((event) => {
+      if (event.documentId === id && active) {
+        seenEvent = true;
+        listener(event.state);
+      }
+    });
+    const release = () => {
+      if (subscriptionId)
+        void this.client
+          .request("preview_unsubscribe", { subscriptionId })
+          .catch(() => {});
+    };
+    void this.client
+      .request("preview_subscribe", { id })
+      .then((subscription) => {
+        subscriptionId = subscription.subscriptionId;
+        if (!active) release();
+        else if (!seenEvent) listener(subscription.state);
+      })
+      .catch(() => {
+        if (active) listener(null);
+      });
+    return () => {
+      active = false;
+      detach();
+      release();
+    };
   }
   private merge(document: ServiceDocument, replace = false) {
     const record = this.records.get(document.id);
@@ -329,6 +374,13 @@ export class WorkerDocuments {
     }
   }
   async saveAll() {
+    if (
+      [...this.records.values()].some(
+        (record) =>
+          record.readOnlyReason && record.content !== record.savedContent,
+      )
+    )
+      return false;
     return (
       await Promise.all(
         [...this.records.values()]
@@ -354,6 +406,8 @@ export class WorkerDocuments {
   async closeDocument(id: string) {
     const record = this.records.get(id);
     if (!record || this.closing) return false;
+    if (record.readOnlyReason && record.content !== record.savedContent)
+      return false;
     record.locked = true;
     this.notify();
     try {
@@ -509,6 +563,54 @@ export async function openOpfsEditor(): Promise<{
   } catch (error) {
     client.dispose();
     worker.terminate();
+    throw error;
+  }
+}
+
+export async function openRemoteEditor(
+  url: string,
+  token: string,
+  backend: VaultBackend,
+): Promise<{
+  identity: InstanceIdentity;
+  documents: import("./contract").EditorDocuments;
+  backend: VaultBackend;
+  authorize?: (token: string) => Promise<void>;
+}> {
+  const worker = new Worker(new URL("./remote-worker.ts", import.meta.url), {
+    type: "module",
+  });
+  const client = new EditorClient(worker);
+  const error = () =>
+    client.fail(
+      new VaultError("IO", "远端编辑 Worker 已停止，尚未确认的输入仍保留。"),
+    );
+  worker.addEventListener("error", error);
+  worker.addEventListener("messageerror", error);
+  worker.postMessage({ kind: "initialize", url, token });
+  try {
+    const identity = await client.ready;
+    const documents = new WorkerDocuments(
+      client,
+      () => {
+        worker.terminate();
+        void backend.close();
+      },
+      (listener) => backend.watch(listener),
+    );
+    return {
+      identity,
+      documents,
+      backend: documents.treeBackend,
+      authorize: async (token) => {
+        await client.request("authorize", { token });
+        (backend as import("../vault/http").HttpVaultBackend).authorize(token);
+      },
+    };
+  } catch (error) {
+    client.dispose();
+    worker.terminate();
+    await backend.close();
     throw error;
   }
 }

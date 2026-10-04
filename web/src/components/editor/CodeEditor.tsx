@@ -4,6 +4,7 @@ import {
   onCleanup,
   onSettled,
   Show,
+  untrack,
 } from "solid-js";
 import {
   Annotation,
@@ -55,8 +56,11 @@ import { languageSupport } from "./languages";
 import "./editor.css";
 
 import type { EditorBuffer } from "@/lib/editor/buffer";
+import type { PreviewSync } from "./preview-sync";
 export type { EditorBuffer } from "@/lib/editor/buffer";
 interface CodeEditorProps {
+  previewSync?: PreviewSync;
+  reveal?: { from: number; to: number; requestId: string };
   document: EditorDocument;
   onTransaction?: (transaction: ViewEdit) => boolean;
   onUndo?: (context: SelectionContext, redo: boolean) => void;
@@ -93,6 +97,9 @@ const highlight = HighlightStyle.define([
 ]);
 
 export default function CodeEditor(props: CodeEditorProps) {
+  const previewSync = untrack(() => props.previewSync);
+  const documentId = untrack(() => props.document.id);
+  let detachPreviewSync: (() => void) | undefined;
   let host!: HTMLDivElement;
   let view: EditorView | undefined;
   let buffer: EditorBuffer;
@@ -154,6 +161,9 @@ export default function CodeEditor(props: CodeEditorProps) {
       autocorrect: "off",
     }),
     EditorView.updateListener.of((update) => {
+      if (update.docChanged) previewSync?.invalidateEditor(update.view);
+      if (update.geometryChanged || update.viewportChanged)
+        previewSync?.editorLayoutChanged(update.view);
       if (
         update.docChanged &&
         !update.transactions.some((transaction) =>
@@ -319,6 +329,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     view = new EditorView({ parent: host, state });
     view.scrollDOM.scrollTop = buffer.scrollTop;
     view.scrollDOM.scrollLeft = buffer.scrollLeft;
+    detachPreviewSync = previewSync?.mountEditor(documentId, view);
     cursor(view.state);
     void configureLanguage(props.document.path);
     observer = new MutationObserver(() => {
@@ -394,7 +405,32 @@ export default function CodeEditor(props: CodeEditorProps) {
       });
     },
   );
+  createEffect(
+    () => props.reveal,
+    (request) => {
+      if (
+        !view ||
+        !request ||
+        request.from < 0 ||
+        request.to < request.from ||
+        request.to > view.state.doc.length
+      )
+        return;
+      view.dispatch({
+        selection: EditorSelection.single(request.from, request.to),
+        // The mapped range may span many lines. Reveal its start instead of
+        // moving to the selection head at the end of an already visible node.
+        effects: EditorView.scrollIntoView(request.from, {
+          y: "nearest",
+          x: "nearest",
+          yMargin: 0,
+        }),
+      });
+      onSettled(() => view?.focus());
+    },
+  );
   onCleanup(() => {
+    detachPreviewSync?.();
     disposed = true;
     observer?.disconnect();
     if (view) {

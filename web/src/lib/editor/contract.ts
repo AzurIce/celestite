@@ -1,6 +1,13 @@
 import type { VaultBackend } from "../vault/types";
 import type { VaultPath } from "../vault/path";
 import type { DocumentSnapshot, DocumentsSnapshot } from "./documents";
+import type {
+  DocumentPreviews,
+  PreviewEvent,
+  PreviewLink,
+  PreviewState,
+  PreviewSubscription,
+} from "./preview-contract";
 
 export interface Vault {
   vaultId: string;
@@ -59,6 +66,7 @@ export interface EditorDocument extends DocumentSnapshot {
 }
 /** View facade common to local service and the transitional HTTP adapter. */
 export interface EditorDocuments {
+  readonly previews?: DocumentPreviews;
   readonly treeBackend: VaultBackend;
   snapshot(): DocumentsSnapshot;
   subscribe(listener: (state: DocumentsSnapshot) => void): () => void;
@@ -121,6 +129,7 @@ export type WorkerMessage =
   | { kind: "ready"; identity: InstanceIdentity; sessionId: string }
   | { kind: "reply"; requestId: number; result?: unknown; error?: RpcError }
   | { kind: "fatal"; error: RpcError }
+  | { kind: "preview"; event: PreviewEvent }
   | ServiceEvent;
 export interface WorkerRequest {
   kind: "request";
@@ -132,6 +141,14 @@ export interface WorkerRequest {
 
 /** Async host operations: identical envelope over Worker messages or native IPC. */
 export interface ServiceMethods {
+  authorize: { params: { token: string }; result: void };
+  preview_subscribe: { params: { id: string }; result: PreviewSubscription };
+  preview_unsubscribe: { params: { subscriptionId: string }; result: boolean };
+  preview_retry: { params: { id: string }; result: PreviewState };
+  preview_link: {
+    params: { id: string; taskId: string; target: string };
+    result: PreviewLink;
+  };
   open: { params: { path: VaultPath }; result: ServiceDocument };
   edit: {
     params: {

@@ -2,12 +2,8 @@ import { VaultDocuments } from "../editor/documents";
 import { FileTreeModel } from "../file-tree/model";
 import type { EditorBuffer } from "../editor/buffer";
 import { openAppDocument, type SettingsFile } from "../settings/app-file";
-import {
-  openHttpVault,
-  normalizeVaultUrl,
-  type HttpVaultBackend,
-} from "./http";
-import { openOpfsEditor } from "../editor/worker-documents";
+import { openHttpVault, normalizeVaultUrl } from "./http";
+import { openOpfsEditor, openRemoteEditor } from "../editor/worker-documents";
 import type { EditorDocuments, InstanceIdentity } from "../editor/contract";
 import { VaultError } from "./errors";
 import type { VaultBackend } from "./types";
@@ -20,6 +16,7 @@ export interface VaultConnection {
   url?: string;
 }
 export interface VaultInstance {
+  authorize?: (token: string) => Promise<void>;
   identity?: InstanceIdentity;
   id: string;
   name: string;
@@ -42,6 +39,7 @@ interface ManagerOptions {
   file?: SettingsFile;
   openLocal?: () => Promise<VaultBackend>;
   openRemote?: typeof openHttpVault;
+  openRemoteEditor?: typeof openRemoteEditor;
 }
 const defaultConnection = (): VaultConnection => ({
   id: DEFAULT_VAULT_ID,
@@ -174,7 +172,11 @@ export class VaultManager {
           this.options.openRemote ?? openHttpVault
         )(connection.url!);
         connection.name = descriptor.name;
-        vault = this.build(connection, backend, descriptor.readOnly);
+        vault = await this.buildRemote(
+          connection,
+          backend,
+          descriptor.readOnly,
+        );
       }
       if (this.disposed || this.removals.has(connection.id)) {
         await vault.documents.close();
@@ -241,11 +243,20 @@ export class VaultManager {
       connection.name = descriptor.name;
       let vault = this.runtimes.get(id);
       if (vault) {
-        (vault.backend as HttpVaultBackend).authorize(token);
-        await backend.close();
+        try {
+          await vault.authorize?.(token);
+        } finally {
+          await backend.close();
+        }
         vault.name = descriptor.name;
+        vault.readOnly = descriptor.readOnly;
       } else {
-        vault = this.build(connection, backend, descriptor.readOnly);
+        vault = await this.buildRemote(
+          connection,
+          backend,
+          descriptor.readOnly,
+          token,
+        );
         this.runtimes.set(id, vault);
       }
       if (request === this.selection) this.active = vault;
@@ -258,6 +269,27 @@ export class VaultManager {
       if (request === this.selection) this.opening = false;
       this.notify();
     }
+  }
+  private async buildRemote(
+    connection: VaultConnection,
+    http: VaultBackend,
+    readOnly: boolean,
+    token = "",
+  ): Promise<VaultInstance> {
+    const editor = await (this.options.openRemoteEditor ?? openRemoteEditor)(
+      connection.url!,
+      token,
+      http,
+    );
+    return {
+      id: connection.id,
+      name: connection.name,
+      ...editor,
+      tree: new FileTreeModel(editor.backend),
+      editorBuffers: new Map(),
+      treeView: { scrollTop: 0 },
+      readOnly,
+    };
   }
   /** Removing a connection never calls backend.remove(). The default entry is structural. */
   async removeConnection(id: string): Promise<void> {

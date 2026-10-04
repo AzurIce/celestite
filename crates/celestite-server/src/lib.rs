@@ -397,7 +397,7 @@ async fn describe(
         .lock()
         .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(

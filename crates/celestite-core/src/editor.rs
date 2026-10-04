@@ -17,6 +17,8 @@ pub struct EditorOptions {
 }
 
 struct Record {
+    hosted: bool,
+    read_only: bool,
     header: DocumentHeader,
     document: Document,
     pending_packets: Vec<SyncPacket>,
@@ -76,12 +78,31 @@ pub struct EditorEditResult {
     pub restored_selection: Option<SelectionContext>,
 }
 
+/// Host receipt for a private client replica. File baselines remain host-owned;
+/// receiving a receipt does not claim the client's volatile history is durable.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaHostState {
+    pub path: String,
+    pub version: Version,
+    pub saved_content: String,
+    pub backend_revision: String,
+    pub bom: bool,
+    pub line_ending: String,
+    pub deleted: bool,
+    pub conflict: bool,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 pub struct EditorCore<B: Backend> {
     backend: B,
     records: BTreeMap<String, Record>,
     failure: Option<String>,
     requires_reopen: bool,
     options: EditorOptions,
+    previews: preview::PreviewSessions,
 }
 
 pub fn validate_editor_path(path: &str) -> EditorResult<()> {
@@ -257,6 +278,8 @@ impl<B: Backend> EditorCore<B> {
             records.insert(
                 header.id.clone(),
                 Record {
+                    hosted: false,
+                    read_only: false,
                     header,
                     document,
                     pending_packets,
@@ -277,6 +300,7 @@ impl<B: Backend> EditorCore<B> {
             failure: None,
             requires_reopen: false,
             options,
+            previews: preview::PreviewSessions::default(),
         };
         core.recover_directory().await?;
         Ok(core)
@@ -286,6 +310,101 @@ impl<B: Backend> EditorCore<B> {
     }
     pub fn persistent(&self) -> bool {
         self.backend.persistent()
+    }
+    /// View subscriptions belong to the caller's transport session. The platform
+    /// supplies this identity, rather than trusting a value in a UI request.
+    pub fn subscribe_preview(
+        &mut self,
+        id: &str,
+        client_session: &str,
+    ) -> EditorResult<PreviewSubscription> {
+        if client_session.is_empty() {
+            return Err(EditorError::new(
+                "InvalidPreview",
+                "Missing client session",
+                id,
+            ));
+        }
+        self.preview_document(id)?;
+        self.sync_preview(id);
+        let record = self.record(id)?;
+        let snapshot = record.document.snapshot();
+        let path = record.header.path.clone();
+        Ok(self
+            .previews
+            .subscribe(id, client_session, &snapshot, &path, self.backend.now_ms()))
+    }
+    pub fn unsubscribe_preview(&mut self, subscription_id: &str, client_session: &str) -> bool {
+        self.previews.unsubscribe(subscription_id, client_session)
+    }
+    pub fn release_preview_client(&mut self, client_session: &str) {
+        self.previews.release_client(client_session);
+    }
+    pub fn preview_state(&mut self, id: &str) -> EditorResult<PreviewState> {
+        self.sync_preview(id);
+        self.previews.state(id)
+    }
+    pub fn take_preview_task(&mut self, id: &str) -> EditorResult<Option<PreviewTask>> {
+        self.preview_document(id)?;
+        self.sync_preview(id);
+        if !self.previews.contains(id) {
+            return Ok(None);
+        }
+        let snapshot = self.record(id)?.document.snapshot();
+        Ok(self.previews.take_task(id, snapshot, self.backend.now_ms()))
+    }
+    pub fn complete_preview(&mut self, completion: PreviewCompletion) -> bool {
+        if let Some(id) = self.previews.document_for_task(&completion.task_id) {
+            self.sync_preview(&id);
+        }
+        self.previews.complete(completion)
+    }
+    /// Platform must revoke/terminate its old executor before retrying. Already
+    /// running synchronous Rust code cannot be interrupted by this method.
+    pub fn retry_preview(&mut self, id: &str) -> EditorResult<PreviewState> {
+        self.preview_document(id)?;
+        self.sync_preview(id);
+        self.previews.retry(id, self.backend.now_ms())?;
+        self.previews.state(id)
+    }
+    pub fn take_preview_events(&mut self) -> Vec<PreviewEvent> {
+        self.previews.take_events()
+    }
+    pub fn preview_link(
+        &mut self,
+        id: &str,
+        task_id: &str,
+        target: &str,
+    ) -> EditorResult<PreviewLink> {
+        let state = self.preview_state(id)?;
+        if state.status != PreviewStatus::Ready || state.target.task_id != task_id {
+            return Err(EditorError::new(
+                "StaleVersion",
+                "预览正在更新，请稍后再打开链接。",
+                id,
+            ));
+        }
+        resolve_preview_target(&state.target.path, target)
+    }
+    fn preview_document(&self, id: &str) -> EditorResult<()> {
+        if self.record(id)?.header.deleted {
+            return Err(EditorError::new("NotFound", "Document was deleted", id));
+        }
+        Ok(())
+    }
+    fn sync_preview(&mut self, id: &str) {
+        if !self.previews.contains(id) {
+            return;
+        }
+        match self.records.get(id) {
+            Some(record) if !record.header.deleted => self.previews.reconcile(
+                id,
+                &record.document.version(),
+                &record.header.path,
+                self.backend.now_ms(),
+            ),
+            _ => self.previews.close(id),
+        }
     }
     fn record(&self, id: &str) -> EditorResult<&Record> {
         self.records
@@ -300,6 +419,13 @@ impl<B: Backend> EditorCore<B> {
     }
     fn live(&self, id: &str) -> EditorResult<()> {
         self.writable()?;
+        if self.record(id)?.read_only {
+            return Err(EditorError::new(
+                "PermissionDenied",
+                "当前远端文档只读。",
+                id,
+            ));
+        }
         if self.record(id)?.header.deleted {
             return Err(EditorError::new(
                 "NotFound",
@@ -331,7 +457,8 @@ impl<B: Backend> EditorCore<B> {
             persistence_error: self.failure.clone(),
             error: record.error.clone(),
             autosave_delay: if dirty
-                && self.backend.has_projection()
+                && (self.backend.has_projection() || record.hosted)
+                && !record.read_only
                 && !header.deleted
                 && !record.conflict
                 && record.error.is_none()
@@ -363,6 +490,7 @@ impl<B: Backend> EditorCore<B> {
         {
             record.first_dirty = Some(self.backend.now_ms());
         }
+        self.sync_preview(id);
     }
     async fn persist(&mut self, id: &str) -> EditorResult<()> {
         loop {
@@ -470,6 +598,8 @@ impl<B: Backend> EditorCore<B> {
         self.records.insert(
             id.clone(),
             Record {
+                hosted: false,
+                read_only: false,
                 header,
                 document,
                 pending_packets: vec![],
@@ -532,6 +662,8 @@ impl<B: Backend> EditorCore<B> {
         self.records.insert(
             header.id.clone(),
             Record {
+                hosted: false,
+                read_only: false,
                 header,
                 document,
                 uncommitted: vec![],
@@ -1078,6 +1210,217 @@ impl<B: Backend> EditorCore<B> {
     pub fn updates(&self, id: &str, version: &Version) -> EditorResult<SyncPacket> {
         Ok(self.record(id)?.document.export_updates_since(version)?)
     }
+    pub async fn apply_host_state(
+        &mut self,
+        id: &str,
+        state: ReplicaHostState,
+    ) -> EditorResult<()> {
+        if self.backend.has_projection() {
+            return Err(EditorError::new(
+                "Unsupported",
+                "Host receipts require a private replica",
+                id,
+            ));
+        }
+        validate_editor_path(&state.path)?;
+        validate_text(&state.saved_content, &state.path)?;
+        if state.path.is_empty()
+            || self.records.iter().any(|(other, record)| {
+                other != id && !record.header.deleted && record.header.path == state.path
+            })
+        {
+            return Err(EditorError::new(
+                "Conflict",
+                "Host path belongs to another document",
+                &state.path,
+            ));
+        }
+        let version = self.record(id)?.document.version();
+        if version.identity != state.version.identity
+            || state.version.clocks.iter().any(|(writer, count)| {
+                *count < 0 || version.clocks.get(writer).copied().unwrap_or(0) < *count
+            })
+            || !matches!(state.line_ending.as_str(), "\n" | "\r" | "\r\n")
+        {
+            return Err(EditorError::new(
+                "Conflict",
+                "Host receipt has an unseen or different history",
+                id,
+            ));
+        }
+        let record = self.records.get_mut(id).unwrap();
+        record.hosted = true;
+        record.read_only = state.read_only;
+        record.header.path = state.path;
+        record.header.saved_text = state.saved_content;
+        record.header.disk_revision = state.backend_revision;
+        record.header.bom = state.bom;
+        record.header.line_ending = state.line_ending;
+        record.header.deleted = state.deleted;
+        record.conflict = state.conflict;
+        record.error = state.error;
+        if record.document.snapshot().text == record.header.saved_text {
+            record.first_dirty = None;
+        }
+        self.persist(id).await?;
+        self.sync_preview(id);
+        Ok(())
+    }
+    pub async fn reset_replica(&mut self, path: &str, packet: SyncPacket) -> EditorResult<String> {
+        if self.backend.has_projection() || self.backend.persistent() {
+            return Err(EditorError::new(
+                "Unsupported",
+                "Only volatile private replicas can be reset",
+                path,
+            ));
+        }
+        validate_editor_path(path)?;
+        if path.is_empty() || packet.data.len() > 16 * 1024 * 1024 {
+            return Err(EditorError::new(
+                "Unsupported",
+                "Invalid replica path or snapshot size",
+                path,
+            ));
+        }
+        let id = packet.identity.document_id.clone();
+        if self.records.iter().any(|(other, record)| {
+            other != &id && !record.header.deleted && record.header.path == path
+        }) {
+            return Err(EditorError::new(
+                "Conflict",
+                "Replica path belongs to another document",
+                path,
+            ));
+        }
+        if let Some(record) = self.records.get(&id)
+            && record.document.identity() != &packet.identity
+        {
+            return Err(EditorError::new(
+                "Conflict",
+                "Replica history changed",
+                path,
+            ));
+        }
+        let document = Document::from_snapshot(&packet, None)?;
+        let snapshot = document.snapshot();
+        validate_text(&snapshot.text, path)?;
+        let header = DocumentHeader {
+            id: id.clone(),
+            path: path.into(),
+            seed: packet,
+            sequence: 0,
+            applied: snapshot.version,
+            saved_text: snapshot.text,
+            disk_revision: String::new(),
+            saved_version: None,
+            pending_write: None,
+            disk_cursor: None,
+            deleted: false,
+            bom: false,
+            line_ending: "\n".into(),
+        };
+        self.backend.replace_volatile_record(&header).await?;
+        self.records.insert(
+            id.clone(),
+            Record {
+                hosted: false,
+                read_only: false,
+                header,
+                document,
+                pending_packets: vec![],
+                pending_observation: None,
+                uncommitted: vec![],
+                durable: None,
+                conflict: false,
+                error: None,
+                last_group: String::new(),
+                last_edit: 0,
+                first_dirty: None,
+            },
+        );
+        self.sync_preview(&id);
+        Ok(id)
+    }
+    /// Commit a client replica through the host's normal conditional save path.
+    /// A file revision mismatch is detected before importing the client's edits.
+    pub async fn commit_replica(
+        &mut self,
+        id: &str,
+        packet: Option<SyncPacket>,
+        expected_revision: &str,
+        action: &str,
+    ) -> EditorResult<()> {
+        self.live(id)?;
+        if !self.backend.has_projection() {
+            return Err(EditorError::new(
+                "Unsupported",
+                "Replica commits require a host file projection",
+                id,
+            ));
+        }
+        if action == "discard" {
+            let record = self.record(id)?;
+            if record.document.snapshot().text != record.header.saved_text {
+                return Err(EditorError::new(
+                    "Conflict",
+                    "Host has unsaved edits; resolve the host save before discarding the client draft",
+                    &record.header.path,
+                ));
+            }
+            return self.resolve(id, "discard").await;
+        }
+        if !matches!(action, "save" | "overwrite") {
+            return Err(EditorError::new(
+                "InvalidEdit",
+                "Unknown replica commit action",
+                id,
+            ));
+        }
+        let packet =
+            packet.ok_or_else(|| EditorError::new("InvalidEdit", "Missing client snapshot", id))?;
+        if packet.data.len() > 16 * 1024 * 1024
+            || packet.identity != *self.record(id)?.document.identity()
+        {
+            return Err(EditorError::new(
+                "Conflict",
+                "Invalid client snapshot identity or size",
+                id,
+            ));
+        }
+        let client = Document::from_snapshot(&packet, None)?;
+        let client_text = client.snapshot().text;
+        validate_text(&client_text, id)?;
+        if action == "save" {
+            let disk = self
+                .backend
+                .read_file(&self.record(id)?.header.path, Some(MAX_TEXT_BYTES as u64))
+                .await?;
+            if expected_revision.is_empty() || disk.revision != expected_revision {
+                return Err(EditorError::new(
+                    "Conflict",
+                    "文件已被其他客户端或程序修改。",
+                    &self.record(id)?.header.path,
+                ));
+            }
+        }
+        self.import(id, packet).await?;
+        if action == "overwrite" {
+            // Explicit overwrite chooses exactly the client's text even if the
+            // host has already adopted another writer's filesystem changes.
+            let state = self.read(id)?.snapshot;
+            self.edit(
+                id,
+                state.version,
+                text_difference(&state.text, &client_text),
+                SelectionContext::default(),
+                "input.overwrite".into(),
+            )
+            .await?;
+            self.resolve(id, "overwrite").await
+        } else {
+            self.save(id, None).await
+        }
+    }
     pub async fn save(&mut self, id: &str, expected: Option<Version>) -> EditorResult<()> {
         let result = self.save_inner(id, expected).await;
         if let Err(error) = &result
@@ -1295,6 +1638,7 @@ impl<B: Backend> EditorCore<B> {
                     record.first_dirty = None;
                 }
             }
+            self.sync_preview(id);
         }
         self.persist_headers().await?;
         self.backend.set_directory_intent(None).await
@@ -1376,6 +1720,7 @@ impl<B: Backend> EditorCore<B> {
                 for (id, path) in &intent.entries {
                     self.records.get_mut(id).unwrap().header.path =
                         format!("{}{}", to, &path[from.len()..]);
+                    self.sync_preview(id);
                 }
                 self.persist_headers().await?;
             } else if matches!(
@@ -1518,6 +1863,32 @@ impl<B: Backend> EditorCore<B> {
         use serde_json::{Value, to_value};
         let id = params["id"].as_str().unwrap_or("");
         let value = match method {
+            "preview_subscribe" => {
+                let client = params["clientSession"].as_str().unwrap_or("");
+                to_value(self.subscribe_preview(id, client)?)
+            }
+            "preview_unsubscribe" => to_value(self.unsubscribe_preview(
+                params["subscriptionId"].as_str().unwrap_or(""),
+                params["clientSession"].as_str().unwrap_or(""),
+            )),
+            "preview_state" => to_value(self.preview_state(id)?),
+            "preview_release_client" => {
+                self.release_preview_client(params["clientSession"].as_str().unwrap_or(""));
+                Ok(Value::Null)
+            }
+            "preview_take_task" => to_value(self.take_preview_task(id)?),
+            "preview_complete" => {
+                let completion = serde_json::from_value(params["completion"].clone())
+                    .map_err(|e| EditorError::new("InvalidPreview", e.to_string(), id))?;
+                to_value(self.complete_preview(completion))
+            }
+            "preview_retry" => to_value(self.retry_preview(id)?),
+            "preview_link" => to_value(self.preview_link(
+                id,
+                params["taskId"].as_str().unwrap_or(""),
+                params["target"].as_str().unwrap_or(""),
+            )?),
+            "preview_events" => to_value(self.take_preview_events()),
             "join" => {
                 let path = params["path"]
                     .as_str()
@@ -1526,6 +1897,19 @@ impl<B: Backend> EditorCore<B> {
                     .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
                 let id = self.join(path, packet).await?;
                 to_value(self.read(&id)?)
+            }
+            "replica_reset" => {
+                let path = params["path"].as_str().unwrap_or("");
+                let packet = serde_json::from_value(params["packet"].clone())
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), path))?;
+                let id = self.reset_replica(path, packet).await?;
+                to_value(self.read(&id)?)
+            }
+            "replica_host_state" => {
+                let state = serde_json::from_value(params["state"].clone())
+                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
+                self.apply_host_state(id, state).await?;
+                to_value(self.read(id)?)
             }
             "export_snapshot" => to_value(self.snapshot(id)?),
             "export_updates" => {
@@ -1611,6 +1995,9 @@ impl<B: Backend> EditorCore<B> {
             }
             "flush" | "close" => {
                 self.flush().await?;
+                if method == "close" {
+                    self.previews.clear();
+                }
                 Ok(Value::Null)
             }
             "file" => {

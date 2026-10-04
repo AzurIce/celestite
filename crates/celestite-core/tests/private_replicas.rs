@@ -113,3 +113,82 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
         assert_eq!(core.read("file").unwrap().snapshot.text, "draft");
     });
 }
+
+#[test]
+fn host_receipts_and_discard_keep_replica_versions_and_other_personal_undo() {
+    block_on(async {
+        let packet = Document::new(
+            DocumentIdentity {
+                document_id: "file".into(),
+                history_id: "history".into(),
+            },
+            None,
+            "seed",
+        )
+        .unwrap()
+        .export_snapshot()
+        .unwrap();
+        let mut core = replica("client", packet.clone()).await;
+        let other = Document::new(
+            DocumentIdentity {
+                document_id: "other".into(),
+                history_id: "other-history".into(),
+            },
+            None,
+            "other",
+        )
+        .unwrap()
+        .export_snapshot()
+        .unwrap();
+        core.join("other.md", other).await.unwrap();
+        for (id, text) in [("file", "draft"), ("other", "keep other edit")] {
+            let version = core.read(id).unwrap().snapshot.version;
+            core.execute_service(
+                "replace_text",
+                json!({"id":id,"version":version,"text":text}),
+            )
+            .await
+            .unwrap();
+        }
+        let state = ReplicaHostState {
+            path: "a.md".into(),
+            version: core.read("file").unwrap().snapshot.version,
+            saved_content: "seed".into(),
+            backend_revision: "remote-1".into(),
+            bom: false,
+            line_ending: "\n".into(),
+            deleted: false,
+            conflict: false,
+            error: None,
+            read_only: false,
+        };
+        core.apply_host_state("file", state.clone()).await.unwrap();
+        assert!(core.read("file").unwrap().autosave_delay.is_some());
+        assert!(core.read("file").unwrap().durable_version.is_none());
+        let mut unseen = state.clone();
+        unseen.version.clocks.insert("unseen".into(), 1);
+        assert!(core.apply_host_state("file", unseen).await.is_err());
+        assert_eq!(core.read("file").unwrap().backend_revision, "remote-1");
+        assert_eq!(
+            core.reset_replica("other.md", packet.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "Conflict"
+        );
+        assert_eq!(core.read("file").unwrap().snapshot.text, "draft");
+        core.reset_replica("a.md", packet).await.unwrap();
+        assert_eq!(core.read("file").unwrap().snapshot.text, "seed");
+        assert!(!core.read("file").unwrap().undo.can_undo);
+        assert_eq!(core.read("other").unwrap().snapshot.text, "keep other edit");
+        assert!(core.read("other").unwrap().undo.can_undo);
+        let mut read_only = state;
+        read_only.version = core.read("file").unwrap().snapshot.version;
+        read_only.read_only = true;
+        core.apply_host_state("file", read_only).await.unwrap();
+        assert_eq!(core.execute_service("replace_text", json!({"id":"file","version":core.read("file").unwrap().snapshot.version,"text":"blocked"})).await.unwrap_err().code,
+            "PermissionDenied");
+        core.subscribe_preview("file", "readonly-view").unwrap();
+        assert!(core.take_preview_task("file").unwrap().is_some());
+    });
+}

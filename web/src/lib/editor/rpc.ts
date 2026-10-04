@@ -1,4 +1,5 @@
 import { VaultError, VaultRenameError } from "../vault/errors";
+import type { PreviewEvent } from "./preview-contract";
 import type {
   ServiceMethods,
   InstanceIdentity,
@@ -70,6 +71,8 @@ export class EditorClient {
   private nextId = 0;
   private closed = false;
   private sequence = 0;
+  private previewSequence = 0;
+  private previewListeners = new Set<(event: PreviewEvent) => void>();
   private pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -110,6 +113,15 @@ export class EditorClient {
       this.pending.delete(message.requestId);
       if (message.error) request.reject(decodeError(message.error));
       else request.resolve(message.result);
+    } else if (message.kind === "preview") {
+      if (message.event.sequence !== this.previewSequence + 1) {
+        this.fail(
+          new VaultError("IO", "预览服务通知不连续，请重新打开工作区。"),
+        );
+        return;
+      }
+      this.previewSequence = message.event.sequence;
+      for (const listener of this.previewListeners) listener(message.event);
     } else if (message.kind === "document") {
       if (message.sequence !== this.sequence + 1) {
         this.fail(
@@ -153,6 +165,12 @@ export class EditorClient {
       this.listeners.delete(listener);
     };
   }
+  subscribePreview(listener: (event: PreviewEvent) => void) {
+    this.previewListeners.add(listener);
+    return () => {
+      this.previewListeners.delete(listener);
+    };
+  }
   fail(error: Error) {
     if (this.closed) return;
     this.closed = true;
@@ -164,6 +182,7 @@ export class EditorClient {
     this.failures.clear();
     this.transport.removeEventListener("message", this.message);
     this.listeners.clear();
+    this.previewListeners.clear();
   }
   dispose() {
     this.fail(new VaultError("Closed", "编辑服务已关闭。"));
