@@ -3,15 +3,25 @@ import { FileTreeModel } from "../file-tree/model";
 import type { EditorBuffer } from "../editor/buffer";
 import { openAppDocument, type SettingsFile } from "../settings/app-file";
 import { openHttpVault, normalizeVaultUrl } from "./http";
-import { openOpfsEditor, openRemoteEditor } from "../editor/client/documents";
+import { openLocalEditor, openRemoteEditor } from "../editor/client/documents";
 import type { EditorDocuments, InstanceIdentity } from "../editor/contract";
 import { VaultError } from "./errors";
 import type { VaultBackend } from "./types";
+import {
+  authorizeDirectory,
+  pickLocalDirectory,
+  type LocalDirectoryHandle,
+} from "./file-system-access";
+import {
+  IndexedDbDirectoryRegistry,
+  type DirectoryRegistry,
+} from "./directory-registry";
+import type { LocalEditorSource } from "../editor/local/worker";
 
 export const DEFAULT_VAULT_ID = "opfs:default";
 export interface VaultConnection {
   id: string;
-  kind: "opfs" | "remote";
+  kind: "opfs" | "directory" | "remote";
   name: string;
   url?: string;
 }
@@ -40,6 +50,13 @@ interface ManagerOptions {
   openLocal?: () => Promise<VaultBackend>;
   openRemote?: typeof openHttpVault;
   openRemoteEditor?: typeof openRemoteEditor;
+  directories?: DirectoryRegistry;
+  pickDirectory?: typeof pickLocalDirectory;
+  openLocalEditor?: (source: LocalEditorSource) => Promise<{
+    identity: InstanceIdentity;
+    backend: VaultBackend;
+    documents: EditorDocuments;
+  }>;
 }
 const defaultConnection = (): VaultConnection => ({
   id: DEFAULT_VAULT_ID,
@@ -63,8 +80,16 @@ export class VaultManager {
   private removals = new Set<string>();
   private file?: SettingsFile;
   private initialization?: Promise<void>;
+  private directories?: DirectoryRegistry;
+  private directoryHandles = new Map<string, LocalDirectoryHandle>();
+  private directoryError: string | null = null;
   constructor(private options: ManagerOptions = {}) {
     this.file = options.file;
+    this.directories =
+      options.directories ??
+      (typeof indexedDB === "undefined"
+        ? undefined
+        : new IndexedDbDirectoryRegistry());
   }
   snapshot(): VaultManagerSnapshot {
     return {
@@ -73,7 +98,10 @@ export class VaultManager {
       active: this.active,
       opening: this.opening,
       error: this.error,
-      persistenceError: this.persistenceError,
+      persistenceError:
+        [this.persistenceError, this.directoryError]
+          .filter(Boolean)
+          .join(" ") || null,
     };
   }
   subscribe(listener: (state: VaultManagerSnapshot) => void) {
@@ -122,6 +150,18 @@ export class VaultManager {
     } catch (error) {
       this.persistenceError = `无法读取连接记录：${message(error)}`;
     }
+    try {
+      for (const record of (await this.directories?.list()) ?? []) {
+        this.directoryHandles.set(record.id, record.handle);
+        this.connections.push({
+          id: record.id,
+          kind: "directory",
+          name: record.name,
+        });
+      }
+    } catch (error) {
+      this.directoryError = `无法读取本机目录记录：${message(error)}`;
+    }
     if (this.disposed) return;
     this.notify();
     await this.activate(DEFAULT_VAULT_ID);
@@ -150,11 +190,21 @@ export class VaultManager {
     if (pending) return pending;
     const operation = (async () => {
       let vault: VaultInstance;
-      if (connection.kind === "opfs") {
-        if (this.options.openLocal)
+      if (connection.kind !== "remote") {
+        if (connection.kind === "opfs" && this.options.openLocal)
           vault = this.build(connection, await this.options.openLocal());
         else {
-          const { identity, backend, documents } = await openOpfsEditor();
+          const source: LocalEditorSource =
+            connection.kind === "opfs"
+              ? { kind: "opfs", id: "default" }
+              : {
+                  kind: "directory",
+                  id: connection.id,
+                  handle: this.directoryHandle(connection.id),
+                };
+          const { identity, backend, documents } = await (
+            this.options.openLocalEditor ?? openLocalEditor
+          )(source);
           vault = {
             id: connection.id,
             name: connection.name,
@@ -197,12 +247,19 @@ export class VaultManager {
   async activate(id: string): Promise<boolean> {
     const connection = this.connections.find((c) => c.id === id);
     if (!connection || this.disposed || this.removals.has(id)) return false;
+    const authorization =
+      connection.kind === "directory"
+        ? authorizeDirectory(this.directoryHandle(id))
+        : undefined;
     const request = ++this.selection;
     this.opening = true;
     this.error = null;
     this.notify();
     try {
+      await authorization;
       const vault = await this.open(connection);
+      if (connection.kind === "directory")
+        await vault.documents.observeFiles?.();
       if (request !== this.selection || this.disposed) return false;
       this.active = vault;
       this.error = null;
@@ -216,6 +273,47 @@ export class VaultManager {
         this.opening = false;
         this.notify();
       }
+    }
+  }
+  private directoryHandle(id: string): LocalDirectoryHandle {
+    const handle = this.directoryHandles.get(id);
+    if (!handle)
+      throw new VaultError("NotFound", "目录记录已不存在，请重新选择目录。");
+    return handle;
+  }
+  async openDirectory(): Promise<boolean> {
+    if (this.disposed) throw new VaultError("Closed", "Vault 管理器已关闭。");
+    const request = ++this.selection;
+    this.opening = true;
+    this.error = null;
+    this.notify();
+    try {
+      // Picker runs before any storage IO, preserving the click's activation.
+      const handle = await (this.options.pickDirectory ?? pickLocalDirectory)();
+      if (!handle || this.disposed) return false;
+      if (!this.directories)
+        throw new VaultError("Unsupported", "浏览器无法保存本机目录身份。");
+      const record = await this.directories.remember(handle);
+      if (this.disposed || this.removals.has(record.id)) return false;
+      this.directoryHandles.set(record.id, record.handle);
+      let connection = this.connections.find((entry) => entry.id === record.id);
+      if (!connection) {
+        connection = { id: record.id, name: record.name, kind: "directory" };
+        this.connections.push(connection);
+      }
+      connection.name = record.name;
+      this.directoryError = null;
+      const vault = await this.open(connection);
+      vault.name = record.name;
+      if (request !== this.selection || this.disposed) return false;
+      this.active = vault;
+      return true;
+    } catch (error) {
+      if (request === this.selection) this.error = message(error);
+      throw error;
+    } finally {
+      if (request === this.selection) this.opening = false;
+      this.notify();
     }
   }
   async connect(value: string, token = ""): Promise<boolean> {
@@ -324,11 +422,16 @@ export class VaultManager {
         this.active = fallback;
       }
       this.runtimes.delete(id);
+      if (this.directoryHandles.has(id)) {
+        await this.directories!.forget(id);
+        this.directoryHandles.delete(id);
+      }
       this.connections = this.connections.filter((c) => c.id !== id);
       await this.persist();
       this.notify();
     } finally {
       this.removals.delete(id);
+      this.notify();
     }
   }
   private persist(): Promise<void> {

@@ -1,4 +1,4 @@
-import { VaultError, opfsError } from "../../vault/errors";
+import { VaultError, fileSystemError } from "../../vault/errors";
 import { vaultPath } from "../../vault/path";
 import type { InstanceIdentity } from "../contract";
 
@@ -87,7 +87,7 @@ export class OpfsInstanceStore {
     } catch (error) {
       if (error instanceof DOMException && error.name === "NotFoundError")
         return null;
-      throw opfsError(error, "readHistory", path);
+      throw fileSystemError(error, "readHistory", path);
     }
   }
   async json<T>(path: string): Promise<T | null> {
@@ -102,7 +102,7 @@ export class OpfsInstanceStore {
     try {
       await write(await this.file(path, true), data);
     } catch (error) {
-      throw opfsError(error, "commitHistory", path);
+      throw fileSystemError(error, "commitHistory", path);
     }
   }
   async putJson(path: string, value: unknown) {

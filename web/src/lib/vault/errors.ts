@@ -61,7 +61,7 @@ export function isDomError(error: unknown, name: string): boolean {
 }
 
 /** 平台错误保留在 cause 中；业务层只需处理统一的 code。 */
-export function opfsError(
+export function fileSystemError(
   error: unknown,
   operation: string,
   path?: string,

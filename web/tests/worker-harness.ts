@@ -72,7 +72,7 @@ export async function installWorkerHarness(page: Page, remote = false) {
     { remote, bootstrap },
   );
   if (!remote)
-    await page.route("**/src/lib/editor/opfs/worker.ts*", async (route) => {
+    await page.route("**/src/lib/editor/local/worker.ts*", async (route) => {
       const response = await route.fetch();
       await route.fulfill({
         response,

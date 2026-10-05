@@ -9,6 +9,7 @@ import {
   IconButton,
 } from "../ui";
 import { Folder, X } from "../icons";
+import { supportsLocalDirectories } from "@/lib/vault/file-system-access";
 import {
   DEFAULT_VAULT_ID,
   type VaultManager,
@@ -37,6 +38,18 @@ export function VaultConnections(props: {
         setToken("");
         setOpen(false);
       }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function openDirectory() {
+    if (busy()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (await props.manager.openDirectory()) setOpen(false);
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -96,7 +109,7 @@ export function VaultConnections(props: {
         <DialogContent class="vault-connections-dialog">
           <DialogTitle>管理 Vault</DialogTitle>
           <DialogDescription>
-            本地 Vault 始终保留。连接远端后，文件保存在对应服务器。
+            默认 Vault 始终保留。可打开本机目录，或连接服务器上的远端 Vault。
           </DialogDescription>
           <ul class="vault-connection-list">
             <For each={props.state.connections}>
@@ -107,7 +120,9 @@ export function VaultConnections(props: {
                     <p class="mt-1 break-all text-ui-sm text-secondary">
                       {connection.kind === "opfs"
                         ? "默认本地 Vault · 不可移除"
-                        : connection.url}
+                        : connection.kind === "directory"
+                          ? "本机目录 · 文件直接保存到此目录"
+                          : connection.url}
                     </p>
                   </div>
                   <Button
@@ -120,7 +135,7 @@ export function VaultConnections(props: {
                   >
                     打开
                   </Button>
-                  <Show when={connection.kind === "remote"}>
+                  <Show when={connection.kind !== "opfs"}>
                     <IconButton
                       size="sm"
                       aria-label={`移除连接 ${connection.name}`}
@@ -139,7 +154,7 @@ export function VaultConnections(props: {
               <div class="mt-4 rounded-control border border-solid border-border p-3">
                 <p class="text-ui-sm">
                   移除“{connection.name}
-                  ”的连接？会先保存已打开的文件，服务器中的文件仍保留。
+                  ”的连接？会先保存已打开的文件，目录中的文件仍保留。
                 </p>
                 <div class="mt-3 flex justify-end gap-2">
                   <Button
@@ -160,6 +175,19 @@ export function VaultConnections(props: {
                 </div>
               </div>
             )}
+          </Show>
+          <Show when={supportsLocalDirectories()}>
+            <div class="mt-5 border-t border-solid border-border pt-5">
+              <Button
+                disabled={busy() || props.state.opening}
+                onClick={() => void openDirectory()}
+              >
+                打开本机目录
+              </Button>
+              <p class="mt-2 text-ui-sm text-secondary">
+                选择目录并授权读写，已有文件可直接编辑。重新打开时可能需要再次授权。
+              </p>
+            </div>
           </Show>
           <form
             class="mt-5 border-t border-solid border-border pt-5"

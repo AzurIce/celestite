@@ -13,6 +13,6 @@ pub mod preview;
 pub use preview::*;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-mod opfs;
+mod browser;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;

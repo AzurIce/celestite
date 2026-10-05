@@ -204,3 +204,160 @@ test("an obsolete open cannot activate after a more recent selection", async () 
   assert.equal(manager.snapshot().opened.length, 2);
   await manager.close();
 });
+
+function localDirectorySetup(registryFailure = false) {
+  const local = files(),
+    directory = files();
+  let selected = true,
+    permission: PermissionState = "granted",
+    prompts = 0,
+    opens = 0;
+  const handle = {
+    kind: "directory",
+    name: "Project",
+    async requestPermission() {
+      prompts++;
+      return permission;
+    },
+  } as unknown as import("../../src/lib/vault/file-system-access").LocalDirectoryHandle;
+  const records = new Map<
+    string,
+    import("../../src/lib/vault/directory-registry").DirectoryConnection
+  >();
+  const directories: import("../../src/lib/vault/directory-registry").DirectoryRegistry =
+    {
+      async list() {
+        if (registryFailure) throw new Error("IDB unavailable");
+        return [...records.values()];
+      },
+      async remember(handle) {
+        const record = { id: "directory:project", name: handle.name, handle };
+        records.set(record.id, record);
+        return record;
+      },
+      async forget(id) {
+        records.delete(id);
+      },
+    };
+  const create = () =>
+    new VaultManager({
+      file: new Registry(),
+      directories,
+      openLocal: async () => local.backend,
+      pickDirectory: async () => (selected ? handle : null),
+      openLocalEditor: async (source) => {
+        assert.equal(source.kind, "directory");
+        opens++;
+        const documents = new VaultDocuments(directory.backend);
+        return {
+          identity: {
+            instanceId: "dir",
+            vault: { vaultId: "dir", historyId: "dir" },
+          },
+          backend: documents.treeBackend,
+          documents,
+        };
+      },
+    });
+  return {
+    create,
+    directory,
+    records,
+    opens: () => opens,
+    prompts: () => prompts,
+    deny: () => {
+      permission = "denied";
+    },
+    grant: () => {
+      permission = "granted";
+    },
+    cancel: () => {
+      selected = false;
+    },
+  };
+}
+
+test("directory connections reuse their runtime, restore lazily, and authorize before reopening", async () => {
+  const state = localDirectorySetup();
+  const first = state.create();
+  await first.initialize();
+  await first.openDirectory();
+  const runtime = first.snapshot().active!;
+  await first.openDirectory();
+  assert.equal(first.snapshot().active, runtime);
+  assert.equal(first.snapshot().connections.length, 2);
+  assert.equal(state.opens(), 1);
+  const second = state.create();
+  await second.initialize();
+  assert.equal(state.opens(), 1);
+  assert.equal(second.snapshot().connections[1].kind, "directory");
+  const opening = second.activate(runtime.id);
+  assert.equal(
+    state.prompts(),
+    1,
+    "permission is requested synchronously from the click",
+  );
+  assert.equal(await opening, true);
+  assert.equal(state.opens(), 2);
+  await first.close();
+  await second.close();
+});
+
+test("denied directory permission retains the runtime and dirty edits until a new grant", async () => {
+  const state = localDirectorySetup();
+  const manager = state.create();
+  await manager.initialize();
+  await manager.openDirectory();
+  const runtime = manager.snapshot().active!;
+  await runtime.documents.open(vaultPath("a.md"));
+  runtime.documents.update(runtime.documents.snapshot().activeId!, "unsaved");
+  state.deny();
+  assert.equal(await manager.activate(runtime.id), false);
+  assert.match(manager.snapshot().error!, /读写权限/);
+  assert.equal(runtime.documents.snapshot().documents[0].content, "unsaved");
+  assert.equal(state.directory.isClosed(), false);
+  state.grant();
+  assert.equal(await manager.activate(runtime.id), true);
+  assert.equal(state.opens(), 1);
+  await manager.close();
+});
+
+test("removing a directory forgets its handle only after saving; save failure retains the connection", async () => {
+  const state = localDirectorySetup();
+  const manager = state.create();
+  await manager.initialize();
+  await manager.openDirectory();
+  const runtime = manager.snapshot().active!;
+  await manager.removeConnection(runtime.id);
+  assert.equal(state.records.size, 0);
+  assert.equal(state.directory.removed(), 0);
+  assert.equal(state.directory.isClosed(), true);
+  assert.equal(manager.snapshot().active!.id, DEFAULT_VAULT_ID);
+  await manager.close();
+
+  const failure = localDirectorySetup();
+  const second = failure.create();
+  await second.initialize();
+  await second.openDirectory();
+  const dirty = second.snapshot().active!;
+  await dirty.documents.open(vaultPath("a.md"));
+  dirty.documents.update(dirty.documents.snapshot().activeId!, "unsaved");
+  failure.directory.setFailure();
+  await assert.rejects(second.removeConnection(dirty.id));
+  assert.equal(failure.records.size, 1);
+  assert.equal(failure.directory.isClosed(), false);
+  await second.close();
+});
+
+test("picker cancellation and unavailable directory storage preserve the default Vault", async () => {
+  const state = localDirectorySetup(true);
+  const manager = state.create();
+  await manager.initialize();
+  assert.equal(manager.snapshot().active!.id, DEFAULT_VAULT_ID);
+  assert.match(manager.snapshot().persistenceError!, /IDB unavailable/);
+  state.cancel();
+  assert.equal(await manager.openDirectory(), false);
+  assert.equal(manager.snapshot().connections.length, 1);
+  assert.equal(manager.snapshot().opening, false);
+  await manager.close();
+});

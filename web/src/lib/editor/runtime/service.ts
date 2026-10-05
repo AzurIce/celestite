@@ -29,7 +29,10 @@ export type EditorWorkerHost = Pick<
   | "fileOperation"
   | "close"
   | "previewResources"
-> & { authorize?: (token: string) => Promise<ServiceDocument[]> };
+> & {
+  authorize?: (token: string) => Promise<ServiceDocument[]>;
+  observeFiles?: () => Promise<void>;
+};
 export async function serveEditorWorker(
   create: (
     emit: (event: ServiceEvent) => void,
@@ -72,6 +75,8 @@ export async function serveEditorWorker(
         throw new VaultError("Closed", "编辑服务会话无效或正在关闭。");
       const p = request.params;
       switch (request.method) {
+        case "observe_files":
+          return host.observeFiles?.();
         case "authorize":
           if (!host.authorize)
             throw new VaultError("Unsupported", "连接不支持认证更新。");

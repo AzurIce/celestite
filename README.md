@@ -18,9 +18,8 @@
 
 - Web App
   在本仓库 Github Pages 开箱可用
-  - OPFS 存储实现（`OpfsBackend`）：持久保存本地 Vault 的历史与普通文件
+  - 浏览器存储实现（`BrowserBackend`）：私有历史存于 OPFS，普通文件可使用 OPFS 或 File System Access API 本机目录
   - 内存存储实现（`MemoryBackend`）：保存远端 Vault 客户端的会话历史
-  - File System Access API 存储实现（WIP）
 - Tauri App（WIP）
   - Tauri API 存储实现
 - Native Headless Server

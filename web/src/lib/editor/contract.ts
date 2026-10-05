@@ -73,6 +73,7 @@ export interface ConnectionState {
   unconfirmed?: boolean;
 }
 export interface EditorDocuments {
+  observeFiles?(): Promise<void>;
   retryObservation?(id: string): Promise<boolean>;
   reconnect?(discardUnconfirmed?: boolean): Promise<void>;
   readonly previews?: DocumentPreviews;
@@ -197,6 +198,7 @@ export interface ServiceMethods {
   };
   save: { params: { id: string }; result: ServiceDocument };
   retry_history: { params: { id: string }; result: ServiceDocument };
+  observe_files: { params: Record<string, never>; result: void };
   retry_observation: { params: { id: string }; result: ServiceDocument };
   resolve: {
     params: { id: string; action: "overwrite" | "discard" | "retry" };

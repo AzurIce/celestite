@@ -45,19 +45,33 @@ pub fn preview_resource_requests(task: &str) -> Result<String, JsValue> {
     Ok(encode(crate::preview::preview_resource_requests(&task)))
 }
 
-/// Worker-owned shared editor with its concrete OPFS Backend.
+/// Worker-owned shared editor with its browser IO Backend.
 #[wasm_bindgen]
 pub struct EditorBinding {
-    core: EditorCore<crate::opfs::OpfsBackend>,
+    core: EditorCore<crate::browser::BrowserBackend>,
 }
 #[wasm_bindgen]
 impl EditorBinding {
-    pub async fn open(identity: String, io: js_sys::Function) -> Result<EditorBinding, JsValue> {
-        let backend = crate::opfs::OpfsBackend::new(io, decode(&identity)?);
+    pub async fn open(
+        identity: String,
+        io: js_sys::Function,
+        merge_external: bool,
+    ) -> Result<EditorBinding, JsValue> {
+        let backend = crate::browser::BrowserBackend::new(io, decode(&identity)?);
         Ok(Self {
-            core: EditorCore::open(backend)
-                .await
-                .map_err(|e| JsValue::from_str(&encode(e)))?,
+            core: EditorCore::open_with_options(
+                backend,
+                EditorOptions {
+                    external_changes: if merge_external {
+                        ExternalChangePolicy::Merge
+                    } else {
+                        ExternalChangePolicy::Conflict
+                    },
+                    defer_filesystem_diff: false,
+                },
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&encode(e)))?,
         })
     }
     pub async fn execute(&mut self, method: String, params: String) -> Result<String, JsValue> {

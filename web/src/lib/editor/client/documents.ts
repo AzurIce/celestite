@@ -530,6 +530,10 @@ export class WorkerDocuments {
     if (!this.online() || !record || record.readOnlyReason) return false;
     return this.enqueue(() => this.saveRecord(record));
   }
+  async observeFiles(): Promise<void> {
+    if (this.closing) return;
+    await this.enqueue(() => this.client.request("observe_files", {}));
+  }
   async retryObservation(id: string): Promise<boolean> {
     const record = this.records.get(id);
     if (!this.online() || !record) return false;
@@ -765,12 +769,14 @@ export class WorkerDocuments {
   }
 }
 
-export async function openOpfsEditor(): Promise<{
+export async function openLocalEditor(
+  source: import("../local/worker").LocalEditorSource,
+): Promise<{
   identity: InstanceIdentity;
   documents: WorkerDocuments;
   backend: VaultBackend;
 }> {
-  const worker = new Worker(new URL("../opfs/worker.ts", import.meta.url), {
+  const worker = new Worker(new URL("../local/worker.ts", import.meta.url), {
     type: "module",
   });
   const client = new EditorClient(worker);
@@ -780,9 +786,16 @@ export async function openOpfsEditor(): Promise<{
     );
   worker.addEventListener("error", error);
   worker.addEventListener("messageerror", error);
+  worker.postMessage({ kind: "initialize", source });
   try {
     const identity = await client.ready;
-    const documents = new WorkerDocuments(client, () => worker.terminate());
+    let detach = () => {};
+    const documents = new WorkerDocuments(client, () => {
+      detach();
+      worker.terminate();
+    });
+    if (source.kind === "directory") detach = observeDirectory(documents);
+
     return { identity, documents, backend: documents.treeBackend };
   } catch (error) {
     client.dispose();
@@ -845,4 +858,28 @@ export async function openRemoteEditor(
     await backend.close();
     throw error;
   }
+}
+
+/** Coalesce foreground checks and serialize them with accepted local inputs. */
+function observeDirectory(documents: WorkerDocuments) {
+  let pending = false;
+  const observe = () => {
+    if (document.visibilityState === "hidden" || pending) return;
+    pending = true;
+    void documents
+      .observeFiles()
+      .catch(() => {})
+      .finally(() => {
+        pending = false;
+      });
+  };
+  const timer = setInterval(observe, 3000);
+  window.addEventListener("focus", observe);
+  document.addEventListener("visibilitychange", observe);
+  observe();
+  return () => {
+    clearInterval(timer);
+    window.removeEventListener("focus", observe);
+    document.removeEventListener("visibilitychange", observe);
+  };
 }

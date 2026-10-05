@@ -5,7 +5,10 @@ import { OpfsInstanceStore } from "./store";
 import { encodeError } from "../rpc";
 
 /** Browser primitives for the Rust Backend. No editing or recovery policy here. */
-export function createOpfsIo(store: OpfsInstanceStore, backend: VaultBackend) {
+export function createBrowserIo(
+  store: OpfsInstanceStore,
+  backend: VaultBackend,
+) {
   return (request: string): string | Promise<string> => {
     const { method, params: p } = JSON.parse(request);
     if (method === "newId") return crypto.randomUUID();
@@ -61,7 +64,7 @@ export function createOpfsIo(store: OpfsInstanceStore, backend: VaultBackend) {
         case "remove":
           return backend.remove(vaultPath(p.path), { recursive: p.recursive });
         default:
-          throw new VaultError("Unsupported", `未知 OPFS 操作：${method}`);
+          throw new VaultError("Unsupported", `未知浏览器文件操作：${method}`);
       }
     };
     return execute().then(

@@ -22,8 +22,8 @@ UI 的正文是 core 已接受正文与待确认输入的投影；CRDT 历史和
 
 代码中需要区分两种 Backend：
 
-- Rust `Backend`：EditorCore 注入的存储与 IO 契约，包含身份、历史恢复与提交、可选普通文件投影。浏览器使用 `OpfsBackend` 或 `MemoryBackend`。
-- TypeScript `VaultBackend`：文件访问契约，提供 `readDir`、`stat`、字节读写、目录操作、变化监听和关闭。OPFS 与 HTTP 文件适配器实现该接口；UI 通常使用经 Worker RPC 转发的 `treeBackend`。
+- Rust `Backend`：EditorCore 注入的存储与 IO 契约，包含身份、历史恢复与提交、可选普通文件投影。浏览器使用 `BrowserBackend` 或 `MemoryBackend`。
+- TypeScript `VaultBackend`：文件访问契约，提供 `readDir`、`stat`、字节读写、目录操作、变化监听和关闭。OPFS、本机目录与 HTTP 文件适配器实现该接口；UI 通常使用经 Worker RPC 转发的 `treeBackend`。
 
 远端实例的 Rust core 使用 `MemoryBackend` 保存客户端历史；它的文件访问由 `HttpVaultBackend` 连接 host。HTTP 文件适配器不会将客户端历史存入 OPFS。WebSocket 则承担独立的文本同步与保存命令。
 
@@ -38,6 +38,10 @@ UI 的正文是 core 已接受正文与待确认输入的投影；CRDT 历史和
 | 远端连接记录                   | OPFS `/celestite/connections.json` | 保存 URL 与名称，不保存正文、CRDT 历史或认证令牌  |
 
 应用设置与连接记录在存储能力不可用时可以退回会话内存；默认本地 Vault 的 OPFS 后端不降级为内存存储。普通目录和 core 私有历史分开，文件树不展示私有历史目录。
+
+本机目录 Vault 通过 File System Access API 直接访问所选目录，私有身份与历史仍存于 OPFS `/editor-instances/directory-<uuid>`。目录 handle 与连接身份位于 IndexedDB，按同一目录去重；页面启动只加载连接，用户点击后申请读写权限并打开独立 Worker。同一实例仅允许一个标签页持有内核。移除连接不删除普通文件或私有历史；再次登记会创建新的实例身份。
+
+本机目录在前台定期、恢复焦点及页面可见时核对已登记文档，core 从磁盘历史合入外部修改。未打开文件不主动加载正文，文件树按缓存范围刷新；IME 期间延后后台核对。保存前再次核对，失败保留正文；暂存写入在提交前复查内容 revision。Web Locks 无法协调本机程序，检查与最终写入／删除之间仍存在竞争窗口。
 
 host 的历史是否跨重启保留取决于服务端是否配置持久化存储，描述响应通过 `persistentHistory` 报告。历史提交与普通文件保存分别确认：host 已确认但尚未写回普通文件的正文，在启用持久化历史时仍可跨 host 重启恢复。
 
@@ -185,9 +189,9 @@ host 普通目录的外部修改由文件监听提示和定期核对发现。文
 - [VaultManager](../../web/src/lib/vault/manager.ts)：实例创建、切换、关闭与连接记录。
 - [FileTreeModel](../../web/src/lib/file-tree/model.ts)：局部目录缓存、展开与刷新。
 - [WorkerDocuments](../../web/src/lib/editor/client/documents.ts)：主线程视图投影、文件 RPC 与关闭标签。
-- [本地 Worker](../../web/src/lib/editor/opfs/worker.ts)、[远端 Worker](../../web/src/lib/editor/remote/worker.ts)：core 与后端的构造。
+- [本地 Worker](../../web/src/lib/editor/local/worker.ts)、[远端 Worker](../../web/src/lib/editor/remote/worker.ts)：core 与后端的构造。
 - [RemoteEditorHost](../../web/src/lib/editor/remote/host.ts)、[RemoteTransport](../../web/src/lib/editor/remote/transport.ts)：远端命令、快照导入、请求关联与重连。
 - [HTTP 文件适配器](../../web/src/lib/vault/http.ts)、[预览资源读取](../../web/src/lib/editor/preview/resources.ts)：普通文件访问与只读资源。
-- [OpfsBackend](../../crates/celestite-core/src/opfs.rs)、[MemoryBackend](../../crates/celestite-core/src/memory.rs)：客户端存储实现。
+- [BrowserBackend](../../crates/celestite-core/src/browser.rs)、[MemoryBackend](../../crates/celestite-core/src/memory.rs)：客户端存储实现。
 - [EditorCore](../../crates/celestite-core/src/editor.rs)：历史恢复、文件发现、编辑、身份与保存。
 - [server 同步](../../crates/celestite-server/src/sync.rs)、[HTTP 文件入口](../../crates/celestite-server/src/lib.rs)、[文件核对](../../crates/celestite-server/src/reconcile.rs)：host 协作与普通目录协调。

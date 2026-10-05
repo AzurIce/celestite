@@ -113,7 +113,7 @@ Kobalte alpha 的浮层注册和输入读取时机通过 Bun 补丁适配了 Sol
 
 ## Vault 文件后端
 
-`src/lib/vault` 提供平台无关的 `VaultBackend` 接口和 Web 的 OPFS 实现。接口绑定一个根目录，包含直接子项遍历、元数据查询、二进制读取、完整内容保存、目录创建、删除、重命名、外部监听和关闭。缓存、业务变化事件、编辑缓冲区及自动保存由后续的 Vault / 文档运行时负责。
+`src/lib/vault` 提供平台无关的 `VaultBackend` 接口，以及 OPFS、本机目录与 HTTP 实现。接口绑定一个根目录，包含直接子项遍历、元数据查询、二进制读取、完整内容保存、目录创建、删除、重命名、外部监听和关闭。缓存、业务变化事件、编辑缓冲区及自动保存由后续的 Vault / 文档运行时负责。
 
 ```ts
 import { openOpfsVault, ROOT_PATH, vaultPath } from "@/lib/vault";
@@ -144,7 +144,7 @@ try {
 
 OPFS 后端要求安全上下文，以及 `getDirectory()`、`createWritable()` 和 Web Locks 支持。所有修改通过按 Vault ID 命名的同源锁协调，覆盖应用自己的不同会话和标签页；直接绕过后端操作 OPFS 的代码不受此约定保护。`close()` 拒绝新操作并等待已接收操作完成，不删除数据；暂停的目录迭代器不会阻塞关闭，关闭后继续迭代会报 `Closed`。
 
-`openOpfsVault("another-id")` 可打开隔离的另一个目录；当前界面固定提供 `default` 本地 Vault，并支持连接多个远端 Vault。主页通过 `VaultManager` 管理各后端及其生命周期。OPFS 的 `watch()` 不发出任何事件，返回可重复调用的空取消订阅函数；后端关闭后订阅会报 `Closed`。应用操作引起的业务变化由上层发布。浏览器配额与持久存储申请属于平台服务，OPFS 数据也仍需要导出或备份。
+`openOpfsVault("another-id")` 可打开隔离的另一个目录；当前界面提供 `default` 本地 Vault，并支持打开多个本机目录及连接多个远端 Vault。主页通过 `VaultManager` 管理各后端及其生命周期。OPFS 的 `watch()` 不发出任何事件，返回可重复调用的空取消订阅函数；后端关闭后订阅会报 `Closed`。应用操作引起的业务变化由上层发布。浏览器配额与持久存储申请属于平台服务，OPFS 数据也仍需要导出或备份。
 
 移动的内存模拟测试验证路径保护、同路径、目标冲突、流式复制、写入/读取/提交故障、清理失败、部分删除、共享写锁和关闭等待：
 
@@ -157,6 +157,20 @@ bun run test:vault
 ```sh
 bun run test:ui tests/vault.spec.ts
 ```
+
+## File System Access API 本机目录
+
+支持 `showDirectoryPicker` 的安全上下文中，“管理 Vault”提供“打开本机目录”。主线程在用户点击时选择目录并申请读写权限，将 handle 通过 structured clone 传给独立编辑 Worker；文件树、编辑、撤销、项目设置和预览共用现有接口。
+
+`directory-handle.ts` 共用 OPFS 与本机目录的文件操作；`file-system-access.ts` 管理选择、授权和后端构造。目录连接及 handle 存在 IndexedDB `celestite-local-directories`，登记时通过 `isSameEntry()` 去重，并用 Web Locks 协调跨标签页登记。不同位置的同名目录分别登记。刷新只恢复连接列表，点击打开时直接申请权限；权限失效保留正文，可从“管理 Vault”再次打开并授权。
+
+普通文件直接写回所选目录；实例身份和历史存于 OPFS `/editor-instances/directory-<uuid>`，不在本机目录里创建私有历史文件。每个目录实例独占打开，不允许另一标签页同时写入同一份私有历史。移除连接先保存正文、释放 Worker，再删除 IndexedDB handle 记录；普通文件和 OPFS 私有历史保留。重新登记已移除的目录会分配新的实例。
+
+前台每三秒、页面恢复可见与窗口恢复焦点时核对已登记文档，并提示文件树重新读取已缓存目录。Rust core 从磁盘基线合并外部变化，保留本地编辑与个人撤销；IME 期间延后该文档的后台核对。保存前再次核对，使用内容 revision 条件写入；观察或权限失败可见，保留历史与编辑正文。目录监听不依赖实验性 `FileSystemObserver`，不会捕获每个瞬间状态，也不预先把整库正文加入历史。
+
+本机程序不受 Web Locks 约束，浏览器无法提供与外部程序之间的原子 compare-and-swap。暂存写入提交前再次校验 revision；移动在复制后检查源树的大小与修改时间，发现变化保留源和完整目标。写入或复制失败可能留下新建条目或部分目标，本机后端不自动删除这些条目，以免删除外部程序刚写入的数据。元数据检查不能识别所有替换，也不能消除最终核对与提交／删除之间的竞争；本机目录多步骤操作不提供事务性保证。
+
+`tests/file-system-access.spec.ts` 以注入 chooser 返回真实浏览器目录 handle 的方式验证 Worker / WASM、IndexedDB 恢复、跨标签页身份与占用、外部修改合并及权限失败恢复；操作系统原生选择器与真实权限弹窗仍需人工验证。
 
 ## 文件树
 
@@ -279,7 +293,7 @@ bun run test:ui tests/settings-ui.spec.ts
 | Tab / Shift + Tab          | 缩进 / 减少缩进；CodeMirror 支持 Escape 后用 Tab 移出编辑器 |
 | 标签上的关闭按钮           | 先保存文档再关闭；保存失败时保留标签与缓冲区                |
 
-本地与远端都使用 Worker 内的 Rust `EditorCore` 管理正文、个人撤销和预览；`WorkerDocuments` 管理 UI 视图和待确认输入。本地注入 `OpfsBackend`，远端注入 `MemoryBackend`，从 host 快照加入同一文档历史。远端输入实时发送 CRDT 增量；显式保存将因果版本交给 host core 条件写回，成功回执更新已保存正文。已删除文件不会被延迟保存重新创建。失败显示原因并保留修改，停止自动重试，可使用保存按钮或“重试保存”恢复。
+本地与远端都使用 Worker 内的 Rust `EditorCore` 管理正文、个人撤销和预览；`WorkerDocuments` 管理 UI 视图和待确认输入。本地的 OPFS 与本机目录均注入 `BrowserBackend`，远端注入 `MemoryBackend`，从 host 快照加入同一文档历史。远端输入实时发送 CRDT 增量；显式保存将因果版本交给 host core 条件写回，成功回执更新已保存正文。已删除文件不会被延迟保存重新创建。失败显示原因并保留修改，停止自动重试，可使用保存按钮或“重试保存”恢复。
 
 `MemoryBackend` 是 core 的内存历史存储后端，通过 `MemoryEditorBinding` 接入远端 Worker；它保存文档快照与增量，不提供内存文件系统，也不写入 OPFS。远端文件和目录由 HTTP 适配器访问 host。关闭标签释放 UI buffer，Worker 历史继续保留和同步；刷新后从 host 重建会话，未确认输入没有本机持久化副本。后端实现见 [core README](../crates/celestite-core/README.md#backend-与服务接口)，加载范围与请求流程见 [Web 当前状态与请求交互](../docs/state/web.md)。
 
@@ -314,20 +328,20 @@ cargo build -p celestite-server
 bun run --cwd web test:ui tests/multi-vault.spec.ts
 ```
 
-## 默认 OPFS 编辑服务
+## 本地编辑服务
 
-默认库的 Rust 编辑内核在 Dedicated Worker 中运行。`WorkerDocuments` 保留 UI 视图与待确认输入，`EditorClient` 承载异步请求 / 通知，`EditorHost` 只适配消息、视图状态与定时任务；Rust `EditorCore<Backend>` 统一执行文档、保存、冲突与目录恢复逻辑，`OpfsBackend` 通过浏览器 IO 桥访问 OPFS。server 的 native 后端使用同一个 core。CodeMirror 输入发送 UTF-16 增量，撤销 / 重做使用 Rust 内核。
+默认库的 Rust 编辑内核在 Dedicated Worker 中运行。`WorkerDocuments` 保留 UI 视图与待确认输入，`EditorClient` 承载异步请求 / 通知，`EditorHost` 只适配消息、视图状态与定时任务；Rust `EditorCore<Backend>` 统一执行文档、保存、冲突与目录恢复逻辑，`BrowserBackend` 通过浏览器 IO 桥访问普通目录与 OPFS 私有历史。server 的 native 后端使用同一个 core。CodeMirror 输入发送 UTF-16 增量，撤销 / 重做使用 Rust 内核。
 
 `src/lib/editor/` 按职责组织，共用的契约、RPC、文档状态和文本工具位于顶层：
 
-| 目录         | 职责                                                  |
-| ------------ | ----------------------------------------------------- |
-| `client/`    | UI 文档视图、待确认输入与本地 / 远端 Worker 连接      |
-| `runtime/`   | 本地与远端共用的 core host、Worker 命令队列与服务入口 |
-| `opfs/`      | OPFS 历史存储、浏览器 IO 桥与本地编辑 Worker          |
-| `remote/`    | 远端编辑 host、WebSocket 同步传输与远端编辑 Worker    |
-| `preview/`   | 预览契约、任务调度、项目资源与组件运行时              |
-| `generated/` | 构建生成的 WASM 绑定                                  |
+| 目录         | 职责                                                    |
+| ------------ | ------------------------------------------------------- |
+| `client/`    | UI 文档视图、待确认输入与本地 / 远端 Worker 连接        |
+| `runtime/`   | 本地与远端共用的 core host、Worker 命令队列与服务入口   |
+| `local/`     | OPFS 私有历史、浏览器 IO 桥、本地编辑 Worker 与目录观察 |
+| `remote/`    | 远端编辑 host、WebSocket 同步传输与远端编辑 Worker      |
+| `preview/`   | 预览契约、任务调度、项目资源与组件运行时                |
+| `generated/` | 构建生成的 WASM 绑定                                    |
 
 普通文件位于 `vaults/default`，稳定身份和 CRDT 历史位于 `editor-instances/default`。每次接受编辑先提交私有增量日志，普通文件另行自动保存；文件写回失败后，已提交历史仍可在刷新时恢复。历史提交失败会暂停编辑，重试保存先提交历史。个人撤销栈只保留在本次 Worker 生命周期。
 

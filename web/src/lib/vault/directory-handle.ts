@@ -1,0 +1,530 @@
+import {
+  isDomError,
+  fileSystemError,
+  VaultError,
+  VaultRenameError,
+} from "./errors";
+import { childPath, ROOT_PATH, splitPath, vaultPath } from "./path";
+import type { VaultPath } from "./path";
+import type {
+  ChangeHint,
+  Entry,
+  EntryStat,
+  VaultBackend,
+  WriteFileOptions,
+} from "./types";
+
+type DirectoryEntry = FileSystemFileHandle | FileSystemDirectoryHandle;
+
+export async function contentRevision(data: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(data));
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function isFileHandle(
+  handle: FileSystemHandle,
+): handle is FileSystemFileHandle {
+  return handle.kind === "file";
+}
+
+function isDirectoryHandle(
+  handle: FileSystemHandle,
+): handle is FileSystemDirectoryHandle {
+  return handle.kind === "directory";
+}
+
+/** File operations shared by OPFS and user-granted directories. */
+export class DirectoryHandleVaultBackend implements VaultBackend {
+  private closed = false;
+  private closing?: Promise<void>;
+  private readonly pending = new Set<Promise<unknown>>();
+
+  constructor(
+    private readonly root: FileSystemDirectoryHandle,
+    private readonly locks: LockManager,
+    private readonly lockName: string,
+    private readonly options: { externalWriters?: boolean } = {},
+  ) {}
+
+  async *readDir(path: VaultPath): AsyncIterable<Entry> {
+    const directory = await this.run("readDir", path, () =>
+      this.directory(vaultPath(path)),
+    );
+    const iterator = directory.entries();
+    while (true) {
+      // 不跨 yield 持有锁或操作计数，close 不会被暂停的迭代器阻塞。
+      const result = await this.run("readDir", path, () => iterator.next());
+      if (result.done) return;
+      const [name, handle] = result.value;
+      yield { path: childPath(path, name), kind: handle.kind };
+    }
+  }
+
+  stat(path: VaultPath): Promise<EntryStat | null> {
+    return this.run("stat", path, async () => {
+      vaultPath(path);
+      try {
+        const entry = await this.entry(path);
+        if (entry.kind === "directory") return { path, kind: "directory" };
+        const file = await entry.getFile();
+        return {
+          path,
+          kind: "file",
+          size: file.size,
+          modifiedAt: file.lastModified,
+        };
+      } catch (error) {
+        if (isDomError(error, "NotFoundError")) return null;
+        throw error;
+      }
+    });
+  }
+
+  readFile(path: VaultPath): Promise<Uint8Array> {
+    return this.run("readFile", path, async () => {
+      vaultPath(path);
+      const entry = await this.entry(path);
+      if (entry.kind !== "file") {
+        throw new VaultError(
+          "NotFile",
+          "Cannot read a directory as a file",
+          path,
+        );
+      }
+      return new Uint8Array(await (await entry.getFile()).arrayBuffer());
+    });
+  }
+
+  readFileSnapshot(
+    path: VaultPath,
+  ): Promise<{ data: Uint8Array; revision: string }> {
+    return this.run("readFileSnapshot", path, async () => {
+      vaultPath(path);
+      const entry = await this.entry(path);
+      if (entry.kind !== "file")
+        throw new VaultError(
+          "NotFile",
+          "Cannot read a directory as a file",
+          path,
+        );
+      const data = new Uint8Array(await (await entry.getFile()).arrayBuffer());
+      return { data, revision: await contentRevision(data) };
+    });
+  }
+
+  writeFile(
+    path: VaultPath,
+    data: Uint8Array,
+    options: WriteFileOptions,
+  ): Promise<string> {
+    return this.run("writeFile", path, async () => {
+      const { parent, name } = splitPath(path);
+      // 在第一次 await 前复制，排队保存不受调用者之后修改 buffer 的影响。
+      const bytes = new Uint8Array(data);
+      const mode = options.mode;
+      if (mode !== "create" && mode !== "replace") {
+        throw new VaultError("Unsupported", "Unknown file write mode", path);
+      }
+      return await this.mutate(async () => {
+        const directory = await this.directory(parent);
+        const existing = await this.findEntry(directory, name);
+        if (mode === "create" && existing) {
+          throw new VaultError("AlreadyExists", "Entry already exists", path);
+        }
+        if (mode === "replace" && !existing) {
+          throw new VaultError("NotFound", "File does not exist", path);
+        }
+        if (existing?.kind === "directory") {
+          throw new VaultError(
+            "NotFile",
+            "Cannot write a directory as a file",
+            path,
+          );
+        }
+        if (options.expectedRevision !== undefined) {
+          if (
+            !existing ||
+            existing.kind !== "file" ||
+            (await contentRevision(
+              new Uint8Array(await (await existing.getFile()).arrayBuffer()),
+            )) !== options.expectedRevision
+          )
+            throw new VaultError(
+              "Conflict",
+              "文件已被其他客户端或程序修改。",
+              path,
+            );
+        }
+
+        const file =
+          existing ?? (await directory.getFileHandle(name, { create: true }));
+        let writable: FileSystemWritableFileStream | undefined;
+        try {
+          writable = await file.createWritable();
+          await writable.write(bytes);
+          // Browser locks cannot stop native programs. Check again while the
+          // replacement is still staged; the final check/close is not an OS CAS.
+          if (
+            this.options.externalWriters &&
+            options.expectedRevision !== undefined &&
+            (await contentRevision(
+              new Uint8Array(await (await file.getFile()).arrayBuffer()),
+            )) !== options.expectedRevision
+          )
+            throw new VaultError(
+              "Conflict",
+              "文件在保存期间被外部程序修改。",
+              path,
+            );
+          await writable.close();
+          return await contentRevision(bytes);
+        } catch (error) {
+          // createWritable rejected before opening a stream: the existing file is untouched.
+          if (existing && writable === undefined) {
+            const failure = fileSystemError(error, "writeFile", path);
+            throw new VaultError(
+              failure.code,
+              failure.message,
+              path,
+              error,
+              true,
+            );
+          }
+          // 已有文件通过 abort 保留旧内容；新建失败时清理空条目。
+          try {
+            await writable?.abort();
+          } catch {
+            /* 流可能已经关闭或出错。 */
+          }
+          if (!existing && !this.options.externalWriters) {
+            try {
+              await directory.removeEntry(name);
+            } catch (cleanupError) {
+              throw new VaultError(
+                "IO",
+                "Write failed and the new entry could not be removed",
+                path,
+                {
+                  writeError: error,
+                  cleanupError,
+                },
+              );
+            }
+          }
+          throw error;
+        }
+      });
+    });
+  }
+
+  mkdir(path: VaultPath, options?: { recursive?: boolean }): Promise<void> {
+    return this.run("mkdir", path, async () => {
+      vaultPath(path);
+      const recursive = options?.recursive ?? false;
+      await this.mutate(async () => {
+        if (recursive) {
+          await this.directory(path, true);
+          return;
+        }
+        if (path === ROOT_PATH) {
+          throw new VaultError(
+            "AlreadyExists",
+            "Vault root already exists",
+            path,
+          );
+        }
+        const { parent, name } = splitPath(path);
+        const directory = await this.directory(parent);
+        if (await this.findEntry(directory, name)) {
+          throw new VaultError("AlreadyExists", "Entry already exists", path);
+        }
+        await directory.getDirectoryHandle(name, { create: true });
+      });
+    });
+  }
+
+  remove(path: VaultPath, options?: { recursive?: boolean }): Promise<void> {
+    return this.run("remove", path, async () => {
+      const { parent, name } = splitPath(path);
+      const recursive = options?.recursive ?? false;
+      await this.mutate(async () => {
+        const directory = await this.directory(parent);
+        await directory.removeEntry(name, { recursive });
+      });
+    });
+  }
+
+  rename(from: VaultPath, to: VaultPath): Promise<void> {
+    return this.run("rename", from, async () => {
+      // 即便 from === to，也先拒绝根路径和未经校验的路径。
+      const sourcePath = splitPath(from);
+      const targetPath = splitPath(to);
+      await this.mutate(async () => {
+        const sourceParent = await this.directory(sourcePath.parent);
+        const source = await this.findEntry(sourceParent, sourcePath.name);
+        if (!source)
+          throw new VaultError("NotFound", "Source entry does not exist", from);
+        if (from === to) return;
+        if (source.kind === "directory" && to.startsWith(`${from}/`)) {
+          throw new VaultError(
+            "InvalidPath",
+            "Cannot move a directory into itself",
+            to,
+          );
+        }
+        const targetParent = await this.directory(targetPath.parent);
+        if (await this.findEntry(targetParent, targetPath.name)) {
+          throw new VaultError(
+            "AlreadyExists",
+            "Target entry already exists",
+            to,
+          );
+        }
+
+        const sourceStamp = this.options.externalWriters
+          ? await this.treeStamp(source)
+          : undefined;
+
+        let target: DirectoryEntry | undefined;
+        try {
+          target =
+            source.kind === "file"
+              ? await targetParent.getFileHandle(targetPath.name, {
+                  create: true,
+                })
+              : await targetParent.getDirectoryHandle(targetPath.name, {
+                  create: true,
+                });
+          await this.copyEntry(source, target, to);
+        } catch (error) {
+          let cleanupError: VaultError | undefined;
+          if (target && !this.options.externalWriters) {
+            try {
+              await targetParent.removeEntry(targetPath.name, {
+                recursive: true,
+              });
+            } catch (cleanup) {
+              cleanupError = fileSystemError(cleanup, "remove", to);
+            }
+          }
+          throw new VaultRenameError(
+            fileSystemError(error, "copy", to),
+            from,
+            to,
+            "copy",
+            cleanupError,
+          );
+        }
+
+        // 复制全部成功后才开始删除。删除可能部分完成，此后绝不能回滚目标。
+        try {
+          if (
+            sourceStamp !== undefined &&
+            sourceStamp !== (await this.treeStamp(source))
+          )
+            throw new VaultError(
+              "Conflict",
+              "源目录在移动期间被外部程序修改，源和目标均保留。",
+              from,
+            );
+          await sourceParent.removeEntry(sourcePath.name, {
+            recursive: source.kind === "directory",
+          });
+        } catch (error) {
+          throw new VaultRenameError(
+            fileSystemError(error, "remove", from),
+            from,
+            to,
+            "remove-source",
+          );
+        }
+      });
+    });
+  }
+
+  watch(_listener: (hint: ChangeHint) => void): Promise<() => void> {
+    return this.run("watch", ROOT_PATH, async () => () => {});
+  }
+
+  close(): Promise<void> {
+    if (!this.closing) {
+      this.closed = true;
+      this.closing = Promise.allSettled([...this.pending]).then(
+        () => undefined,
+      );
+    }
+    return this.closing;
+  }
+
+  private run<T>(
+    operation: string,
+    path: VaultPath,
+    task: () => Promise<T>,
+  ): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(
+        new VaultError("Closed", "Vault backend is closed", path),
+      );
+    }
+    const promise = (async () => {
+      try {
+        return await task();
+      } catch (error) {
+        throw fileSystemError(error, operation, path);
+      }
+    })();
+    this.pending.add(promise);
+    const finished = () => this.pending.delete(promise);
+    void promise.then(finished, finished);
+    return promise;
+  }
+
+  private async mutate<T>(task: () => Promise<T>): Promise<T> {
+    // 所有会话和标签页使用相同锁名，保护检查后创建等复合操作。
+    return await this.locks.request(this.lockName, task);
+  }
+
+  /** Metadata only: moving large attachments must not buffer their contents. */
+  private async treeStamp(entry: DirectoryEntry): Promise<string> {
+    if (entry.kind === "file") {
+      const file = await entry.getFile();
+      return JSON.stringify([file.size, file.lastModified]);
+    }
+    const children: [string, string, string][] = [];
+    for await (const [name, child] of entry.entries())
+      children.push([
+        name,
+        child.kind,
+        await this.treeStamp(child as DirectoryEntry),
+      ]);
+    children.sort((a, b) => a[0].localeCompare(b[0]));
+    return JSON.stringify(children);
+  }
+
+  /** 只在已持有 Vault 写锁时调用；顺序复制，失败后没有后台复制任务残留。 */
+  private async copyEntry(
+    source: FileSystemHandle,
+    target: DirectoryEntry,
+    path: VaultPath,
+  ): Promise<void> {
+    if (isFileHandle(source) && target.kind === "file") {
+      const file = await source.getFile();
+      const reader = file.stream().getReader();
+      let writable: FileSystemWritableFileStream | undefined;
+      try {
+        writable = await target.createWritable();
+        let copied = 0;
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          await writable.write(chunk.value);
+          copied += chunk.value.byteLength;
+        }
+        if (copied !== file.size) {
+          throw new VaultError(
+            "IO",
+            "File stream length changed during copy",
+            path,
+          );
+        }
+        await writable.close();
+      } catch (error) {
+        let cancelError: unknown;
+        let abortError: unknown;
+        try {
+          await reader.cancel();
+        } catch (cancel) {
+          cancelError = cancel;
+        }
+        try {
+          await writable?.abort();
+        } catch (abort) {
+          abortError = abort;
+        }
+        if (cancelError !== undefined || abortError !== undefined) {
+          const copyError = fileSystemError(error, "copy", path);
+          throw new VaultError(
+            copyError.code,
+            "Copy failed and stream cleanup failed",
+            path,
+            {
+              copyError,
+              cancelError,
+              abortError,
+            },
+          );
+        }
+        throw error;
+      } finally {
+        reader.releaseLock();
+      }
+      return;
+    }
+    if (isDirectoryHandle(source) && target.kind === "directory") {
+      for await (const [name, entry] of source.entries()) {
+        const destination = childPath(path, name);
+        const child =
+          entry.kind === "file"
+            ? await target.getFileHandle(name, { create: true })
+            : await target.getDirectoryHandle(name, { create: true });
+        await this.copyEntry(entry, child, destination);
+      }
+      return;
+    }
+    throw new VaultError(
+      "IO",
+      "Source and target kinds differ during copy",
+      path,
+    );
+  }
+
+  private async directory(
+    path: VaultPath,
+    create = false,
+  ): Promise<FileSystemDirectoryHandle> {
+    let directory = this.root;
+    let current = ROOT_PATH;
+    for (const name of path === ROOT_PATH ? [] : path.split("/")) {
+      current = childPath(current, name);
+      try {
+        directory = await directory.getDirectoryHandle(name, { create });
+      } catch (error) {
+        if (isDomError(error, "TypeMismatchError")) {
+          throw new VaultError(
+            "NotDirectory",
+            "Path component is not a directory",
+            current,
+            error,
+          );
+        }
+        throw error;
+      }
+    }
+    return directory;
+  }
+
+  private async entry(path: VaultPath): Promise<DirectoryEntry> {
+    if (path === ROOT_PATH) return this.root;
+    const { parent, name } = splitPath(path);
+    const directory = await this.directory(parent);
+    const entry = await this.findEntry(directory, name);
+    if (!entry) throw new DOMException("Entry does not exist", "NotFoundError");
+    return entry;
+  }
+
+  private async findEntry(
+    directory: FileSystemDirectoryHandle,
+    name: string,
+  ): Promise<DirectoryEntry | null> {
+    try {
+      return await directory.getFileHandle(name);
+    } catch (error) {
+      if (isDomError(error, "NotFoundError")) return null;
+      if (isDomError(error, "TypeMismatchError"))
+        return directory.getDirectoryHandle(name);
+      throw error;
+    }
+  }
+}

@@ -1,4 +1,4 @@
-//! Browser IO adapter. JS only exposes OPFS primitives; legacy storage is decoded here.
+//! Browser IO adapter. JS exposes file and private-history primitives; legacy storage is decoded here.
 use crate::*;
 use js_sys::{Function, Promise};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-pub struct OpfsBackend {
+pub struct BrowserBackend {
     io: Function,
     identity: InstanceIdentity,
     entries: Vec<Entry>,
@@ -45,7 +45,7 @@ struct UpdateMeta {
     kind: PacketKind,
 }
 
-impl OpfsBackend {
+impl BrowserBackend {
     pub fn new(io: Function, identity: InstanceIdentity) -> Self {
         Self {
             io,
@@ -58,10 +58,10 @@ impl OpfsBackend {
         let promise = self
             .io
             .call1(&JsValue::NULL, &JsValue::from_str(&request))
-            .map_err(|e| EditorError::new("IO", format!("OPFS bridge: {e:?}"), ""))?;
+            .map_err(|e| EditorError::new("IO", format!("Browser bridge: {e:?}"), ""))?;
         let result = JsFuture::from(Promise::resolve(&promise))
             .await
-            .map_err(|e| EditorError::new("IO", format!("OPFS bridge: {e:?}"), ""))?;
+            .map_err(|e| EditorError::new("IO", format!("Browser bridge: {e:?}"), ""))?;
         let response: Value = serde_json::from_str(
             &result
                 .as_string()
@@ -90,7 +90,7 @@ impl OpfsBackend {
             .await
     }
 }
-impl Backend for OpfsBackend {
+impl Backend for BrowserBackend {
     fn identity(&self) -> &InstanceIdentity {
         &self.identity
     }
@@ -130,7 +130,7 @@ impl Backend for OpfsBackend {
             if !valid_id(&entry.id) || !valid_id(&entry.history_id) || !ids.insert(&entry.id) {
                 return Err(EditorError::new(
                     "IO",
-                    "Invalid OPFS catalog identity",
+                    "Invalid browser catalog identity",
                     &entry.path,
                 ));
             }
@@ -236,7 +236,7 @@ impl Backend for OpfsBackend {
             {
                 return Err(EditorError::new(
                     "IO",
-                    "Stored OPFS history identity/version mismatch",
+                    "Stored browser history identity/version mismatch",
                     &entry.path,
                 ));
             }

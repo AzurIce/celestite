@@ -36,17 +36,17 @@ cargo test -p celestite-core
 cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 ```
 
-默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `DocumentBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<OpfsBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录并可配置 redb 历史存储。64 位 writer ID 在 JSON 中保持字符串。
+默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `DocumentBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<BrowserBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录并可配置 redb 历史存储。64 位 writer ID 在 JSON 中保持字符串。
 
 ## Backend 与服务接口
 
 `Backend` 定义身份、时钟、历史加载、幂等提交、目录恢复意图及可选的普通文件 IO。`has_projection()` 决定实例是否映射普通目录；没有映射时，只提交私有历史，不报告普通文件已保存。异步方法不要求 `Send`，OPFS IO 可以留在 Worker 中；native 包装在阻塞任务中执行文件和 redb IO。
 
-| 实现            | 历史存储                            | 普通文件映射  | 使用位置                              |
-| --------------- | ----------------------------------- | ------------- | ------------------------------------- |
-| `OpfsBackend`   | OPFS 私有历史目录                   | OPFS 普通目录 | 本地默认 Web Vault                    |
-| `MemoryBackend` | Rust 内存集合，非持久化             | 无            | 远端 Web 客户端、无头副本与同步调试器 |
-| `NativeBackend` | 可配置 redb；未配置时历史仅驻留内存 | 本机普通目录  | server host                           |
+| 实现             | 历史存储                            | 普通文件映射            | 使用位置                              |
+| ---------------- | ----------------------------------- | ----------------------- | ------------------------------------- |
+| `BrowserBackend` | OPFS 私有历史目录                   | OPFS 或获授权的本机目录 | 本地 Web Vault                        |
+| `MemoryBackend`  | Rust 内存集合，非持久化             | 无                      | 远端 Web 客户端、无头副本与同步调试器 |
+| `NativeBackend`  | 可配置 redb；未配置时历史仅驻留内存 | 本机普通目录            | server host                           |
 
 [`MemoryBackend`](src/memory.rs) 是公开的 `Backend` 实现，以 `BTreeMap<String, StoredDocument>` 保存文档头、初始 CRDT 快照与增量 journal。`commit()` 校验序号与重发内容后更新记录，`load()` 返回内存记录，`replace_volatile_documents()` 原子替换整批记录并清空增量。它的 `persistent()` 和 `has_projection()` 均为 `false`，文件与目录 IO 返回 `Unsupported`；编辑与撤销由 `EditorCore` 中的活动文档执行。后端随 core 释放，不跨 Worker 或进程重启保留数据。
 
