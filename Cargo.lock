@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "notist"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=c80d55ed0580bb12424d1ff1f8778292f8b891bf#c80d55ed0580bb12424d1ff1f8778292f8b891bf"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
 dependencies = [
  "notist-core",
  "notist-html",
@@ -3076,7 +3076,7 @@ dependencies = [
 [[package]]
 name = "notist-core"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=c80d55ed0580bb12424d1ff1f8778292f8b891bf#c80d55ed0580bb12424d1ff1f8778292f8b891bf"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
 dependencies = [
  "rowan",
 ]
@@ -3084,18 +3084,30 @@ dependencies = [
 [[package]]
 name = "notist-html"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=c80d55ed0580bb12424d1ff1f8778292f8b891bf#c80d55ed0580bb12424d1ff1f8778292f8b891bf"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
 dependencies = [
  "notist-core",
  "serde_json",
 ]
 
 [[package]]
-name = "notist-md"
+name = "notist-lowering"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=c80d55ed0580bb12424d1ff1f8778292f8b891bf#c80d55ed0580bb12424d1ff1f8778292f8b891bf"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
 dependencies = [
  "notist-core",
+ "notist-syntax",
+ "rowan",
+]
+
+[[package]]
+name = "notist-md"
+version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
+dependencies = [
+ "notist-core",
+ "notist-lowering",
+ "notist-syntax",
  "rowan",
  "rushdown",
 ]
@@ -3103,9 +3115,10 @@ dependencies = [
 [[package]]
 name = "notist-pipeline"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=c80d55ed0580bb12424d1ff1f8778292f8b891bf#c80d55ed0580bb12424d1ff1f8778292f8b891bf"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
 dependencies = [
  "notist-core",
+ "notist-lowering",
  "notist-md",
  "notist-syntax",
  "rowan",
@@ -3114,7 +3127,7 @@ dependencies = [
 [[package]]
 name = "notist-syntax"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=c80d55ed0580bb12424d1ff1f8778292f8b891bf#c80d55ed0580bb12424d1ff1f8778292f8b891bf"
+source = "git+https://github.com/AzurIce/notist.git?rev=46d650aa88e23b96f7e4be725c5a8c75ab63636d#46d650aa88e23b96f7e4be725c5a8c75ab63636d"
 dependencies = [
  "rowan",
 ]
