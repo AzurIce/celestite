@@ -137,6 +137,7 @@ export default function CodeEditor(props: CodeEditorProps) {
   let buffer: EditorBuffer;
   let disposed = false;
   let languageRequest = 0;
+  let languagePath: string | undefined;
   let selectionRevision = 0;
   let observer: MutationObserver | undefined;
   const [languageError, setLanguageError] = createSignal(false);
@@ -284,6 +285,10 @@ export default function CodeEditor(props: CodeEditorProps) {
         })
       : [];
   async function configureLanguage(path: string) {
+    // Document metadata is republished during disk checks. Keep the parser and
+    // its decorations when the file's language selection has not changed.
+    if (path === languagePath) return;
+    languagePath = path;
     const request = ++languageRequest;
     setLanguageError(false);
     try {

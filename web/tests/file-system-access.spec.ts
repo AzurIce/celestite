@@ -3,7 +3,7 @@ import { installWorkerHarness, workerEvaluate } from "./worker-harness";
 
 // Only the native chooser is replaced. Handles, structured cloning, IndexedDB,
 // streams, Web Locks and the Worker/WASM editor are real browser implementations.
-async function installPicker(page: Page) {
+async function installPicker(page: Page, source = "one\ntwo\n") {
   await installWorkerHarness(page);
   await page.addInitScript(() => {
     Object.assign(window, {
@@ -18,16 +18,16 @@ async function installPicker(page: Page) {
     });
   });
   await page.goto("/");
-  await page.evaluate(async () => {
+  await page.evaluate(async (source) => {
     const root = await (
       await navigator.storage.getDirectory()
     ).getDirectoryHandle("Test Project", { create: true });
     const stream = await (
       await root.getFileHandle("a.md", { create: true })
     ).createWritable();
-    await stream.write("one\ntwo\n");
+    await stream.write(source);
     await stream.close();
-  });
+  }, source);
   await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
   await page.getByRole("button", { name: "打开本机目录", exact: true }).click();
   await expect(
@@ -55,6 +55,70 @@ async function diskText(page: Page) {
 }
 const editor = (page: Page) =>
   page.getByRole("textbox", { name: "代码编辑器" });
+
+test("idle directory observations keep highlighting and tree controls stable while disk changes still arrive", async ({
+  page,
+}) => {
+  await installPicker(page, "# Heading\n\n**strong** and #badge[label]\n");
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await expect(
+    editor(page).locator('[data-syntax="function.call"]'),
+  ).toHaveText("badge");
+  const stability = await page.evaluate(async () => {
+    const content = document.querySelector(".cm-content")!;
+    const token = content.querySelector('[data-syntax="function.call"]');
+    let mutations = 0;
+    const observer = new MutationObserver((records) => {
+      mutations += records.length;
+    });
+    observer.observe(content, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    observer.observe(document.querySelector(".tree-toolbar")!, {
+      attributes: true,
+      subtree: true,
+      attributeFilter: ["disabled"],
+    });
+    observer.observe(document.querySelector(".tree-body")!, {
+      attributes: true,
+      attributeFilter: ["aria-busy"],
+    });
+    window.dispatchEvent(new Event("focus"));
+    await new Promise((resolve) => setTimeout(resolve, 6500));
+    observer.disconnect();
+    return {
+      mutations,
+      sameContent: content === document.querySelector(".cm-content"),
+      sameToken:
+        token === content.querySelector('[data-syntax="function.call"]'),
+    };
+  });
+  expect(stability).toEqual({
+    mutations: 0,
+    sameContent: true,
+    sameToken: true,
+  });
+  await changeDisk(page, "# Changed\n\n#newcall[value]\n");
+  await expect(
+    editor(page).locator('[data-syntax="function.call"]'),
+  ).toHaveText("newcall");
+  await page.evaluate(async () => {
+    const root = await (
+      await navigator.storage.getDirectory()
+    ).getDirectoryHandle("Test Project");
+    const stream = await (
+      await root.getFileHandle("external.md", { create: true })
+    ).createWritable();
+    await stream.write("external\n");
+    await stream.close();
+    window.dispatchEvent(new Event("focus"));
+  });
+  await expect(
+    page.getByRole("treeitem", { name: "external.md", exact: true }),
+  ).toBeVisible();
+});
 
 test("composition defers observation and writeback until accepted input has settled", async ({
   page,

@@ -28,6 +28,7 @@ class MemoryBackend implements VaultBackend {
   mutations: string[] = [];
   onRename?: (from: VaultPath, to: VaultPath) => void | Promise<void>;
   onWrite?: (path: VaultPath) => void;
+  onRead?: (path: VaultPath) => void | Promise<void>;
   dir(path: string) {
     const key = vaultPath(path);
     this.entries.set(key, { path: key, kind: "directory" });
@@ -41,6 +42,7 @@ class MemoryBackend implements VaultBackend {
   }
   async *readDir(path: VaultPath) {
     this.reads.push(path);
+    await this.onRead?.(path);
     if (this.entries.get(path)?.kind !== "directory")
       throw new VaultError("NotDirectory", "Not a directory");
     for (const entry of this.entries.values())
@@ -410,4 +412,91 @@ test("external invalidation waits for active IO and does not hide a partial-oper
   assert.equal(model.snapshot().busy, false);
   assert.match(model.snapshot().error!, /完整目标已保留/);
   assert.ok(model.snapshot().byPath.has(vaultPath("a")));
+});
+
+test("unchanged watch checks preserve the snapshot and controls; changed entries publish once", async () => {
+  const backend = new MemoryBackend().file("a");
+  const model = new FileTreeModel(backend);
+  await model.refresh();
+  model.select(vaultPath("a"));
+  model.copySelection();
+  const initial = model.snapshot();
+  let notifications = 0;
+  model.subscribe((state) => {
+    notifications++;
+    assert.equal(state.busy, false);
+  });
+  model.invalidate();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(notifications, 0);
+  assert.equal(model.snapshot(), initial);
+  backend.file("b");
+  model.invalidate();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(notifications, 1);
+  assert.ok(model.snapshot().byPath.has(vaultPath("b")));
+  assert.deepEqual(selected(model), [vaultPath("a")]);
+  assert.deepEqual(model.snapshot().clipboard, initial.clipboard);
+});
+
+test("a foreground mutation waits for background IO and hints coalesce", async () => {
+  const backend = new MemoryBackend().file("a");
+  const model = new FileTreeModel(backend);
+  await model.refresh();
+  let resume!: () => void;
+  const gate = new Promise<void>((_resolve, reject) => {
+    resume = () =>
+      reject(new VaultError("PermissionDenied", "Old read failed"));
+  });
+  backend.onRead = () => gate;
+  model.invalidate();
+  model.invalidate();
+  assert.equal(model.snapshot().busy, false);
+  const create = model.create(ROOT_PATH, "b", "file");
+  assert.equal(model.snapshot().busy, true);
+  assert.equal(backend.mutations.length, 0);
+  backend.onRead = undefined;
+  resume();
+  assert.equal(await create, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(model.snapshot().byPath.has(vaultPath("b")));
+  assert.equal(model.snapshot().busy, false);
+  assert.equal(model.snapshot().error, null);
+});
+
+test("background reads retain collapses and preserve operation errors", async () => {
+  const backend = new MemoryBackend().dir("notes").file("notes/a");
+  const model = new FileTreeModel(backend);
+  await model.refresh();
+  await model.toggle(vaultPath("notes"));
+  let resume!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  backend.onRead = (path) => (path === "notes" ? gate : undefined);
+  model.invalidate();
+  while (backend.reads.filter((path) => path === "notes").length < 2)
+    await Promise.resolve();
+  model.collapseAll();
+  resume();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(model.snapshot().expanded.size, 0);
+  assert.deepEqual(
+    model.snapshot().rows.map((row) => row.path),
+    [vaultPath("notes")],
+  );
+  backend.onRead = () => {
+    throw new VaultError("PermissionDenied", "No permission");
+  };
+  model.invalidate();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(model.snapshot().error!, /无法访问/);
+  assert.equal(model.snapshot().busy, false);
+  let changes = 0;
+  model.subscribe(() => {
+    changes++;
+  });
+  model.invalidate();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(changes, 0);
 });

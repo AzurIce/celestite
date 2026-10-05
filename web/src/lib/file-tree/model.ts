@@ -96,6 +96,7 @@ export class FileTreeModel {
   private error: string | null = null;
   private disposed = false;
   private invalidated = false;
+  private backgroundRefresh?: Promise<void>;
   private cached?: TreeSnapshot;
   private readonly listeners = new Set<(state: TreeSnapshot) => void>();
 
@@ -210,9 +211,31 @@ export class FileTreeModel {
     } finally {
       // 读取某个子目录失败时仍提交已读到的目录，避免继续展示已删除的旧条目。
       if (next.has(ROOT_PATH)) {
-        this.children = next;
-        this.expanded = expanded;
-        this.reconcile();
+        // A folder may have been collapsed while a background read was pending.
+        const retained = new Set(
+          [...this.expanded].filter((path) => expanded.has(path)),
+        );
+        const changed =
+          next.size !== this.children.size ||
+          [...next].some(([path, entries]) => {
+            const previous = this.children.get(path);
+            return (
+              !previous ||
+              previous.length !== entries.length ||
+              entries.some(
+                (entry, index) =>
+                  entry.path !== previous[index].path ||
+                  entry.kind !== previous[index].kind,
+              )
+            );
+          }) ||
+          retained.size !== this.expanded.size;
+        if (changed) {
+          this.children = next;
+          this.expanded = retained;
+          this.reconcile();
+          this.cached = undefined;
+        }
       }
     }
   }
@@ -220,16 +243,18 @@ export class FileTreeModel {
     label: string,
     task: (completed: () => void) => Promise<void>,
     reload = true,
-    clearError = true,
   ): Promise<boolean> {
     if (this.busy || this.disposed) return false;
     this.busy = true;
-    if (clearError) this.error = null;
+    this.error = null;
     this.status = label;
     this.notify();
     let completed = 0;
     let success = false;
     try {
+      // Foreground mutations wait for an existing read, while their own busy
+      // state still rejects duplicate user commands.
+      await this.backgroundRefresh;
       await task(() => {
         completed++;
       });
@@ -250,23 +275,45 @@ export class FileTreeModel {
     this.notify();
     if (this.invalidated && !this.disposed) {
       this.invalidated = false;
-      void this.refresh(true);
+      this.invalidate();
     }
     return success;
   }
-  refresh(preserveError = false) {
+  refresh() {
     return this.perform(
       "正在读取文件…",
       async () => {
         await this.reload();
       },
       false,
-      !preserveError,
     );
   }
   invalidate() {
-    if (this.busy) this.invalidated = true;
-    else void this.refresh(true);
+    if (this.disposed) return;
+    if (this.busy || this.backgroundRefresh) {
+      this.invalidated = true;
+      return;
+    }
+    // Watch hints are background IO, so leave controls and status alone. Only
+    // publish a snapshot when entries or an error actually change.
+    this.backgroundRefresh = this.refreshInBackground().finally(() => {
+      this.backgroundRefresh = undefined;
+      if (this.invalidated && !this.busy && !this.disposed) {
+        this.invalidated = false;
+        this.invalidate();
+      }
+    });
+  }
+  private async refreshInBackground() {
+    const before = this.snapshot();
+    const previousError = this.error;
+    try {
+      await this.reload();
+    } catch (error) {
+      // A foreground command already owns the next read and its error state.
+      if (!this.busy) this.error ??= describeTreeError(error);
+    }
+    if (this.cached !== before || this.error !== previousError) this.notify();
   }
   clearError() {
     this.error = null;
