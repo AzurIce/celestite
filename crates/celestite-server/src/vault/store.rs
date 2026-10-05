@@ -249,7 +249,7 @@ impl Store {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::File::open(path)
         .and_then(|file| file.sync_all())

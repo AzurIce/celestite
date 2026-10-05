@@ -55,10 +55,7 @@ function StateView(props: {
 export default function SyncDebug() {
   const session = new DebugSession();
   const [state, setState] = createSignal(session.snapshot());
-  const [url, setUrl] = createSignal(
-    "http://127.0.0.1:7437/api/v1/vaults/notist",
-  );
-  const [token, setToken] = createSignal("");
+  const [url, setUrl] = createSignal("");
   const [path, setPath] = createSignal("");
   const unsubscribe = session.subscribe(setState);
   onCleanup(() => {
@@ -96,7 +93,7 @@ export default function SyncDebug() {
         class="debug-connect"
         onSubmit={(event) => {
           event.preventDefault();
-          void session.connect(url(), token());
+          void session.connect(url());
         }}
       >
         <label>
@@ -108,17 +105,7 @@ export default function SyncDebug() {
             disabled={state().connected || state().busy}
           />
         </label>
-        <label>
-          访问令牌
-          <input
-            aria-label="访问令牌"
-            type="password"
-            autocomplete="off"
-            value={token()}
-            onInput={(event) => setToken(event.currentTarget.value)}
-            disabled={state().connected || state().busy}
-          />
-        </label>
+
         <Button
           type="submit"
           variant="primary"
@@ -130,7 +117,6 @@ export default function SyncDebug() {
           disabled={!state().connected || working()}
           onClick={() => {
             session.disconnect();
-            setToken("");
           }}
         >
           结束会话

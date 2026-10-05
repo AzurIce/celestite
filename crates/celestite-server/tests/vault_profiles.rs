@@ -5,10 +5,21 @@ use celestite_server::{build_server, Config, HistoryMode, ServerConfig, VaultCon
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 use tower::ServiceExt;
+
+struct Host {
+    router: Router,
+    keys: HashMap<String, String>,
+}
+impl Host {
+    fn url(&self, vault: &str, tail: &str) -> String {
+        format!("/{}/api/v1{tail}", self.keys[vault])
+    }
+}
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -43,15 +54,35 @@ impl Fixture {
             vaults: vec![self.vault("a", mode)],
         }
     }
-    fn router(&self, config: Config) -> Router {
-        build_server(config, self.dir.path()).unwrap().router
+    fn router(&self, config: Config) -> Host {
+        let ids: Vec<_> = config.vaults.iter().map(|v| v.id.clone()).collect();
+        let server = build_server(config, self.dir.path()).unwrap();
+        let keys = ids
+            .into_iter()
+            .map(|id| {
+                let key = server
+                    .create_share(
+                        &id,
+                        celestite_server::Permission::Edit,
+                        "profile-test".into(),
+                    )
+                    .unwrap()
+                    .key;
+                (id, key)
+            })
+            .collect();
+        Host {
+            router: server.router,
+            keys,
+        }
     }
     fn rejects(&self, config: Config) {
         assert!(build_server(config, self.dir.path()).is_err());
     }
 }
-async fn request(router: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
+async fn request(router: &Host, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = router
+        .router
         .clone()
         .oneshot(
             Request::builder()
@@ -67,16 +98,16 @@ async fn request(router: &Router, method: &str, path: &str, body: Value) -> (u16
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&body).unwrap())
 }
-async fn ok(router: &Router, method: &str, path: &str, body: Value) -> Value {
+async fn ok(router: &Host, method: &str, path: &str, body: Value) -> Value {
     let (status, value) = request(router, method, path, body).await;
     assert_eq!(status, 200, "{value}");
     value
 }
-async fn open(router: &Router, vault: &str) -> Value {
+async fn open(router: &Host, vault: &str) -> Value {
     ok(
         router,
         "POST",
-        &format!("/api/v1/vaults/{vault}/documents/open"),
+        &router.url(vault, "/documents/open"),
         json!({"path":"note.md"}),
     )
     .await
@@ -194,9 +225,10 @@ async fn each_vault_preserves_identity_and_unsaved_history_across_restart_and_ur
         a["snapshot"]["version"]["identity"],
         b["snapshot"]["version"]["identity"]
     );
-    let before = ok(&router, "GET", "/api/v1/vaults/a", Value::Null).await;
+    let before = ok(&router, "GET", &router.url("a", ""), Value::Null).await;
     let route = format!(
-        "/api/v1/vaults/a/documents/{}/transact",
+        "{}/documents/{}/transact",
+        router.url("a", ""),
         a["id"].as_str().unwrap()
     );
     let committed = ok(
@@ -220,7 +252,7 @@ async fn each_vault_preserves_identity_and_unsaved_history_across_restart_and_ur
     config.vaults[0].name = "New display name".into();
     config.vaults.push(f.vault("b", HistoryMode::Recover));
     let router = f.router(config);
-    let after = ok(&router, "GET", "/api/v1/vaults/renamed-url", Value::Null).await;
+    let after = ok(&router, "GET", &router.url("renamed-url", ""), Value::Null).await;
     assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
     assert_eq!(after["capabilities"]["persistentHistory"], true);
     let restored = open(&router, "renamed-url").await;
@@ -239,7 +271,7 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
     ok(
         &router,
         "POST",
-        &format!("/api/v1/vaults/a/documents/{id}/transact"),
+        &router.url("a", &format!("/documents/{id}/transact")),
         json!({
             "expected_version":initial["snapshot"]["version"], "origin":"test",
             "edits":[{"from":0,"to":0,"insert":"old draft "}],
@@ -250,7 +282,7 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
     let packet = ok(
         &router,
         "GET",
-        &format!("/api/v1/vaults/a/documents/{id}/snapshot"),
+        &router.url("a", &format!("/documents/{id}/snapshot")),
         Value::Null,
     )
     .await;
@@ -267,7 +299,8 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
         &router,
         "POST",
         &format!(
-            "/api/v1/vaults/a/documents/{}/import",
+            "{}/documents/{}/import",
+            router.url("a", ""),
             new["id"].as_str().unwrap()
         ),
         packet.clone(),
@@ -282,6 +315,8 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
         .unwrap();
     let mut config = f.config(HistoryMode::Recover);
     config.vaults[0].state_dir = Some(archive);
+    // Recovering archived history starts a new sharing store; revoked links stay revoked.
+    config.vaults[0].initialize_shares = true;
     let router = f.router(config);
     let old = open(&router, "a").await;
     assert_eq!(old["id"], initial["id"]);
@@ -329,6 +364,11 @@ fn ephemeral_is_explicit_and_cannot_initialize_or_reset() {
     let mut config = f.config(HistoryMode::Recover);
     config.vaults[0].ephemeral = true;
     config.vaults[0].state_dir = None;
+    let mut invalid = f.config(HistoryMode::Recover);
+    invalid.vaults[0].ephemeral = true;
+    invalid.vaults[0].state_dir = None;
+    invalid.vaults[0].initialize_shares = true;
+    f.rejects(invalid);
     drop(f.router(config));
     assert!(!f.path("state-a/history.redb").exists());
 }

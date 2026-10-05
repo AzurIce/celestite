@@ -196,6 +196,7 @@ mod tests {
             id: "notes".into(),
             name: "Notes".into(),
             read_only: false,
+            shares: crate::shares::Store::open(None, &documents.identity.id, false).unwrap(),
             files: Mutex::new(FsVault::open(root.path()).unwrap()),
             documents: Mutex::new(documents),
             packages: crate::package_resources::PackageResources::new(
@@ -415,6 +416,7 @@ mod tests {
             id: "notes".into(),
             name: "Notes".into(),
             read_only: false,
+            shares: crate::shares::Store::open(None, &documents.identity.id, false).unwrap(),
             packages: crate::package_resources::PackageResources::new(
                 root.path().to_owned(),
                 events.clone(),

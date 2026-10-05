@@ -1,5 +1,5 @@
 use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -33,12 +33,14 @@ pub struct Cli {
     /// Clear explicitly configured origins (the server's own origin is still allowed)
     #[arg(long)]
     clear_allowed_origins: bool,
-    /// Environment variable containing the Bearer token
-    #[arg(long, value_name = "VARIABLE", conflicts_with = "no_token")]
-    token_env: Option<String>,
-    /// Remove the configured token requirement (only allowed on loopback)
-    #[arg(long)]
-    no_token: bool,
+    /// Private Unix socket for share management (defaults inside the first Vault state directory)
+    #[arg(long, value_name = "SOCKET")]
+    management_socket: Option<PathBuf>,
+    /// Initialize an empty share store for an existing stopped Vault, then exit
+    #[arg(long, value_name = "ID", value_parser = parse_vault_id)]
+    init_shares: Vec<String>,
+    #[command(subcommand)]
+    pub command: Option<Command>,
     /// Serve a built Web UI from this directory
     #[arg(long, value_name = "DIRECTORY", conflicts_with = "no_web")]
     web_dir: Option<PathBuf>,
@@ -69,6 +71,38 @@ pub struct Cli {
     /// Override a Vault's read-only state; repeat for multiple Vaults
     #[arg(long, value_name = "ID=true|false", value_parser = parse_read_only)]
     vault_read_only: Vec<ReadOnly>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Manage shares through the running host's private Unix socket
+    Share {
+        #[command(subcommand)]
+        action: ShareCommand,
+    },
+}
+#[derive(Subcommand)]
+pub enum ShareCommand {
+    Create {
+        #[arg(value_parser = parse_vault_id)]
+        vault: String,
+        #[arg(long, value_enum)]
+        permission: celestite_server::Permission,
+        #[arg(long, default_value = "")]
+        label: String,
+        /// Public server origin including any reverse proxy deployment prefix
+        #[arg(long)]
+        base_url: String,
+    },
+    List {
+        #[arg(value_parser = parse_vault_id)]
+        vault: String,
+    },
+    Revoke {
+        #[arg(value_parser = parse_vault_id)]
+        vault: String,
+        share: uuid::Uuid,
+    },
 }
 
 #[derive(Clone)]
@@ -144,6 +178,8 @@ impl Cli {
             }
             config.server.web_dir = config.server.web_dir.map(|path| base.join(path));
             config.server.state_dir = config.server.state_dir.map(|path| base.join(path));
+            config.server.management_socket =
+                config.server.management_socket.map(|path| base.join(path));
             config
         } else {
             if self.vault.is_empty() {
@@ -160,10 +196,8 @@ impl Cli {
         if self.clear_allowed_origins || !self.allowed_origins.is_empty() {
             config.server.allowed_origins = self.allowed_origins;
         }
-        if self.no_token {
-            config.server.token_env = None;
-        } else if let Some(token_env) = self.token_env {
-            config.server.token_env = Some(token_env);
+        if let Some(socket) = self.management_socket {
+            config.server.management_socket = Some(cwd.join(socket));
         }
         if self.no_web {
             config.server.web_dir = None;
@@ -248,6 +282,19 @@ impl Cli {
                 vault.history_mode = mode;
             }
         }
+        for id in self.init_shares {
+            let vault = find_vault(&mut config, &id)?;
+            if vault.ephemeral
+                || vault.initialize_shares
+                || vault.history_mode != HistoryMode::Recover
+            {
+                return Err(
+                    "--init-shares requires an existing persistent Vault and cannot be repeated"
+                        .into(),
+                );
+            }
+            vault.initialize_shares = true;
+        }
         Ok(config)
     }
 }
@@ -277,7 +324,7 @@ mod tests {
 [server]
 listen = "127.0.0.1:8000"
 allowed_origins = ["http://old.example"]
-token_env = "OLD_TOKEN"
+management_socket = "management/socket"
 web_dir = "assets"
 state_dir = "state"
 [[vaults]]
@@ -313,7 +360,7 @@ read_only = true
             vec!["server", "--vault", "notes="],
             vec!["server", "--vault-read-only", "notes=maybe"],
             vec!["server", "--config", "config.toml", "--no-config"],
-            vec!["server", "--token-env", "TOKEN", "--no-token"],
+            vec!["server", "--token-env", "TOKEN"],
             vec!["server", "--web-dir", "assets", "--no-web"],
             vec![
                 "server",
@@ -344,7 +391,7 @@ read_only = true
         .load(cwd.path())
         .unwrap();
         assert_eq!(config.server.listen, ServerConfig::default().listen);
-        assert!(config.server.token_env.is_none());
+        assert!(config.server.management_socket.is_none());
         assert_eq!(config.vaults.len(), 2);
         assert_eq!(config.vaults[0].name, "我的笔记");
         assert_eq!(config.vaults[0].path, cwd.path().join("notes"));
@@ -370,8 +417,8 @@ read_only = true
             "http://first.example",
             "--allowed-origin",
             "https://second.example",
-            "--token-env",
-            "NEW_TOKEN",
+            "--management-socket",
+            "private/socket",
             "--vault",
             "work=work",
             "--vault-read-only",
@@ -383,7 +430,10 @@ read_only = true
             config.server.allowed_origins,
             ["http://first.example", "https://second.example"]
         );
-        assert_eq!(config.server.token_env.as_deref(), Some("NEW_TOKEN"));
+        assert_eq!(
+            config.server.management_socket,
+            Some(cwd.path().join("private/socket"))
+        );
         assert_eq!(config.server.web_dir, Some(config_dir.join("assets")));
         assert_eq!(config.server.state_dir, Some(config_dir.join("state")));
         assert_eq!(config.vaults[0].path, config_dir.join("notes"));
@@ -421,16 +471,14 @@ read_only = true
             .load(cwd.path())
             .unwrap();
         assert_eq!(config.vaults[0].path, cwd.path().join("notes"));
-        let config = Cli::try_parse_from([
-            "server",
-            "--no-token",
-            "--no-web",
-            "--clear-allowed-origins",
-        ])
-        .unwrap()
-        .load(cwd.path())
-        .unwrap();
-        assert!(config.server.token_env.is_none());
+        let config = Cli::try_parse_from(["server", "--no-web", "--clear-allowed-origins"])
+            .unwrap()
+            .load(cwd.path())
+            .unwrap();
+        assert_eq!(
+            config.server.management_socket,
+            Some(cwd.path().join("management/socket"))
+        );
         assert!(config.server.web_dir.is_none());
         assert!(config.server.allowed_origins.is_empty());
         let config = Cli::try_parse_from(["server", "--no-config", "--vault", "work=work"])

@@ -9,6 +9,8 @@ notist = { workspace = true }
 futures-lite = "2.6.1"
 cap-std = "4"
 blake3 = "1"
+base64 = "0.22"
+getrandom = "0.3"
 uuid = { version = "1", features = ["v4"] }
 redb = "4.3"
 clap = { version = "4", features = ["derive"] }
@@ -24,6 +26,8 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 
@@ -31,5 +35,4 @@ rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio-tungstenite = "0.29"

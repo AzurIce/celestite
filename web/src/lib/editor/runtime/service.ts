@@ -29,7 +29,7 @@ export type EditorWorkerHost = Pick<
   | "fileOperation"
   | "close"
   | "previewResources"
-> & { authorize?: (token: string) => Promise<ServiceDocument[]> };
+> & { reconnect?: () => Promise<ServiceDocument[]> };
 export async function serveEditorWorker(
   create: (
     emit: (event: ServiceEvent) => void,
@@ -72,10 +72,10 @@ export async function serveEditorWorker(
         throw new VaultError("Closed", "编辑服务会话无效或正在关闭。");
       const p = request.params;
       switch (request.method) {
-        case "authorize":
-          if (!host.authorize)
-            throw new VaultError("Unsupported", "连接不支持认证更新。");
-          return host.authorize(String(p.token));
+        case "reconnect":
+          if (!host.reconnect)
+            throw new VaultError("Unsupported", "连接不支持重新连接。");
+          return host.reconnect();
         case "preview_subscribe":
           return host.executePreview("preview_subscribe", {
             id: String(p.id),

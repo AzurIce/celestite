@@ -16,7 +16,6 @@ export interface VaultConnection {
   url?: string;
 }
 export interface VaultInstance {
-  authorize?: (token: string) => Promise<void>;
   identity?: InstanceIdentity;
   id: string;
   name: string;
@@ -52,6 +51,7 @@ export class VaultManager {
   private connections: VaultConnection[] = [defaultConnection()];
   private runtimes = new Map<string, VaultInstance>();
   private inflight = new Map<string, Promise<VaultInstance>>();
+  private connecting = new Map<string, Promise<boolean>>();
   private active: VaultInstance | null = null;
   private opening = false;
   private error: string | null = null;
@@ -95,17 +95,19 @@ export class VaultManager {
       const text = await this.file.read();
       if (text) {
         const document = JSON.parse(text);
-        if (document.version !== 1 || !Array.isArray(document.connections))
+        if (document.version !== 2 || !Array.isArray(document.connections))
           throw new Error("连接记录格式无效。");
         const seen = new Set<string>();
         for (const connection of document.connections) {
           if (
+            typeof connection.id !== "string" ||
+            !/^remote:[0-9a-f-]{36}$/.test(connection.id) ||
             typeof connection.url !== "string" ||
             typeof connection.name !== "string"
           )
             throw new Error("连接记录格式无效。");
           const url = normalizeVaultUrl(connection.url);
-          const id = "remote:" + url;
+          const id = connection.id;
           if (!seen.has(id)) {
             seen.add(id);
             this.connections.push({
@@ -218,9 +220,22 @@ export class VaultManager {
       }
     }
   }
-  async connect(value: string, token = ""): Promise<boolean> {
+  async connect(value: string): Promise<boolean> {
     const url = normalizeVaultUrl(value);
-    const id = "remote:" + url;
+    const pending = this.connecting.get(url);
+    if (pending) return pending;
+    const operation = this.connectRemote(url);
+    this.connecting.set(url, operation);
+    void operation.then(
+      () => this.connecting.delete(url),
+      () => this.connecting.delete(url),
+    );
+    return operation;
+  }
+  private async connectRemote(url: string): Promise<boolean> {
+    const id =
+      this.connections.find((connection) => connection.url === url)?.id ??
+      "remote:" + crypto.randomUUID();
     if (this.removals.has(id) || this.disposed)
       throw new VaultError("Closed", "Vault is closing");
     const request = ++this.selection;
@@ -230,7 +245,7 @@ export class VaultManager {
     try {
       const { backend, descriptor } = await (
         this.options.openRemote ?? openHttpVault
-      )(url, token);
+      )(url);
       if (this.disposed || this.removals.has(id)) {
         await backend.close();
         return false;
@@ -244,7 +259,7 @@ export class VaultManager {
       let vault = this.runtimes.get(id);
       if (vault) {
         try {
-          await vault.authorize?.(token);
+          await vault.documents.reconnect?.();
         } finally {
           await backend.close();
         }
@@ -255,7 +270,6 @@ export class VaultManager {
           connection,
           backend,
           descriptor.readOnly,
-          token,
         );
         this.runtimes.set(id, vault);
       }
@@ -274,11 +288,9 @@ export class VaultManager {
     connection: VaultConnection,
     http: VaultBackend,
     readOnly: boolean,
-    token = "",
   ): Promise<VaultInstance> {
     const editor = await (this.options.openRemoteEditor ?? openRemoteEditor)(
       connection.url!,
-      token,
       http,
     );
     return {
@@ -333,10 +345,10 @@ export class VaultManager {
   }
   private persist(): Promise<void> {
     const document = {
-      version: 1,
+      version: 2,
       connections: this.connections
         .filter((c) => c.kind === "remote")
-        .map((c) => ({ url: c.url, name: c.name })),
+        .map((c) => ({ id: c.id, url: c.url, name: c.name })),
     };
     const operation = this.persistence.then(async () => {
       try {

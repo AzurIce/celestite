@@ -3,16 +3,15 @@
 //! history; saving the ordinary file is a separate command.
 use crate::{
     editor_api::{run_documents, run_documents_with_tree},
-    get_vault,
     vault::{
         changes::Subscription, documents::DocumentState, fs::VaultError, store::VaultIdentity,
     },
-    Access, ApiError, HostedVault, ServerState,
+    ApiError, HostedVault, RemoteAccess, ServerState,
 };
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        State,
     },
     response::Response,
     routing::get,
@@ -33,15 +32,14 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
-    Router::new().route("/api/v1/vaults/{id}/sync", get(upgrade))
+    Router::new().route("/{id}/api/v1/sync", get(upgrade))
 }
 async fn upgrade(
     State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
-    Extension(access): Extension<Access>,
+    Extension(access): Extension<RemoteAccess>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let vault = get_vault(&state, &id)?;
+    let vault = access.grant.vault.clone();
     let shutdown = state.shutdown.subscribe();
     Ok(ws
         .max_message_size(80 * 1024 * 1024)
@@ -58,7 +56,6 @@ pub(crate) fn contains(current: &Version, checkpoint: &Version) -> bool {
 #[serde(rename_all = "camelCase")]
 struct Hello {
     protocol_version: u32,
-    token: Option<String>,
     vault_identity: VaultIdentity,
 }
 #[derive(Clone, Deserialize)]
@@ -179,13 +176,18 @@ async fn command(
     vault: Arc<HostedVault>,
     session: Session,
     request: Request,
+    grant: Arc<crate::shares::Grant>,
 ) -> Result<Value, ApiError> {
-    let mutation = matches!(
-        request.command,
-        Command::Updates { .. } | Command::Save { .. }
-    );
+    use crate::shares::Operation;
+    let operation = match &request.command {
+        Command::Updates { .. } | Command::Save { .. } | Command::RetryObservation { .. } => {
+            Operation::Edit
+        }
+        Command::Open { .. } | Command::Probe { .. } | Command::Ping => Operation::Read,
+    };
+    let _admission = grant.admit(operation).await?;
     let notify_tree = matches!(request.command, Command::Open { .. } | Command::Save { .. });
-    run_documents_with_tree(vault,mutation,notify_tree,move |files,docs| {
+    run_documents_with_tree(vault,operation == Operation::Edit,notify_tree,move |files,docs| {
         let mut session = session.lock().map_err(|_|VaultError::new("IO","Session lock failed",""))?;
         if !session.alive.load(Ordering::Acquire) || request.session_id != session.id {
             return Err(VaultError::new("Closed","Session expired", ""));
@@ -243,7 +245,7 @@ async fn send(
 async fn serve(
     mut socket: WebSocket,
     vault: Arc<HostedVault>,
-    access: Access,
+    access: RemoteAccess,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let hello = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
@@ -252,12 +254,7 @@ async fn serve(
         _ => None,
     };
     let Some(hello) = parsed else { return };
-    if hello.protocol_version != 1
-        || access
-            .token
-            .as_ref()
-            .is_some_and(|token| hello.token.as_ref() != Some(token))
-    {
+    if hello.protocol_version != 1 || access.grant.check(crate::shares::Operation::Read).is_err() {
         let _=socket.send(Message::Text(json!({"kind":"fatal","code":"PermissionDenied","message":"Invalid handshake or authentication"}).to_string().into())).await;
         return;
     }
@@ -304,34 +301,54 @@ async fn serve(
         }
         reader_alive.store(false, Ordering::Release);
     });
-    let outcome=async {
-        send(&mut sink,json!({"kind":"hello","sessionId":session_id,"vaultIdentity":identity})).await?;
-        let initial = run_documents(vault.clone(), false, |_, docs| docs.subscribe()).await.map_err(|_|())?;
+    let outcome = async {
+        send(
+            &mut sink,
+            json!({"kind":"hello","sessionId":session_id,"vaultIdentity":identity}),
+        )
+        .await?;
+        let initial = run_documents(vault.clone(), false, |_, docs| docs.subscribe())
+            .await
+            .map_err(|_| ())?;
         for notice in initial.initial.documents {
             let shared = session.clone();
             let frame = run_documents(vault.clone(), false, move |files, docs| {
-                let mut session = shared.lock().map_err(|_|VaultError::new("IO","Session lock failed",""))?;
+                let mut session = shared
+                    .lock()
+                    .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
                 session.receipt(docs, docs.state(files, &notice.id)?)
-            }).await.map_err(|_|())?;
+            })
+            .await
+            .map_err(|_| ())?;
             // Never build an entire Vault's initial JSON snapshots in memory.
             send(&mut sink, frame).await?;
         }
         // Re-establish the barrier after sending the potentially large initial
         // snapshot. Changes during that transfer are exported as deltas.
-        let (frames,subscription)=collect(vault.clone(),session.clone()).await.map_err(|_|())?;
-        for frame in frames {send(&mut sink,frame).await?;}
-        let mut feed=subscription.receiver;
-        send(&mut sink,json!({"kind":"ready","sessionId":session_id})).await?;
-        let mut heartbeat=tokio::time::interval(Duration::from_secs(10));
+        let (frames, subscription) = collect(vault.clone(), session.clone())
+            .await
+            .map_err(|_| ())?;
+        for frame in frames {
+            send(&mut sink, frame).await?;
+        }
+        let mut feed = subscription.receiver;
+        send(&mut sink, json!({"kind":"ready","sessionId":session_id})).await?;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
         loop {
-            if !alive.load(Ordering::Acquire) || *shutdown.borrow(){break;}
+            if !alive.load(Ordering::Acquire)
+                || *shutdown.borrow()
+                || access.grant.check(crate::shares::Operation::Read).is_err()
+            {
+                break;
+            }
             tokio::select! {
                 _=shutdown.changed()=>break,
+                _=access.grant.cancelled()=>break,
                 _=heartbeat.tick()=>{send(&mut sink,json!({"kind":"heartbeat"})).await?;},
                 request=rx.recv()=>{
                     let Some(request)=request else {break};
                     let request_id=request.request_id;
-                    match command(vault.clone(),session.clone(),request).await {
+                    match command(vault.clone(),session.clone(),request,access.grant.clone()).await {
                         Ok(value)=>{send(&mut sink,json!({"kind":"reply","requestId":request_id,"result":value})).await?;},
                         Err(error)=>{send(&mut sink,json!({"kind":"reply","requestId":request_id,"error":error.0})).await?;}
                     }
@@ -366,8 +383,10 @@ async fn serve(
                 }
             }
         }
-        Ok::<(),()>(())
-    }.await;
+        Ok::<(), ()>(())
+    };
+    let outcome =
+        tokio::select! { result = outcome => result, _ = access.grant.cancelled() => Err(()) };
     alive.store(false, Ordering::Release);
     reader.abort();
     let _ = sink.close().await;

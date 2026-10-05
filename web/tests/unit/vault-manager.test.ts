@@ -7,11 +7,7 @@ import type { SettingsFile } from "../../src/lib/settings/app-file";
 import type { HttpVaultBackend } from "../../src/lib/vault/http";
 import { VaultDocuments } from "../../src/lib/editor/documents";
 import type { openRemoteEditor } from "../../src/lib/editor/client/documents";
-const fakeRemoteEditor: typeof openRemoteEditor = async (
-  _url,
-  _token,
-  backend,
-) => {
+const fakeRemoteEditor: typeof openRemoteEditor = async (_url, backend) => {
   const documents = new VaultDocuments(backend);
   return {
     identity: {
@@ -77,7 +73,7 @@ class Registry implements SettingsFile {
     this.text = JSON.stringify(document);
   }
 }
-const url = "https://example.com/api/v1/vaults/notes";
+const url = "https://example.com/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 function setup(registry = new Registry()) {
   const local = files(),
     remote = files();
@@ -93,7 +89,8 @@ function setup(registry = new Registry()) {
         descriptor: {
           protocol: "celestite-vault",
           version: 1,
-          id: "notes",
+          shareId: "test-share",
+          vaultIdentity: { id: "test-vault", historyId: "test-history" },
           name: "Remote",
           readOnly: false,
           capabilities: { watch: true, conditionalWrite: true },
@@ -103,6 +100,18 @@ function setup(registry = new Registry()) {
   });
   return { manager, local, remote, registry, calls: () => calls };
 }
+test("simultaneous connections to the same share reuse one instance", async () => {
+  const { manager, calls } = setup();
+  await manager.initialize();
+  assert.deepEqual(
+    await Promise.all([manager.connect(url), manager.connect(url + "/")]),
+    [true, true],
+  );
+  assert.equal(calls(), 1);
+  assert.equal(manager.snapshot().connections.length, 2);
+  assert.equal(manager.snapshot().opened.length, 2);
+  await manager.close();
+});
 test("the default Vault cannot be removed and opening identities isolate buffers and tree state", async () => {
   const { manager } = setup();
   await manager.initialize();
@@ -130,8 +139,14 @@ test("the default Vault cannot be removed and opening identities isolate buffers
 test("connections restore lazily and removing a connection never deletes remote files", async () => {
   const registry = new Registry();
   registry.text = JSON.stringify({
-    version: 1,
-    connections: [{ url, name: "Remote" }],
+    version: 2,
+    connections: [
+      {
+        id: "remote:00000000-0000-4000-8000-000000000001",
+        url,
+        name: "Remote",
+      },
+    ],
   });
   const { manager, remote, calls } = setup(registry);
   await manager.initialize();
@@ -167,8 +182,14 @@ test("failed saves keep the connection, backend and dirty buffer alive", async (
 test("an obsolete open cannot activate after a more recent selection", async () => {
   const registry = new Registry();
   registry.text = JSON.stringify({
-    version: 1,
-    connections: [{ url, name: "Remote" }],
+    version: 2,
+    connections: [
+      {
+        id: "remote:00000000-0000-4000-8000-000000000001",
+        url,
+        name: "Remote",
+      },
+    ],
   });
   let release!: () => void;
   const pending = new Promise<void>((resolve) => {
@@ -187,7 +208,8 @@ test("an obsolete open cannot activate after a more recent selection", async () 
         descriptor: {
           protocol: "celestite-vault",
           version: 1,
-          id: "notes",
+          shareId: "test-share",
+          vaultIdentity: { id: "test-vault", historyId: "test-history" },
           name: "Remote",
           readOnly: false,
           capabilities: { watch: true, conditionalWrite: true },
@@ -202,5 +224,40 @@ test("an obsolete open cannot activate after a more recent selection", async () 
   assert.equal(await opening, false);
   assert.equal(manager.snapshot().active!.id, DEFAULT_VAULT_ID);
   assert.equal(manager.snapshot().opened.length, 2);
+  await manager.close();
+});
+
+test("readonly and edit shares of one Vault keep separate instances and non-secret connection IDs", async () => {
+  const registry = new Registry();
+  const local = files();
+  const manager = new VaultManager({
+    file: registry,
+    openLocal: async () => local.backend,
+    openRemoteEditor: fakeRemoteEditor,
+    openRemote: async (url) => ({
+      backend: files().backend as HttpVaultBackend,
+      descriptor: {
+        protocol: "celestite-vault",
+        version: 1,
+        shareId: url.includes("/ro-") ? "reader" : "editor",
+        name: "Same Vault",
+        readOnly: url.includes("/ro-"),
+        vaultIdentity: { id: "vault", historyId: "history" },
+        capabilities: { watch: true, conditionalWrite: true },
+      },
+    }),
+  });
+  await manager.initialize();
+  await manager.connect(url);
+  const editor = manager.snapshot().active!;
+  const readonlyUrl = url.replace("/AAAA", "/ro-AAAA");
+  await manager.connect(readonlyUrl);
+  const reader = manager.snapshot().active!;
+  assert.notEqual(editor.id, reader.id);
+  assert.notEqual(editor.documents, reader.documents);
+  assert.equal(editor.readOnly, false);
+  assert.equal(reader.readOnly, true);
+  assert.ok(!editor.id.includes(url));
+  assert.equal(JSON.parse(registry.text!).connections.length, 2);
   await manager.close();
 });

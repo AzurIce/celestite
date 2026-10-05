@@ -21,20 +21,26 @@ export function VaultConnections(props: {
   state: VaultManagerSnapshot;
 }) {
   const [url, setUrl] = createSignal("");
-  const [token, setToken] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [removing, setRemoving] = createSignal<VaultConnection | null>(null);
   const [open, setOpen] = createSignal(false);
+  function description(connection: VaultConnection) {
+    if (connection.kind === "opfs") return "默认本地 Vault · 不可移除";
+    const vault = props.state.opened.find(
+      (vault) => vault.id === connection.id,
+    );
+    const status = vault ? (vault.readOnly ? "只读" : "可编辑") : "未连接";
+    return `${new URL(connection.url!).origin} · ${status}`;
+  }
   async function connect(event: SubmitEvent) {
     event.preventDefault();
     if (busy()) return;
     setBusy(true);
     setError(null);
     try {
-      if (await props.manager.connect(url(), token())) {
+      if (await props.manager.connect(url())) {
         setUrl("");
-        setToken("");
         setOpen(false);
       }
     } catch (error) {
@@ -78,7 +84,6 @@ export function VaultConnections(props: {
           if (!busy()) {
             setOpen(value);
             if (!value) {
-              setToken("");
               setError(null);
               setRemoving(null);
             }
@@ -105,11 +110,21 @@ export function VaultConnections(props: {
                   <div class="min-w-0 flex-1">
                     <p class="text-ui-sm font-medium">{connection.name}</p>
                     <p class="mt-1 break-all text-ui-sm text-secondary">
-                      {connection.kind === "opfs"
-                        ? "默认本地 Vault · 不可移除"
-                        : connection.url}
+                      {description(connection)}
                     </p>
                   </div>
+                  <Show when={connection.kind === "remote"}>
+                    <Button
+                      size="sm"
+                      onClick={() =>
+                        void navigator.clipboard
+                          .writeText(connection.url!)
+                          .catch(() => setError("无法复制连接链接。"))
+                      }
+                    >
+                      复制链接
+                    </Button>
+                  </Show>
                   <Button
                     size="sm"
                     disabled={busy() || props.state.opening}
@@ -173,28 +188,13 @@ export function VaultConnections(props: {
               class="ui-input mt-2 w-full"
               type="url"
               required
-              placeholder="https://example.com/api/v1/vaults/notes"
+              placeholder="https://example.com/ro-<key>"
               value={url()}
               onInput={(event) => setUrl(event.currentTarget.value)}
               disabled={busy()}
             />
-            <label
-              class="mt-3 block text-ui-sm text-secondary"
-              for="remote-vault-token"
-            >
-              访问令牌（可选）
-            </label>
-            <input
-              id="remote-vault-token"
-              class="ui-input mt-2 w-full"
-              type="password"
-              autocomplete="off"
-              value={token()}
-              onInput={(event) => setToken(event.currentTarget.value)}
-              disabled={busy()}
-            />
             <p class="mt-2 text-ui-sm text-secondary">
-              令牌仅用于本次会话。刷新后可通过同一 URL 重新认证。
+              粘贴宿主提供的只读或编辑链接。
             </p>
             <div class="mt-4 flex justify-end">
               <Button type="submit" disabled={busy() || props.state.opening}>

@@ -15,7 +15,7 @@ import type {
 export interface RemoteVaultDescriptor {
   protocol: "celestite-vault";
   version: 1;
-  id: string;
+  shareId: string;
   name: string;
   readOnly: boolean;
   previewResourceRoot?: string;
@@ -39,8 +39,8 @@ export function normalizeVaultUrl(value: string): string {
     !["http:", "https:"].includes(url.protocol) ||
     url.username ||
     url.password ||
-    url.search ||
-    url.hash
+    url.href.includes("?") ||
+    url.href.includes("#")
   ) {
     throw new VaultError(
       "InvalidPath",
@@ -48,11 +48,10 @@ export function normalizeVaultUrl(value: string): string {
     );
   }
   url.pathname = url.pathname.replace(/\/+$/, "");
-  if (!/\/api\/v1\/vaults\/[a-zA-Z0-9_-]+$/.test(url.pathname))
-    throw new VaultError(
-      "InvalidPath",
-      "Vault URL 应以 /api/v1/vaults/<id> 结尾。",
-    );
+  const key = url.pathname.slice(url.pathname.lastIndexOf("/") + 1);
+  const random = key.startsWith("ro-") ? key.slice(3) : key;
+  if (!/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(random))
+    throw new VaultError("InvalidPath", "请输入宿主生成的完整分享链接。");
   return url.href;
 }
 const codes = new Set<VaultErrorCode>([
@@ -86,8 +85,8 @@ async function responseError(response: Response): Promise<VaultError> {
   );
 }
 
-export async function openHttpVault(value: string, token = "") {
-  const backend = new HttpVaultBackend(normalizeVaultUrl(value), token);
+export async function openHttpVault(value: string) {
+  const backend = new HttpVaultBackend(normalizeVaultUrl(value));
   try {
     const descriptor = await backend.describe();
     return { backend, descriptor };
@@ -104,16 +103,7 @@ export class HttpVaultBackend implements VaultBackend {
   private revisions = new Map<VaultPath, string>();
   private listeners = new Set<(hint: ChangeHint) => void>();
   private watcher?: AbortController;
-  constructor(
-    readonly url: string,
-    private token = "",
-  ) {}
-  authorize(token: string) {
-    this.token = token;
-    this.watcher?.abort();
-    this.watcher = undefined;
-    this.startWatcher();
-  }
+  constructor(readonly url: string) {}
   documentRequest<T>(route: string, body?: unknown): Promise<T> {
     return this.run(async () => {
       const response = await this.request(
@@ -163,24 +153,20 @@ export class HttpVaultBackend implements VaultBackend {
         }),
     };
   }
-  private headers(): Record<string, string> {
-    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
-  }
   private async request(
     route: string,
     query: Record<string, string> = {},
     init: RequestInit = {},
   ) {
-    const url = new URL(this.url + route);
+    const url = new URL(this.url + "/api/v1" + route);
     url.search = new URLSearchParams(query).toString();
     const headers = new Headers(init.headers);
-    for (const [key, value] of Object.entries(this.headers()))
-      headers.set(key, value);
     try {
       const response = await fetch(url, {
         ...init,
         cache: "no-store",
         credentials: "omit",
+        referrerPolicy: "no-referrer",
         headers,
         signal: AbortSignal.timeout(15000),
       });
@@ -223,8 +209,10 @@ export class HttpVaultBackend implements VaultBackend {
       if (
         raw.protocol !== "celestite-vault" ||
         raw.version !== 1 ||
-        typeof raw.id !== "string" ||
-        raw.id !== new URL(this.url).pathname.split("/").pop() ||
+        typeof raw.shareId !== "string" ||
+        !raw.shareId ||
+        typeof raw.vaultIdentity?.id !== "string" ||
+        typeof raw.vaultIdentity?.historyId !== "string" ||
         typeof raw.name !== "string" ||
         !raw.name.trim() ||
         typeof raw.readOnly !== "boolean" ||
@@ -405,9 +393,9 @@ export class HttpVaultBackend implements VaultBackend {
   private async watchLoop(controller: AbortController) {
     while (!controller.signal.aborted) {
       try {
-        const response = await fetch(this.url + "/events", {
-          headers: this.headers(),
+        const response = await fetch(this.url + "/api/v1/events", {
           credentials: "omit",
+          referrerPolicy: "no-referrer",
           cache: "no-store",
           signal: controller.signal,
         });

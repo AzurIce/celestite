@@ -14,9 +14,29 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 ./target/debug/celestite-server --config /tmp/celestite-demo/config.toml
 ```
 
-打开 Web 客户端，在底部“管理 Vault”中连接 `http://127.0.0.1:7437/api/v1/vaults/notes`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。
+在另一个终端为正在运行的宿主创建分享：
 
-配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。名称与目录可修改，保留 ID 即保留 URL。
+```sh
+./target/debug/celestite-server --config /tmp/celestite-demo/config.toml \
+  share create notes --permission readonly --label '阅读分享' --base-url http://127.0.0.1:7437
+./target/debug/celestite-server --config /tmp/celestite-demo/config.toml \
+  share create notes --permission edit --label '编辑分享' --base-url http://127.0.0.1:7437
+./target/debug/celestite-server --config /tmp/celestite-demo/config.toml share list notes
+# 用列表中的非秘密 ShareId 撤销某份分享：
+./target/debug/celestite-server --config /tmp/celestite-demo/config.toml share revoke notes <ShareId>
+```
+
+创建命令将完整链接输出到 stdout，原始 key 只返回一次；列表不能恢复原链接。打开 Web 客户端，在底部“管理 Vault”中粘贴输出的 `http://127.0.0.1:7437/<key>` 或 `http://127.0.0.1:7437/ro-<random>`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。
+
+配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。配置 ID 用于宿主管理；分享绑定持久化的 Vault 身份，改名或修改配置 ID 保留已有链接。更改目录继续遵守 profile 的根目录迁移校验。
+
+## 分享状态与升级
+
+每个持久化 Vault 的私有状态目录保存 `shares.redb`，与 `history.redb` 分开。初始化 Vault 时同时创建空分享库，不自动发布默认链接；正常启动恢复凭证摘要和授权，分享库缺失或损坏时报错。临时内存 Vault 的分享随宿主退出丢失。
+
+已有 `history.redb` 的宿主升级时，先停止旧进程，运行 `--init-shares notes` 创建空分享库，再正常启动并创建新链接。移除配置中的 `token_env`；旧的按配置 ID 连接 URL 已删除，客户端需要重新添加宿主提供的分享链接。`--reset-vault` 创建新身份并归档旧分享库，旧链接失效。
+
+撤销先持久化并阻止新的操作，随后关闭对应 WebSocket 和 SSE；已经进入提交过程的操作允许完成。其他分享和宿主自己的文件监听 / 协调不受影响。完整链接是凭证，客户端连接记录为重连保存它；转发链接即转交权限。
 
 ## 命令行
 
@@ -29,7 +49,8 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
   --allowed-origin http://localhost:1420 \
   --vault notes=./notes --vault-name 'notes=我的笔记' \
   --vault reference=./reference --vault-read-only reference=true \
-  --ephemeral-vault notes --ephemeral-vault reference
+  --ephemeral-vault notes --ephemeral-vault reference \
+  --management-socket ./private-management/socket
 
 # 覆盖部分配置；其他 Vault 及设置保留
 ./target/debug/celestite-server --config ./config.toml \
@@ -46,14 +67,14 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 | `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                         |
 | `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名       |
 | `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                         |
-| `--token-env VARIABLE`             | 覆盖用于读取访问令牌的环境变量名                                |
-| `--no-token`                       | 清除配置中的令牌要求；非回环监听仍会拒绝启动                    |
 | `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                           |
 | `--state-dir DIRECTORY`            | 兼容旧的共享状态目录布局 `<id>.redb`                            |
 | `--vault-state-dir ID=DIRECTORY`   | 可重复；覆盖指定 Vault 的私有状态目录，使用 `history.redb`      |
 | `--ephemeral-vault ID`             | 可重复；明确使用临时内存历史，禁用该 Vault 的持久化             |
 | `--init-vault ID`                  | 可重复；首次初始化指定 Vault 的历史，完成后退出；已有数据库报错 |
 | `--reset-vault ID`                 | 可重复；归档指定 Vault 的旧历史，创建新身份，完成后退出         |
+| `--management-socket SOCKET`       | 覆盖本机分享管理 socket；父目录必须为 0700                      |
+| `--init-shares ID`                 | 为旧的持久化 Vault 显式创建空分享库，完成后退出                 |
 | `--no-web`                         | 禁用配置中的静态 Web 资源目录                                   |
 | `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                    |
 | `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                             |
@@ -61,9 +82,9 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 
 命令行目录路径以**当前工作目录**为基准，配置文件中的路径仍以**配置文件所在目录**为基准。新增 Vault 默认名称为 ID、可写；覆盖已有 Vault 目录保留其名称与只读状态，除非另行覆盖。不支持通过命令行移除配置中的 Vault，完全替换注册列表可使用 `--no-config` 加多个 `--vault`。
 
-`ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。令牌参数只接受环境变量名称，令牌本身不会进入命令行参数或 URL。
+`ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。
 
-`server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；监听其他地址必须配置 `token_env`，从环境变量读取 Bearer token。前端令牌只保留在当前会话，连接 URL 与本地记录不包含令牌。远端 HTTPS 可由反向代理提供，代理后的客户端来源也需配置。CORS 支持 `Authorization`、`If-Match` 和读取 `ETag`，有 Origin 的 API 请求另行检查来源；CORS 不承担认证。
+`server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；网络访问通过 URL 中的完整随机 key 鉴权，不依赖账号。readonly 的 `ro-` 属于凭证，修改前缀不会转换权限。HTTP 和 WebSocket 共用授权，readonly 允许读取、预览和实时更新，edit 允许正文及目录修改，仍受 Vault 级 `read_only` 限制。分享管理只在私有 Unix socket 上提供，编辑链接不能管理分享。默认 socket 位于首个持久化 Vault 的 `state_dir/management/socket`，可通过 `management_socket` 覆盖；父目录自动按 0700 创建，已有目录必须满足该权限，socket 为 0600。公网使用 HTTPS / WSS，反向代理需转发 WebSocket，并脱敏访问路径中的 key。应用日志脱敏 key，授权响应使用 `no-store` / `no-referrer`。CORS 支持 `If-Match`、`Content-Type` 和读取 `ETag`，有 Origin 的请求另行检查来源；CORS 不承担认证。
 
 ## 日志
 
@@ -79,20 +100,20 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
 
 ## API v1
 
-下面路径均相对于 `/api/v1/vaults/<id>`，文件路径通过查询参数传递，使用 Vault 内相对路径与 `/` 分隔。空路径表示根目录。
+下面路径均相对于 `/<key>/api/v1`，文件路径通过查询参数传递，使用 Vault 内相对路径与 `/` 分隔。空路径表示根目录。
 
-| 方法   | 路径                               | 功能                                          |
-| ------ | ---------------------------------- | --------------------------------------------- |
-| GET    | 根地址                             | 描述：协议、版本、ID、名称、只读和能力        |
-| GET    | `/directory?path=`                 | 直接子项，不读正文                            |
-| GET    | `/stat?path=`                      | 元数据；不存在返回 JSON null                  |
-| GET    | `/file?path=`                      | 二进制正文、内容哈希 ETag，禁止缓存           |
-| PUT    | `/file?path=&mode=create`          | 不覆盖的新建，原始字节 body                   |
-| PUT    | `/file?path=&mode=replace`         | 已有文件替换，必须带读取时的 If-Match         |
-| POST   | `/directory?path=&recursive=false` | 创建目录                                      |
-| DELETE | `/entry?path=&recursive=false`     | 删除条目，根目录受保护                        |
-| POST   | `/rename`                          | JSON `{ "from": "a", "to": "b" }`，不覆盖目标 |
-| GET    | `/events`                          | SSE 变化提示；连接和重连首帧使整个树失效      |
+| 方法   | 路径                               | 功能                                                    |
+| ------ | ---------------------------------- | ------------------------------------------------------- |
+| GET    | 根地址                             | 描述：协议、版本、ShareId、Vault 身份、名称、只读和能力 |
+| GET    | `/directory?path=`                 | 直接子项，不读正文                                      |
+| GET    | `/stat?path=`                      | 元数据；不存在返回 JSON null                            |
+| GET    | `/file?path=`                      | 二进制正文、内容哈希 ETag，禁止缓存                     |
+| PUT    | `/file?path=&mode=create`          | 不覆盖的新建，原始字节 body                             |
+| PUT    | `/file?path=&mode=replace`         | 已有文件替换，必须带读取时的 If-Match                   |
+| POST   | `/directory?path=&recursive=false` | 创建目录                                                |
+| DELETE | `/entry?path=&recursive=false`     | 删除条目，根目录受保护                                  |
+| POST   | `/rename`                          | JSON `{ "from": "a", "to": "b" }`，不覆盖目标           |
+| GET    | `/events`                          | SSE 变化提示；连接和重连首帧使整个树失效                |
 
 错误采用 JSON `{ code, message, path }`，前端恢复为 `VaultError`。多步操作不保证事务。每个 Vault 内操作串行，磁盘操作在线程池执行；服务内多个客户端的版本比较与提交在同一锁内完成。外部程序不参与该锁，内容核对与提交之间仍有竞争窗口；没有跨程序的原子 CAS 承诺。
 
@@ -106,12 +127,11 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 ## 在线协作 WebSocket
 
-描述接口报告 `websocketSync: true`。每个客户端 VaultInstance 建立一条 `/api/v1/vaults/<id>/sync` 连接；HTTPS 使用 WSS，反向代理需转发 WebSocket upgrade。来源检查发生在升级前，认证通过首个 JSON 消息完成，不把令牌写入 URL：
+描述接口报告 `websocketSync: true`。每个客户端 VaultInstance 建立一条 `/<key>/api/v1/sync` 连接；HTTPS 使用 WSS，反向代理需转发 WebSocket upgrade。分享鉴权与来源检查发生在升级前；首个 JSON 消息只校验协议和预期 Vault / 历史身份：
 
 ```json
 {
   "protocolVersion": 1,
-  "token": "本次会话令牌",
   "vaultIdentity": {
     "id": "描述接口的 id",
     "historyId": "描述接口的 historyId"
@@ -137,7 +157,7 @@ host 返回 `hello`（`sessionId`），然后按文档发送 `document`（元数
 
 ## 无头编辑器 API
 
-下面路径仍相对于 `/api/v1/vaults/<id>`。正文与文档业务由 `celestite-core::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
+下面路径仍相对于 `/<key>/api/v1`。正文与文档业务由 `celestite-core::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
 
 | 方法 | 路径                                  | 请求 / 行为                                                                             |
 | ---- | ------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -216,7 +236,7 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 待协调时保存返回 `409 FilesystemReconciliationPending`，计算超时返回 `409 FilesystemDiffTimeout`，两者都携带文件路径并保留历史和磁盘内容。相同失败输入从 30 秒退避至最多 5 分钟；新内容绕过退避。`POST /documents/<document>/retry-observation` 或 WebSocket `retry_observation`（参数 `id`）立即重新排队，返回当前文档状态；重试只协调，不写回物理文件，也允许只读 Vault 使用。
 
-`GET /api/v1/vaults/{id}/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全量文档元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已提交 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文。
+`GET /<key>/api/v1/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全量文档元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已提交 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文。
 
 初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全量状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId`，保留 Vault / 文档历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容；私有历史提交失败不会把未提交正文版本宣布为已确认版本；此时 `/snapshot` 与 `/updates` 暂停导出，避免通知后的一次失败提交被后续拉取当作已确认历史。
 
@@ -256,6 +276,6 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 
 Vault 根目录只确定文档范围。`Notist.toml` 中的 package 路径相对于该配置解析，可使用 `../packages/grammar` 或绝对路径；无需扩大 Vault 根或迁移文档历史。
 
-描述接口的 `previewResourceRoot` 提供编译资源解析根。`POST /api/v1/vaults/<id>/preview/resources` 接收 `{context: {documentPath, overlays}, request: {path, read}}`，返回文件种类、可选字节或不存在状态；`POST /api/v1/vaults/<id>/preview/directory` 接收相同 `context` 和绝对 `path`，返回直接子项。`overlays` 包含 Vault 内的 `Notist.toml` 未保存正文及已读取的外部清单源码快照，不写入磁盘；外部身份使用规范绝对路径，仅在 Notist 依赖图实际读取时生效。资源发现由 Notist 执行，这两条接口只读取直接或递归依赖的 `Notist.toml`、`lib.notc` 与 `components/`，沿用 Vault 的认证与来源检查；单文件上限 16 MiB，目录内部符号链接不跟随。
+描述接口的 `previewResourceRoot` 提供编译资源解析根。`POST /<key>/api/v1/preview/resources` 接收 `{context: {documentPath, overlays}, request: {path, read}}`，返回文件种类、可选字节或不存在状态；`POST /<key>/api/v1/preview/directory` 接收相同 `context` 和绝对 `path`，返回直接子项。`overlays` 包含 Vault 内的 `Notist.toml` 未保存正文及已读取的外部清单源码快照，不写入磁盘；外部身份使用规范绝对路径，仅在 Notist 依赖图实际读取时生效。资源发现由 Notist 执行，这两条接口只读取直接或递归依赖的 `Notist.toml`、`lib.notc` 与 `components/`，沿用 Vault 的认证与来源检查；单文件上限 16 MiB，目录内部符号链接不跟随。
 
 每个 package 的清单声明 `[package].name`，依赖键与名称一致。递归依赖、根配置的开发依赖和各作用域的 transforms 均由 Notist 装配；server 只提供资源。外部清单、声明与组件目录变更触发预览失效通知，不运行文档协调，也不将 package 导入文件树或 CRDT 历史。外部配置和声明诊断由 Web 显示只读源码快照。启用这些接口需要重新构建并重启 server；现有 Vault 路径和状态目录保持原配置。

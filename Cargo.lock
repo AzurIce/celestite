@@ -673,12 +673,14 @@ name = "celestite-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "blake3",
  "cap-std",
  "celestite-core",
  "clap",
  "futures-lite",
  "futures-util",
+ "getrandom 0.3.4",
  "http-body-util",
  "notify",
  "notist",

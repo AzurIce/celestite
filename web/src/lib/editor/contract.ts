@@ -167,7 +167,7 @@ export interface ServiceMethods {
     result: PreviewAssets;
   };
   composition: { params: { id: string; active: boolean }; result: void };
-  authorize: { params: { token: string }; result: ServiceDocument[] };
+  reconnect: { params: Record<string, never>; result: ServiceDocument[] };
   preview_subscribe: { params: { id: string }; result: PreviewSubscription };
   preview_unsubscribe: { params: { subscriptionId: string }; result: boolean };
   preview_retry: { params: { id: string }; result: PreviewState };

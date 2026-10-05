@@ -57,7 +57,10 @@ pub(crate) fn prepare(
             return Err("Vault directories must not overlap".into());
         }
         let history_path = if config.ephemeral {
-            if config.state_dir.is_some() || config.history_mode != HistoryMode::Recover {
+            if config.state_dir.is_some()
+                || config.history_mode != HistoryMode::Recover
+                || config.initialize_shares
+            {
                 return Err(format!("Vault {}: ephemeral cannot be combined with state_dir, initialization or reset", config.id).into());
             }
             None

@@ -78,7 +78,6 @@ export function hasUnsent(local: Version, host: Version) {
 /** Reference pull/push transport; no hidden saves or production session protocol. */
 export class DebugSession {
   private url = "";
-  private token = "";
   private descriptor: Descriptor | null = null;
   private documents: DebugDocument[] = [];
   private host: DebugDocument | null = null;
@@ -165,12 +164,12 @@ export class DebugSession {
     }
   }
   private async http<T>(path: string, body?: unknown): Promise<T> {
-    const response = await fetch(this.url + path, {
+    const response = await fetch(this.url + "/api/v1" + path, {
       method: body === undefined ? "GET" : "POST",
       cache: "no-store",
+      referrerPolicy: "no-referrer",
       signal: AbortSignal.any([this.abort.signal, AbortSignal.timeout(15000)]),
       headers: {
-        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -182,11 +181,10 @@ export class DebugSession {
       );
     return value as T;
   }
-  connect(value: string, token: string) {
+  connect(value: string) {
     return this.operation("host", "连接", async () => {
       if (this.descriptor) throw new Error("请先结束当前调试会话");
       this.url = normalizeVaultUrl(value);
-      this.token = token;
       const descriptor = await this.http<Descriptor>("");
       if (
         descriptor.protocol !== "celestite-vault" ||
@@ -454,7 +452,6 @@ export class DebugSession {
     this.descriptor = null;
     this.host = null;
     this.documents = [];
-    this.token = "";
     this.error = null;
     this.record("all", "结束会话", "调试内存实例已释放");
   }

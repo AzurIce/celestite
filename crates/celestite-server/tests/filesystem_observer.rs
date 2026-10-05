@@ -43,6 +43,10 @@ impl Host {
             root,
         )
         .unwrap();
+        let key = server
+            .create_share("notes", celestite_server::Permission::Edit, "test".into())
+            .unwrap()
+            .key;
         let (shutdown, stopping) = oneshot::channel();
         let stop_events = server.shutdown;
         let task = tokio::spawn(async move {
@@ -55,7 +59,7 @@ impl Host {
         });
         Self {
             client: Client::new(),
-            url: format!("http://{address}/api/v1/vaults/notes"),
+            url: format!("http://{address}/{key}/api/v1"),
             shutdown,
             stopping: stop_events,
             task,
