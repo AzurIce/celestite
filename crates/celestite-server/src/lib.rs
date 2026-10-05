@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 mod editor_api;
+mod package_resources;
 mod profiles;
 mod reconcile;
 mod sync;
@@ -100,6 +101,7 @@ struct HostedVault {
     name: String,
     read_only: bool,
     files: Mutex<FsVault>,
+    packages: package_resources::PackageResources,
     documents: Mutex<Documents>,
     events: broadcast::Sender<ChangeHint>,
     _watcher: Mutex<notify::RecommendedWatcher>,
@@ -301,6 +303,7 @@ pub fn build_server(
             id: vault.id.clone(),
             name: vault.name,
             read_only: vault.read_only,
+            packages: package_resources::PackageResources::new(root.clone(), events.clone())?,
             files: Mutex::new(files),
             documents: Mutex::new(documents),
             events,
@@ -318,6 +321,7 @@ pub fn build_server(
         shutdown: shutdown.clone(),
     });
     let api = Router::new()
+        .merge(package_resources::routes())
         .merge(editor_api::routes())
         .merge(sync::routes())
         .route("/api/v1/vaults/{id}", get(describe))
@@ -440,7 +444,7 @@ async fn describe(
         .lock()
         .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "id": vault.id, "name": vault.name, "readOnly": vault.read_only, "previewResourceRoot": vault.packages.root, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(

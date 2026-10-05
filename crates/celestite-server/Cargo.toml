@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 celestite-core = { path = "../celestite-core" }
+notist = { workspace = true }
 futures-lite = "2.6.1"
 cap-std = "4"
 blake3 = "1"

@@ -611,6 +611,35 @@ export function VaultEditor(props: VaultEditorProps) {
                           onScroll={(scrollTop) =>
                             views.set(id, { mode: mode(), scrollTop })
                           }
+                          onDiagnostic={async (diagnostic) => {
+                            if (
+                              !(await props.documents.open(
+                                vaultPath(diagnostic.path),
+                              ))
+                            )
+                              throw new Error(`无法打开 ${diagnostic.path}`);
+                            const snapshot = props.documents.snapshot();
+                            const target = snapshot.documents.find(
+                              (document) => document.id === snapshot.activeId,
+                            );
+                            if (
+                              !target ||
+                              target.pending ||
+                              (diagnostic.source !== null &&
+                                target.content !== diagnostic.source)
+                            )
+                              throw new Error(
+                                "诊断来源已变化，请重新生成预览。",
+                              );
+                            chooseMode("source");
+                            onSettled(() => {
+                              setReveal({
+                                from: diagnostic.from,
+                                to: diagnostic.to,
+                                requestId: crypto.randomUUID(),
+                              });
+                            });
+                          }}
                           onReveal={(from, to, keepSplit) => {
                             if (!keepSplit || displayMode() !== "split")
                               chooseMode("source");

@@ -103,6 +103,7 @@ pub struct EditorCore<B: Backend> {
     requires_reopen: bool,
     options: EditorOptions,
     previews: preview::PreviewSessions,
+    preview_environment: BTreeMap<String, Version>,
 }
 
 pub fn validate_editor_path(path: &str) -> EditorResult<()> {
@@ -301,6 +302,7 @@ impl<B: Backend> EditorCore<B> {
             requires_reopen: false,
             options,
             previews: preview::PreviewSessions::default(),
+            preview_environment: BTreeMap::new(),
         };
         core.recover_directory().await?;
         Ok(core)
@@ -351,7 +353,28 @@ impl<B: Backend> EditorCore<B> {
             return Ok(None);
         }
         let snapshot = self.record(id)?.document.snapshot();
-        Ok(self.previews.take_task(id, snapshot, self.backend.now_ms()))
+        let mut task = self.previews.take_task(id, snapshot, self.backend.now_ms());
+        if let Some(task) = &mut task {
+            task.overlays = self
+                .records
+                .values()
+                .filter(|record| {
+                    !record.header.deleted && !preview::supports_preview(&record.header.path)
+                })
+                .map(|record| (record.header.path.clone(), record.document.snapshot().text))
+                .collect();
+            if task.overlays.values().map(String::len).sum::<usize>() > 32 * 1024 * 1024 {
+                self.previews.complete(PreviewCompletion {
+                    task_id: task.ticket.task_id.clone(),
+                    outcome: PreviewOutcome::Failure {
+                        message: "预览项目的未保存内容超过容量，请关闭部分文件。".into(),
+                        diagnostics: vec![],
+                    },
+                });
+                return Ok(None);
+            }
+        }
+        Ok(task)
     }
     pub fn complete_preview(&mut self, completion: PreviewCompletion) -> bool {
         if let Some(id) = self.previews.document_for_task(&completion.task_id) {
@@ -368,7 +391,25 @@ impl<B: Backend> EditorCore<B> {
         self.previews.state(id)
     }
     pub fn take_preview_events(&mut self) -> Vec<PreviewEvent> {
+        self.sync_preview_environment();
         self.previews.take_events()
+    }
+    pub fn invalidate_preview_project(&mut self) {
+        self.previews.invalidate_project(self.backend.now_ms());
+    }
+    fn sync_preview_environment(&mut self) {
+        let current = self
+            .records
+            .values()
+            .filter(|record| {
+                !record.header.deleted && !preview::supports_preview(&record.header.path)
+            })
+            .map(|record| (record.header.path.clone(), record.document.version()))
+            .collect();
+        if self.preview_environment != current {
+            self.preview_environment = current;
+            self.invalidate_preview_project();
+        }
     }
     pub fn preview_link(
         &mut self,
@@ -393,6 +434,7 @@ impl<B: Backend> EditorCore<B> {
         Ok(())
     }
     fn sync_preview(&mut self, id: &str) {
+        self.sync_preview_environment();
         if !self.previews.contains(id) {
             return;
         }
@@ -1968,6 +2010,10 @@ impl<B: Backend> EditorCore<B> {
                 params["target"].as_str().unwrap_or(""),
             )?),
             "preview_events" => to_value(self.take_preview_events()),
+            "preview_invalidate_project" => {
+                self.invalidate_preview_project();
+                to_value(())
+            }
             "join" => {
                 let path = params["path"]
                     .as_str()

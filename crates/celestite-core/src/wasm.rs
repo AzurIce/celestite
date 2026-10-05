@@ -38,6 +38,13 @@ pub fn render_preview(task: &str) -> Result<String, JsValue> {
     Ok(encode(compute_preview(&task)))
 }
 
+#[cfg(feature = "preview")]
+#[wasm_bindgen]
+pub fn preview_resource_requests(task: &str) -> Result<String, JsValue> {
+    let task: PreviewTask = decode(task)?;
+    Ok(encode(crate::preview::preview_resource_requests(&task)))
+}
+
 /// Worker-owned shared editor with its concrete OPFS Backend.
 #[wasm_bindgen]
 pub struct EditorBinding {

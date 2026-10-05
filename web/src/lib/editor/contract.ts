@@ -2,6 +2,7 @@ import type { VaultBackend } from "../vault/types";
 import type { VaultPath } from "../vault/path";
 import type { DocumentSnapshot, DocumentsSnapshot } from "./documents";
 import type {
+  PreviewAssets,
   DocumentPreviews,
   PreviewEvent,
   PreviewLink,
@@ -149,6 +150,10 @@ export interface WorkerRequest {
 
 /** Async host operations: identical envelope over Worker messages or native IPC. */
 export interface ServiceMethods {
+  preview_assets: {
+    params: { id: string; taskId: string };
+    result: PreviewAssets;
+  };
   composition: { params: { id: string; active: boolean }; result: void };
   authorize: { params: { token: string }; result: ServiceDocument[] };
   preview_subscribe: { params: { id: string }; result: PreviewSubscription };

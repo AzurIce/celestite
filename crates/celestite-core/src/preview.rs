@@ -39,13 +39,62 @@ pub struct PreviewTicket {
 pub struct PreviewTask {
     pub ticket: PreviewTicket,
     pub source: String,
+    #[serde(default)]
+    pub overlays: BTreeMap<String, String>,
+    #[serde(default)]
+    pub resources: BTreeMap<String, PreviewResource>,
+    #[serde(default = "default_resource_root")]
+    pub resource_root: String,
 }
+
+fn default_resource_root() -> String {
+    "/vault".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewResource {
+    pub kind: Option<PreviewResourceKind>,
+    pub data: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewResourceKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewResourceRequest {
+    pub path: String,
+    pub read: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewComponent {
+    pub package: String,
+    pub name: String,
+    pub tag: String,
+    pub path: String,
+    pub package_root: String,
+}
+
+#[cfg(feature = "preview")]
+mod project;
+#[cfg(feature = "preview")]
+pub use project::preview_resource_requests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewDiagnosticOrigin {
     Analysis,
+    Transform,
     Render,
+    Environment,
 }
 
 /// Half-open UTF-16 offsets in the task's LF source, not the UI input projection.
@@ -57,6 +106,9 @@ pub struct PreviewDiagnostic {
     pub origin: PreviewDiagnosticOrigin,
     pub phase: String,
     pub message: String,
+    pub path: String,
+    /// Only cross-file diagnostics carry their source, to verify navigation.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +118,8 @@ pub struct PreviewOutput {
     pub diagnostics: Vec<PreviewDiagnostic>,
     #[serde(default)]
     pub source_map: Vec<PreviewSourceMapping>,
+    #[serde(default)]
+    pub used_components: Vec<PreviewComponent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,18 +139,33 @@ pub struct PreviewSourceMapping {
     pub to: usize,
     pub kind: PreviewMappingKind,
 }
+fn diagnostic_bytes(diagnostics: &[PreviewDiagnostic]) -> usize {
+    diagnostics.iter().fold(0usize, |size, diagnostic| {
+        size.saturating_add(std::mem::size_of::<PreviewDiagnostic>())
+            .saturating_add(diagnostic.message.len())
+            .saturating_add(diagnostic.phase.len())
+            .saturating_add(diagnostic.path.len())
+            .saturating_add(diagnostic.source.as_ref().map_or(0, String::len))
+    })
+}
 impl PreviewOutput {
     fn bytes(&self) -> usize {
-        self.diagnostics.iter().fold(
-            self.html.len().saturating_add(
-                self.source_map
-                    .len()
-                    .saturating_mul(std::mem::size_of::<PreviewSourceMapping>()),
-            ),
-            |size, diagnostic| {
-                size.saturating_add(std::mem::size_of::<PreviewDiagnostic>())
-                    .saturating_add(diagnostic.message.len())
-                    .saturating_add(diagnostic.phase.len())
+        self.used_components.iter().fold(
+            self.html
+                .len()
+                .saturating_add(
+                    self.source_map
+                        .len()
+                        .saturating_mul(std::mem::size_of::<PreviewSourceMapping>()),
+                )
+                .saturating_add(diagnostic_bytes(&self.diagnostics)),
+            |size, component| {
+                size.saturating_add(std::mem::size_of::<PreviewComponent>())
+                    .saturating_add(component.package.len())
+                    .saturating_add(component.name.len())
+                    .saturating_add(component.tag.len())
+                    .saturating_add(component.path.len())
+                    .saturating_add(component.package_root.len())
             },
         )
     }
@@ -105,8 +174,14 @@ impl PreviewOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PreviewOutcome {
-    Success { output: PreviewOutput },
-    Failure { message: String },
+    Success {
+        output: PreviewOutput,
+    },
+    Failure {
+        message: String,
+        #[serde(default)]
+        diagnostics: Vec<PreviewDiagnostic>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +215,7 @@ pub struct PreviewState {
     pub status: PreviewStatus,
     pub result: Option<PreviewResult>,
     pub error: Option<String>,
+    pub diagnostics: Vec<PreviewDiagnostic>,
     /// Deadline on the Backend clock. None while the current target is running
     /// or awaiting retry. An older running task can still delay dispatch.
     pub due_at: Option<u64>,
@@ -263,6 +339,7 @@ pub fn resolve_preview_target(path: &str, target: &str) -> EditorResult<PreviewL
 /// synchronously in an edit or save command. No IO or CRDT writes occur here.
 #[cfg(feature = "preview")]
 pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
+    let mut environment_diagnostics = Vec::new();
     let computed = (|| -> EditorResult<PreviewOutput> {
         if task.source.len() > crate::MAX_TEXT_BYTES || task.source.contains('\r') {
             return Err(EditorError::new(
@@ -280,18 +357,64 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
         })?;
         // Frontend selection is case-sensitive; the logical path remains in
         // the ticket for resource resolution, while dispatch uses a canonical ext.
-        let analysis = notist::Notist::default()
-            .analyze(format!("preview.{extension}"), &task.source)
+        let resources = project::SnapshotResources::new(task);
+        let mut vault = notist::Vault::new(resources);
+        let path = std::path::Path::new(&task.ticket.path).with_extension(extension);
+        let computed = vault
+            .render_html(&path, &task.source, notist::RenderOptions::default())
             .map_err(|error| {
-                EditorError::new("Unsupported", error.to_string(), &task.ticket.path)
+                if let notist::VaultError::Environment(errors) = &error {
+                    environment_diagnostics = errors
+                        .iter()
+                        .map(|error| PreviewDiagnostic {
+                            from: error.source[..usize::from(error.diagnostic.span.start())]
+                                .encode_utf16()
+                                .count(),
+                            to: error.source[..usize::from(error.diagnostic.span.end())]
+                                .encode_utf16()
+                                .count(),
+                            origin: PreviewDiagnosticOrigin::Environment,
+                            phase: error.diagnostic.phase.to_string(),
+                            message: error.diagnostic.message.clone(),
+                            path: project::resource_key(&task.resource_root, &error.path),
+                            source: Some(error.source.clone()),
+                        })
+                        .collect();
+                }
+                EditorError::new("InvalidPreview", error.to_string(), &task.ticket.path)
             })?;
-        let rendered = notist_html::Renderer::new()
-            .with_source_map()
-            .render_with_diagnostics(analysis.root());
+        let analysis = computed.analysis;
+        let transformed = computed.transformed;
+        let rendered = computed.rendered;
+        let environment = vault.environment_for(&path).map_err(|error| {
+            EditorError::new("InvalidPreview", error.to_string(), &task.ticket.path)
+        })?;
+        let used_components = rendered
+            .used_components
+            .iter()
+            .filter_map(|component| {
+                Some(PreviewComponent {
+                    package: component.id.package.clone(),
+                    name: component.id.name.clone(),
+                    tag: component.tag.clone(),
+                    path: project::resource_key(&task.resource_root, component.module.resource()?),
+                    package_root: project::resource_key(
+                        &task.resource_root,
+                        &environment.packages()[&component.id.package].root,
+                    ),
+                })
+            })
+            .collect();
         let raw_diagnostics: Vec<_> = analysis
             .diagnostics()
             .iter()
             .map(|diagnostic| (PreviewDiagnosticOrigin::Analysis, diagnostic))
+            .chain(
+                transformed
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (PreviewDiagnosticOrigin::Transform, diagnostic)),
+            )
             .chain(
                 rendered
                     .diagnostics
@@ -353,11 +476,14 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
                     origin,
                     phase: diagnostic.phase.to_string(),
                     message: diagnostic.message.clone(),
+                    path: task.ticket.path.clone(),
+                    source: None,
                 }
             })
             .collect();
         let output = PreviewOutput {
             html: rendered.html,
+            used_components,
             diagnostics,
             source_map: rendered
                 .source_map
@@ -389,6 +515,7 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
             Ok(output) => PreviewOutcome::Success { output },
             Err(error) => PreviewOutcome::Failure {
                 message: error.message,
+                diagnostics: environment_diagnostics,
             },
         },
     }
@@ -407,6 +534,7 @@ pub(crate) struct PreviewSessions {
     sequence: u64,
     sessions: BTreeMap<String, Session>,
     changed: BTreeSet<String>,
+    generation: u64,
 }
 
 impl Default for PreviewSessions {
@@ -419,11 +547,38 @@ impl Default for PreviewSessions {
             sequence: 0,
             sessions: BTreeMap::new(),
             changed: BTreeSet::new(),
+            generation: 0,
         }
     }
 }
 
 impl PreviewSessions {
+    pub fn invalidate_project(&mut self, now: u64) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("preview generation exhausted");
+        let ids: Vec<_> = self.sessions.keys().cloned().collect();
+        for id in ids {
+            let task_id = self.token();
+            let session = self.sessions.get_mut(&id).unwrap();
+            session.state.target.task_id = task_id;
+            session.state.target.render_generation =
+                format!("notist-project-v1:{}", self.generation);
+            session.state.error = None;
+            session.state.diagnostics.clear();
+            if supports_preview(&session.state.target.path) {
+                let first = *session.dirty_since.get_or_insert(now);
+                session.state.status = PreviewStatus::Pending;
+                session.state.due_at = Some(
+                    now.saturating_add(PREVIEW_DEBOUNCE_MS)
+                        .min(first.saturating_add(PREVIEW_MAX_WAIT_MS)),
+                );
+            }
+            self.changed.insert(id);
+        }
+    }
+
     fn token(&mut self) -> String {
         self.next_id = self.next_id.checked_add(1).expect("preview ID exhausted");
         format!("{}:{}", self.scope, self.next_id)
@@ -467,7 +622,7 @@ impl PreviewSessions {
                             document_id: id.into(),
                             version: snapshot.version.clone(),
                             path: path.into(),
-                            render_generation: "notist-html-map-v1".into(),
+                            render_generation: format!("notist-project-v1:{}", self.generation),
                         },
                         status: if supported {
                             PreviewStatus::Pending
@@ -476,6 +631,7 @@ impl PreviewSessions {
                         },
                         result: None,
                         error: None,
+                        diagnostics: vec![],
                         due_at: supported.then_some(now),
                     },
                     running: None,
@@ -550,6 +706,7 @@ impl PreviewSessions {
         session.state.target.version = version.clone();
         session.state.target.path = path.into();
         session.state.error = None;
+        session.state.diagnostics.clear();
         if supports_preview(path) {
             let first = *session.dirty_since.get_or_insert(now);
             session.state.status = PreviewStatus::Pending;
@@ -591,6 +748,9 @@ impl PreviewSessions {
         Some(PreviewTask {
             ticket,
             source: snapshot.text,
+            overlays: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            resource_root: default_resource_root(),
         })
     }
 
@@ -606,27 +766,56 @@ impl PreviewSessions {
         let Some(id) = id else {
             return false;
         };
+        let cached_elsewhere = self
+            .sessions
+            .iter()
+            .filter(|(other, _)| *other != &id)
+            .fold(0usize, |size, (_, session)| {
+                size.saturating_add(
+                    session
+                        .state
+                        .result
+                        .as_ref()
+                        .map_or(0, |result| result.output.bytes()),
+                )
+                .saturating_add(diagnostic_bytes(&session.state.diagnostics))
+            });
         let outcome = match completion.outcome {
             PreviewOutcome::Success { output } => {
-                let cached_elsewhere = self
-                    .sessions
-                    .iter()
-                    .filter(|(other, _)| *other != &id)
-                    .filter_map(|(_, session)| session.state.result.as_ref())
-                    .fold(0usize, |size, result| {
-                        size.saturating_add(result.output.bytes())
-                    });
                 if output.bytes() > MAX_PREVIEW_OUTPUT_BYTES
                     || cached_elsewhere.saturating_add(output.bytes()) > MAX_PREVIEW_CACHE_BYTES
                 {
                     PreviewOutcome::Failure {
                         message: "预览内容超过缓存容量，请缩小文档或关闭其他预览。".into(),
+                        diagnostics: vec![],
                     }
                 } else {
                     PreviewOutcome::Success { output }
                 }
             }
-            other => other,
+            PreviewOutcome::Failure {
+                message,
+                mut diagnostics,
+            } => {
+                let bytes = diagnostic_bytes(&diagnostics);
+                let retained = self.sessions[&id]
+                    .state
+                    .result
+                    .as_ref()
+                    .map_or(0, |result| result.output.bytes());
+                if bytes > MAX_PREVIEW_OUTPUT_BYTES
+                    || cached_elsewhere
+                        .saturating_add(retained)
+                        .saturating_add(bytes)
+                        > MAX_PREVIEW_CACHE_BYTES
+                {
+                    diagnostics.clear();
+                }
+                PreviewOutcome::Failure {
+                    message,
+                    diagnostics,
+                }
+            }
         };
         let session = self.sessions.get_mut(&id).unwrap();
         let ticket = session.running.take().unwrap();
@@ -639,10 +828,15 @@ impl PreviewSessions {
                 session.state.result = Some(PreviewResult { ticket, output });
                 session.state.status = PreviewStatus::Ready;
                 session.state.error = None;
+                session.state.diagnostics.clear();
             }
-            PreviewOutcome::Failure { message } => {
+            PreviewOutcome::Failure {
+                message,
+                diagnostics,
+            } => {
                 session.state.status = PreviewStatus::Failed;
                 session.state.error = Some(message);
+                session.state.diagnostics = diagnostics;
             }
         }
         self.changed.insert(id);
@@ -658,6 +852,7 @@ impl PreviewSessions {
         session.state.target.session_id = session_id;
         session.running = None;
         session.state.error = None;
+        session.state.diagnostics.clear();
         session.dirty_since = None;
         let supported = supports_preview(&session.state.target.path);
         session.state.status = if supported {

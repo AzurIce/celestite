@@ -47,6 +47,8 @@ export class WorkerDocuments {
     },
     link: (id, taskId, target) =>
       this.client.request("preview_link", { id, taskId, target }),
+    assets: (id, taskId) =>
+      this.client.request("preview_assets", { id, taskId }),
   };
   reconnect?: (discardUnconfirmed?: boolean) => Promise<void>;
   private connection?: ConnectionState;

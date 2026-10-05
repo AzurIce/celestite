@@ -8,6 +8,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
+import { packageFixture } from "./package-fixture";
 
 type Api = { url: string; root: string; token: string };
 const binary =
@@ -346,6 +347,9 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   expect(await readFile(join(api.root, "notes", name), "utf8")).toContain(
     "# Remote draft",
   );
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览已更新",
+  );
   await preview.getByRole("link", { name: "go to Notist" }).click();
   await expect(preview.locator("h1")).toHaveText("远端 Notist");
   await expect(preview.locator(".notist-custom")).toContainText("ok");
@@ -354,6 +358,150 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   await expect
     .poll(() => page.evaluate(() => window.getSelection()?.toString()))
     .toContain("ok");
+});
+
+test("remote packages load JS and WASM and invalidate on declaration changes without editing the document", async ({
+  page,
+  api,
+}) => {
+  for (const [path, data] of packageFixture("packaged/")) {
+    const target = join(api.root, "notes", path);
+    await mkdir(target.slice(0, target.lastIndexOf("/")), { recursive: true });
+    await writeFile(target, data);
+  }
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page
+    .getByRole("treeitem", { name: "packaged", exact: true })
+    .getByRole("button", { name: "展开" })
+    .click();
+  await page
+    .getByRole("treeitem", { name: "package.not", exact: true })
+    .click();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  const preview = page.getByRole("region", { name: "文档预览" });
+  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await expect(
+    preview.locator("demo-card p").filter({ hasText: "WASM" }),
+  ).toHaveText("相对 JS / WASM 42");
+  const declaration = join(
+    api.root,
+    "notes",
+    "packaged/packages/demo/lib.notc",
+  );
+  await writeFile(
+    declaration,
+    'fn card(title: String = "远端声明更新")[children: Content] -> Content;',
+  );
+  await expect(preview.locator("demo-card strong")).toHaveText("远端声明更新");
+  await writeFile(declaration, "fn card(");
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览失败",
+  );
+  await expect(preview.locator("demo-card strong")).toHaveText("远端声明更新");
+  await preview.locator("summary").click();
+  await preview
+    .getByRole("button")
+    .filter({ hasText: "packaged/packages/demo/lib.notc:" })
+    .first()
+    .click();
+  await expect(
+    page.getByRole("tab", {
+      name: "packaged/packages/demo/lib.notc",
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(editor(page)).toHaveText("fn card(");
+});
+
+test("recursive external packages remain outside the Vault and update the preview without entering history", async ({
+  page,
+  api,
+}) => {
+  for (const [path, data] of packageFixture()) {
+    const target = path.startsWith("packages/")
+      ? join(api.root, path.replace("packages/", "external-packages/"))
+      : join(api.root, "work", path === "package.not" ? "external.not" : path);
+    await mkdir(target.slice(0, target.lastIndexOf("/")), { recursive: true });
+    await writeFile(
+      target,
+      path === "Notist.toml"
+        ? '[dependencies]\nbridge = {path = "../external-packages/bridge"}\n'
+        : data,
+    );
+  }
+  const bridge = join(api.root, "external-packages/bridge");
+  await mkdir(bridge, { recursive: true });
+  await writeFile(
+    join(bridge, "Notist.toml"),
+    '[package]\nname = "bridge"\n[dependencies]\ndemo = {path = "../demo"}\n',
+  );
+  await writeFile(join(bridge, "lib.notc"), "fn unused() -> Content;");
+  await page.goto("/");
+  await connect(page, api.url.replace(/notes$/, "work"), api.token);
+  await page
+    .getByRole("treeitem", { name: "external.not", exact: true })
+    .click();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  const preview = page.getByRole("region", { name: "文档预览" });
+  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await expect(
+    preview.locator("demo-card p").filter({ hasText: "WASM" }),
+  ).toHaveText("相对 JS / WASM 42");
+  expect(
+    (await hostDocuments(api, "work")).some(
+      (doc) =>
+        doc.path.includes("external-packages") || doc.path.endsWith("lib.notc"),
+    ),
+  ).toBe(false);
+  await expect(
+    page.getByRole("treeitem", { name: "external-packages", exact: true }),
+  ).toHaveCount(0);
+  const declaration = join(api.root, "external-packages/demo/lib.notc");
+  await writeFile(
+    declaration,
+    'fn card(title: String = "外部声明更新")[children: Content] -> Content;',
+  );
+  await expect(preview.locator("demo-card strong")).toHaveText("外部声明更新");
+  await writeFile(declaration, "fn card(");
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览失败",
+  );
+  await expect(preview.locator("demo-card strong")).toHaveText("外部声明更新");
+  await preview.locator("summary").click();
+  await preview
+    .getByRole("button")
+    .filter({ hasText: "/external-packages/demo/lib.notc:" })
+    .first()
+    .click();
+  await expect(
+    preview.getByRole("region", { name: "package 诊断源码" }),
+  ).toContainText("fn card(");
+  await expect(
+    page.getByRole("tab", { name: "external.not", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await writeFile(
+    declaration,
+    'fn card(title: String = "声明恢复")[children: Content] -> Content;',
+  );
+  await expect(preview.locator("demo-card strong")).toHaveText("声明恢复");
+  await writeFile(
+    join(api.root, "external-packages/demo/Notist.toml"),
+    "[package",
+  );
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览失败",
+  );
+  await expect(preview.locator("demo-card strong")).toHaveText("声明恢复");
+  await preview.locator("summary").click();
+  await preview
+    .getByRole("button")
+    .filter({ hasText: "/external-packages/demo/Notist.toml:" })
+    .first()
+    .click();
+  await expect(
+    preview.getByRole("region", { name: "package 诊断源码" }),
+  ).toContainText("[package");
 });
 
 test("connection records survive reload without storing tokens; removing a connection keeps server files", async ({

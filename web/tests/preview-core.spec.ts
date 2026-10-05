@@ -140,3 +140,81 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
   expect(result.pairedVersion).toBe(true);
   expect(result.savedVersion).toBeNull();
 });
+
+test("preview Worker applies package default transforms and retains Unicode diagnostic ranges", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const completion = await page.evaluate(async () => {
+    const worker = new Worker(
+      new URL("/src/lib/editor/preview/worker.ts", location.href),
+      { type: "module" },
+    );
+    const task: PreviewTask = {
+      ticket: {
+        taskId: "transform-task",
+        sessionId: "transform-session",
+        documentId: "doc",
+        path: "math.not",
+        renderGeneration: "transform-test",
+        version: {
+          identity: { document_id: "doc", history_id: "history" },
+          clocks: {},
+        },
+      },
+      resourceRoot: "/vault",
+      source: "😀 $x$ #math(false)",
+      overlays: {
+        "Notist.toml":
+          "future_option = true\n[dependencies]\nkatex = {path = 'packages/katex'}\n",
+        "packages/katex/Notist.toml":
+          "[package]\nname = 'katex'\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'katex::math'\n",
+        "packages/katex/lib.notc": "fn math(text: String) -> InlineContent;",
+        "packages/katex/components/math.js":
+          "export default class extends HTMLElement {}",
+      },
+      resources: {
+        "packages/katex/components/math/index.js": {
+          kind: null,
+          data: null,
+          error: null,
+        },
+      },
+    };
+    try {
+      return await new Promise<PreviewCompletion>((resolve, reject) => {
+        worker.addEventListener("message", (event) => {
+          if (event.data.kind === "resources") {
+            reject(new Error("unexpected resource request"));
+            return;
+          }
+          resolve(event.data);
+        });
+        worker.addEventListener("error", (event) =>
+          reject(new Error(event.message)),
+        );
+        worker.postMessage(task);
+      });
+    } finally {
+      worker.terminate();
+    }
+  });
+  expect(completion.outcome.kind).toBe("success");
+  if (completion.outcome.kind !== "success")
+    throw new Error(completion.outcome.message);
+  const output = completion.outcome.output;
+  expect(output.html).toContain("<katex-math");
+  expect(output.usedComponents[0].package).toBe("katex");
+  expect(
+    output.sourceMap.some((mapping) => mapping.from === 3 && mapping.to === 6),
+  ).toBe(true);
+  expect(output.diagnostics).toContainEqual(
+    expect.objectContaining({
+      origin: "transform",
+      path: "math.not",
+      from: 7,
+      to: 19,
+      source: null,
+    }),
+  );
+});

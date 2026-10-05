@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -63,3 +63,44 @@ run(bindgen, [
   "--out-name",
   "celestite_core",
 ]);
+// Fetch the browser runtime from the same Cargo-locked Notist checkout.
+const metadata = spawnSync(
+  "cargo",
+  [
+    "metadata",
+    "--locked",
+    "--manifest-path",
+    "crates/celestite-core/Cargo.toml",
+    "--features",
+    "wasm,preview",
+    "--format-version",
+    "1",
+    "--filter-platform",
+    "wasm32-unknown-unknown",
+  ],
+  { cwd: root, env, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
+);
+if (metadata.error || metadata.status !== 0)
+  throw metadata.error ?? new Error(metadata.stderr);
+const packages = JSON.parse(metadata.stdout).packages as {
+  name: string;
+  manifest_path: string;
+}[];
+const html = packages.find((pkg) => pkg.name === "notist-html");
+if (!html) throw new Error("Cargo metadata did not include notist-html");
+const runtime = readFileSync(
+  resolve(dirname(html.manifest_path), "runtime/component-protocol.js"),
+  "utf8",
+);
+// Component URLs are published at runtime; Vite must leave these imports intact.
+writeFileSync(
+  resolve(out, "notist_html_runtime.js"),
+  runtime.replaceAll(
+    "import(component.module)",
+    "import(/* @vite-ignore */ component.module)",
+  ),
+);
+writeFileSync(
+  resolve(out, "notist_html_runtime.d.ts"),
+  "export function registerComponents(components: { tag: string; module: string }[]): Promise<void>;\n",
+);

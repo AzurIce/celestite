@@ -58,6 +58,7 @@ fn output(task: &PreviewTask, html: &str) -> PreviewCompletion {
                 html: html.into(),
                 diagnostics: vec![],
                 source_map: vec![],
+                used_components: vec![],
             },
         },
     }
@@ -71,6 +72,7 @@ fn sized_output(task: &PreviewTask, bytes: usize) -> PreviewCompletion {
                 html: "x".repeat(bytes),
                 diagnostics: vec![],
                 source_map: vec![],
+                used_components: vec![],
             },
         },
     }
@@ -298,7 +300,8 @@ fn failure_preserves_last_output_and_explicit_retry_revokes_running_generation()
         assert!(core.complete_preview(PreviewCompletion {
             task_id: failed.ticket.task_id.clone(),
             outcome: PreviewOutcome::Failure {
-                message: "worker failed".into()
+                message: "worker failed".into(),
+                diagnostics: vec![],
             },
         }));
         let state = core.preview_state("doc").unwrap();
@@ -407,8 +410,12 @@ fn both_frontends_render_identical_escaped_output_without_mutating_core() {
             assert!(result.diagnostics.is_empty());
             assert_eq!(
                 notist_html::Renderer::new().render(
-                    notist::Notist::default()
-                        .analyze(task.ticket.path.to_lowercase(), &task.source)
+                    notist::Pipeline::default()
+                        .analyze(
+                            task.ticket.path.to_lowercase(),
+                            &task.source,
+                            notist::builtins::registry()
+                        )
                         .unwrap()
                         .root()
                 ),
@@ -556,5 +563,254 @@ fn links_resolve_from_the_document_directory_and_cannot_escape_vault() {
                 .code,
             "StaleVersion"
         );
+    });
+}
+
+#[cfg(feature = "preview")]
+#[test]
+fn packages_render_with_project_sources_and_cross_file_diagnostics() {
+    block_on(async {
+        let mut core = core("notes/a.not", "#widgets::badge(\"x\")[😀正文]").await;
+        core.subscribe_preview("doc", "client").unwrap();
+        let mut task = core.take_preview_task("doc").unwrap().unwrap();
+        task.overlays.insert(
+            "Notist.toml".into(),
+            "[dependencies]\nwidgets = {path = 'packages/widgets'}".into(),
+        );
+        task.overlays.insert(
+            "packages/widgets/lib.notc".into(),
+            "fn badge(label: String)[children: InlineContent] -> InlineContent;".into(),
+        );
+        task.overlays.insert(
+            "packages/widgets/Notist.toml".into(),
+            "[package]\nname = 'widgets'\n".into(),
+        );
+        task.resources.insert(
+            "notes/Notist.toml".into(),
+            PreviewResource {
+                kind: None,
+                data: None,
+                error: None,
+            },
+        );
+        let requests = preview_resource_requests(&task);
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            task.resources.insert(
+                request.path.clone(),
+                PreviewResource {
+                    kind: request
+                        .path
+                        .ends_with("badge.js")
+                        .then_some(PreviewResourceKind::File),
+                    data: None,
+                    error: None,
+                },
+            );
+        }
+        assert!(preview_resource_requests(&task).is_empty());
+        let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
+            panic!("package failed")
+        };
+        assert!(output.diagnostics.is_empty());
+        assert!(output.html.contains("<widgets-badge"));
+        assert_eq!(
+            output.used_components[0].path,
+            "packages/widgets/components/badge.js"
+        );
+        assert!(
+            output
+                .source_map
+                .iter()
+                .any(|entry| entry.to == task.source.encode_utf16().count())
+        );
+        let broken = "// 😀\nfn badge(label: Int = false) -> InlineContent;";
+        task.overlays
+            .insert("packages/widgets/lib.notc".into(), broken.into());
+        let PreviewOutcome::Failure { diagnostics, .. } = compute_preview(&task).outcome else {
+            panic!("bad declaration accepted")
+        };
+        assert!(!diagnostics.is_empty());
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.path, "packages/widgets/lib.notc");
+            assert_eq!(diagnostic.source.as_deref(), Some(broken));
+            assert!(
+                diagnostic.from < diagnostic.to && diagnostic.to <= broken.encode_utf16().count()
+            );
+        }
+    });
+}
+
+#[test]
+fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits() {
+    block_on(async {
+        let mut core = core("a.not", "= same body").await;
+        core.subscribe_preview("doc", "client").unwrap();
+        let old = core.take_preview_task("doc").unwrap().unwrap();
+        let declaration = Document::new(
+            DocumentIdentity {
+                document_id: "defs".into(),
+                history_id: "defs-history".into(),
+            },
+            Some(101),
+            "fn leaf() -> Content;",
+        )
+        .unwrap();
+        core.join(
+            "packages/demo/lib.notc",
+            declaration.export_snapshot().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(!core.complete_preview(output(&old, "stale environment")));
+        time(2000);
+        let new = core.take_preview_task("doc").unwrap().unwrap();
+        assert_eq!(old.ticket.version, new.ticket.version);
+        assert_ne!(old.ticket.render_generation, new.ticket.render_generation);
+        assert_eq!(
+            new.overlays["packages/demo/lib.notc"],
+            "fn leaf() -> Content;"
+        );
+        core.invalidate_preview_project();
+        assert!(!core.complete_preview(output(&new, "stale file snapshot")));
+    });
+}
+
+#[cfg(feature = "preview")]
+#[test]
+fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnostics() {
+    block_on(async {
+        let source = "😀 $x$ #math(false)";
+        let mut core = core("math.not", source).await;
+        core.subscribe_preview("doc", "client").unwrap();
+        let mut task = core.take_preview_task("doc").unwrap().unwrap();
+        let config = "future_option = true\n[dependencies]\nkatex = {path = 'packages/katex', future_option = true}\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'katex::math'\nfuture_option = true\n";
+        task.overlays.insert("Notist.toml".into(), config.into());
+        task.overlays.insert(
+            "packages/katex/Notist.toml".into(),
+            "[package]\nname = 'katex'\n".into(),
+        );
+        task.overlays.insert(
+            "packages/katex/lib.notc".into(),
+            "fn math(text: String) -> InlineContent;".into(),
+        );
+        task.overlays.insert(
+            "packages/katex/components/math.js".into(),
+            "export default class extends HTMLElement {}".into(),
+        );
+        task.resources.insert(
+            "packages/katex/components/math/index.js".into(),
+            PreviewResource {
+                kind: None,
+                data: None,
+                error: None,
+            },
+        );
+        assert!(preview_resource_requests(&task).is_empty());
+        let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
+            panic!("transform config failed")
+        };
+        assert!(output.html.contains("<katex-math"));
+        assert_eq!(output.used_components[0].package, "katex");
+        assert!(
+            output
+                .source_map
+                .iter()
+                .any(|mapping| (mapping.from, mapping.to) == (3, 6))
+        );
+        let diagnostic = output
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.origin == PreviewDiagnosticOrigin::Transform)
+            .expect("missing transform diagnostic");
+        assert_eq!(diagnostic.path, "math.not");
+        assert_eq!(
+            (diagnostic.from, diagnostic.to),
+            (7, source.encode_utf16().count())
+        );
+        assert!(diagnostic.source.is_none());
+        assert!(diagnostic.message.contains("replace skipped"));
+        // Known transform identities still produce source-bearing configuration errors.
+        task.overlays.insert(
+            "Notist.toml".into(),
+            config.replace("katex::math", "missing::math"),
+        );
+        let PreviewOutcome::Failure { diagnostics, .. } = compute_preview(&task).outcome else {
+            panic!("invalid transform accepted")
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "Notist.toml" && diagnostic.source.is_some())
+        );
+    });
+}
+
+#[cfg(feature = "preview")]
+#[test]
+fn resource_snapshots_support_sibling_and_absolute_packages_with_a_stable_document_root() {
+    block_on(async {
+        let mut core = core("a.not", "#widgets::badge(\"x\")[正文]").await;
+        core.subscribe_preview("doc", "client").unwrap();
+        let mut task = core.take_preview_task("doc").unwrap().unwrap();
+        task.resource_root = "/workspace/docs".into();
+        for dependency in ["../packages/widgets", "/workspace/packages/widgets"] {
+            task.resources.clear();
+            task.resources.insert(
+                "/workspace/packages/widgets/Notist.toml".into(),
+                PreviewResource {
+                    kind: Some(PreviewResourceKind::File),
+                    data: Some(b"[package]\nname = 'widgets'\n".to_vec()),
+                    error: None,
+                },
+            );
+            task.overlays.insert(
+                "Notist.toml".into(),
+                format!("[dependencies]\nwidgets = {{path = '{dependency}'}}"),
+            );
+            task.resources.insert(
+                "/workspace/packages/widgets/lib.notc".into(),
+                PreviewResource {
+                    kind: Some(PreviewResourceKind::File),
+                    data: Some(
+                        b"fn badge(label: String)[children: InlineContent] -> InlineContent;"
+                            .to_vec(),
+                    ),
+                    error: None,
+                },
+            );
+            for request in preview_resource_requests(&task) {
+                assert!(
+                    request
+                        .path
+                        .starts_with("/workspace/packages/widgets/components/")
+                );
+                task.resources.insert(
+                    request.path.clone(),
+                    PreviewResource {
+                        kind: request
+                            .path
+                            .ends_with("badge.js")
+                            .then_some(PreviewResourceKind::File),
+                        data: None,
+                        error: None,
+                    },
+                );
+            }
+            assert!(preview_resource_requests(&task).is_empty());
+            let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
+                panic!("external package failed")
+            };
+            assert!(output.html.contains("<widgets-badge"));
+            assert_eq!(
+                output.used_components[0].package_root,
+                "/workspace/packages/widgets"
+            );
+            assert_eq!(
+                output.used_components[0].path,
+                "/workspace/packages/widgets/components/badge.js"
+            );
+            assert_eq!(task.ticket.path, "a.not");
+        }
     });
 }

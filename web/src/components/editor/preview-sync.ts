@@ -172,7 +172,7 @@ export class PreviewSync {
     if (pos === null) return;
     const candidates = this.elements.filter(
       ({ mapping, element }) =>
-        mapping.kind !== "container" &&
+        (mapping.kind !== "container" || element.tagName.includes("-")) &&
         mapping.from <= pos &&
         pos <= mapping.to &&
         element.getClientRects().length,

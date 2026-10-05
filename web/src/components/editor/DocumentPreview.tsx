@@ -16,10 +16,12 @@ import type {
 import type {
   PreviewResult,
   PreviewState,
+  PreviewDiagnostic,
 } from "@/lib/editor/preview/contract";
 import contentStyle from "./preview-content.css?inline";
 import type { PreviewSync } from "./preview-sync";
 import "./preview.css";
+import { loadComponents } from "@/lib/editor/preview/components";
 
 function sameVersion(a: Version, b: Version) {
   return (
@@ -40,6 +42,7 @@ export function DocumentPreview(props: {
   onScroll: (top: number) => void;
   onReveal: (from: number, to: number, keepSplit?: boolean) => void;
   onNavigate: (path: string, fragment: string | null) => Promise<boolean>;
+  onDiagnostic: (diagnostic: PreviewDiagnostic) => Promise<void>;
 }) {
   let host!: HTMLDivElement;
   let scroller!: HTMLDivElement;
@@ -56,8 +59,12 @@ export function DocumentPreview(props: {
   let detachSync: (() => void) | undefined;
   let pointerDown: { x: number; y: number } | undefined;
   const [state, setState] = createSignal<PreviewState | null>(null);
+  const [packageDiagnostic, setPackageDiagnostic] =
+    createSignal<PreviewDiagnostic | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [unavailable, setUnavailable] = createSignal(false);
+  const [loadingComponents, setLoadingComponents] = createSignal(false);
+  let loadingTask: string | undefined;
   const unsubscribe = documents.previews!.subscribe(documentId, (value) => {
     setUnavailable(value === null);
     setState(value);
@@ -77,7 +84,9 @@ export function DocumentPreview(props: {
     state()?.status === "failed" || unavailable()
       ? "预览失败"
       : current()
-        ? "预览已更新"
+        ? loadingComponents()
+          ? "正在加载组件…"
+          : "预览已更新"
         : state()?.result
           ? "预览正在更新…"
           : "正在生成预览…";
@@ -109,11 +118,45 @@ export function DocumentPreview(props: {
     }
     if (mountedResult?.ticket.taskId !== result.ticket.taskId) {
       const top = mountedResult ? scroller.scrollTop : initialScrollTop;
-      // Only default notist-html output from the internal executor reaches here.
+      // HTML and component identities come from the same accepted Rust result.
       article.innerHTML = result.output.html;
       mountedResult = result;
       scroller.scrollTop = top;
+      setError(null);
+      setPackageDiagnostic(null);
     }
+    if (
+      data.ready &&
+      loadingTask !== result.ticket.taskId &&
+      result.output.usedComponents?.length
+    ) {
+      loadingTask = result.ticket.taskId;
+      setLoadingComponents(true);
+      void documents
+        .previews!.assets(documentId, result.ticket.taskId)
+        .then((assets) => {
+          if (
+            disposed ||
+            untrack(() => state()?.target.taskId) !== result.ticket.taskId
+          )
+            return;
+          return loadComponents(result.output.usedComponents, assets);
+        })
+        .catch((error) => {
+          if (
+            !disposed &&
+            untrack(() => state()?.target.taskId) === result.ticket.taskId
+          )
+            setError(String(error));
+        })
+        .finally(() => {
+          if (!disposed && loadingTask === result.ticket.taskId) {
+            setLoadingComponents(false);
+            sync.layoutChanged();
+          }
+        });
+    } else if (!result.output.usedComponents?.length)
+      setLoadingComponents(false);
     sync.setPreview(result, data.ready);
     if (
       data.ready &&
@@ -138,6 +181,7 @@ export function DocumentPreview(props: {
     });
     root.addEventListener("click", (event) => {
       if (!(event instanceof MouseEvent)) return;
+      if (event.defaultPrevented) return;
       const down = pointerDown;
       pointerDown = undefined;
       if (
@@ -154,6 +198,8 @@ export function DocumentPreview(props: {
         if (mapping) onReveal(mapping.from, mapping.to, true);
         return;
       }
+      // Links inside a component belong to that component's own document.
+      if (anchor.getRootNode() !== root) return;
       event.preventDefault();
       const target = anchor.getAttribute("href");
       const result = untrack(() => state()?.result);
@@ -187,9 +233,13 @@ export function DocumentPreview(props: {
         });
     });
   });
+  const diagnostics = () =>
+    state()?.status === "failed"
+      ? (state()?.diagnostics ?? [])
+      : (state()?.result?.output.diagnostics ?? []);
   createEffect(displayData, (data) => {
     latestDisplay = data;
-    display(data);
+    untrack(() => display(data));
   });
   onCleanup(() => {
     disposed = true;
@@ -232,23 +282,62 @@ export function DocumentPreview(props: {
       >
         <div ref={host} />
       </div>
-      <Show when={state()?.result?.output.diagnostics.length}>
+      <Show when={diagnostics().length}>
         <details class="preview-diagnostics">
-          <summary>
-            预览诊断（{state()?.result?.output.diagnostics.length}）
-          </summary>
-          <For each={state()?.result?.output.diagnostics}>
+          <summary>预览诊断（{diagnostics().length}）</summary>
+          <For each={diagnostics()}>
             {(diagnostic) => (
               <button
                 type="button"
-                disabled={!current()}
-                onClick={() => props.onReveal(diagnostic.from, diagnostic.to)}
+                disabled={diagnostic.source === null && !current()}
+                onClick={() => {
+                  if (
+                    diagnostic.path.startsWith("/") &&
+                    diagnostic.source !== null
+                  ) {
+                    setPackageDiagnostic(diagnostic);
+                    return;
+                  }
+                  if (
+                    diagnostic.source === null &&
+                    diagnostic.path === props.document.path
+                  )
+                    props.onReveal(diagnostic.from, diagnostic.to);
+                  else
+                    void props.onDiagnostic(diagnostic).catch((error) => {
+                      if (!disposed) setError(String(error));
+                    });
+                }}
               >
+                {diagnostic.source !== null ? `${diagnostic.path}: ` : ""}
                 {diagnostic.message}
               </button>
             )}
           </For>
         </details>
+      </Show>
+      <Show when={packageDiagnostic()}>
+        {(diagnostic) => (
+          <section class="preview-package-source" aria-label="package 诊断源码">
+            <div>
+              <span>{diagnostic().path} · 只读</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setPackageDiagnostic(null)}
+              >
+                关闭源码
+              </Button>
+            </div>
+            <pre tabindex={0}>
+              {diagnostic().source!.slice(0, diagnostic().from)}
+              <mark>
+                {diagnostic().source!.slice(diagnostic().from, diagnostic().to)}
+              </mark>
+              {diagnostic().source!.slice(diagnostic().to)}
+            </pre>
+          </section>
+        )}
       </Show>
     </section>
   );

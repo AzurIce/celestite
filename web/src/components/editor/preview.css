@@ -84,3 +84,25 @@
     border-left: 0;
   }
 }
+
+.preview-package-source {
+  border-top: 1px solid var(--color-border);
+  padding: 8px 16px;
+  max-height: 240px;
+  overflow: auto;
+  font-size: var(--font-size-ui-sm);
+}
+.preview-package-source > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.preview-package-source pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.preview-package-source mark {
+  background: color-mix(in srgb, var(--color-accent) 25%, transparent);
+  color: inherit;
+}

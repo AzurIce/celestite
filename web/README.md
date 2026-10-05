@@ -18,7 +18,7 @@ bun run build
 
 `dev`、`build` 和 `typecheck` 会先构建 Rust WASM 内核。需要 Rust 的 `wasm32-unknown-unknown` target（仓库 flake 已提供）。构建脚本使用 wasm-bindgen CLI 0.2.129；系统版本不一致时自动安装到 `web/.cache/wasm-tools`，首次安装需要网络。也可以通过 `WASM_BINDGEN` 指定匹配的 CLI，`CARGO_TARGET_DIR` 指定编译缓存。
 
-WASM 构建启用 core 的 `preview` feature，Notist 与 notist-html 通过 Cargo git 依赖自动获取，使用 `celestite-core/Cargo.toml` 固定的提交；不需要单独检出 Notist 仓库。构建使用 `--locked`，升级依赖时同步更新提交与 `Cargo.lock`。预览计算与任务契约见 [core README](../crates/celestite-core/README.md#预览计算与会话)。
+WASM 构建启用 core 的 `preview` feature，Notist 与 notist-html 通过 Cargo git 依赖自动获取，使用工作区 `Cargo.toml` 固定的提交；不需要单独检出 Notist 仓库。构建使用 `--locked`，升级依赖时同步更新提交与 `Cargo.lock`。预览计算与任务契约见 [core README](../crates/celestite-core/README.md#预览计算与会话)。
 
 首页自动打开默认 Web Vault，显示文件树及代码编辑器。深浅主题通过右下角状态栏的主题菜单切换。
 
@@ -281,6 +281,8 @@ bun run test:ui tests/settings-ui.spec.ts
 
 本地与远端都使用 Worker 内的 Rust `EditorCore` 管理正文、个人撤销和预览；`WorkerDocuments` 管理 UI 视图和待确认输入。本地注入 `OpfsBackend`，远端注入 `MemoryBackend`，从 host 快照加入同一文档历史。远端输入实时发送 CRDT 增量；显式保存将因果版本交给 host core 条件写回，成功回执更新已保存正文。已删除文件不会被延迟保存重新创建。失败显示原因并保留修改，停止自动重试，可使用保存按钮或“重试保存”恢复。
 
+`MemoryBackend` 是 core 的内存历史存储后端，通过 `MemoryEditorBinding` 接入远端 Worker；它保存文档快照与增量，不提供内存文件系统，也不写入 OPFS。远端文件和目录由 HTTP 适配器访问 host。关闭标签释放 UI buffer，Worker 历史继续保留和同步；刷新后从 host 重建会话，未确认输入没有本机持久化副本。后端实现见 [core README](../crates/celestite-core/README.md#backend-与服务接口)，加载范围与请求流程见 [Web 当前状态与请求交互](../docs/state/web.md)。
+
 文件树接收该运行时的 `treeBackend`。移动、重命名、删除以及复制/下载读取会先保存相关缓冲区，相关文档在操作期间短暂禁止编辑；保存失败则拒绝后续文件操作。文件树原有的目录树与 OPFS 后端仍保持独立，OPFS watch 不产生事件。
 
 文本内部使用 LF；保存保留打开时的 UTF-8 BOM 和首个换行符形式（LF / CRLF / CR），混合换行文件编辑后统一为首个形式。隐藏页面和关闭工作区时尝试保存全部缓冲区，存在未保存内容时注册浏览器离开提醒。页面终止事件不能保证异步写入完成，仍以界面的“已保存”为准。当前不合并其他窗口或外部程序对同一文件的并发修改，默认 OPFS 刷新可恢复已提交到私有历史、尚未写回普通文件的草稿；尚未提交的输入仍需保持页面打开。
@@ -298,6 +300,8 @@ bun run test:ui tests/settings-ui.spec.ts
 远端协作使用每 VaultInstance 一条 WebSocket：握手核对历史与权限，host 分配会话和 writer，快照补齐后开放编辑。输入和个人撤销发送 CRDT 增量，host 提交历史后确认并广播；客户端 core 导入后增量更新 UI，保留个人撤销、光标与待确认输入，IME 期间延迟导入。文件树失效、保存回执和心跳复用同一条连接，目录查询与附件传输仍使用 HTTP。客户端关闭标签后仍接收其他文档的更新。
 
 协作保存是独立操作，历史确认不代表物理文件已写回。host 的文件系统 bridge 将外部修改合入共享历史并推送；保存时若因果版本过期，客户端先补齐再尝试，不覆盖未见更新。共享历史不能通过客户端“丢弃编辑”整体清除。本地 OPFS 的条件保存冲突仍提供覆盖、丢弃和取消。
+
+外部修改的后台协调状态与连接状态分开显示。计算期间显示同步提示，失败时显示“外部修改尚未同步”和“重试同步”；已提交正文保持可读且在线编辑可继续，保存和自动写回暂停。重试立即重新排队，协调完成后恢复正常状态，用户再显式保存。
 
 单个远端文件上限 64 MiB，文本编辑上限仍为 5 MiB，远端提交的历史快照上限 16 MiB。断线、超时或权限失效时暂停编辑，整个 Vault 工作区（文件树与编辑区）显示断线遮罩及重连按钮。重连直接以 host 历史重建会话和个人撤销，不重放旧操作。未确认输入可导出当前正文，用户明确丢弃后重连；连接失败保留原正文。重新认证核对 Vault 与历史身份，身份变化时保留旧正文并拒绝复用。客户端副本只在会话内存中，不提供刷新恢复、离线同步或写请求自动重放。客户端存储不可用时，连接面板明确显示本次会话的存储状态；OPFS 默认 Vault 打不开仍可从底部连接远端。
 
@@ -322,7 +326,7 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 | `runtime/`   | 本地与远端共用的 core host、Worker 命令队列与服务入口 |
 | `opfs/`      | OPFS 历史存储、浏览器 IO 桥与本地编辑 Worker          |
 | `remote/`    | 远端编辑 host、WebSocket 同步传输与远端编辑 Worker    |
-| `preview/`   | 预览契约、任务调度与独立分析 Worker                   |
+| `preview/`   | 预览契约、任务调度、项目资源与组件运行时              |
 | `generated/` | 构建生成的 WASM 绑定                                  |
 
 普通文件位于 `vaults/default`，稳定身份和 CRDT 历史位于 `editor-instances/default`。每次接受编辑先提交私有增量日志，普通文件另行自动保存；文件写回失败后，已提交历史仍可在刷新时恢复。历史提交失败会暂停编辑，重试保存先提交历史。个人撤销栈只保留在本次 Worker 生命周期。
@@ -334,6 +338,10 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 本地或远端 Vault 打开 `.not`、`.md` 或 `.markdown` 后，可在文档工具栏选择“源码”“分栏”“预览”；只读正文也可预览，窄屏使用源码 / 预览切换。切换保留编辑会话、撤销记录和滚动位置，隐藏预览会取消分析订阅。
 
 预览基于 core 已接受的未保存正文，在独立 Worker 中通过 Notist / notist-html 全量分析与渲染。后续编辑以 120 ms 防抖、500 ms 最长合并等待调度；慢任务期间继续编辑和保存，过期结果不会覆盖当前正文的预览。执行器失败或超时保留上一份结果，可点击“重试预览”恢复。
+
+项目配置与 package 声明由 Notist 的 `Vault` 解析。每个 package 提供声明 `[package].name` 的 `Notist.toml` 与 `lib.notc`，依赖键须与包名一致；递归依赖、开发依赖及 package 默认 transforms 都由 Notist 装配。Vault 内资源从 backend 只读取得，Vault 外的 package 从宿主的独立只读接口取得。依赖路径相对于配置文件解析，支持相邻目录与绝对路径，文档根不变；外部 package 不进入文件树、编辑历史或保存流程。已打开的配置、声明与组件源码优先使用 core 中的未保存内容；读取预览资源不会触发文件保存。配置与声明编辑、文件操作以及远端文件变化都会使项目预览更新，外部 package 的清单、声明与组件目录同样接收变化通知。Vault 内的跨文件诊断可打开对应文件，并在源码仍匹配时定位；外部 package 诊断显示带高亮范围的只读源码快照。
+
+package 组件使用与 Cargo 固定提交一致的 Notist 浏览器运行时。组件目录快照通过同源虚拟 URL 提供，相对 JS 导入和 `new URL(..., import.meta.url)` 加载的 WASM 保持目录关系；Service Worker 脚本随 Web 构建输出，支持 GitHub Pages 子路径。package 预览需要浏览器支持 Service Worker 且运行在 HTTPS 或 localhost。正文和声明更新可直接预览，组件 JS / WASM 实现变化需刷新页面加载。
 
 HTML 在 ShadowRoot 中继承应用主题。展开底部诊断可跳转源码；更新中的诊断暂不可定位。文档链接相对于当前文件目录解析，支持 Vault 内文件和片段，越出 Vault 或不存在的目标显示错误；外部链接在新窗口打开。
 

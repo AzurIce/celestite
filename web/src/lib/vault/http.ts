@@ -1,3 +1,7 @@
+import type {
+  PackageResourceProvider,
+  PreviewTask,
+} from "../editor/preview/contract";
 import { VaultError, type VaultErrorCode } from "./errors";
 import { vaultPath, type VaultPath } from "./path";
 import type {
@@ -14,6 +18,7 @@ export interface RemoteVaultDescriptor {
   id: string;
   name: string;
   readOnly: boolean;
+  previewResourceRoot?: string;
   vaultIdentity?: { id: string; historyId: string };
   capabilities: {
     watch: boolean;
@@ -125,6 +130,39 @@ export class HttpVaultBackend implements VaultBackend {
       return response.json() as Promise<T>;
     });
   }
+  packageResources(
+    descriptor: RemoteVaultDescriptor,
+  ): PackageResourceProvider | undefined {
+    if (!descriptor.previewResourceRoot) return;
+    const context = (task: PreviewTask) => {
+      const overlays: Record<string, string> = {};
+      for (const [path, resource] of Object.entries(task.resources))
+        if (
+          (path === "Notist.toml" || path.endsWith("/Notist.toml")) &&
+          resource.data
+        )
+          overlays[path] = new TextDecoder().decode(
+            new Uint8Array(resource.data),
+          );
+      for (const [path, source] of Object.entries(task.overlays))
+        if (path === "Notist.toml" || path.endsWith("/Notist.toml"))
+          overlays[path] = source;
+      return { documentPath: task.ticket.path, overlays };
+    };
+    return {
+      root: descriptor.previewResourceRoot,
+      read: (request, task) =>
+        this.documentRequest("/preview/resources", {
+          context: context(task),
+          request,
+        }),
+      readDir: (path, task) =>
+        this.documentRequest("/preview/directory", {
+          context: context(task),
+          path,
+        }),
+    };
+  }
   private headers(): Record<string, string> {
     return this.token ? { Authorization: `Bearer ${this.token}` } : {};
   }
@@ -152,7 +190,7 @@ export class HttpVaultBackend implements VaultBackend {
       if (error instanceof VaultError) throw error;
       throw new VaultError(
         "IO",
-        init.method && init.method !== "GET"
+        init.method && init.method !== "GET" && !route.startsWith("/preview/")
           ? "远端请求未完成，写操作可能已提交，请刷新核对后再重试。"
           : "远端请求未完成，请检查连接。",
         undefined,

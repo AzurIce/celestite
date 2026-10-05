@@ -26,6 +26,7 @@ export type EditorWorkerHost = Pick<
   | "flush"
   | "fileOperation"
   | "close"
+  | "previewResources"
 > & { authorize?: (token: string) => Promise<ServiceDocument[]> };
 export async function serveEditorWorker(
   create: (
@@ -91,6 +92,8 @@ export async function serveEditorWorker(
             taskId: String(p.taskId),
             target: String(p.target),
           });
+        case "preview_assets":
+          return previews.assets(String(p.id), String(p.taskId));
         case "composition":
           return host.composition(String(p.id), Boolean(p.active));
         case "open":
@@ -168,6 +171,7 @@ export async function serveEditorWorker(
     (task) => {
       if (!closing) void enqueue(task).catch(() => {});
     },
+    host.previewResources,
   );
   const lifetime = new Promise<void>((resolve) => {
     release = resolve;

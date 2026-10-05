@@ -138,13 +138,19 @@ mod tests {
         let (trigger, receiver) = channel();
         // Intentionally never register this watcher: no notification can wake the worker.
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
+        let events = broadcast::channel(128).0;
         let vault = Arc::new(HostedVault {
             id: "notes".into(),
             name: "Notes".into(),
             read_only: false,
+            packages: crate::package_resources::PackageResources::new(
+                root.path().to_owned(),
+                events.clone(),
+            )
+            .unwrap(),
             files: Mutex::new(FsVault::open(root.path()).unwrap()),
             documents: Mutex::new(documents),
-            events: broadcast::channel(128).0,
+            events,
             _watcher: Mutex::new(watcher),
             reconcile_trigger: trigger.clone(),
             reconciler: Mutex::new(None),

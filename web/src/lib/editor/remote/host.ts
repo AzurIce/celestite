@@ -47,7 +47,7 @@ export class RemoteEditorHost extends EditorHost {
     emit: (event: ServiceEvent) => void,
     private scheduleRemote: (task: () => Promise<unknown>) => void,
   ) {
-    super(core, http, emit, scheduleRemote);
+    super(core, http, emit, scheduleRemote, http.packageResources(descriptor));
   }
   async connect(token: string, reset = false) {
     const identity = this.descriptor.vaultIdentity!;
@@ -491,6 +491,9 @@ export class RemoteEditorHost extends EditorHost {
     } catch (error) {
       if (this.connectionFailure(error)) await this.pause(error);
       throw error;
+    } finally {
+      if (["writeFile", "mkdir", "rename", "remove"].includes(method))
+        await this.executePreview("preview_invalidate_project", {});
     }
   }
   private async performFileOperation(

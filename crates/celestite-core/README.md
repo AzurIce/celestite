@@ -54,21 +54,21 @@ host 的 `commit_replica` 在导入客户端快照前核对磁盘版本，再通
 
 ## 预览计算与会话
 
-`preview` feature 提供纯 Rust 的 `compute_preview(&PreviewTask)`，复用 Notist / notist-html 输出 HTML 片段和源码、渲染诊断。两个 crate 使用 `https://github.com/AzurIce/notist.git` 的同一固定提交，由 Cargo 获取并通过 `Cargo.lock` 锁定；无需同级源码目录。默认编译不启用预览计算依赖，core 的会话和任务契约始终可用。Web 构建启用 `wasm,preview`，额外导出 `render_preview(taskJson)`；该入口不创建 EditorCore、不打开 OPFS。
+`preview` feature 提供纯 Rust 的 `compute_preview(&PreviewTask)`，通过 Notist `Vault` 的资源接口加载配置与 package，执行配置中的 IR transforms，输出 HTML、源码映射、组件描述和跨文件诊断。工作区 `Cargo.toml` 中的两个 crate 使用 `https://github.com/AzurIce/notist.git` 的同一固定提交，由 Cargo 获取并通过 `Cargo.lock` 锁定；无需同级源码目录。默认编译不启用预览计算依赖，core 的会话和任务契约始终可用。Web 构建启用 `wasm,preview`，额外导出 `preview_resource_requests(taskJson)` 与 `render_preview(taskJson)`；该入口不创建 EditorCore、不打开 OPFS。
 
 平台按以下顺序承载预览：
 
 1. `subscribe_preview(document_id, client_session)` 返回订阅标识和状态；多个视图共享一个文档会话。平台填写自己的客户端会话身份。
 2. `take_preview_events()` 取得合并后的状态事件；按 `dueAt` 在 Backend 时钟上设置计时器。首次订阅立即就绪，后续变化以 120 ms 防抖、500 ms 最长等待合并。
-3. 到期调用 `take_preview_task(document_id)`，取得 core 原子生成的正文与版本快照。同一文档已有运行任务或尚未到期时返回 `None`。
-4. 在独立执行器中调用 `compute_preview` 或 WASM `render_preview`，然后将 `PreviewCompletion` 交给 `complete_preview`。返回 `false` 表示结果过期、重复或任务已撤销；匹配的旧任务结束后仍需检查最新待处理任务。
+3. 到期调用 `take_preview_task(document_id)`，取得 core 原子生成的正文、版本、项目代次及非预览文档的未保存覆盖。同一文档已有运行任务或尚未到期时返回 `None`。
+4. 调用 `preview_resource_requests`，由平台以只读 IO 补齐 `task.resources`，重复直到没有缺失资源；不存在的配置候选也保留查询结果。Notist 决定配置发现及 package 加载规则，平台不自行解析配置。任务的 `resourceRoot` 由宿主提供，文档 ticket 路径仍相对 Vault；Vault 内资源使用相对键，外部 package 使用绝对编译资源身份，宿主通过独立 package 通道读取。随后在独立执行器中调用 `compute_preview` 或 WASM `render_preview`，然后将 `PreviewCompletion` 交给 `complete_preview`。返回 `false` 表示结果过期、重复或任务已撤销；匹配的旧任务结束后仍需检查最新待处理任务。
 5. 视图隐藏或关闭时 `unsubscribe_preview`；客户端断开时 `release_preview_client`。最后一个订阅释放会话及缓存，文档历史保留。
 
-输入、撤销、导入、外部重载和路径变化会使目标任务失效。任务标识在 core 重开和会话重建后不同；执行器仅回传任务标识，core 从自己的上下文恢复版本与路径。诊断区间已转换为任务正文的 UTF-16 范围，使用诊断定位前必须确认结果仍适用。
+输入、撤销、导入、外部重载和路径变化会使目标任务失效。非预览文档的正文变化推进项目代次；平台在目录操作或外部文件通知后调用 `invalidate_preview_project()`，正文不变的旧任务同样不能被接受。任务标识在 core 重开和会话重建后不同；执行器仅回传任务标识，core 从自己的上下文恢复版本与路径。诊断区间已转换为任务正文的 UTF-16 范围，正文诊断定位前必须确认结果仍适用；跨文件诊断携带自己的路径和 LF 源码，平台打开目标后校验源码一致才定位。
 
 计算或执行器失败通过 `PreviewOutcome::Failure` 返回，保留上一份显示结果，不自动重试。平台撤销旧执行器后调用 `retry_preview` 取得新代次。预览读取已接受正文，不依赖正文是否已保存或历史提交是否成功。
 
-计算输入上限 5 MiB，单份输出上限 16 MiB，core 缓存输出总量上限 64 MiB；输出容量包含 HTML、诊断与源码映射，超过限制时返回预览失败。最后一个订阅关闭后释放该文档的缓存。Web 执行器同时运行一个任务，30 秒未返回则终止并等待显式重试；运行旧任务期间只保留最新目标版本。
+正文输入上限 5 MiB，Web 项目资源与未保存覆盖合计上限 32 MiB，组件目录快照上限 32 MiB，单份输出上限 16 MiB，core 缓存输出总量上限 64 MiB；输出容量包含 HTML、正文与失败诊断、源码映射和组件描述，超过限制时返回预览失败。最后一个订阅关闭后释放该文档的缓存。Web 执行器同时运行一个任务，30 秒未返回则终止并等待显式重试；运行旧任务期间只保留最新目标版本。
 
 输出的 `sourceMap` 记录实际 HTML 元素的内部 `data-notist-node` 标识、UTF-16 源码区间及 `block` / `inline` / `container` 粒度。Notist renderer 开启 `with_source_map()` 后返回 UTF-8 字节范围，core 在同一次源码扫描中与诊断一起转换坐标；renderer 默认输出不变。映射与 HTML 共用结果 ticket，节点标识仅在当前任务内有效。core 不保存 DOM 坐标；Web 在当前映射上测量排版，并通过内容锚点进行双向定位与滚动跟随。
 

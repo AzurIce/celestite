@@ -2,7 +2,11 @@ import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
 import type { VaultBackend } from "../../vault/types";
 import { decodeError } from "../rpc";
-import type { PreviewCoreMethods } from "../preview/contract";
+import type {
+  PackageResourceProvider,
+  PreviewCoreMethods,
+} from "../preview/contract";
+import { PreviewResources } from "../preview/resources";
 import type {
   ConnectionState,
   EditResult,
@@ -43,6 +47,7 @@ export interface CoreEdit {
 }
 /** Worker transport, view projections and timers; Rust owns all editor policy. */
 export class EditorHost {
+  readonly previewResources: PreviewResources;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private previews = new Map<string, ServiceDocument>();
   private eventSequence = 0;
@@ -51,7 +56,10 @@ export class EditorHost {
     protected backend: VaultBackend,
     private emit: (event: ServiceEvent) => void,
     private schedule: (task: () => Promise<unknown>) => void,
-  ) {}
+    packages?: PackageResourceProvider,
+  ) {
+    this.previewResources = new PreviewResources(backend, packages);
+  }
   protected async execute<T>(
     method: string,
     params: Record<string, unknown> = {},
@@ -132,6 +140,7 @@ export class EditorHost {
     });
   }
   protected publishTree() {
+    this.schedule(() => this.executePreview("preview_invalidate_project", {}));
     this.emit({ kind: "tree", sequence: ++this.eventSequence });
   }
   protected async refreshViews(content = true) {
@@ -248,6 +257,8 @@ export class EditorHost {
           : {}),
       });
     } finally {
+      if (["writeFile", "mkdir", "rename", "remove"].includes(method))
+        await this.executePreview("preview_invalidate_project", {});
       await this.refreshViews();
     }
     if (method === "readFile") return new Uint8Array(result as number[]);
