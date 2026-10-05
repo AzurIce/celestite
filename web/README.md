@@ -35,7 +35,7 @@ bun run test:ui
 
 仓库的 [.github/workflows/pages.yml](../.github/workflows/pages.yml) 在推送到 `main` 或手动运行时构建 Web，部署默认分支到 GitHub Pages。首次使用需在仓库 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。
 
-CI 只检出 Celestite，Cargo 按固定提交获取 Notist。Bun 使用 1.4.2，Node 使用 24，Rust 使用与 flake 相同的 `nightly-2026-08-01` 及 WASM target；构建脚本自动安装匹配的 wasm-bindgen CLI。安装使用冻结的 Bun lockfile，Rust 构建核对 `Cargo.lock`，类型与格式检查通过后上传 `web/dist`，由独立部署 job 发布。
+CI 只检出 Celestite，Cargo 按固定提交获取 Notist。Bun 使用 1.4.2，Node 使用 24，Rust 使用与 flake 相同的 `nightly-2026-10-01` 及 WASM target；构建脚本自动安装匹配的 wasm-bindgen CLI。安装使用冻结的 Bun lockfile，Rust 构建核对 `Cargo.lock`，类型与格式检查通过后上传 `web/dist`，由独立部署 job 发布。
 
 构建的 `base` 使用 Pages 返回的路径，兼容仓库子路径、用户主页与自定义域名。`/debug/sync/` 有独立静态入口，可以直接访问或刷新；返回编辑器链接使用同一站点路径。本地可用 `bun run build --base /celestite/` 验证子路径构建。
 

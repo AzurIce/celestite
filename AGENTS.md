@@ -18,4 +18,4 @@ Web 代码（`.ts .tsx .js .jsx .css .html .json .md`）的统一格式化工具
 - 新目录/新文件若不该被格式化，加入 `web/.prettierignore`
 - 版本对齐：devDependency 里的 prettier 版本必须等于 Zed 内置格式化器版本（记录在 `~/.local/share/zed/prettier/package.json`，当前 3.9.9）。Zed 升级后如该版本变化，同步升级 devDependency，否则两边输出可能漂移
 
-Rust 目前未强制该流程：`cargo fmt --all` 可用（flake 固定 nightly-2026-08-01），需要同等体验时再补 `rustfmt.toml` 与同款规则。
+Rust 目前未强制该流程：`cargo fmt --all` 可用（flake 固定 nightly-2026-10-01），需要同等体验时再补 `rustfmt.toml` 与同款规则。

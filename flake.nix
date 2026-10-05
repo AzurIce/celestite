@@ -26,7 +26,7 @@
         pkgs = import nixpkgs { inherit system overlays; };
         craneLib = (crane.mkLib pkgs).overrideToolchain (
           p:
-          p.rust-bin.nightly."2026-08-01".default.override {
+          p.rust-bin.nightly."2026-10-01".default.override {
             targets = [ "wasm32-unknown-unknown" ];
             extensions = [
               "rust-src"
