@@ -1,7 +1,7 @@
 //! Invalidation feed, serialized by the same lock as the host core.
 //! It carries committed causal versions, never text or operation acknowledgements.
 use super::{fs::Result, store::VaultIdentity};
-use celestite_core::{EditorDocument, Version};
+use celestite_core::{EditorDocument, ExternalChangeStatus, Version};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
@@ -19,6 +19,7 @@ pub(crate) struct DocumentNotice {
     conflict: bool,
     available: bool,
     error: Option<String>,
+    external_change: Option<ExternalChangeStatus>,
     persistence_error: Option<String>,
 }
 pub(crate) fn exportable(state: &EditorDocument, persistent: bool) -> bool {
@@ -45,6 +46,7 @@ impl DocumentNotice {
             conflict: state.conflict,
             available,
             error: state.error,
+            external_change: state.external_change,
             persistence_error: state.persistence_error,
         }
     }

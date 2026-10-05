@@ -1,7 +1,7 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
 import type { VaultBackend } from "../../vault/types";
-import { decodeError } from "../rpc";
+import { decodeError, encodeError } from "../rpc";
 import type {
   PackageResourceProvider,
   PreviewCoreMethods,
@@ -18,12 +18,14 @@ import type {
   TextSnapshot,
   UndoState,
   RpcError,
+  ExternalChangeStatus,
 } from "../contract";
 
 export interface CorePort {
   execute(method: string, params: string): Promise<string>;
 }
 export interface CoreDocument {
+  externalChange?: ExternalChangeStatus | null;
   id: string;
   path: string;
   snapshot: TextSnapshot;
@@ -88,6 +90,7 @@ export class EditorHost {
     return {
       id: raw.id,
       path: vaultPath(raw.path),
+      deleted: raw.deleted,
       savedContent: raw.savedContent,
       ...(content ? { content: raw.snapshot.text } : {}),
       bom: raw.bom,
@@ -96,6 +99,7 @@ export class EditorHost {
       canPreview: true,
       saving: false,
       error: raw.error,
+      externalChange: raw.externalChange,
       conflict: raw.conflict,
       core: {
         version: raw.snapshot.version,
@@ -110,10 +114,11 @@ export class EditorHost {
     raw: CoreDocument,
     content = false,
     change?: ServiceDocument["change"],
+    includeDeleted = false,
   ) {
     clearTimeout(this.timers.get(raw.id));
     this.timers.delete(raw.id);
-    if (raw.deleted) return;
+    if (raw.deleted && !includeDeleted) return;
     if (raw.autosaveDelay !== null) {
       this.timers.set(
         raw.id,
@@ -182,13 +187,18 @@ export class EditorHost {
     context: SelectionContext,
     userEvent: string,
   ): Promise<EditResult> {
-    const result = await this.execute<CoreEdit>("edit", {
-      id,
-      version,
-      edits,
-      context,
-      userEvent,
-    });
+    let result: CoreEdit;
+    try {
+      result = await this.execute<CoreEdit>("edit", {
+        id,
+        version,
+        edits,
+        context,
+        userEvent,
+      });
+    } catch (error) {
+      return this.rejectedEdit(id, error);
+    }
     this.publish(result.document);
     return {
       document: this.document(result.document),
@@ -196,6 +206,32 @@ export class EditorHost {
       ...(result.restoredSelection
         ? { restoredSelection: result.restoredSelection }
         : {}),
+    };
+  }
+  async read(id: string): Promise<ServiceDocument> {
+    return this.document(await this.execute<CoreDocument>("read", { id }));
+  }
+  protected async rejectedEdit(
+    id: string,
+    error: unknown,
+  ): Promise<EditResult> {
+    // Core edit errors with these codes occur before a text transaction is
+    // accepted. IO failures after acceptance are returned in the document.
+    if (
+      !(error instanceof VaultError) ||
+      ![
+        "InvalidEdit",
+        "Unsupported",
+        "StaleVersion",
+        "Conflict",
+        "PermissionDenied",
+      ].includes(error.code)
+    )
+      throw error;
+    return {
+      document: await this.read(id),
+      edits: [],
+      rejection: encodeError(error),
     };
   }
   async undo(
@@ -219,6 +255,11 @@ export class EditorHost {
     await this.refreshViews(false);
     return this.document(raw);
   }
+  async retryObservation(id: string) {
+    const raw = await this.execute<CoreDocument>("retry_observation", { id });
+    this.publish(raw);
+    return this.document(raw);
+  }
   async save(id: string) {
     const preview = this.previews.get(id);
     if (preview) return preview;
@@ -226,7 +267,13 @@ export class EditorHost {
     this.publish(raw);
     return this.document(raw);
   }
-  async resolve(id: string, action: "overwrite" | "discard") {
+  async resolve(id: string, action: "overwrite" | "discard" | "retry") {
+    if (action === "retry")
+      throw new VaultError(
+        "Unsupported",
+        "本地保存冲突需要选择覆盖或丢弃。",
+        id,
+      );
     try {
       const raw = await this.execute<CoreDocument>("resolve", { id, action });
       this.publish(raw, true);

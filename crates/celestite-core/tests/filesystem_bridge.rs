@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 #[derive(Default)]
 struct State {
+    now: u64,
     bytes: Vec<u8>,
     records: BTreeMap<String, StoredDocument>,
     attempts: Vec<(DocumentHeader, Option<JournalEntry>)>,
@@ -23,6 +24,7 @@ impl HostBackend {
         Self {
             state: Rc::new(RefCell::new(State {
                 bytes: bytes.into(),
+                now: 1000,
                 ..Default::default()
             })),
             identity: InstanceIdentity {
@@ -58,7 +60,7 @@ impl Backend for HostBackend {
         true
     }
     fn now_ms(&self) -> u64 {
-        1000
+        self.state.borrow().now
     }
     fn new_id(&self) -> EditorResult<String> {
         static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -161,9 +163,201 @@ async fn open_host(backend: HostBackend) -> EditorResult<EditorCore<HostBackend>
         backend,
         EditorOptions {
             external_changes: ExternalChangePolicy::Merge,
+            ..Default::default()
         },
     )
     .await
+}
+
+async fn open_deferred(backend: HostBackend) -> EditorCore<HostBackend> {
+    EditorCore::open_with_options(
+        backend,
+        EditorOptions {
+            external_changes: ExternalChangePolicy::Merge,
+            defer_filesystem_diff: true,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[test]
+fn detached_observation_merges_into_newer_live_edits_and_keeps_personal_undo() {
+    block_on(async {
+        let backend = HostBackend::new(b"A middle B");
+        let mut core = open_deferred(backend.clone()).await;
+        let id = core.open_file("a.md").await.unwrap();
+        let writer = core.read(&id).unwrap().writer_id;
+        backend.external(b"A1 middle B1");
+        core.refresh(&id).await.unwrap();
+        let task = core.take_file_observation().unwrap().unwrap();
+        assert!(core.take_file_observation().unwrap().is_none());
+        assert_eq!(
+            core.read(&id).unwrap().external_change,
+            Some(ExternalChangeStatus::Pending)
+        );
+        let error = core.save(&id, None).await.unwrap_err();
+        assert_eq!(error.code, "FilesystemReconciliationPending");
+        assert_eq!(backend.state.borrow().writes, 0);
+        edit(&mut core, &id, 2, 8, "MIDDLE").await;
+        assert!(
+            core.complete_file_observation(task.compute())
+                .await
+                .unwrap()
+        );
+        let state = core.read(&id).unwrap();
+        assert_eq!(state.snapshot.text, "A1 MIDDLE B1");
+        assert_eq!(state.saved_content, "A1 middle B1");
+        assert_eq!(state.writer_id, writer);
+        assert!(state.external_change.is_none());
+        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "A1 middle B1");
+        let sequence = backend.header(&id).sequence;
+        core.refresh(&id).await.unwrap();
+        assert!(!core.has_file_observations());
+        assert_eq!(backend.header(&id).sequence, sequence);
+    });
+}
+
+#[test]
+fn changed_disk_invalidates_old_success_or_timeout_and_coalesces_one_latest_task() {
+    block_on(async {
+        for timeout in [false, true] {
+            let backend = HostBackend::new(b"base");
+            let mut core = open_deferred(backend.clone()).await;
+            let id = core.open_file("a.md").await.unwrap();
+            let before = core.read(&id).unwrap().snapshot;
+            backend.external(b"first");
+            core.refresh(&id).await.unwrap();
+            let task = core.take_file_observation().unwrap().unwrap();
+            backend.external(b"second");
+            core.refresh(&id).await.unwrap();
+            backend.external(b"latest");
+            core.refresh(&id).await.unwrap();
+            assert!(core.take_file_observation().unwrap().is_none());
+            let result = if timeout {
+                task.compute_with_budget(std::time::Duration::ZERO)
+            } else {
+                task.compute()
+            };
+            assert!(!core.complete_file_observation(result).await.unwrap());
+            assert_eq!(core.read(&id).unwrap().snapshot, before);
+            assert_eq!(backend.header(&id).sequence, 0);
+            let latest = core.take_file_observation().unwrap().unwrap();
+            assert!(
+                core.complete_file_observation(latest.compute())
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(core.read(&id).unwrap().snapshot.text, "latest");
+            assert_eq!(backend.header(&id).sequence, 1);
+        }
+    });
+}
+
+#[test]
+fn advancing_disk_cursor_invalidates_detached_results() {
+    block_on(async {
+        let backend = HostBackend::new(b"base\n");
+        let mut core = open_deferred(backend.clone()).await;
+        let id = core.open_file("a.md").await.unwrap();
+        backend.external(b"next\n");
+        core.refresh(&id).await.unwrap();
+        let task = core.take_file_observation().unwrap().unwrap();
+        backend.external(b"base\r\n");
+        core.refresh(&id).await.unwrap();
+        let cursor = backend.header(&id).disk_cursor.unwrap();
+        assert_eq!(cursor.observation, 1);
+        assert!(
+            !core
+                .complete_file_observation(task.compute())
+                .await
+                .unwrap()
+        );
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "base\n");
+        assert_eq!(backend.header(&id).sequence, 0);
+        assert_eq!(backend.header(&id).disk_cursor.unwrap().bytes, b"base\r\n");
+    });
+}
+
+#[test]
+fn timeout_preserves_history_exposes_status_blocks_writes_and_backs_off() {
+    block_on(async {
+        let backend = HostBackend::new(b"base");
+        let mut core = open_deferred(backend.clone()).await;
+        let id = core.open_file("a.md").await.unwrap();
+        let before = core.read(&id).unwrap().snapshot;
+        backend.external(b"next");
+        core.refresh(&id).await.unwrap();
+        let task = core.take_file_observation().unwrap().unwrap();
+        let error = core
+            .complete_file_observation(task.compute_with_budget(std::time::Duration::ZERO))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "FilesystemDiffTimeout");
+        assert_eq!(error.path, "a.md");
+        assert_eq!(core.read(&id).unwrap().snapshot, before);
+        assert_eq!(backend.header(&id).sequence, 0);
+        assert_eq!(
+            core.read(&id).unwrap().external_change,
+            Some(ExternalChangeStatus::Failed {
+                code: error.code.clone(),
+                message: error.message.clone(),
+                retry_at: 31_000,
+            })
+        );
+        for _ in 0..10 {
+            core.refresh(&id).await.unwrap();
+        }
+        assert!(!core.has_file_observations());
+        assert_eq!(
+            core.save(&id, None).await.unwrap_err().code,
+            "FilesystemDiffTimeout"
+        );
+        assert_eq!(backend.state.borrow().writes, 0);
+        backend.state.borrow_mut().now = 31_000;
+        core.refresh(&id).await.unwrap();
+        let retry = core.take_file_observation().unwrap().unwrap();
+        core.complete_file_observation(retry.compute_with_budget(std::time::Duration::ZERO))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            core.read(&id).unwrap().external_change,
+            Some(ExternalChangeStatus::Failed {
+                retry_at: 91_000,
+                ..
+            })
+        ));
+        core.retry_file_observation(&id).await.unwrap();
+        let retry = core.take_file_observation().unwrap().unwrap();
+        core.complete_file_observation(retry.compute())
+            .await
+            .unwrap();
+        assert!(core.read(&id).unwrap().external_change.is_none());
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "next");
+    });
+}
+
+#[test]
+fn changed_input_bypasses_timeout_backoff() {
+    block_on(async {
+        let backend = HostBackend::new(b"base");
+        let mut core = open_deferred(backend.clone()).await;
+        let id = core.open_file("a.md").await.unwrap();
+        backend.external(b"next");
+        core.refresh(&id).await.unwrap();
+        let task = core.take_file_observation().unwrap().unwrap();
+        core.complete_file_observation(task.compute_with_budget(std::time::Duration::ZERO))
+            .await
+            .unwrap_err();
+        backend.external(b"changed");
+        core.refresh(&id).await.unwrap();
+        let task = core.take_file_observation().unwrap().unwrap();
+        core.complete_file_observation(task.compute())
+            .await
+            .unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "changed");
+    });
 }
 
 async fn edit(core: &mut EditorCore<HostBackend>, id: &str, from: usize, to: usize, insert: &str) {

@@ -47,6 +47,7 @@ fn preview_result(task: &PreviewTask) -> PreviewCompletion {
         task_id: task.ticket.task_id.clone(),
         outcome: PreviewOutcome::Success {
             output: PreviewOutput {
+                used_components: vec![],
                 html: "<p>result</p>".into(),
                 diagnostics: vec![],
                 source_map: vec![],

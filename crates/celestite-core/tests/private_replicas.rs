@@ -2,6 +2,161 @@ use celestite_core::*;
 use futures_lite::future::block_on;
 use serde_json::json;
 
+fn seed(id: &str, text: &str) -> SyncPacket {
+    Document::new(
+        DocumentIdentity {
+            document_id: id.into(),
+            history_id: format!("history-{id}"),
+        },
+        None,
+        text,
+    )
+    .unwrap()
+    .export_snapshot()
+    .unwrap()
+}
+fn hosted(packet: SyncPacket, path: &str, deleted: bool) -> ReplicaDocument {
+    let snapshot = Document::from_snapshot(&packet, None).unwrap().snapshot();
+    ReplicaDocument {
+        packets: vec![packet],
+        writer_id: None,
+        state: ReplicaHostState {
+            path: path.into(),
+            version: snapshot.version,
+            saved_content: snapshot.text,
+            backend_revision: "disk".into(),
+            bom: false,
+            line_ending: "\n".into(),
+            deleted,
+            read_only: false,
+            conflict: false,
+            error: None,
+            external_change: None,
+        },
+    }
+}
+
+#[test]
+fn deleted_and_recreated_paths_join_in_either_order() {
+    block_on(async {
+        for reverse in [false, true] {
+            let mut core = replica("client", seed("base", "base")).await;
+            let mut inputs = vec![
+                hosted(seed("old", "old"), "same.md", true),
+                hosted(seed("new", "new"), "same.md", false),
+            ];
+            if reverse {
+                inputs.reverse();
+            }
+            core.replace_replica_session(inputs).await.unwrap();
+            assert!(core.read("old").unwrap().deleted);
+            assert_eq!(core.read("new").unwrap().snapshot.text, "new");
+            assert!(core.read("base").unwrap().deleted);
+        }
+        let mut core = replica("client", seed("base", "base")).await;
+        core.join_replica_document(hosted(seed("new", "new"), "same.md", false))
+            .await
+            .unwrap();
+        core.join_replica_document(hosted(seed("old", "old"), "same.md", true))
+            .await
+            .unwrap();
+        assert!(core.read("old").unwrap().deleted);
+    });
+}
+
+#[test]
+fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
+    block_on(async {
+        let a = seed("A", "A");
+        let b = seed("B", "B");
+        let mut core = replica("client", a.clone()).await;
+        core.join("b.md", b.clone()).await.unwrap();
+        let version = core.read("A").unwrap().snapshot.version;
+        core.execute_service(
+            "replace_text",
+            json!({"id":"A","version":version,"text":"retained draft"}),
+        )
+        .await
+        .unwrap();
+        let original = core.read("A").unwrap();
+        let subscription = core.subscribe_preview("A", "view").unwrap();
+        let mut invalid = hosted(b.clone(), "a.md", false);
+        invalid.state.version.clocks.insert("unseen".into(), 1);
+        assert!(
+            core.replace_replica_session(vec![hosted(a.clone(), "c.md", false), invalid])
+                .await
+                .is_err()
+        );
+        let retained = core.read("A").unwrap();
+        assert_eq!(original.snapshot.version, retained.snapshot.version);
+        assert_eq!(original.writer_id, retained.writer_id);
+        assert!(retained.undo.can_undo);
+        assert_eq!(retained.path, "a.md");
+        // B precedes A, while B's new path was owned by A in the old session.
+        core.replace_replica_session(vec![hosted(b, "a.md", false), hosted(a, "c.md", false)])
+            .await
+            .unwrap();
+        assert_eq!(core.read("A").unwrap().path, "c.md");
+        assert_eq!(core.read("B").unwrap().path, "a.md");
+        assert!(!core.read("A").unwrap().undo.can_undo);
+        assert_eq!(core.preview_state("A").unwrap().target.path, "c.md");
+        core.retry_preview("A").unwrap();
+        assert!(core.take_preview_task("A").unwrap().is_some());
+        assert!(core.unsubscribe_preview(&subscription.subscription_id, "view"));
+    });
+}
+
+#[test]
+fn session_imports_catch_up_packets_and_close_does_not_require_write_permission() {
+    block_on(async {
+        let initial = seed("file", "seed");
+        let mut source = Document::from_snapshot(&initial, None).unwrap();
+        let before = source.version();
+        source
+            .transact(Transaction {
+                expected_version: before.clone(),
+                edits: vec![TextEdit {
+                    from: 0,
+                    to: 0,
+                    insert: "remote ".into(),
+                }],
+                origin: "test".into(),
+                undo_metadata: None,
+                undo_positions: vec![],
+            })
+            .unwrap();
+        let mut input = hosted(source.export_snapshot().unwrap(), "a.md", false);
+        input.packets = vec![
+            initial.clone(),
+            source.export_updates_since(&before).unwrap(),
+        ];
+        input.state.read_only = true;
+        let mut core = replica("client", initial).await;
+        core.replace_replica_session(vec![input]).await.unwrap();
+        assert_eq!(core.read("file").unwrap().snapshot.text, "remote seed");
+        let before = source.version();
+        source
+            .transact(Transaction {
+                expected_version: before.clone(),
+                edits: vec![TextEdit {
+                    from: 0,
+                    to: 0,
+                    insert: "next ".into(),
+                }],
+                origin: "test".into(),
+                undo_metadata: None,
+                undo_positions: vec![],
+            })
+            .unwrap();
+        core.import("file", source.export_updates_since(&before).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(core.read("file").unwrap().snapshot.text, "next remote seed");
+        assert_eq!(core.execute_service("replace_text", json!({"id":"file","version":core.read("file").unwrap().snapshot.version,"text":"blocked"})).await.unwrap_err().code, "PermissionDenied");
+        core.execute_service("close", json!({})).await.unwrap();
+    });
+}
+
 async fn replica(name: &str, packet: SyncPacket) -> EditorCore<MemoryBackend> {
     let mut core = EditorCore::open(MemoryBackend::new(
         InstanceIdentity {
@@ -115,7 +270,7 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
 }
 
 #[test]
-fn host_receipts_and_discard_keep_replica_versions_and_other_personal_undo() {
+fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() {
     block_on(async {
         let packet = Document::new(
             DocumentIdentity {
@@ -151,6 +306,7 @@ fn host_receipts_and_discard_keep_replica_versions_and_other_personal_undo() {
             .unwrap();
         }
         let state = ReplicaHostState {
+            external_change: None,
             path: "a.md".into(),
             version: core.read("file").unwrap().snapshot.version,
             saved_content: "seed".into(),
@@ -169,19 +325,29 @@ fn host_receipts_and_discard_keep_replica_versions_and_other_personal_undo() {
         unseen.version.clocks.insert("unseen".into(), 1);
         assert!(core.apply_host_state("file", unseen).await.is_err());
         assert_eq!(core.read("file").unwrap().backend_revision, "remote-1");
+        let collision = hosted(packet.clone(), "other.md", false);
+        let other_packet = core.snapshot("other").unwrap();
         assert_eq!(
-            core.reset_replica("other.md", packet.clone())
-                .await
-                .unwrap_err()
-                .code,
+            core.replace_replica_session(vec![
+                collision,
+                hosted(other_packet.clone(), "other.md", false),
+            ])
+            .await
+            .unwrap_err()
+            .code,
             "Conflict"
         );
         assert_eq!(core.read("file").unwrap().snapshot.text, "draft");
-        core.reset_replica("a.md", packet).await.unwrap();
+        core.replace_replica_session(vec![
+            hosted(packet, "a.md", false),
+            hosted(other_packet, "other.md", false),
+        ])
+        .await
+        .unwrap();
         assert_eq!(core.read("file").unwrap().snapshot.text, "seed");
         assert!(!core.read("file").unwrap().undo.can_undo);
         assert_eq!(core.read("other").unwrap().snapshot.text, "keep other edit");
-        assert!(core.read("other").unwrap().undo.can_undo);
+        assert!(!core.read("other").unwrap().undo.can_undo);
         let mut read_only = state;
         read_only.version = core.read("file").unwrap().snapshot.version;
         read_only.read_only = true;

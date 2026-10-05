@@ -1,5 +1,7 @@
 export type VaultErrorCode =
   | "InvalidPath"
+  | "InvalidEdit"
+  | "StaleVersion"
   | "NotFound"
   | "AlreadyExists"
   | "NotDirectory"
@@ -8,6 +10,8 @@ export type VaultErrorCode =
   | "PermissionDenied"
   | "QuotaExceeded"
   | "Busy"
+  | "FilesystemDiffTimeout"
+  | "FilesystemReconciliationPending"
   | "Unsupported"
   | "Closed"
   | "Conflict"

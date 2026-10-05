@@ -75,7 +75,7 @@ export class WorkerDocuments {
     private client: EditorClient,
     private terminate: () => void,
     watch: VaultBackend["watch"] = async () => () => {},
-    remote = false,
+    private readonly remote = false,
   ) {
     if (remote) this.connection = { status: "online", error: null };
     this.unsubscribe = client.subscribe((event) => {
@@ -225,6 +225,7 @@ export class WorkerDocuments {
       if (record.acceptedContent !== change.before) {
         record.blocked = true;
         record.error = "远端投影版本不连续，输入仍保留。请复制正文后重新连接。";
+        record.inputFailure = { outcome: "projection", message: record.error };
         return;
       }
       const beforeProjection = record.content;
@@ -270,6 +271,7 @@ export class WorkerDocuments {
         record.locked = false;
         delete record.remoteChange;
         delete record.restoredSelection;
+        delete record.inputFailure;
         this.merge(document, true);
         record.reloadVersion++;
       }
@@ -322,7 +324,7 @@ export class WorkerDocuments {
   async open(path: VaultPath): Promise<boolean> {
     if (!this.online() || this.closing) return false;
     const existing = [...this.records.values()].find(
-      (record) => record.path === path,
+      (record) => record.path === path && !record.deleted,
     );
     if (existing) {
       this.activate(existing.id);
@@ -395,6 +397,7 @@ export class WorkerDocuments {
     void this.enqueue(() => this.performEdit(record, input)).catch((error) => {
       record.blocked = true;
       record.error = `编辑尚未确认，输入已保留。${error instanceof Error ? error.message : String(error)}`;
+      record.inputFailure = { outcome: "unknown", message: record.error };
       this.notify();
     });
     return true;
@@ -419,11 +422,45 @@ export class WorkerDocuments {
       context: input.before,
       userEvent: input.userEvent,
     });
+    if (result.rejection) {
+      record.blocked = true;
+      record.error = result.rejection.message;
+      record.inputFailure = {
+        outcome: "rejected",
+        message: result.rejection.message,
+      };
+      this.notify();
+      return false;
+    }
     record.inputs.shift();
     record.acceptedContent = result.document.content ?? input.content;
     this.merge(result.document);
     this.notify();
     return !record.core?.historyError;
+  }
+  async discardRejectedInput(id: string): Promise<boolean> {
+    const record = this.records.get(id);
+    if (
+      !record ||
+      !this.online() ||
+      this.closing ||
+      record.inputFailure?.outcome !== "rejected"
+    )
+      return false;
+    return this.enqueue(async () => {
+      if (!this.online() || record.inputFailure?.outcome !== "rejected")
+        return false;
+      // Drain older queued requests, then adopt the current accepted history.
+      // Later optimistic inputs depend on the rejected one and are withdrawn too.
+      const document = await this.client.request("read", { id });
+      record.inputs = [];
+      record.blocked = false;
+      delete record.inputFailure;
+      this.merge(document, true);
+      record.reloadVersion++;
+      this.notify();
+      return true;
+    });
   }
   private async flushInputs(record: ViewRecord) {
     if (record.blocked) return false;
@@ -493,6 +530,21 @@ export class WorkerDocuments {
     if (!this.online() || !record || record.readOnlyReason) return false;
     return this.enqueue(() => this.saveRecord(record));
   }
+  async retryObservation(id: string): Promise<boolean> {
+    const record = this.records.get(id);
+    if (!this.online() || !record) return false;
+    return this.enqueue(async () => {
+      try {
+        this.merge(await this.client.request("retry_observation", { id }));
+        this.notify();
+        return true;
+      } catch (error) {
+        record.error = String(error);
+        this.notify();
+        return false;
+      }
+    });
+  }
   private async saveRecord(record: ViewRecord) {
     if (!this.online()) return false;
     try {
@@ -544,13 +596,21 @@ export class WorkerDocuments {
     if (!this.online()) return false;
     const record = this.records.get(id);
     if (!record || this.closing) return false;
-    if (record.readOnlyReason && record.content !== record.savedContent)
+    if (
+      !this.remote &&
+      record.readOnlyReason &&
+      record.content !== record.savedContent
+    )
       return false;
     record.locked = true;
     this.notify();
     try {
       return await this.enqueue(async () => {
-        if (!record.readOnlyReason && !(await this.saveRecord(record)))
+        if (
+          this.remote
+            ? !(await this.flushInputs(record))
+            : !record.readOnlyReason && !(await this.saveRecord(record))
+        )
           return false;
         this.forget(id);
         return true;
@@ -566,7 +626,7 @@ export class WorkerDocuments {
     if (record) this.prompt(record, "close");
     return false;
   }
-  async resolveConflict(action: "overwrite" | "discard" | "cancel") {
+  async resolveConflict(action: "overwrite" | "discard" | "retry" | "cancel") {
     if (!this.online()) return false;
     const prompt = this.conflictPrompt;
     if (!prompt || this.conflictResolving || this.closing) return false;
@@ -577,6 +637,15 @@ export class WorkerDocuments {
     }
     const record = this.records.get(prompt.id);
     if (!record) return false;
+    if (
+      record.conflictResolution === "shared"
+        ? action !== "retry"
+        : action === "retry"
+    ) {
+      this.conflictError = "当前文档不支持这个冲突处理操作。";
+      this.notify();
+      return false;
+    }
     record.locked = true;
     this.conflictResolving = true;
     this.conflictError = null;
@@ -661,7 +730,21 @@ export class WorkerDocuments {
     this.closing = true;
     this.openRequest++;
     return (this.closePromise = (async () => {
-      if (
+      if (this.remote) {
+        await this.enqueue(async () => {
+          for (const record of this.records.values()) {
+            if (
+              record.blocked ||
+              (record.inputs.length &&
+                (!this.online() || !(await this.flushInputs(record))))
+            )
+              throw new VaultError(
+                "IO",
+                "未确认的编辑仍保留，连接仍保留。请导出正文并重新连接。",
+              );
+          }
+        });
+      } else if (
         !(await this.saveAll()) &&
         [...this.records.values()].some(
           (record) => record.inputs.length || record.core?.historyError,

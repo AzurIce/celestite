@@ -85,6 +85,9 @@ enum Command {
         id: String,
         version: Version,
     },
+    RetryObservation {
+        id: String,
+    },
     Ping,
 }
 #[derive(Clone, Deserialize)]
@@ -191,6 +194,10 @@ async fn command(
             Command::Ping => json!({"pong":true}),
             Command::Open{path} => { let id=docs.open_file(files,&path)?; session.sent.remove(&id); session.saved.remove(&id); session.receipt(docs,docs.state(files,&id)?)? }
             Command::Probe{id,version} => { let state=docs.state(files,&id)?; docs.snapshot(&id)?; json!({"committed":contains(&state.snapshot.version,&version),"version":state.snapshot.version}) }
+            Command::RetryObservation{id} => {
+                docs.retry_file_observation(&id)?;
+                session.receipt(docs,docs.state(files,&id)?)?
+            }
             Command::Save{id,version} => {
                 docs.refresh(files,&id)?;
                 docs.save(files,&id,version)?;

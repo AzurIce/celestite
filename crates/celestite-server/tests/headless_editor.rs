@@ -96,6 +96,21 @@ impl Server {
             .await
     }
 
+    async fn settled(&self, id: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = self.ok("GET", &route(id, ""), Value::Null).await;
+                if state["externalChange"].is_null() {
+                    return state;
+                }
+                assert_eq!(state["externalChange"]["phase"], "pending", "{state}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background observation committed")
+    }
+
     async fn stop(self) {
         drop(self.client);
         let _ = self.shutdown.send(());
@@ -158,6 +173,7 @@ async fn replica_commit_checks_file_revision_before_import_and_returns_saved_his
         .contains("中文"));
     let mut overwrite = body;
     overwrite["action"] = json!("overwrite");
+    server.settled(id).await;
     let receipt = server
         .ok("POST", &route(id, "/client-commit"), overwrite)
         .await;
@@ -485,12 +501,12 @@ async fn external_changes_merge_with_dirty_history_and_are_preserved_across_rest
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap().to_string();
     std::fs::write(root.path().join("a.md"), "external").unwrap();
-    let clean = server.ok("GET", &route(&id, ""), Value::Null).await;
+    let clean = server.settled(&id).await;
     assert_eq!(snapshot(&clean).text, "external");
     assert_eq!(clean["undo"]["can_undo"], false);
     server.ok("POST", &route(&id, "/transact"), json!({"expected_version": snapshot(&clean).version, "origin": "test", "edits": [{"from": 8, "to": 8, "insert": " local"}]})).await;
     std::fs::write(root.path().join("a.md"), "other editor").unwrap();
-    let dirty = server.ok("GET", &route(&id, ""), Value::Null).await;
+    let dirty = server.settled(&id).await;
     assert_eq!(snapshot(&dirty).text, "other editor local");
     assert_eq!(dirty["conflict"], false);
     assert_eq!(

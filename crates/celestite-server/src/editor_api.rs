@@ -45,6 +45,10 @@ pub(crate) fn routes() -> Router<Arc<ServerState>> {
         .route("/api/v1/vaults/{id}/documents/{document}/redo", post(redo))
         .route("/api/v1/vaults/{id}/documents/{document}/save", post(save))
         .route(
+            "/api/v1/vaults/{id}/documents/{document}/retry-observation",
+            post(retry_observation),
+        )
+        .route(
             "/api/v1/vaults/{id}/documents/{document}/client-commit",
             post(client_commit),
         )
@@ -95,6 +99,9 @@ pub(crate) async fn run_documents_with_tree<T: Send + 'static>(
             .map_err(|_| VaultError::new("IO", "Document lock failed", ""))?;
         let result = action(&files, &mut documents);
         let published = documents.publish_changes();
+        if documents.has_file_observations() {
+            vault.reconcile_trigger.request();
+        }
         if notify_tree && (mutation || published.as_ref().is_ok_and(|changed| *changed)) {
             let _ = vault.events.send(ChangeHint::all());
         }
@@ -118,6 +125,19 @@ async fn list(
     Ok(Json(
         run_documents(get_vault(&state, &id)?, false, |files, docs| {
             docs.list(files)
+        })
+        .await?,
+    ))
+}
+
+async fn retry_observation(
+    State(state): State<Arc<ServerState>>,
+    Path((id, document)): Path<(String, String)>,
+) -> std::result::Result<Json<DocumentState>, ApiError> {
+    Ok(Json(
+        run_documents(get_vault(&state, &id)?, false, move |files, docs| {
+            docs.retry_file_observation(&document)?;
+            docs.state(files, &document)
         })
         .await?,
     ))

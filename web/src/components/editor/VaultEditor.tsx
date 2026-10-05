@@ -26,16 +26,26 @@ import {
   Save,
   X,
 } from "@/components/icons";
-import type { EditorDocuments } from "@/lib/editor/contract";
+import type {
+  EditorDocuments,
+  ExternalChangeStatus,
+} from "@/lib/editor/contract";
 import { setSetting, settings } from "@/lib/settings";
 import type { EditorBuffer } from "./CodeEditor";
 import { languageName } from "./languages";
+
 import type { VimMode } from "./vim";
 import { SaveConflict } from "./SaveConflict";
 import { DocumentPreview } from "./DocumentPreview";
 import { PreviewSync } from "./preview-sync";
 import { vaultPath } from "@/lib/vault/path";
 import "./editor.css";
+
+function externalChangeMessage(status: ExternalChangeStatus) {
+  return status.phase === "pending"
+    ? "正在同步磁盘中的外部修改，完成后可保存。"
+    : `外部修改尚未同步，自动写回已暂停。${status.message}`;
+}
 
 const CodeEditor = lazy(() => import("./CodeEditor"));
 type PreviewMode = "source" | "split" | "preview";
@@ -491,6 +501,7 @@ export function VaultEditor(props: VaultEditorProps) {
                         !active()?.pending &&
                         !active()?.core?.historyError) ||
                       active()?.saving ||
+                      !!active()?.externalChange ||
                       active()?.locked ||
                       !!active()?.readOnlyReason
                     }
@@ -501,7 +512,35 @@ export function VaultEditor(props: VaultEditorProps) {
                     保存
                   </Button>
                 </header>
-                <Show when={active()?.error}>
+                <Show when={active()?.externalChange}>
+                  {(status) => (
+                    <div
+                      role="status"
+                      class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-secondary"
+                    >
+                      <span class="flex-1">
+                        {externalChangeMessage(status())}
+                      </span>
+                      <Show
+                        when={
+                          status().phase === "failed" &&
+                          props.documents.retryObservation
+                        }
+                      >
+                        <Button
+                          size="sm"
+                          disabled={active()?.locked}
+                          onClick={() =>
+                            void props.documents.retryObservation?.(id)
+                          }
+                        >
+                          重试同步
+                        </Button>
+                      </Show>
+                    </div>
+                  )}
+                </Show>
+                <Show when={active()?.error && !active()?.externalChange}>
                   <div
                     role="alert"
                     class="flex shrink-0 items-center gap-2 border-b border-solid border-border px-4 py-2 text-ui-sm text-danger"

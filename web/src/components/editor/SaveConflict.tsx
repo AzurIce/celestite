@@ -18,6 +18,7 @@ export function SaveConflict(props: {
     props.state.documents.find(
       (file) => file.id === props.state.conflictPrompt?.id,
     );
+  const shared = () => file()?.conflictResolution === "shared";
   return (
     <Dialog
       open={!!props.state.conflictPrompt}
@@ -35,25 +36,48 @@ export function SaveConflict(props: {
           if (props.state.conflictResolving) event.preventDefault();
         }}
       >
-        <DialogTitle>文件已在磁盘上修改</DialogTitle>
+        <DialogTitle>
+          {shared() ? "共享文档暂时无法保存" : "文件已在磁盘上修改"}
+        </DialogTitle>
         <DialogDescription>
-          “{file()?.path}”在你编辑期间已被其他客户端或程序修改。
-          要用编辑器中的内容覆盖磁盘版本，还是丢弃本地编辑？
+          <Show
+            when={shared()}
+            fallback={
+              <>
+                “{file()?.path}”在你编辑期间已被其他客户端或程序修改。
+                要用编辑器中的内容覆盖磁盘版本，还是丢弃本地编辑？
+              </>
+            }
+          >
+            “{file()?.path}”的共享编辑已保留。请核对磁盘变化后重试保存；
+            保存冲突不会丢弃或覆盖协作者的共享历史。
+          </Show>
         </DialogDescription>
         <div class="mt-5 flex flex-col gap-2">
-          <Button
-            variant="primary"
-            disabled={props.state.conflictResolving}
-            onClick={() => void props.documents.resolveConflict("overwrite")}
-          >
-            覆盖保存
-          </Button>
-          <Button
-            disabled={props.state.conflictResolving}
-            onClick={() => void props.documents.resolveConflict("discard")}
-          >
-            丢弃编辑
-          </Button>
+          <Show when={shared()}>
+            <Button
+              variant="primary"
+              disabled={props.state.conflictResolving}
+              onClick={() => void props.documents.resolveConflict("retry")}
+            >
+              重试保存
+            </Button>
+          </Show>
+          <Show when={!shared()}>
+            <Button
+              variant="primary"
+              disabled={props.state.conflictResolving}
+              onClick={() => void props.documents.resolveConflict("overwrite")}
+            >
+              覆盖保存
+            </Button>
+            <Button
+              disabled={props.state.conflictResolving}
+              onClick={() => void props.documents.resolveConflict("discard")}
+            >
+              丢弃编辑
+            </Button>
+          </Show>
           <Button
             ref={cancel}
             disabled={props.state.conflictResolving}

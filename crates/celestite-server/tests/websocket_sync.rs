@@ -320,6 +320,10 @@ async fn external_changes_are_pushed_for_unopened_documents_and_survive_initial_
     loop {
         let frame = next(&mut a.socket).await;
         if frame["kind"] == "document" && frame["document"]["path"] == "unopened.md" {
+            if frame["document"]["externalChange"]["phase"] == "pending" {
+                // Metadata can announce queued work before its history commits.
+                continue;
+            }
             assert_eq!(
                 frame["document"]["savedContent"],
                 "observed without opening"

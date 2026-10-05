@@ -73,7 +73,7 @@ impl Reconciler {
                     break;
                 }
                 let Some(vault) = vault.upgrade() else { break };
-                if let Err(error) = observe(&vault) {
+                if let Err(error) = observe(&vault, &stopping) {
                     tracing::error!(vault_id = %vault.id, code = %error.code, message = %error.message, "Background file reconciliation failed");
                 }
             })?;
@@ -99,7 +99,10 @@ impl Drop for Reconciler {
     }
 }
 
-fn observe(vault: &HostedVault) -> crate::vault::fs::Result<()> {
+fn with_documents<T>(
+    vault: &HostedVault,
+    action: impl FnOnce(&mut crate::vault::documents::Documents) -> crate::vault::fs::Result<T>,
+) -> crate::vault::fs::Result<T> {
     // Match every HTTP document/file operation's lock order.
     let _files = vault
         .files
@@ -109,7 +112,7 @@ fn observe(vault: &HostedVault) -> crate::vault::fs::Result<()> {
         .documents
         .lock()
         .map_err(|_| crate::vault::fs::VaultError::new("IO", "Document lock failed", ""))?;
-    let result = documents.reconcile();
+    let result = action(&mut documents);
     // Also publish failures: a previously usable document can now require recovery.
     if documents.publish_changes()? {
         let _ = vault.events.send(ChangeHint::all());
@@ -118,12 +121,281 @@ fn observe(vault: &HostedVault) -> crate::vault::fs::Result<()> {
     result
 }
 
+fn observe(vault: &HostedVault, stopping: &AtomicBool) -> crate::vault::fs::Result<()> {
+    observe_with(vault, stopping, |task| task.compute())
+}
+
+fn observe_with(
+    vault: &HostedVault,
+    stopping: &AtomicBool,
+    mut execute: impl FnMut(
+        celestite_core::FileObservationTask,
+    ) -> celestite_core::FileObservationResult,
+) -> crate::vault::fs::Result<()> {
+    with_documents(vault, |docs| docs.reconcile())?;
+    let count = with_documents(vault, |docs| docs.resident().map(|states| states.len()))?;
+    for _ in 0..count {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        let task = match with_documents(vault, |docs| docs.take_file_observation()) {
+            Ok(Some(task)) => task,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(vault_id = %vault.id, path = %error.path, code = %error.code, message = %error.message, "File observation preparation failed; continuing other files");
+                continue;
+            }
+        };
+        let path = task.path().to_string();
+        let started = std::time::Instant::now();
+        // Both Vault locks were dropped. HTTP and collaboration edits can advance
+        // live history throughout this isolated, bounded calculation.
+        let result = execute(task);
+        let accepted = with_documents(vault, |docs| docs.complete_file_observation(result));
+        match accepted {
+            Ok(accepted) => {
+                tracing::debug!(vault_id = %vault.id, %path, accepted, elapsed_ms = started.elapsed().as_millis(), "Filesystem diff completed")
+            }
+            Err(error) => {
+                tracing::warn!(vault_id = %vault.id, path = %error.path, code = %error.code, message = %error.message, "File observation failed; preserving history and continuing other files")
+            }
+        }
+    }
+    with_documents(vault, |docs| {
+        if docs.has_file_observations() {
+            vault.reconcile_trigger.request();
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vault::{documents::Documents, fs::FsVault};
     use std::sync::Mutex;
     use tokio::sync::broadcast;
+
+    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Arc<HostedVault>) {
+        let root = tempfile::tempdir().unwrap();
+        let history = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "A middle B").unwrap();
+        std::fs::write(root.path().join("b.md"), "other").unwrap();
+        let mut documents = Documents::open(
+            Some(&history.path().join("history.redb")),
+            root.path(),
+            crate::HistoryMode::Initialize,
+        )
+        .unwrap();
+        documents.reconcile().unwrap();
+        let (trigger, _) = channel();
+        let (events, _) = broadcast::channel(128);
+        let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
+        let vault = Arc::new(HostedVault {
+            id: "notes".into(),
+            name: "Notes".into(),
+            read_only: false,
+            files: Mutex::new(FsVault::open(root.path()).unwrap()),
+            documents: Mutex::new(documents),
+            packages: crate::package_resources::PackageResources::new(
+                root.path().into(),
+                events.clone(),
+            )
+            .unwrap(),
+            events,
+            _watcher: Mutex::new(watcher),
+            reconcile_trigger: trigger,
+            reconciler: Mutex::new(None),
+        });
+        (root, history, vault)
+    }
+
+    #[test]
+    fn diff_releases_both_vault_locks_and_merges_edits_accepted_while_running() {
+        let (root, _history, vault) = fixture();
+        let (ready, prepared) = mpsc::sync_channel(1);
+        let (resume, released) = mpsc::sync_channel(1);
+        std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
+        let worker_vault = vault.clone();
+        let worker = thread::spawn(move || {
+            observe_with(&worker_vault, &AtomicBool::new(false), |task| {
+                ready.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                task.compute()
+            })
+            .unwrap()
+        });
+        prepared.recv_timeout(Duration::from_secs(5)).unwrap();
+        {
+            let files = vault
+                .files
+                .try_lock()
+                .expect("diff must not hold the file lock");
+            let mut docs = vault
+                .documents
+                .try_lock()
+                .expect("diff must not hold the document lock");
+            let states = docs.resident().unwrap();
+            let a = states.iter().find(|s| s.path == "a.md").unwrap();
+            docs.transact(
+                &a.id,
+                celestite_core::Transaction {
+                    expected_version: a.snapshot.version.clone(),
+                    origin: "local".into(),
+                    edits: vec![celestite_core::TextEdit {
+                        from: 2,
+                        to: 8,
+                        insert: "MIDDLE".into(),
+                    }],
+                    undo_metadata: None,
+                    undo_positions: vec![],
+                },
+            )
+            .unwrap();
+            let b = states.iter().find(|s| s.path == "b.md").unwrap();
+            docs.transact(
+                &b.id,
+                celestite_core::Transaction {
+                    expected_version: b.snapshot.version.clone(),
+                    origin: "local".into(),
+                    edits: vec![celestite_core::TextEdit {
+                        from: 5,
+                        to: 5,
+                        insert: " saved".into(),
+                    }],
+                    undo_metadata: None,
+                    undo_positions: vec![],
+                },
+            )
+            .unwrap();
+            let version = docs.state(&files, &b.id).unwrap().snapshot.version;
+            docs.save(&files, &b.id, version).unwrap();
+        }
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        let states = vault.documents.lock().unwrap().resident().unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .find(|s| s.path == "a.md")
+                .unwrap()
+                .snapshot
+                .text,
+            "A1 MIDDLE B1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("b.md")).unwrap(),
+            "other saved"
+        );
+    }
+
+    #[test]
+    fn failure_is_published_without_losing_readable_history_and_manual_retry_commits() {
+        let (root, _history, vault) = fixture();
+        let mut subscription = vault.documents.lock().unwrap().subscribe().unwrap();
+        std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
+        observe_with(&vault, &AtomicBool::new(false), |task| {
+            task.compute_with_budget(Duration::ZERO)
+        })
+        .unwrap();
+        let mut events = vec![];
+        while let Ok(event) = subscription.receiver.try_recv() {
+            events.push(serde_json::to_value(event).unwrap());
+        }
+        let failed = events.last().unwrap()["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["path"] == "a.md")
+            .unwrap();
+        assert_eq!(failed["externalChange"]["phase"], "failed");
+        assert_eq!(failed["externalChange"]["code"], "FilesystemDiffTimeout");
+        assert_eq!(failed["available"], true);
+        let id = failed["id"].as_str().unwrap();
+        let mut docs = vault.documents.lock().unwrap();
+        assert_eq!(
+            docs.resident()
+                .unwrap()
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .snapshot
+                .text,
+            "A middle B"
+        );
+        docs.reconcile().unwrap();
+        assert!(!docs.has_file_observations());
+        docs.retry_file_observation(id).unwrap();
+        drop(docs);
+        observe(&vault, &AtomicBool::new(false)).unwrap();
+        let state = vault
+            .documents
+            .lock()
+            .unwrap()
+            .resident()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert_eq!(state.snapshot.text, "A1 middle B1");
+        assert!(state.external_change.is_none());
+    }
+
+    #[test]
+    fn rename_during_diff_discards_the_old_path_result_then_reconciles_the_new_path() {
+        let (root, _history, vault) = fixture();
+        std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
+        let task = with_documents(&vault, |docs| {
+            docs.reconcile()?;
+            docs.take_file_observation()
+        })
+        .unwrap()
+        .unwrap();
+        let old = vault
+            .documents
+            .lock()
+            .unwrap()
+            .resident()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.path == "a.md")
+            .unwrap();
+        {
+            let files = vault.files.lock().unwrap();
+            vault
+                .documents
+                .lock()
+                .unwrap()
+                .rename(&files, "a.md", "renamed.md")
+                .unwrap();
+        }
+        assert!(!with_documents(&vault, |docs| docs
+            .complete_file_observation(task.compute()))
+        .unwrap());
+        let interim = vault
+            .documents
+            .lock()
+            .unwrap()
+            .resident()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == old.id)
+            .unwrap();
+        assert_eq!(interim.snapshot, old.snapshot);
+        assert_eq!(interim.path, "renamed.md");
+        observe(&vault, &AtomicBool::new(false)).unwrap();
+        let state = vault
+            .documents
+            .lock()
+            .unwrap()
+            .resident()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == old.id)
+            .unwrap();
+        assert_eq!(state.snapshot.text, "A1 middle B1");
+    }
 
     #[tokio::test]
     async fn periodic_scan_repairs_missing_notifications_and_stop_joins_before_reopening_history() {
@@ -163,10 +435,17 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.path().join("a.md"), "missed notification").unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), subscription.receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = subscription.receiver.recv().await.unwrap();
+                let json = serde_json::to_value(&event).unwrap();
+                if json["documents"][0]["externalChange"].is_null() {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(event.kind, "changed");
         let state = vault
             .documents

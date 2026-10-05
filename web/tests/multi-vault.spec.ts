@@ -125,8 +125,61 @@ async function seedLocal(page: Page) {
 }
 const editor = (page: Page) => page.locator(".cm-content");
 
+test("external diff failures stay online, pause saving and can be retried", async ({
+  page,
+  api,
+}) => {
+  const name = "observation-stall.txt";
+  const disk = join(api.root, "work", name);
+  const original = "a".repeat(40_000);
+  const content = () =>
+    editor(page).evaluate(
+      (element) =>
+        (element as any).cmTile.root.view.state.doc.toString() as string,
+    );
+  await writeFile(disk, original);
+  await page.goto("/");
+  await connect(page, api.url.replace(/notes$/, "work"), api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  await expect.poll(async () => (await content()).length).toBe(original.length);
+  // A long line with no shared scalars exhausts the fixed compute budget.
+  await writeFile(disk, "b".repeat(40_000));
+  await expect(page.getByText(/外部修改尚未同步，自动写回已暂停/)).toBeVisible({
+    timeout: 12_000,
+  });
+  await expect(
+    page.getByRole("button", { name: "保存", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "尝试重新连接", exact: true }),
+  ).not.toBeVisible();
+  await expect.poll(async () => (await content()).length).toBe(original.length);
+  await page.getByRole("button", { name: "重试同步", exact: true }).click();
+  await expect(
+    page.getByText("正在同步磁盘中的外部修改，完成后可保存。", { exact: true }),
+  ).toBeVisible();
+  // New input supersedes the running retry; its late timeout must not replace
+  // the new status or commit the obsolete all-b branch.
+  await writeFile(disk, original + " recovered");
+  await expect
+    .poll(async () => (await content()).endsWith(" recovered"), {
+      timeout: 12_000,
+    })
+    .toBe(true);
+  await expect(
+    page.getByRole("button", { name: "重试同步", exact: true }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByText("正在同步磁盘中的外部修改，完成后可保存。", { exact: true }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "尝试重新连接", exact: true }),
+  ).not.toBeVisible();
+  expect(await readFile(disk, "utf8")).toBe(original + " recovered");
+});
+
 for (const intent of ["save", "close"] as const) {
-  test(`filesystem changes merge into collaborative history before ${intent}`, async ({
+  test(`filesystem changes merge into collaborative history and ${intent} preserves save semantics`, async ({
     page,
     api,
   }) => {
@@ -156,7 +209,11 @@ for (const intent of ["save", "close"] as const) {
         .click();
     await expect
       .poll(() => readFile(disk, "utf8"))
-      .toBe("disk:original-client");
+      .toBe(intent === "save" ? "disk:original-client" : "disk:original");
+    if (intent === "close") {
+      await page.getByRole("treeitem", { name, exact: true }).click();
+      await expect(editor(page)).toHaveText("disk:original-client");
+    }
     await expect(
       page.getByRole("dialog", { name: "文件已在磁盘上修改" }),
     ).not.toBeVisible();
@@ -189,6 +246,15 @@ test("collaborative input commits history immediately while disk save stays expl
         (await hostDocuments(api)).find((d) => d.path === name)?.snapshot.text,
     )
     .toBe("live history");
+  const downloaded = page.waitForEvent("download");
+  await page
+    .getByRole("treeitem", { name, exact: true })
+    .locator(".tree-row")
+    .first()
+    .click({ button: "right" });
+  await page.getByRole("menuitem", { name: "下载", exact: true }).click();
+  const download = await downloaded;
+  expect(await readFile((await download.path())!, "utf8")).toBe("original");
   // The synchronized host text does not imply a physical-file save.
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "未保存",
@@ -793,7 +859,7 @@ test("reauthentication rejects a changed host history and retains the client dra
   );
 });
 
-test("disconnected dirty buffers block removing the connection and remain copyable", async ({
+test("unconfirmed input blocks removing the connection and remains copyable", async ({
   page,
   api,
 }) => {
@@ -801,23 +867,15 @@ test("disconnected dirty buffers block removing the connection and remain copyab
   await page.goto("/");
   await connect(page, api.url, api.token);
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await editor(page).fill("keep unsaved shared draft");
-  await expect
-    .poll(
-      async () =>
-        (await hostDocuments(api)).find((d) => d.path === "a.md")?.snapshot
-          .text,
-    )
-    .toBe("keep unsaved shared draft");
   await workerEvaluate(
     page,
-    () =>
-      (self as unknown as { testSockets: WebSocket[] }).testSockets.forEach(
-        (socket) => socket.close(),
-      ),
+    () => {
+      (self as any).dropNextUpdate = true;
+    },
     undefined,
     -1,
   );
+  await editor(page).fill("keep unsaved shared draft");
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
   await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "管理 Vault" });
@@ -828,6 +886,219 @@ test("disconnected dirty buffers block removing the connection and remain copyab
   await expect(dialog.getByRole("alert")).toContainText("连接仍保留");
   await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
   await expect(editor(page)).toHaveText("keep unsaved shared draft");
+});
+
+test("reconnect accepts reused paths and opening a recreated path uses its new history", async ({
+  page,
+  api,
+}) => {
+  const a = "reconnect-path-a.md",
+    b = "reconnect-path-b.md",
+    c = "reconnect-path-c.md";
+  await writeFile(join(api.root, "notes", a), "A");
+  await writeFile(join(api.root, "notes", b), "B");
+  await installWorkerHarness(page, true);
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("A");
+  await workerEvaluate(
+    page,
+    () =>
+      (self as any).testSockets.forEach((socket: WebSocket) => socket.close()),
+    undefined,
+    -1,
+  );
+  const overlay = page.getByRole("region", { name: "远端连接状态" });
+  await expect(overlay).toBeVisible();
+  await page.evaluate(
+    async ({ api, a, b, c }) => {
+      const moduleUrl = "/src/lib/vault/index.ts";
+      const { openHttpVault, vaultPath } = await import(moduleUrl);
+      const { backend } = await openHttpVault(api.url, api.token);
+      await backend.rename(vaultPath(a), vaultPath(c));
+      await backend.rename(vaultPath(b), vaultPath(a));
+      await backend.close();
+    },
+    { api, a, b, c },
+  );
+  await overlay
+    .getByRole("button", { name: "尝试重新连接", exact: true })
+    .click();
+  await expect(overlay).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: c, exact: true })).toBeVisible();
+  await expect(editor(page)).toHaveText("A");
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("B");
+  await page.evaluate(
+    async ({ api, a }) => {
+      const moduleUrl = "/src/lib/vault/index.ts";
+      const { openHttpVault, vaultPath } = await import(moduleUrl);
+      const { backend } = await openHttpVault(api.url, api.token);
+      await backend.remove(vaultPath(a));
+      await backend.writeFile(vaultPath(a), new TextEncoder().encode("new A"), {
+        mode: "create",
+      });
+      await backend.close();
+    },
+    { api, a },
+  );
+  await expect(editor(page)).toHaveAttribute("contenteditable", "false");
+  await expect(editor(page)).toHaveText("B");
+  await expect(
+    page.getByRole("treeitem", { name: a, exact: true }),
+  ).toBeVisible();
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("new A");
+  await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+  await page.reload();
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("new A");
+});
+
+test("rejected input stays exportable and can be withdrawn without reconnecting", async ({
+  page,
+  api,
+}) => {
+  const name = "rejected-input.md";
+  const disk = join(api.root, "notes", name);
+  await writeFile(disk, "base");
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  await expect(editor(page)).toHaveText("base");
+  await editor(page).evaluate((element) => {
+    const view = (element as any).cmTile.root.view;
+    view.dispatch({ changes: { from: 4, insert: "\u0000" } });
+    view.dispatch({ changes: { from: 5, insert: "dependent" } });
+  });
+  const overlay = page.getByRole("region", { name: "远端连接状态" });
+  await expect(overlay).toContainText("输入未被接受");
+  await expect(editor(page)).toHaveAttribute("contenteditable", "false");
+  const exported = page.waitForEvent("download");
+  await overlay.getByRole("button", { name: "导出当前正文" }).click();
+  const download = await exported;
+  const drafts = JSON.parse(await readFile((await download.path())!, "utf8"));
+  expect(
+    drafts.find((draft: { path: string }) => draft.path === name).content,
+  ).toBe("base\u0000dependent");
+  expect(
+    (await hostDocuments(api)).find((d) => d.path === name)?.snapshot.text,
+  ).toBe("base");
+  await overlay.getByRole("button", { name: "撤回未接受输入" }).click();
+  await expect(overlay).toHaveCount(0);
+  await expect(editor(page)).toHaveText("base");
+  await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+  await editor(page).fill("accepted");
+  await expect
+    .poll(
+      async () =>
+        (await hostDocuments(api)).find((d) => d.path === name)?.snapshot.text,
+    )
+    .toBe("accepted");
+  expect(await readFile(disk, "utf8")).toBe("base");
+});
+
+test("shared save conflicts offer retry without discarding shared history", async ({
+  page,
+  api,
+}) => {
+  const name = "shared-save-conflict.md";
+  const disk = join(api.root, "notes", name);
+  await writeFile(disk, "base");
+  await installWorkerHarness(page, true);
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  await editor(page).fill("shared draft");
+  await expect
+    .poll(
+      async () =>
+        (await hostDocuments(api)).find((d) => d.path === name)?.snapshot.text,
+    )
+    .toBe("shared draft");
+  await workerEvaluate(
+    page,
+    () => {
+      (self as any).rejectNextSave = true;
+    },
+    undefined,
+    -1,
+  );
+  await page.keyboard.press("Control+s");
+  const dialog = page.getByRole("dialog", { name: "共享文档暂时无法保存" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "丢弃编辑" })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "覆盖保存" })).toHaveCount(0);
+  expect(await readFile(disk, "utf8")).toBe("base");
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(editor(page)).toHaveText("shared draft");
+  await workerEvaluate(
+    page,
+    () => {
+      (self as any).rejectNextSave = true;
+    },
+    undefined,
+    -1,
+  );
+  await editor(page).focus();
+  await page.keyboard.press("Control+s");
+  await dialog.getByRole("button", { name: "重试保存" }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect.poll(() => readFile(disk, "utf8")).toBe("shared draft");
+});
+
+test("removing a confirmed shared connection preserves unsaved host files including unopened documents", async ({
+  page,
+  browser,
+  api,
+}) => {
+  const names = ["close-open.md", "close-unopened.md"];
+  for (const name of names)
+    await writeFile(join(api.root, "notes", name), "disk");
+  await page.goto("/");
+  await connect(page, api.url, api.token);
+  await page.getByRole("treeitem", { name: names[0], exact: true }).click();
+  await editor(page).fill("open shared draft");
+  const otherContext = await browser.newContext();
+  try {
+    const other = await otherContext.newPage();
+    await other.goto("/");
+    await connect(other, api.url, api.token);
+    await other.getByRole("treeitem", { name: names[1], exact: true }).click();
+    await editor(other).fill("unopened shared draft");
+    await expect
+      .poll(async () =>
+        (await hostDocuments(api))
+          .filter((d) => names.includes(d.path))
+          .map((d) => d.snapshot.text)
+          .sort(),
+      )
+      .toEqual(["open shared draft", "unopened shared draft"]);
+    await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+    const dialog = page.getByRole("dialog", {
+      name: "管理 Vault",
+      exact: true,
+    });
+    await dialog.getByRole("button", { name: "移除连接 notes" }).click();
+    await dialog
+      .getByRole("button", { name: "确认移除连接", exact: true })
+      .click();
+    await expect(
+      dialog.getByRole("button", { name: "移除连接 notes" }),
+    ).toHaveCount(0);
+    for (const name of names)
+      expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
+        "disk",
+      );
+    await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
+    await connect(page, api.url, api.token);
+    await page.getByRole("treeitem", { name: names[0], exact: true }).click();
+    await expect(editor(page)).toHaveText("open shared draft");
+  } finally {
+    await otherContext.close();
+  }
 });
 
 test("mobile connection controls fit the viewport", async ({ page, api }) => {

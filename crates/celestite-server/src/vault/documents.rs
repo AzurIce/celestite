@@ -21,6 +21,7 @@ impl Documents {
             NativeBackend::open(state, root, mode)?,
             EditorOptions {
                 external_changes: ExternalChangePolicy::Merge,
+                defer_filesystem_diff: true,
             },
         ))
         .map_err(vault_error)?;
@@ -55,6 +56,18 @@ impl Documents {
     }
     pub fn resident(&self) -> Result<Vec<DocumentState>> {
         self.core.resident().map_err(vault_error)
+    }
+    pub fn has_file_observations(&self) -> bool {
+        self.core.has_file_observations()
+    }
+    pub fn take_file_observation(&mut self) -> Result<Option<FileObservationTask>> {
+        self.core.take_file_observation().map_err(vault_error)
+    }
+    pub fn complete_file_observation(&mut self, result: FileObservationResult) -> Result<bool> {
+        block_on(self.core.complete_file_observation(result)).map_err(vault_error)
+    }
+    pub fn retry_file_observation(&mut self, id: &str) -> Result<()> {
+        block_on(self.core.retry_file_observation(id)).map_err(vault_error)
     }
     pub fn publish_changes(&mut self) -> Result<bool> {
         let states = self.resident()?;

@@ -257,6 +257,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     ),
     EditorView.editable.of(
       (!props.document.locked || !!props.document.core) &&
+        !props.document.inputFailure &&
         !props.document.readOnlyReason &&
         !props.document.core?.historyError,
     ),
@@ -415,6 +416,7 @@ export default function CodeEditor(props: CodeEditorProps) {
   createEffect(
     () =>
       props.document.locked ||
+      !!props.document.inputFailure ||
       !!props.document.readOnlyReason ||
       !!props.document.core?.historyError,
     () => {

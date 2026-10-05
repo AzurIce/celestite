@@ -40,6 +40,7 @@ impl EditorError {
 impl From<crate::CoreError> for EditorError {
     fn from(error: crate::CoreError) -> Self {
         let code = match error {
+            crate::CoreError::FilesystemDiffTimeout => "FilesystemDiffTimeout",
             crate::CoreError::StaleVersion => "StaleVersion",
             crate::CoreError::IdentityMismatch
             | crate::CoreError::WriterCollision
@@ -144,12 +145,15 @@ pub trait Backend {
     ) -> EditorResult<()>;
     async fn directory_intent(&mut self) -> EditorResult<Option<DirectoryIntent>>;
     async fn set_directory_intent(&mut self, intent: Option<&DirectoryIntent>) -> EditorResult<()>;
-    /// Replace a volatile replica after explicitly discarding its local changes.
-    /// Durable stores and file projections do not support this operation.
-    async fn replace_volatile_record(&mut self, _header: &DocumentHeader) -> EditorResult<()> {
+    /// Atomically replace a volatile session's complete history store.
+    /// On failure the previous session must remain intact.
+    async fn replace_volatile_documents(
+        &mut self,
+        _headers: &[DocumentHeader],
+    ) -> EditorResult<()> {
         Err(EditorError::new(
             "Unsupported",
-            "Replica reset is unavailable",
+            "Replica session replacement is unavailable",
             "",
         ))
     }

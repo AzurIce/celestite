@@ -18,9 +18,11 @@ export type EditorWorkerHost = Pick<
   | "composition"
   | "executePreview"
   | "open"
+  | "read"
   | "edit"
   | "undo"
   | "retryHistory"
+  | "retryObservation"
   | "save"
   | "resolve"
   | "flush"
@@ -98,6 +100,8 @@ export async function serveEditorWorker(
           return host.composition(String(p.id), Boolean(p.active));
         case "open":
           return host.open(vaultPath(String(p.path)));
+        case "read":
+          return host.read(String(p.id));
         case "edit":
           return host.edit(
             String(p.id),
@@ -115,12 +119,14 @@ export async function serveEditorWorker(
           );
         case "retry_history":
           return host.retryHistory(String(p.id));
+        case "retry_observation":
+          return host.retryObservation(String(p.id));
         case "save":
           return host.save(String(p.id));
         case "resolve":
           return host.resolve(
             String(p.id),
-            p.action as "overwrite" | "discard",
+            p.action as "overwrite" | "discard" | "retry",
           );
         case "flush":
           return host.flush();

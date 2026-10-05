@@ -49,7 +49,7 @@ export class RemoteEditorHost extends EditorHost {
   ) {
     super(core, http, emit, scheduleRemote, http.packageResources(descriptor));
   }
-  async connect(token: string, reset = false) {
+  async connect(token: string) {
     const identity = this.descriptor.vaultIdentity!;
     const transport = new RemoteTransport(
       this.http.url,
@@ -101,26 +101,58 @@ export class RemoteEditorHost extends EditorHost {
       },
     );
     this.transport = transport;
-    const receipts = await transport.ready;
-    this.operation = 0;
-    this.patches.clear();
-    this.received.clear();
-    this.composing.clear();
-    this.deferred.clear();
-    // A new session only contains host history. Never replay the old writer.
-    const present = new Set(receipts.map((receipt) => receipt.document.id));
-    for (const receipt of receipts)
-      await this.receive(receipt, reset && receipt.packet.kind === "snapshot");
-    for (const host of this.hosts.values())
-      if (reset && !present.has(host.id)) host.deleted = true;
-    this.offline = false;
-    this.unconfirmed = false;
-    const documents: ServiceDocument[] = [];
-    for (const host of this.hosts.values()) {
-      const raw = await this.hostState(host);
-      documents.push(this.document(raw));
+    try {
+      const receipts = await transport.ready;
+      const hosts = new Map<string, CoreDocument>();
+      const documents = new Map<
+        string,
+        { packets: SyncPacket[]; writerId: string }
+      >();
+      const received = new Map<string, number>();
+      for (const receipt of receipts) {
+        const id = receipt.document.id;
+        const prior = hosts.get(id);
+        if (receipt.document.savedContent === undefined && !prior)
+          throw new VaultError("IO", "远端缺少初始磁盘元数据。");
+        const next = documents.get(id) ?? {
+          packets: [],
+          writerId: receipt.writerId,
+        };
+        if (
+          next.writerId !== receipt.writerId ||
+          receipt.sequence <= (received.get(id) ?? -1)
+        )
+          throw new VaultError("IO", "初始协作会话不连续。");
+        next.packets.push(receipt.packet);
+        documents.set(id, next);
+        hosts.set(id, {
+          ...receipt.document,
+          savedContent: receipt.document.savedContent ?? prior!.savedContent,
+          snapshot: { ...receipt.document.snapshot, text: "" },
+        });
+        received.set(id, receipt.sequence);
+      }
+      const states = await this.execute<CoreDocument[]>("replica_session", {
+        documents: [...documents].map(([id, document]) => ({
+          ...document,
+          state: this.replicaState(hosts.get(id)!),
+        })),
+      });
+      // Publish the new session only after every history and the final catalogue
+      // have been accepted. A failed handshake leaves old buffers and undo intact.
+      this.hosts = new Map(states.map((state) => [state.id, state]));
+      this.received = received;
+      this.operation = 0;
+      this.patches.clear();
+      this.composing.clear();
+      this.deferred.clear();
+      this.offline = false;
+      this.unconfirmed = false;
+      return states.map((state) => this.document(state));
+    } catch (error) {
+      transport.close();
+      throw error;
     }
-    return documents;
   }
 
   override async composition(id: string, active: boolean) {
@@ -143,7 +175,7 @@ export class RemoteEditorHost extends EditorHost {
     change?: ServiceDocument["change"],
   ) {
     if (!this.resetting)
-      super.publish({ ...raw, autosaveDelay: null }, content, change);
+      super.publish({ ...raw, autosaveDelay: null }, content, change, true);
   }
   protected override document(
     raw: CoreDocument,
@@ -151,6 +183,7 @@ export class RemoteEditorHost extends EditorHost {
   ): ServiceDocument {
     return {
       ...super.document(raw, content),
+      conflictResolution: "shared",
       readOnlyReason: this.offline
         ? "远端连接中断，正文已保留；请重新连接后继续编辑。"
         : raw.deleted
@@ -158,6 +191,25 @@ export class RemoteEditorHost extends EditorHost {
           : this.descriptor.readOnly
             ? "当前 Vault 只读。"
             : null,
+    };
+  }
+  private replicaState(
+    host: CoreDocument,
+    error = host.error,
+    conflict = host.conflict,
+  ) {
+    return {
+      path: host.path,
+      version: host.snapshot.version,
+      savedContent: host.savedContent,
+      backendRevision: host.backendRevision,
+      bom: host.bom,
+      lineEnding: host.lineEnding,
+      deleted: host.deleted,
+      conflict,
+      error,
+      externalChange: host.externalChange,
+      readOnly: this.descriptor.readOnly,
     };
   }
   private async hostState(
@@ -168,20 +220,12 @@ export class RemoteEditorHost extends EditorHost {
     return this.execute<CoreDocument>("replica_host_state", {
       id: host.id,
       state: {
-        path: host.path,
-        version: host.snapshot.version,
-        savedContent: host.savedContent,
-        backendRevision: host.backendRevision,
-        bom: host.bom,
-        lineEnding: host.lineEnding,
-        deleted: host.deleted,
-        conflict,
-        error,
+        ...this.replicaState(host, error, conflict),
         readOnly: this.descriptor.readOnly || this.offline,
       },
     });
   }
-  private async receive(receipt: RemoteReceipt, reset = false) {
+  private async receive(receipt: RemoteReceipt) {
     const prior = this.hosts.get(receipt.document.id);
     if (receipt.document.savedContent === undefined && !prior)
       throw new VaultError("IO", "远端缺少初始磁盘元数据。");
@@ -194,13 +238,14 @@ export class RemoteEditorHost extends EditorHost {
       return this.document(
         await this.execute<CoreDocument>("read", { id: host.id }),
       );
-    this.received.set(host.id, receipt.sequence);
     let change: ServiceDocument["change"];
-    if (!this.hosts.has(host.id) || reset) {
-      await this.execute(reset ? "replica_reset" : "join", {
-        path: host.path,
-        packet: receipt.packet,
-        writerId: receipt.writerId,
+    if (!this.hosts.has(host.id)) {
+      await this.execute("replica_join", {
+        document: {
+          packets: [receipt.packet],
+          writerId: receipt.writerId,
+          state: this.replicaState(host),
+        },
       });
     } else {
       const before = await this.execute<CoreDocument>("read", { id: host.id });
@@ -230,10 +275,10 @@ export class RemoteEditorHost extends EditorHost {
         this.patches.set(host.id, patches);
       }
     }
-    this.hosts.set(host.id, host);
     const raw = await this.hostState(host);
-    // Deleted buffers remain visible/readable. publish in the base skips them.
-    this.publish({ ...raw, deleted: false }, true, change);
+    this.hosts.set(host.id, host);
+    this.received.set(host.id, receipt.sequence);
+    this.publish(raw, true, change);
     return this.document(raw);
   }
   private connectionFailure(error: unknown) {
@@ -254,7 +299,7 @@ export class RemoteEditorHost extends EditorHost {
         host,
         error instanceof Error ? error.message : String(error),
       );
-      this.publish({ ...raw, deleted: false }, true);
+      this.publish(raw, true);
     }
   }
   override async open(path: VaultPath): Promise<ServiceDocument> {
@@ -294,37 +339,42 @@ export class RemoteEditorHost extends EditorHost {
     userEvent: string,
   ): Promise<EditResult> {
     this.requireOnline();
-    const current = await this.execute<CoreDocument>("read", { id });
-    if (!sameVersion(version, current.snapshot.version)) {
-      let pending: ChangeSet | undefined;
-      for (const patch of this.patches.get(id) ?? []) {
-        if (!sameVersion(patch.before, version)) continue;
-        pending ??= ChangeSet.of(edits, patch.changes.length);
-        pending = pending.map(patch.changes, true);
-        context = {
-          ...context,
-          ranges: context.ranges.map((r) => ({
-            anchor: patch.changes.mapPos(r.anchor),
-            head: patch.changes.mapPos(r.head),
-          })),
-        };
-        version = patch.after;
+    let result: CoreEdit;
+    try {
+      const current = await this.execute<CoreDocument>("read", { id });
+      if (!sameVersion(version, current.snapshot.version)) {
+        let pending: ChangeSet | undefined;
+        for (const patch of this.patches.get(id) ?? []) {
+          if (!sameVersion(patch.before, version)) continue;
+          pending ??= ChangeSet.of(edits, patch.changes.length);
+          pending = pending.map(patch.changes, true);
+          context = {
+            ...context,
+            ranges: context.ranges.map((r) => ({
+              anchor: patch.changes.mapPos(r.anchor),
+              head: patch.changes.mapPos(r.head),
+            })),
+          };
+          version = patch.after;
+        }
+        if (!pending || !sameVersion(version, current.snapshot.version))
+          throw new VaultError(
+            "Conflict",
+            "输入的历史版本已过期，输入仍保留。",
+            current.path,
+          );
+        edits = editsOf(pending);
       }
-      if (!pending || !sameVersion(version, current.snapshot.version))
-        throw new VaultError(
-          "Conflict",
-          "输入的历史版本已过期，输入仍保留。",
-          current.path,
-        );
-      edits = editsOf(pending);
+      result = await this.execute<CoreEdit>("edit", {
+        id,
+        version,
+        edits,
+        context,
+        userEvent,
+      });
+    } catch (error) {
+      return this.rejectedEdit(id, error);
     }
-    const result = await this.execute<CoreEdit>("edit", {
-      id,
-      version,
-      edits,
-      context,
-      userEvent,
-    });
     await this.submit(id, version, result.document.snapshot.version);
     return { document: this.document(result.document), edits: result.edits };
   }
@@ -426,9 +476,24 @@ export class RemoteEditorHost extends EditorHost {
     }
     throw new VaultError("Busy", "远端正文仍在变化，请稍后保存。");
   }
-  override async resolve(id: string, _action: "overwrite" | "discard") {
-    // Physical-file changes are already merged by the host bridge. A client
-    // cannot discard the shared unsaved history of other writers.
+  override async retryObservation(id: string): Promise<ServiceDocument> {
+    this.requireOnline();
+    const receipt = await this.transport!.request<RemoteReceipt>(
+      "retry_observation",
+      { id },
+    );
+    return this.receive(receipt);
+  }
+  override async resolve(
+    id: string,
+    action: "overwrite" | "discard" | "retry",
+  ) {
+    if (action !== "retry")
+      throw new VaultError(
+        "Unsupported",
+        "共享历史不能通过保存冲突丢弃或覆盖，请重试保存。",
+        this.hosts.get(id)?.path,
+      );
     return this.save(id);
   }
   async authorize(token: string) {
@@ -458,7 +523,7 @@ export class RemoteEditorHost extends EditorHost {
     this.descriptor = descriptor;
     this.resetting = true;
     try {
-      const documents = await this.connect(token, true);
+      const documents = await this.connect(token);
       this.publishConnection({ status: "online", error: null });
       this.publishTree();
       return documents;
@@ -471,16 +536,13 @@ export class RemoteEditorHost extends EditorHost {
     }
   }
   override async flush() {
-    if (this.descriptor.readOnly) return;
-    this.requireOnline();
-    for (const host of this.hosts.values()) {
-      const raw = await this.execute<CoreDocument>("read", { id: host.id });
-      if (raw.deleted) continue;
-      if (raw.snapshot.text !== raw.savedContent || raw.error) {
-        const saved = await this.save(host.id);
-        if (saved.error) throw new VaultError("IO", saved.error, saved.path);
-      }
-    }
+    if (this.unconfirmed)
+      throw new VaultError(
+        "Conflict",
+        "存在尚未确认的协作编辑，请导出正文并重新连接。",
+      );
+    // A volatile replica has no file projection. Flush history, never host files.
+    await this.execute("flush_history");
   }
   override async fileOperation(
     method: string,
@@ -505,7 +567,7 @@ export class RemoteEditorHost extends EditorHost {
     const affected = [...this.hosts.values()].filter(
       (host) => host.path === path || host.path.startsWith(path + "/"),
     );
-    if (["readFile", "writeFile", "rename", "remove"].includes(method))
+    if (["writeFile", "rename", "remove"].includes(method))
       for (const host of affected) {
         const raw = await this.execute<CoreDocument>("read", { id: host.id });
         if (

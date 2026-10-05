@@ -5,10 +5,18 @@ import type { VaultBackend, VaultPath } from "../vault";
 import type {
   ConnectionState,
   EditorProjection,
+  ExternalChangeStatus,
   SelectionContext,
 } from "./contract";
 
 export interface DocumentSnapshot {
+  deleted?: boolean;
+  conflictResolution?: "local" | "shared";
+  inputFailure?: {
+    outcome: "rejected" | "unknown" | "projection";
+    message: string;
+  };
+  externalChange?: ExternalChangeStatus | null;
   core?: EditorProjection;
   pending?: number;
   restoredSelection?: SelectionContext & { revision: number };

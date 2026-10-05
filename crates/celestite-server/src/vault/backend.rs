@@ -28,6 +28,8 @@ pub(crate) fn vault_error(error: EditorError) -> fs::VaultError {
         "Conflict" => "Conflict",
         "StaleVersion" => "StaleVersion",
         "InvalidEdit" => "InvalidEdit",
+        "FilesystemDiffTimeout" => "FilesystemDiffTimeout",
+        "FilesystemReconciliationPending" => "FilesystemReconciliationPending",
         _ => "IO",
     };
     fs::VaultError::new(code, error.message, &error.path)

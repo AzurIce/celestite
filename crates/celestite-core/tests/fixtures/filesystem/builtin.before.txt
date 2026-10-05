@@ -1,0 +1,700 @@
+== Builtin Content Functions & Sugar Grammar
+
+记法见 [Grammar Notation](grammar/notation.not)，共用词法、上下文、正文分派、调用及变换见 [Syntax](grammar/README.not)，类型与字面量见 [Types](types.not)。每个函数一节，分别定义签名、语法糖、降糖与必要的恢复；`MD.*` 是 Markdown 前端的 AST 模式。
+
+签名列出已知字段、默认值与 children 契约；已知字段的错误类型、值域及缺少必填字段产生 type 诊断，恢复树保留原值。其他具名字段保留，多余位置参数产生诊断。实现对应关系见 Syntax。
+
+=== text
+
+```signature
+text(text: String) -> InlineContent
+```
+
+```grammar
+lex Escapable -> [`=` `*` `_` `~` `\` `[` `]`
+                   `(` `)` `|` `#` `$` U+0060 `!`];
+lex Escape -> `\` Escapable;
+syntax PlainText -> value:TEXT | value:ESCAPE;
+```
+
+```desugar
+PlainText(value) when value.kind == Text
+  ⇒ text(text: source(value))
+PlainText(value) when value.kind == Escape
+  ⇒ text(text: source(value)[1..])
+LiteralToken(value) ⇒ text(text: source(value))
+MD.Text(s) ⇒ text(text: decode_once(s))
+```
+
+`LiteralToken` 是其他语法的 recover 返回的原始标记；相邻文字按正文空白规则合并。text 参数使用具名写法。
+
+=== paragraph
+
+```signature
+paragraph()[children: InlineContent] -> Content
+```
+
+```grammar
+syntax ParagraphRun(ctx) -> body:InlineRun(ctx, block_end, None);
+syntax ExplicitBreak -> BACKSLASH NL;
+```
+
+```desugar
+ParagraphRun(body) when lower(body) != []
+  ⇒ paragraph()[lower(body)]
+NL ⇒ []
+ExplicitBreak ⇒ []
+MD.Paragraph(body) ⇒ paragraph()[lower(body)]
+```
+
+paragraph 是平坦 CST 元素序列的降糖结果，没有独立 Paragraph CST 节点。空行、显式分段和块节点结束候选段落；单 NL 不插入空格，行末与续行开头空白丢弃。Markdown 双空格换行归一为单 NL，反斜杠换行分段。
+
+=== heading
+
+```signature
+heading(level: Int = 1)[children: InlineContent] -> Content
+require level > 0
+```
+
+```grammar
+syntax Heading(ctx) ->
+  marker:EQ WS body:InlineRun(ctx, always_true, None);
+```
+
+```desugar
+Heading(marker, body) ⇒ heading(level: size(marker))[lower(body)]
+MD.Heading(level, body) ⇒ heading(level: level)[lower(body)]
+```
+
+`always_true` 使当前行的 NL 结束正文，NL 留给外层。原生块分派在块起点识别 Heading；EQ 是整个连续 `=` run。Markdown 对应 ATX 与 Setext 标题。
+
+=== section
+
+```signature
+section()[children: Content] -> Content
+```
+
+无独立源码语法糖；对块序列应用以下 shape 规则：
+
+```shape
+sectionize(forest) {
+  root = []
+  stack = []
+  for node in forest {
+    if ctor(node) == heading {
+      k = node.level
+      while stack != [] and stack.last.level >= k { close_section() }
+      stack.push({ level: k, children: [node] })
+    } else {
+      append node to stack.last.children if stack != [] else root
+    }
+  }
+  while stack != [] { close_section() }
+  return root
+}
+
+close_section() {
+  entry = stack.pop()
+  result = section()[entry.children]
+  transfer entry.children.first.attrs to result.attrs
+  result.span = hull(entry.children)
+  append result to stack.last.children if stack != [] else root
+}
+```
+
+两个前端的普通块序列使用同一规则。
+
+=== strong
+
+```signature
+strong()[children: InlineContent] -> InlineContent
+```
+
+```grammar
+syntax MatchedInline(k, ctx) ->
+  @{ can_open(cursor, ctx) }
+  mate:probe FlankedClose(k; ctx)
+  @{ mate.close > cursor + 1 }
+  open:TokenKind(k)
+  body:InlineRun(ctx, block_end, Flanked(k))
+  close:TokenKind(k)?;
+
+syntax Strong(ctx) -> matched:MatchedInline(Star, ctx);
+```
+
+```scanner
+scanner FlankedClose(k; ctx) -> { end, close } | Miss {
+  let depth = 0
+  for p from cursor + 1 to ctx.limit {
+    if kind(p) == Newline and block_end(p, ctx) { return Miss }
+    if kind(p) == Backslash and kind(p + 1) == Newline { return Miss }
+    if kind(p) == k {
+      if can_close(p, ctx) {
+        if depth == 0 { return { end: p + 1, close: p } }
+        depth -= 1
+      } else if can_open(p, ctx) {
+        depth += 1
+      }
+    }
+  }
+  return Miss
+}
+```
+
+```desugar
+Strong(matched) ⇒ strong()[lower(matched.body)]
+MD.Strong(body) ⇒ strong()[lower(body)]
+```
+
+```recover
+recover MatchedInline on Miss when kind(rule_start) == k {
+  consume = 原始起点的一个界定符 token
+  cst = LiteralToken(原始 token)
+  diagnostic = none
+}
+```
+
+探测按 token 进行；Escape 不作为界定符。真正消费正文仍由 InlineRun 决定，可能先遇到内容槽闭括号等停止条件，因此收尾 token 可选。配对仅检查空白，不检查词内边界；Escape 不参与配对。Markdown 对应 `**...**` / `__...__`。
+
+=== emph
+
+```signature
+emph()[children: InlineContent] -> InlineContent
+```
+
+```grammar
+syntax Emph(ctx) -> matched:MatchedInline(Underscore, ctx);
+```
+
+```desugar
+Emph(matched) ⇒ emph()[lower(matched.body)]
+MD.Emphasis(body) ⇒ emph()[lower(body)]
+```
+
+匹配和恢复使用 strong 节定义的 MatchedInline。Markdown 对应 `*...*` / `_..._`。
+
+=== strike
+
+```signature
+strike()[children: InlineContent] -> InlineContent
+```
+
+```grammar
+syntax Strike(ctx) -> matched:MatchedInline(Tilde, ctx);
+```
+
+```desugar
+Strike(matched) ⇒ strike()[lower(matched.body)]
+MD.Strikethrough(body) ⇒ strike()[lower(body)]
+```
+
+匹配和恢复使用 MatchedInline。Markdown 对应 `~...~` / `~~...~~`。
+
+=== raw
+
+```signature
+raw(text: String, block?: Bool, lang?: String) -> InlineContent | Content
+result = Content if block == true else InlineContent
+```
+
+text 可使用第一个位置参数。
+
+```grammar
+syntax RawInline(ctx) ->
+  open:BACKTICK tail:scan RawTail(size(open); ctx);
+
+syntax RawBlock(ctx) ->
+  open:BACKTICK @{ size(open) >= 3 } ^
+  tag:scan LineTail(ctx)
+  NL?
+  tail:scan FenceTail(size(open); ctx);
+
+syntax BlockBacktick(ctx) -> RawBlock(ctx) | RawInline(ctx);
+```
+
+```scanner
+scanner RawTail(n; ctx) -> { end, payload, close } | Miss {
+  let begin = cursor
+  for p from begin to ctx.limit {
+    if kind(p) == Newline { return Miss }
+    if kind(p) == Backtick and size(token(p)) == n {
+      return { end: p + 1, payload: tokens[begin..p], close: token(p) }
+    }
+  }
+  return Miss
+}
+
+scanner LineTail(ctx) -> { end } {
+  let p = cursor
+  while p < ctx.limit and kind(p) != Newline { p += 1 }
+  return { end: p }
+}
+
+scanner FenceTail(n; ctx) -> { end, payload, close } | Miss {
+  let begin = cursor
+  let p = begin
+  while p < ctx.limit {
+    let q = p
+    if kind(q) == Whitespace
+       and display_width(source(token(q))) == ctx.block_indent {
+      q += 1
+    }
+    if kind(q) == Backtick and size(token(q)) >= n {
+      let stop = next_newline_or_limit(q, ctx)
+      return { end: stop, payload: tokens[begin..p], close: token(q) }
+    }
+    p = after_next_newline_or_limit(p, ctx)
+  }
+  return Miss
+}
+```
+
+`next_newline_or_limit` 返回第一个 NL 的下标或 limit；`after_next_newline_or_limit` 在存在 NL 时返回其后一个下标，否则返回 limit。`display_width` 的 tab 到下一个四列边界。原生块分派优先识别 RawBlock；闭围栏行尾 NL 不消耗。
+
+```desugar
+RawInline(_, tail) ⇒ raw(text: source(tail.payload))
+RawBlock(_, tag, tail) ⇒ raw(text: strip_container_indent(source(tail.payload)),
+                            block: true, lang: nonempty(trim(source(tag))))
+MD.CodeSpan(s) ⇒ raw(text: s)
+MD.CodeBlock(s, info) ⇒ raw(text: s, block: true, lang: nonempty(trim(info)))
+```
+
+```recover
+recover RawInline on Miss when kind(rule_start) == Backtick {
+  consume = 原始起点的一个 BACKTICK token
+  cst = LiteralToken(原始 token)
+  diagnostic = none
+}
+recover RawBlock on Broken {
+  consume = 从原始起点至 ctx.limit
+  cst = Error(Raw(原始 token 序列))
+  diagnostic = syntax, 全部消耗范围, "unclosed raw block"
+}
+```
+
+Error 包装的未闭合 raw 块在 desugar 时跳过。正文保留末尾换行；nonempty 将空字符串转换为 none，省略 lang 字段。`trim` 去掉首尾空白。
+
+`strip_container_indent` 按行移除最多 ctx.block_indent 列的前导空格 / tab；tab 跨过边界时，剩余列补为空格。`strip_continuation_indent` 使用同一算法，但保留第一行。它们处理容器缩进，不移除 payload 自己的额外缩进。
+
+=== math
+
+```signature
+math(text: String) -> InlineContent
+```
+
+text 可使用第一个位置参数。
+
+```grammar
+syntax Math(ctx) ->
+  @{ can_open(cursor, ctx) }
+  open:DOLLAR tail:scan MathTail(ctx);
+```
+
+```scanner
+scanner MathTail(ctx) -> { end, payload } | Miss {
+  let begin = cursor
+  for p from begin to ctx.limit {
+    if kind(p) == Newline and block_end(p, ctx) { return Miss }
+    if kind(p) == Dollar and can_close(p, ctx) {
+      if p == begin { return Miss }
+      return { end: p + 1, payload: tokens[begin..p] }
+    }
+  }
+  return Miss
+}
+```
+
+```desugar
+Math(_, tail) ⇒ math(text: strip_continuation_indent(source(tail.payload)))
+MD.Math(s) ⇒ math(text: s)
+```
+
+```recover
+recover Math on Miss when kind(rule_start) == Dollar {
+  consume = 原始起点的一个 DOLLAR token
+  cst = LiteralToken(原始 token)
+  diagnostic = none
+}
+```
+
+payload 不透明；`strip_continuation_indent` 见 raw 小节。Markdown 同样要求非空、开后与闭前非空白，允许跨软换行；代码内容与转义的美元符号不触发数学解析。
+
+=== link
+
+```signature
+link(target: String, title?: String)[children: InlineContent] -> InlineContent
+```
+
+target 可使用第一个位置参数。
+
+```grammar
+syntax Link(ctx) -> &LBRACKET parsed:LinkBody(ctx, false);
+syntax WikiLink(ctx) -> &(`[` `[`) parsed:WikiBody(ctx);
+```
+
+```scanner
+scanner LinkFrame(embed; ctx) -> { end, label_close, destination_close } | Miss {
+  open = cursor + (1 if embed else 0)
+  要求 kind(open) == LBracket
+  p = open + 1；depth = 1
+  逐 token 扫描至 ctx.limit：
+    NL 且 block_end，或 BACKSLASH NL：返回 Miss
+    Backtick / Dollar：若 OpaqueClose(p, ctx) 成功，跳至该 close 后
+    LBracket：depth += 1
+    RBracket：depth -= 1；depth == 0 时记为 label_close 并停止
+    其他：前进一个 token
+  未找到 label_close 或其后不是 LParen：返回 Miss
+  从 label_close + 2 扫描目的地：
+    parens = 1；quote = none；escaped = false；previous_space = false
+    NL 或 limit：返回 Miss
+    逐源码字符处理当前 token：
+      escaped 为 true：清除 escaped，置 previous_space=false，继续
+      反斜杠：置 escaped=true、previous_space=false，继续
+      quote 已设置：同类引号清除 quote
+      否则：前一个字符为空白时的单 / 双引号设置 quote
+            "(" 令 parens += 1，")" 令 parens -= 1
+      previous_space = 当前字符是否为空白
+    parens == 0：返回 { end: p + 1, label_close, destination_close: p }
+    前进一个 token
+}
+
+scanner OpaqueClose(p, ctx) -> { close } | Miss {
+  要求 kind(p) 为 Backtick 或 Dollar
+  Dollar 还要求 can_open(p, ctx)
+  从 p + 1 逐 token 扫描至 ctx.limit：
+    Backtick 遇 NL，或 Dollar 遇 NL 且 block_end：返回 Miss
+    同类 Backtick 且 run 等长，或同类 Dollar 且 can_close：返回该下标
+  返回 Miss
+}
+
+syntax algorithm LinkBody(ctx, embed) {
+  frame = probe LinkFrame(embed; ctx)；失败则返回 Miss
+  若 embed，消耗 BANG；消耗 LBRACKET
+  label = InlineRun(ctx, 外层 stop, Single(RBracket))
+  消耗当前位置的 RBRACKET 与其后 LPAREN
+  消耗目的地 token 至 frame.destination_close，再消耗 RPAREN
+  返回 { label, destination: 目的地原始源码 }
+}
+
+scanner WikiFrame(ctx) -> { end, target_end, pipe } | Miss {
+  要求前缀为 LBRACKET LBRACKET
+  从 cursor + 2 逐 token 扫描至 ctx.limit：
+    NL：返回 Miss
+    首个 Pipe：记下 pipe
+    连续两个 RBracket：返回 { end: p + 2, target_end: pipe 或 p, pipe }
+  返回 Miss
+}
+
+syntax algorithm WikiBody(ctx) {
+  frame = probe WikiFrame(ctx)；失败则返回 Miss
+  消耗两个 LBRACKET，再消耗 target 至 frame.target_end；label = []
+  若有 pipe，消耗 PIPE，再以 InlineRun(ctx, 外层 stop, Pair(RBracket)) 解析 label
+  消耗当前位置的两个 RBRACKET
+  返回 { target: 已消耗的 target token, label }
+}
+```
+
+LinkBody 与 WikiBody 的 stop 继承调用它们的 InlineRun。预探测的位置不作为 label 的新 limit；实际 label 消费仍使用正文分派与 active 停止条件。Escape token 不作为括号界定符。
+
+```desugar
+Link(parsed) ⇒ link(target: destination(parsed))[lower(parsed.label)]
+WikiLink(parsed) ⇒ link(target: wiki_target(parsed))[lower(parsed.label)]
+MD.Link(target, body, _) ⇒ link(target: decode_once(target))[lower(body)]
+```
+
+`destination(parsed)` 为 destination_parts 的 target；普通链接丢弃语法中的 title，显式调用传入的 title 字段保留。`wiki_target` 从两个开括号之后依序取得原始 token，遇首个 PIPE 或 RBRACKET 停止，拼接后去掉首尾空白，不对标点转义再解码。无正文的 WikiLink 降为无 children 的 link。
+
+```desugar
+destination_parts(parsed) {
+  s = trim(parsed.destination)
+  从左到右扫描字符，反斜杠屏蔽下一个字符
+  找到首个前面是空白的单 / 双引号 q，位置为 i
+  若 s 末尾也是 q 且引号之间存在范围：
+    target = trim_end(s[..i])；title = s[i + 1..末尾引号]
+  否则 target = s；title = none
+  若 target 首尾为 "<" 与 ">"，去掉这层包装
+  target 与 title 各从左到右去掉 ASCII 标点前的反斜杠
+  返回 { target, title }
+}
+```
+
+```recover
+recover Link or WikiLink on Miss when kind(rule_start) == LBracket {
+  consume = 原始起点的一个 LBRACKET token
+  cst = LiteralToken(原始 token)
+  diagnostic = none
+}
+```
+
+Markdown 的行内、引用式链接均匹配 MD.Link。
+
+=== embed
+
+```signature
+embed(target: String, description?: String, title?: String) -> InlineContent
+```
+
+target 可使用第一个位置参数。
+
+```grammar
+syntax Embed(ctx) -> &(`!` `[`) parsed:LinkBody(ctx, true);
+```
+
+```desugar
+Embed(parsed) ⇒ embed(target: destination(parsed),
+                      description: description(parsed.label),
+                      title: embed_title(parsed))
+MD.Image(target, body, title) ⇒ embed(target: decode_once(target),
+                                     description: plain_text(lower(body)),
+                                     title: decode_optional(title))
+```
+
+`embed_title` 取 link 小节的 destination_parts.title。`description` 对 label 先 lower，再按文档顺序递归：Literal 追加其字符串值；Call 优先追加字符串 text 字段，缺少时追加字符串 description 字段，再遍历 children。Markdown 的 plain_text 对 lower 后的 Call 使用同样的字段优先顺序与 children 递归，忽略 Literal；空描述为 `""`，可选标题保留。
+
+embed 表示资源引用；降糖不读取资源或按扩展名推断类型，具体呈现由渲染器决定。
+
+```recover
+recover Embed on Miss when kind(rule_start) == Bang {
+  consume = 原始起点的一个 BANG token
+  cst = LiteralToken(原始 token)
+  diagnostic = none
+}
+```
+
+Markdown 行内、引用式图片均匹配 MD.Image。
+
+=== list
+
+```signature
+list(ordered: Bool = false, start: Int = 1)[children: Content] -> Content
+require structural_children(children) 的构造器全为 item
+```
+
+```grammar
+syntax List(ctx) ->
+  let m = { kind(cursor) }
+  let i = { column(cursor) }
+  @{ m in {Minus, Plus} }
+  first:Item(m, i, ctx)
+  (gap:scan ListGap(m, i; ctx) rest:Item(m, i, ctx))*;
+```
+
+```scanner
+scanner ListGap(m, i; ctx) -> { end } | Miss {
+  if kind(cursor) != Newline { return Miss }
+  let p = cursor + 1
+  loop {
+    while kind(p) == Whitespace { p += 1 }
+    if kind(p) != Newline { break }
+    p += 1
+  }
+  if kind(p) == m and kind(p + 1) == Whitespace and column(p) == i {
+    return { end: p }
+  }
+  return Miss
+}
+```
+
+```desugar
+List(m, first, rest*) ⇒ list(ordered: m == Plus, start: 1)[
+                         lower(first) map(lower, rest)
+                       ]
+MD.List(ordered, start, body) ⇒ list(ordered: ordered,
+                                    start: if ordered then start else 1)[lower(body)]
+```
+
+gap 的空白属于 List CST；同缩进切换标记结束该 list。不保存 Markdown tight / loose 标记。structural_children 见 Syntax。Markdown 的 lazy continuation 由其前端识别；`.not` 的内容归属由 item 小节的缩进规则决定。
+
+=== item
+
+```signature
+item()[children: Content] -> Content
+```
+
+```grammar
+syntax Item(m, i, ctx) ->
+  @{ column(cursor) == i }
+  marker:TokenKind(m) WS
+  let c = { column(cursor) }
+  extent:probe ItemExtent(c; ctx)
+  body:within(extent.end,
+    ItemBody(ctx with block_indent=c, body_start=cursor));
+```
+
+```scanner
+scanner ItemExtent(c; ctx) -> { end } {
+  let p = cursor
+  while p < ctx.limit {
+    if kind(p) != Newline { p += 1; continue }
+    let boundary = p
+    let q = p + 1
+    loop {
+      while kind(q) == Whitespace { q += 1 }
+      if kind(q) != Newline { break }
+      q += 1
+    }
+    if q >= ctx.limit or column(q) < c { return { end: boundary } }
+    p = q
+  }
+  return { end: ctx.limit }
+}
+```
+
+```desugar
+Item(_, _, body) ⇒ item()[blocks(body)]
+MD.ListItem(body) ⇒ item()[lower(body)]
+```
+
+marker 与 WS 的消费前缀固定正文起始列；BlankLine 不单独结束 item。ItemBody 使用 Syntax 的 BlockRun(ctx, Item)；缩进与范围使用上述 ItemExtent。空项没有 children。
+
+=== callout
+
+```signature
+callout(kind?: String)[children: Content] -> Content
+```
+
+`.not` 无语法糖。
+
+```desugar
+MD.Blockquote(body) ⇒ callout(kind: "quote")[lower(body)]
+```
+
+MD.Blockquote 由 Markdown 的 `>` 引用块语法产生。
+
+=== divider
+
+```signature
+divider() -> Content
+```
+
+```grammar
+syntax Divider(ctx) ->
+  @{ block_start(cursor, ctx) }
+  MINUS MINUS MINUS &EndAfterWhitespace(ctx);
+
+syntax EndAfterWhitespace(ctx) -> WS? End(ctx);
+```
+
+```desugar
+Divider ⇒ divider()
+MD.ThematicBreak ⇒ divider()
+```
+
+原生 Divider CST 只包含三个 MINUS，尾部空白和 NL 留给外层。MD.ThematicBreak 对应 Markdown 的 `---` / `***` / `___` 等。
+
+=== table
+
+```signature
+table(align?: Array<String>)[children: Content] -> Content
+require structural_children(children) 的构造器全为 row
+        每个 align 值属于 {"none", "left", "center", "right"}
+```
+
+```grammar
+syntax Table(ctx) ->
+  @{ table_start(cursor, ctx) }
+  header:scan TableLine(ctx)
+  NL delimiter:scan TableLine(ctx)
+  (!@{ block_end(cursor, ctx) } NL rows:scan TableLine(ctx))*;
+```
+
+```scanner
+predicate table_start(p, ctx) {
+  要求 block_start(p, ctx)，且 kind(p) not in {EOF, Whitespace, Newline}
+  从 p probe TableLine(ctx) 得到 header；要求其 end 处为 NL
+  从 header.end + 1 probe TableLine(ctx) 得到 delimiter
+  要求 header.has_pipe or delimiter.has_pipe
+  要求 header.cells 与 delimiter.cells 等长
+  要求每个 delimiter cell 的原始源码满足 AlignCell
+  返回 true；任一要求不成立则返回 false
+}
+```
+
+表头和 delimiter 等宽，至少一行 has_pipe；AlignCell 在字符层匹配整个单元格。
+
+```grammar
+lex AlignCell -> [` ` U+0009]* `:`? `-`+ `:`? [` ` U+0009]*;
+```
+
+```desugar
+Table(header, delimiter, rows*) ⇒ table(align: alignments(delimiter))[
+                                   table_row(header, true, width(delimiter))
+                                   map(r => table_row(r, false, width(delimiter)), rows)
+                                 ]
+MD.Table(align, rows) ⇒ table(align: align)[lower(rows)]
+```
+
+`alignments` 逐 delimiter cell 去掉首尾空白；首 / 尾 / 两端冒号分别映射为 left / right / center，其余为 none。
+
+=== row
+
+```signature
+row(header?: Bool)[children: Content] -> Content
+require structural_children(children) 的构造器全为 cell
+```
+
+```grammar
+syntax TableRow(ctx) -> frame:scan TableLine(ctx);
+```
+
+```scanner
+scanner TableLine(ctx) -> { end, cells, has_pipe } | Miss {
+  从 cursor 扫描至 NL 或 ctx.limit，记录每个 Pipe token 的下标
+  任一 token 的 text 包含 NL 或 CR ⇒ Miss
+  若 ctx.in_body 且首 token 为 RBracket ⇒ Miss
+  去掉行首 / 行尾 Whitespace token
+  空行 ⇒ Miss
+  去掉首 / 尾各一个 Pipe token（存在时）
+  在余下 Pipe token 处分割 cell 区间，保留空区间
+  return { end: 行末 NL 或 limit, cells: 区间序列, has_pipe: 是否出现 Pipe }
+}
+```
+
+```desugar
+table_row(frame, header, width) ⇒ row(header: header)[
+  take(width, map(table_cell, frame.cells)) 后补空 cell 至 width
+]
+MD.TableRow(body, header) ⇒ row(header: header)[lower(body)]
+```
+
+语法糖只在 table 内使用，每个物理行是一行；字面 `|` 使用 `\|`，raw / math 内也适用。header true 为表头、false 为表体。显式 row 省略 header 时不补入字段。
+
+=== cell
+
+```signature
+cell()[children: Content] -> Content
+```
+
+```grammar
+syntax TableCell(range, ctx) ->
+  body:within(range.end,
+    InlineRun(ctx with in_body=false, always_true, None));
+```
+
+TableCell 从 TableLine 提供的 range.start 开始匹配；界定符扫描和消费都受 range.end 限制。
+
+```desugar
+table_cell(range) ⇒ cell()[
+  paragraph()[table_inline(range)] if table_inline(range) != [] else []
+]
+MD.TableCell(body) ⇒ cell()[lower(body)]
+```
+
+table_inline 在 range.start 解析 TableCell 并 lower；随后递归遍历单元格内容，只对 raw / math payload 中的 `\|` 去掉反斜杠。空区间产生空 cell。
+
+=== group
+
+```signature
+group()[children: InlineContent] -> InlineContent
+group()[children: Content] -> Content
+```
+
+```grammar
+syntax AnonymousGroup(ctx) -> &(`#` `[`) parsed:CallBody(ctx);
+```
+
+```desugar
+AnonymousGroup(parsed) ⇒ group()[lower(parsed.body)]
+```
+
+CallBody 按 [Types](types.not) 确定内容槽 flavor；没有名称的调用归为 group。Markdown 无专用语法糖。

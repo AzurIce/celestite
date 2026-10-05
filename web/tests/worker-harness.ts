@@ -8,6 +8,12 @@ export async function installWorkerHarness(page: Page, remote = false) {
     self.WebSocket = class extends NativeTestSocket {
       constructor(...args) { if (self.failConnections) args[0] = String(args[0]) + "/unavailable"; super(...args); self.testSockets.push(this); }
       send(data) {
+        const request = JSON.parse(String(data));
+        if (self.rejectNextSave && request.method === "save") {
+          self.rejectNextSave = false;
+          queueMicrotask(() => this.testHandler.call(this, { data: JSON.stringify({ kind: "reply", requestId: request.requestId, error: { code: "Conflict", message: "test disk conflict" } }) }));
+          return;
+        }
         if (self.dropNextUpdate && JSON.parse(String(data)).method === "updates") {
           self.dropNextUpdate = false;
           this.close();
@@ -15,7 +21,7 @@ export async function installWorkerHarness(page: Page, remote = false) {
         }
         super.send(data);
       }
-      set onmessage(handler) { super.onmessage = event => {
+      set onmessage(handler) { this.testHandler = handler; super.onmessage = event => {
         const frame = JSON.parse(String(event.data));
         if (self.dropNextReply && frame.kind === "reply" && frame.result?.operation) {
           self.dropNextReply = false;

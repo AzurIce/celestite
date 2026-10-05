@@ -212,6 +212,10 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 ### 文档变化通知
 
+外部 diff 在后台释放 Vault 文件锁与文档锁后计算，提交时重新核对磁盘与基线。读取和增量导出始终返回当前已提交历史；计算未完成时不等待新磁盘内容，文档元数据中的 `externalChange` 显示 `pending` 或 `failed`（`code`、`message`、`retryAt`）。状态变化也通过 SSE / WebSocket 推送，不要求先有正文版本变化。
+
+待协调时保存返回 `409 FilesystemReconciliationPending`，计算超时返回 `409 FilesystemDiffTimeout`，两者都携带文件路径并保留历史和磁盘内容。相同失败输入从 30 秒退避至最多 5 分钟；新内容绕过退避。`POST /documents/<document>/retry-observation` 或 WebSocket `retry_observation`（参数 `id`）立即重新排队，返回当前文档状态；重试只协调，不写回物理文件，也允许只读 Vault 使用。
+
 `GET /api/v1/vaults/{id}/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全量文档元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已提交 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文。
 
 初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全量状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId`，保留 Vault / 文档历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容；私有历史提交失败不会把未提交正文版本宣布为已确认版本；此时 `/snapshot` 与 `/updates` 暂停导出，避免通知后的一次失败提交被后续拉取当作已确认历史。

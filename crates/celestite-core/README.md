@@ -36,17 +36,31 @@ cargo test -p celestite-core
 cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 ```
 
-默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding` 和底层 `DocumentBinding`。Web Worker 构造 `EditorCore<OpfsBackend>`，浏览器 IO 桥只提供文件和私有存储读写。server 构造同类型的 `EditorCore<NativeBackend>`，使用普通目录与 redb。64 位 writer ID 在 JSON 中保持字符串。
+默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `DocumentBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<OpfsBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录并可配置 redb 历史存储。64 位 writer ID 在 JSON 中保持字符串。
 
 ## Backend 与服务接口
 
 `Backend` 定义身份、时钟、历史加载、幂等提交、目录恢复意图及可选的普通文件 IO。`has_projection()` 决定实例是否映射普通目录；没有映射时，只提交私有历史，不报告普通文件已保存。异步方法不要求 `Send`，OPFS IO 可以留在 Worker 中；native 包装在阻塞任务中执行文件和 redb IO。
 
+| 实现            | 历史存储                            | 普通文件映射  | 使用位置                              |
+| --------------- | ----------------------------------- | ------------- | ------------------------------------- |
+| `OpfsBackend`   | OPFS 私有历史目录                   | OPFS 普通目录 | 本地默认 Web Vault                    |
+| `MemoryBackend` | Rust 内存集合，非持久化             | 无            | 远端 Web 客户端、无头副本与同步调试器 |
+| `NativeBackend` | 可配置 redb；未配置时历史仅驻留内存 | 本机普通目录  | server host                           |
+
+[`MemoryBackend`](src/memory.rs) 是公开的 `Backend` 实现，以 `BTreeMap<String, StoredDocument>` 保存文档头、初始 CRDT 快照与增量 journal。`commit()` 校验序号与重发内容后更新记录，`load()` 返回内存记录，`replace_volatile_documents()` 原子替换整批记录并清空增量。它的 `persistent()` 和 `has_projection()` 均为 `false`，文件与目录 IO 返回 `Unsupported`；编辑与撤销由 `EditorCore` 中的活动文档执行。后端随 core 释放，不跨 Worker 或进程重启保留数据。
+
 core 提供类型化的 `open_file`、`read`、`edit` / `transact`、`undo`、`import`、`save`、`resolve`、`rename`、`remove` 等 Rust 方法，`execute_service(method, params)` 提供 Worker / IPC 可序列化入口。Web 包装只管理请求队列、事件序号、视图投影和定时器；自动保存延迟由 core 返回。
+
+映射普通目录的实例可用 `ExternalChangePolicy::Merge` 协调外部修改。设置 `EditorOptions.defer_filesystem_diff = true` 后，`refresh` 只安排任务；平台通过 `take_file_observation()` 取得隔离历史分支，在锁外运行 `FileObservationTask::compute()`，再调用 `complete_file_observation()`。core 重读磁盘并校验文档身份、路径、基线与观察序号，允许协作历史在计算期间推进。未采用后台执行的独占 core 使用相同算法内联计算。
+
+差异计算使用固定的行级 Myers 定位与变化区域内的 Unicode 字符级 Myers，共享 5 秒预算；超时拒绝整次观察，不接受粗替换退路。`externalChange` 报告 `pending` 或带错误码、消息及 `retryAt` 的 `failed` 状态；已提交历史保持可读，待完成 / 失败期间不自动写回。相同失败输入从 30 秒逐步退避到最多 5 分钟，新磁盘内容立即重新排队；`retry_file_observation` / `retry_observation` 支持显式重试。
 
 编辑回复保留已接受的正文，即使历史提交失败；`persistenceError` 暂停后续修改，`retry_history` 重试提交。`durableVersion` 只确认本机历史；`savedVersion` 确认普通文件写回。保存按“历史 → 保存意图 → 条件写入 → 回执”执行；移动和删除也先记录恢复意图。恢复保留文档身份并重新分配 writer，个人撤销栈不持久化。
 
-远端 Web Worker 使用 `EditorCore<MemoryBackend>`，从 host 完整快照加入历史，编辑、撤销和预览均在客户端 core 执行。`apply_host_state` 接受 host 的路径、已保存正文、磁盘版本与权限回执，要求回执的历史与版本已由客户端接受；只读限制同时作用于 core 和 UI。内存副本不报告本机持久化成功，但由 core 提供远端自动保存延迟。`reset_replica` 仅适用于非持久化、无文件映射的副本，丢弃时替换单个文档历史并清除其个人撤销，保留其他文档。
+远端 Web Worker 使用 `EditorCore<MemoryBackend>`，从 host 完整快照加入历史，编辑、撤销和预览均在客户端 core 执行。`apply_host_state` 接受 host 的路径、已保存正文、磁盘版本与权限回执，要求回执的历史与版本已由客户端接受；只读限制同时作用于 core 和 UI。内存副本不报告本机持久化成功，远端普通文件只通过显式保存写回。`replace_replica_session` / `replica_session` 仅适用于非持久化、无文件映射的副本，整批验证快照、补齐增量、最终路径与删除状态后原子替换活动历史，并清空个人撤销；失败保留旧会话。`join_replica_document` / `replica_join` 在新文档加入时同时验证 host 元数据，删除记录不占用活动路径。只读和已删除副本仍可导入 host 已接受的历史，不能产生本地编辑。
+
+`flush_history` 和 `close` 只处理历史提交；`flush` 仍执行普通文件保存。关闭远端视图或实例只释放会话，不能写回未打开的共享文档。共享保存失败只提供取消或重试保存，不复用独立实例的覆盖 / 丢弃动作。
 
 host 的 `commit_replica` 在导入客户端快照前核对磁盘版本，再通过既有保存逻辑写回；覆盖动作选择客户端正文，丢弃动作以 host 最新文件为准。传输包装只负责认证、请求与回执，不复制编辑或文件冲突策略。
 

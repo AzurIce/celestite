@@ -73,6 +73,7 @@ export interface ConnectionState {
   unconfirmed?: boolean;
 }
 export interface EditorDocuments {
+  retryObservation?(id: string): Promise<boolean>;
   reconnect?(discardUnconfirmed?: boolean): Promise<void>;
   readonly previews?: DocumentPreviews;
   readonly treeBackend: VaultBackend;
@@ -93,12 +94,18 @@ export interface EditorDocuments {
   requestSave(id?: string | null): Promise<boolean>;
   requestCloseDocument(id: string): Promise<boolean>;
   closeDocument(id: string): Promise<boolean>;
-  resolveConflict(action: "overwrite" | "discard" | "cancel"): Promise<boolean>;
+  resolveConflict(
+    action: "overwrite" | "discard" | "retry" | "cancel",
+  ): Promise<boolean>;
+  discardRejectedInput?(id: string): Promise<boolean>;
   has(id: string): boolean;
   hasUnsaved(): boolean;
   close(): Promise<void>;
 }
 export interface ServiceDocument {
+  deleted?: boolean;
+  conflictResolution?: "local" | "shared";
+  externalChange?: ExternalChangeStatus | null;
   change?: { before: string; edits: TextEdit[] };
   id: string;
   path: VaultPath;
@@ -114,6 +121,7 @@ export interface ServiceDocument {
   core?: EditorProjection;
 }
 export interface EditResult {
+  rejection?: RpcError;
   document: ServiceDocument;
   edits: TextEdit[];
   restoredSelection?: SelectionContext;
@@ -134,6 +142,9 @@ export interface RpcError {
     cleanup?: RpcError;
   };
 }
+export type ExternalChangeStatus =
+  | { phase: "pending" }
+  | { phase: "failed"; code: string; message: string; retryAt: number };
 export type WorkerMessage =
   | { kind: "ready"; identity: InstanceIdentity; sessionId: string }
   | { kind: "reply"; requestId: number; result?: unknown; error?: RpcError }
@@ -150,6 +161,7 @@ export interface WorkerRequest {
 
 /** Async host operations: identical envelope over Worker messages or native IPC. */
 export interface ServiceMethods {
+  read: { params: { id: string }; result: ServiceDocument };
   preview_assets: {
     params: { id: string; taskId: string };
     result: PreviewAssets;
@@ -185,8 +197,9 @@ export interface ServiceMethods {
   };
   save: { params: { id: string }; result: ServiceDocument };
   retry_history: { params: { id: string }; result: ServiceDocument };
+  retry_observation: { params: { id: string }; result: ServiceDocument };
   resolve: {
-    params: { id: string; action: "overwrite" | "discard" };
+    params: { id: string; action: "overwrite" | "discard" | "retry" };
     result: ServiceDocument;
   };
   flush: { params: Record<string, never>; result: void };

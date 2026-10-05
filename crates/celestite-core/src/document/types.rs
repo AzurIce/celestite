@@ -162,6 +162,8 @@ pub enum CoreError {
     InvalidPosition { offset: usize },
     #[error("edits must be ordered, disjoint half-open ranges with distinct starts")]
     InvalidEdits,
+    #[error("Filesystem diff exceeded its time budget; no operations accepted")]
+    FilesystemDiffTimeout,
     #[error("writer {peer} already has operations in this history; use a fresh writer")]
     WriterAlreadyUsed { peer: String },
     #[error("incoming operations reuse this live writer's identity")]

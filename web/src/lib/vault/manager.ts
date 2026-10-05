@@ -301,14 +301,27 @@ export class VaultManager {
       const pending = this.inflight.get(id);
       if (pending) await pending.catch(() => {});
       const vault = this.runtimes.get(id);
-      if (vault && !(await vault.documents.saveAll()))
+      if (
+        vault &&
+        !vault.documents.reconnect &&
+        !(await vault.documents.saveAll())
+      )
         throw new VaultError("IO", "存在未能保存的编辑，连接仍保留。");
-      if (this.active?.id === id && !(await this.activate(DEFAULT_VAULT_ID)))
-        throw new VaultError("IO", "无法打开默认本地 Vault，连接仍保留。");
+      const fallback =
+        this.active?.id === id
+          ? await this.open(
+              this.connections.find((c) => c.id === DEFAULT_VAULT_ID)!,
+            )
+          : undefined;
       if (vault) {
         await vault.documents.close();
         vault.tree.dispose();
         vault.editorBuffers.clear();
+      }
+      if (this.active?.id === id && fallback) {
+        this.selection++;
+        this.opening = false;
+        this.active = fallback;
       }
       this.runtimes.delete(id);
       this.connections = this.connections.filter((c) => c.id !== id);

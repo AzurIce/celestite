@@ -151,6 +151,7 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT
             }
             "InvalidEdit" => StatusCode::BAD_REQUEST,
+            "FilesystemDiffTimeout" | "FilesystemReconciliationPending" => StatusCode::CONFLICT,
             "NotDirectory" | "NotFile" => StatusCode::UNPROCESSABLE_ENTITY,
             "Unsupported" => StatusCode::NOT_IMPLEMENTED,
             "QuotaExceeded" => StatusCode::INSUFFICIENT_STORAGE,

@@ -6,10 +6,12 @@
 //! Keep full history: this API never exposes checkout, raw Loro containers or
 //! shallow snapshots. Undo is local to the lifetime of one fixed writer.
 
+pub(crate) mod filesystem;
 #[cfg(test)]
 mod filesystem_tests;
 mod text;
 mod types;
+pub(crate) use filesystem::FilesystemChange;
 pub use text::{difference as text_difference, utf16_to_byte};
 pub use types::*;
 
@@ -402,12 +404,11 @@ impl Document {
     }
 
     /// Produce operations without touching the live writer, undo stack or subscriptions.
-    pub(crate) fn filesystem_change(
+    pub(crate) fn prepare_filesystem_change(
         &self,
         base: &Version,
         expected: &str,
-        new_text: &str,
-    ) -> Result<(SyncPacket, Version), CoreError> {
+    ) -> Result<FilesystemChange, CoreError> {
         let branch = self.historical_branch(base)?;
         if branch.get_text("source").to_string() != expected {
             return Err(CoreError::InvalidVersion);
@@ -420,37 +421,7 @@ impl Document {
                 break;
             }
         }
-        branch
-            .get_text("source")
-            .update(
-                new_text,
-                loro::UpdateOptions {
-                    timeout_ms: Some(100.0),
-                    use_refined_diff: true,
-                },
-            )
-            .map_err(|_| {
-                crdt_error("Filesystem diff exceeded its time budget; no operations accepted")
-            })?;
-        branch.set_next_commit_origin("filesystem");
-        branch.commit();
-        let version = Version {
-            identity: self.identity.clone(),
-            clocks: branch
-                .state_vv()
-                .iter()
-                .filter(|(_, count)| **count > 0)
-                .map(|(peer, count)| (peer.to_string(), *count))
-                .collect(),
-        };
-        let packet = SyncPacket {
-            identity: self.identity.clone(),
-            kind: PacketKind::Updates,
-            data: branch
-                .export(ExportMode::updates(&version_vector(base)?))
-                .map_err(crdt_error)?,
-        };
-        Ok((packet, version))
+        Ok(FilesystemChange::new(branch, base.clone(), expected.into()))
     }
 
     /// A peer may know edits absent locally; Loro sends only locally available

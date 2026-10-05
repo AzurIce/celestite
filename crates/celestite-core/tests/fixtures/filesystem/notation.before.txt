@@ -1,0 +1,162 @@
+= Grammar Notation
+
+这套记法用于表达语法识别、上下文、降糖与错误恢复。Notist 的具体规则见 [Syntax](README.not)、[Types](../types.not) 与 [Builtin](../builtin.not)。
+
+== 规则种类
+
+| 规则 | 输入 | 输出 |
+| --- | --- | --- |
+| `lex` | Unicode 字符序列 | token 与源码范围 |
+| `syntax` | lexer token 序列及解析上下文 | 匹配范围与捕获值 |
+| `scanner` | 同一 token 序列及上下文 | 有界扫描结果 |
+| `desugar` | CST / AST 模式 | Expr 或 Expr 序列 |
+| `shape` | 已解析构造器的 Expr 序列 | 重组后的 Expr 序列 |
+| `recover` | 指定规则的失败状态 | 消耗范围、恢复结构与诊断 |
+
+`signature` 使用 `name(parameters)[children: T] -> R`；`p?: T` 为可省略字段，`p: T = v` 为有默认值的字段。省略可选字段不会自动插入值。内容类型和挂载写法见 [Types](../types.not)。
+
+块标签使用 `grammar`、`scanner`、`signature`、`desugar`、`shape`、`recover`。`grammar` 块中的每条产生式须标明 lex 或 syntax；没有源码语法的构造器直接声明“无语法糖”。
+
+== 产生式
+
+```grammar
+lex Name(parameters) ::= expression
+syntax Name(parameters) ::= expression
+import syntax Name(parameters) from 明确的源码函数或已定义文法
+import scanner Name(parameters) from 明确的扫描算法
+import predicate Name(parameters) from 明确的纯判断
+```
+
+| 表达式 | 含义 |
+| --- | --- |
+| `"s"` | lex 中精确匹配字符序列；syntax 中匹配一个 text 恰为 s 的 token |
+| `TOKEN` | syntax 中匹配指定 kind 的一个 token |
+| `["a" "b"]` | lex 中的字符集合；`["a".."z"]` 为闭区间 |
+| `Rule(args)` | 调用产生式 |
+| `A B` | 顺序匹配；不自动跳过空白或注释 |
+| `A / B` | 有序选择，先尝试 A；只有 A 普通失败才尝试 B |
+| `E?` | 可选，匹配成功则采用，普通失败则为空 |
+| `E*` / `E+` | 贪婪重复，分别至少零次 / 一次 |
+| `E{n}` / `E{m..n}` | 恰好 n 次 / 至少 m 至多 n 次，n 可为 infinity |
+| `&E` / `!E` | 正 / 负前瞻；不消耗输入、不保留捕获或副作用 |
+| `x:E` | 捕获 E 的结果到 x |
+| `@P(args)` | 在当前位置检查纯谓词，不消耗输入 |
+| `let x = value` | 在当前规则内绑定纯计算结果，不消耗输入 |
+| `within(end, E)` | 用更窄的容器边界匹配 E |
+| `probe S(args)` | 调用 scanner、捕获结果，不移动当前位置 |
+| `scan S(args)` | 调用 scanner，并消耗到结果的 end |
+| `^` | 提交点；此后失败为 Broken，交给对应 recover 规则 |
+| `ε` | 成功但不消耗输入 |
+
+后缀重复优先于前缀操作，前缀操作优先于序列，序列优先于有序选择；括号改变结合方式。`|` 只出现在字符串终结符或签名的类型联合中，不作为文法分支运算符。
+
+字符串使用 `\\`、`\"`、`\n`、`\r`、`\t` 转义；字符集合中的每项必须表示单个 Unicode 字符。导入须注明输入层级、参数含义和对应源码范围；同名规则的扩展或包装须显式说明。
+
+syntax 的字符 run 由 lexer token 表示，例如多个 `=` 是一个 EQ token；使用 `marker:EQ` 和 `size(marker)`，不写成重复 n 次 EQ。
+
+== 匹配与选择
+
+匹配结果为：
+
+```notation
+Match(end, captures)
+Miss
+Broken(position, reason, captures)
+```
+
+普通失败恢复本次尝试的游标、捕获与临时上下文。序列中的后续普通失败使整个序列普通失败；有序选择尝试下一分支。一次选择成功后，外层的后续失败不会重新选择该分支。
+
+重复尽量多地匹配 E；遇到 Miss 停止，不为后续表达式主动退还已经匹配的次数。重复项必须消耗输入；零宽重复属于记法错误。Broken 不能作为可选为空、重复结束或下一分支的依据。
+
+`^` 提交当前规则的前缀；后续 Miss 升级为 Broken，并逐层传播到声明对应 recover 的规则。前瞻与 probe 始终为纯操作，不执行提交和恢复动作。
+
+每条引用的规则、scanner、谓词或变换都须有定义，或者明确列为导入。以中文描述匹配对象时，须将其声明为 scanner / 谓词的算法定义，不能伪装成终结符。
+
+== 捕获
+
+token 捕获包含 kind、text、span；规则捕获包含 span 和命名子捕获，scanner 捕获包含其声明的结果字段。
+
+```notation
+source(x) = x 对应的原始源码切片
+size(x)   = source(x) 的 Unicode 字符数
+start(x)  = x 的 token 起点
+end(x)    = x 的 token 终点
+x?        = 有捕获时的值，否则 none
+x*        = 按匹配顺序收集的捕获序列
+```
+
+可选项缺失时产生 none，重复项产生序列。局部 let 和捕获仅在当前规则及其显式参数传递中可见。参数、字段和源码位置是不同的对象，不混用“起始列”和“token 下标”。
+
+== 上下文与边界
+
+ctx 是规则显式传入的上下文，字段由具体语言规范定义；Notist 的字段及初始值见 Syntax。`ctx with field=value` 产生只覆盖所列字段的新上下文。
+
+`within(end, E)` 临时将 ctx.limit 设为 min(ctx.limit, end)，离开 E 后恢复外层上下文。它不隐含“必须消耗完区间”，有此要求时在 E 末尾显式检查 `@limit`。递归调用继承当前有效上下文。
+
+== Scanner
+
+scanner 使用有序步骤，返回具名结果或 Miss。`lex scanner` 扫描字符，`scanner` 扫描 token；输入层级须显式声明。循环必须推进扫描位置，且不越过 ctx.limit；任何读取到 limit 的操作返回边界状态。scanner 不构建 CST、不产生诊断、不改变外部游标；scan 消耗的范围仍携带原始 token，供所属 syntax 规则构造 CST。
+
+token scanner 的 `cursor` 为本次调用的起始 token 下标；`kind(p)` / `token(p)` 读取该下标的 token，`kind` 在 p >= limit 返回 EOF，token 只在有效区间内读取。`tokens[a..b]` 是右开 token 区间。位置加 1 表示下一个 token，不是下一个字符。
+
+```scanner
+scanner Name(args; ctx) -> { end, fields... } / Miss {
+  let ...
+  for p from ... to ctx.limit {
+    if condition { ... }
+  }
+  return ...
+}
+```
+
+`probe Name` 检查扫描结果；`scan Name` 将结果转为匹配范围。扫描到的 end 是消费终点；若返回另一个位置如 close，必须分别命名。
+
+`first`、`depth`、`balanced`、`indent` 等不是无定义的文法魔法。需要它们时写出循环顺序、边界、屏蔽条件和成功条件。普通括号平衡可以直接递归；只有涉及 lexer token、动态长度或上下文时才使用 scanner。
+
+== 降糖与整理
+
+```desugar
+Pattern ⇒ Expr
+Pattern when predicate ⇒ Expr
+```
+
+左侧是已匹配结构及捕获值；右侧是构造器调用或调用序列。`f(args)[children]` 表示 Expr 构造，不重新解析源码。none 字段省略，`map` / `concat` / `if ... then ... else ...` 为纯计算。
+
+```desugar
+Heading(marker, body) ⇒ heading(level: size(marker))[lower(body)]
+```
+
+签名检查属于 Resolve；按标题形成 section 属于 Shape。它们分别使用签名约束和 shape 规则，不计入源码 syntax。Markdown 的 `MD.*` 是导入的 Markdown AST 模式，其对应规则为 desugar，不冒充 Notist 的源码文法。
+
+== 错误恢复
+
+```recover
+recover Rule on Failure(reason) {
+  consume = 明确定义的范围
+  cst = 明确定义的恢复结构
+  diagnostic = 指定阶段、范围与消息，或 none
+}
+recover Rule on Failure(reason) when Predicate {
+  ...
+}
+```
+
+普通标记匹配失败可消耗原始首 token 并返回文字；确定进入的未闭合块可消耗至容器末尾，包为 Error 并给出诊断。选择哪种行为由各规则的 recover 声明决定，不能由“文法匹配失败”推断。
+
+recover 在所属规则最终失败后执行，在外层分支选择之前将失败转为恢复匹配；它不回到该规则内部的已失败分支。when 只在指定前缀已识别时允许恢复；条件不成立则原样传播失败。前瞻与 probe 内禁用 recover，避免把“可以恢复为文字”当作“语法成立”。rule_start 表示规则原始起点，恢复判断使用原始上下文和显式参数。
+
+恢复结构保留原始 token；trivia 归属和节点范围须注明。文法描述匹配及解析决策，CST 的无损性与范围、IR 的归一化分别由对应阶段的规则约束。
+
+== 有序算法
+
+规则需要过程式表达时，使用 `syntax algorithm Name(args) { ... }`。它与 syntax 产生式具有同样的输入、消费与恢复契约，可构造 CST；与纯 scanner 区分。`predicate Name(args) { ... }` 只返回布尔值，不消费输入。二者可放在 scanner 块中。
+
+算法必须注明分派顺序、循环停止条件、消费范围和失败结果。算法中的规则调用继承匹配语义，纯谓词中的探测禁用 recover。字符级扫描使用 `lex scanner` 声明字符输入，不混用 token 下标。
+
+== 例：捕获与提交
+
+```grammar
+syntax Example ::= begin:OPEN ^ (body:ITEM)* end:CLOSE
+```
+
+本例只演示记法，OPEN / ITEM / CLOSE 是示例 token。OPEN 普通失败时仍可尝试其他分支；匹配 OPEN 后遇到缺失 CLOSE 则传播 Broken。ITEM 的捕获为序列。具体语言的 recover 必须另行声明，不能由此例推断。

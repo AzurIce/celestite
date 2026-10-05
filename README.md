@@ -18,12 +18,15 @@
 
 - Web App
   在本仓库 Github Pages 开箱可用
-  - OPFS 存储实现
+  - OPFS 存储实现（`OpfsBackend`）：持久保存本地 Vault 的历史与普通文件
+  - 内存存储实现（`MemoryBackend`）：保存远端 Vault 客户端的会话历史
   - File System Access API 存储实现（WIP）
 - Tauri App（WIP）
   - Tauri API 存储实现
 - Native Headless Server
-  - Native 存储实现
+  - Native 存储实现（`NativeBackend`）：访问本机目录，可配置 redb 历史持久化
+
+远端客户端的 `MemoryBackend` 保存文本快照与增量，不提供普通文件或目录映射；目录与附件通过 HTTP 访问 host，文本历史通过 WebSocket 同步。客户端副本随 Worker 结束而释放。状态归属与请求流程见 [Web 当前状态与请求交互](docs/state/web.md)。
 
 **实时协作**
 
@@ -34,3 +37,9 @@ CRDT 单 Host 多人协作
 - Headless Server（Host）
 
 **And More...**
+
+## 文档
+
+- [目标架构](docs/architecture.md)
+- [实施路线图](docs/roadmap.md)
+- [Web 当前状态与请求交互](docs/state/web.md)
