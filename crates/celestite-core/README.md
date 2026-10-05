@@ -74,7 +74,7 @@ host 的 `commit_replica` 在导入客户端快照前核对磁盘版本，再通
 
 `preview_link(document_id, task_id, target)` 只接受当前就绪结果的链接，返回同文档片段、规范化的 Vault 内路径或允许的外部 URL。相对路径从任务中的文档目录出发，拒绝越出 Vault、无效编码及不允许的 URL scheme。
 
-上述方法也有 `execute_service` 的 `preview_*` JSON 入口，字段与 Web 的 `preview-contract.ts` 对齐。默认 OPFS Vault 已接入独立 Worker 与预览 UI；后续阶段见 [路线图](../../docs/roadmap.md)。
+上述方法也有 `execute_service` 的 `preview_*` JSON 入口，字段与 Web 的 `web/src/lib/editor/preview/contract.ts` 对齐。默认 OPFS Vault 已接入独立 Worker 与预览 UI；后续阶段见 [路线图](../../docs/roadmap.md)。
 
 ```sh
 cargo test -p celestite-core --features preview

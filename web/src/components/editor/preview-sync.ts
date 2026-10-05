@@ -2,7 +2,7 @@ import type { EditorView } from "@codemirror/view";
 import type {
   PreviewResult,
   PreviewSourceMapping,
-} from "@/lib/editor/preview-contract";
+} from "@/lib/editor/preview/contract";
 
 type Side = "source" | "preview";
 interface MappedElement {

@@ -16,7 +16,7 @@ import type {
 import type {
   PreviewResult,
   PreviewState,
-} from "@/lib/editor/preview-contract";
+} from "@/lib/editor/preview/contract";
 import contentStyle from "./preview-content.css?inline";
 import type { PreviewSync } from "./preview-sync";
 import "./preview.css";

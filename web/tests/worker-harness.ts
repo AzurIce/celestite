@@ -47,7 +47,7 @@ export async function installWorkerHarness(page: Page, remote = false) {
         constructor(url: string | URL, options?: WorkerOptions) {
           const address = new URL(String(url), location.href).href;
           const injected =
-            remote && address.includes("remote-worker.ts")
+            remote && address.includes("/remote/worker.ts")
               ? URL.createObjectURL(
                   new Blob(
                     [`import ${JSON.stringify(address)};\n` + bootstrap],
@@ -66,7 +66,7 @@ export async function installWorkerHarness(page: Page, remote = false) {
     { remote, bootstrap },
   );
   if (!remote)
-    await page.route("**/src/lib/editor/worker.ts*", async (route) => {
+    await page.route("**/src/lib/editor/opfs/worker.ts*", async (route) => {
       const response = await route.fetch();
       await route.fulfill({
         response,

@@ -4,7 +4,7 @@ import type {
   PreviewEvent,
   PreviewState,
   PreviewTask,
-} from "./preview-contract";
+} from "./contract";
 
 type Execute = <K extends keyof PreviewCoreMethods>(
   method: K,
@@ -87,7 +87,7 @@ export class PreviewHost {
     }
   }
   private createWorker() {
-    const worker = new Worker(new URL("./preview-worker.ts", import.meta.url), {
+    const worker = new Worker(new URL("./worker.ts", import.meta.url), {
       type: "module",
       name: "celestite-preview",
     });

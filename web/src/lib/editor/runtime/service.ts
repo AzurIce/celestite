@@ -1,8 +1,8 @@
-import { VaultError } from "../vault/errors";
-import { vaultPath } from "../vault/path";
-import { encodeError } from "./rpc";
-import { PreviewHost } from "./preview-host";
-import type { OpfsEditorHost } from "./opfs-host";
+import { VaultError } from "../../vault/errors";
+import { vaultPath } from "../../vault/path";
+import { encodeError } from "../rpc";
+import { PreviewHost } from "../preview/host";
+import type { EditorHost } from "./host";
 import type {
   InstanceIdentity,
   SelectionContext,
@@ -12,9 +12,9 @@ import type {
   WorkerRequest,
   ServiceEvent,
   ServiceDocument,
-} from "./contract";
+} from "../contract";
 export type EditorWorkerHost = Pick<
-  OpfsEditorHost,
+  EditorHost,
   | "composition"
   | "executePreview"
   | "open"

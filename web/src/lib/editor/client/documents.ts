@@ -1,15 +1,15 @@
-import { VaultError } from "../vault/errors";
-import { vaultPath, type VaultPath } from "../vault/path";
+import { VaultError } from "../../vault/errors";
+import { vaultPath, type VaultPath } from "../../vault/path";
 import type {
   Entry,
   EntryStat,
   VaultBackend,
   WriteFileOptions,
-} from "../vault/types";
-import type { DocumentsSnapshot } from "./documents";
-import { EditorClient } from "./rpc";
-import { rebaseInputs } from "./view-changes";
-import type { DocumentPreviews, PreviewState } from "./preview-contract";
+} from "../../vault/types";
+import type { DocumentsSnapshot } from "../documents";
+import { EditorClient } from "../rpc";
+import { rebaseInputs } from "../view-changes";
+import type { DocumentPreviews, PreviewState } from "../preview/contract";
 import type {
   ConnectionState,
   EditorDocument,
@@ -17,7 +17,7 @@ import type {
   SelectionContext,
   ServiceDocument,
   ViewEdit,
-} from "./contract";
+} from "../contract";
 
 interface ViewRecord extends EditorDocument {
   savedContent: string;
@@ -685,7 +685,7 @@ export async function openOpfsEditor(): Promise<{
   documents: WorkerDocuments;
   backend: VaultBackend;
 }> {
-  const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+  const worker = new Worker(new URL("../opfs/worker.ts", import.meta.url), {
     type: "module",
   });
   const client = new EditorClient(worker);
@@ -712,11 +712,11 @@ export async function openRemoteEditor(
   backend: VaultBackend,
 ): Promise<{
   identity: InstanceIdentity;
-  documents: import("./contract").EditorDocuments;
+  documents: import("../contract").EditorDocuments;
   backend: VaultBackend;
   authorize?: (token: string) => Promise<void>;
 }> {
-  const worker = new Worker(new URL("./remote-worker.ts", import.meta.url), {
+  const worker = new Worker(new URL("../remote/worker.ts", import.meta.url), {
     type: "module",
   });
   const client = new EditorClient(worker);
@@ -749,7 +749,9 @@ export async function openRemoteEditor(
       authorize: async (token) => {
         await documents.authorize(token);
         currentToken = token;
-        (backend as import("../vault/http").HttpVaultBackend).authorize(token);
+        (backend as import("../../vault/http").HttpVaultBackend).authorize(
+          token,
+        );
       },
     };
   } catch (error) {

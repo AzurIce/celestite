@@ -7,7 +7,7 @@ import type {
   PreviewLink,
   PreviewState,
   PreviewSubscription,
-} from "./preview-contract";
+} from "./preview/contract";
 
 export interface Vault {
   vaultId: string;

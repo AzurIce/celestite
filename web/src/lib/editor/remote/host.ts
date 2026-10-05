@@ -1,13 +1,13 @@
 import { ChangeSet } from "@codemirror/state";
-import { VaultError } from "../vault/errors";
-import { vaultPath, type VaultPath } from "../vault/path";
-import type { HttpVaultBackend, RemoteVaultDescriptor } from "../vault/http";
+import { VaultError } from "../../vault/errors";
+import { vaultPath, type VaultPath } from "../../vault/path";
+import type { HttpVaultBackend, RemoteVaultDescriptor } from "../../vault/http";
 import {
-  OpfsEditorHost,
+  EditorHost,
   type CoreDocument,
   type CoreEdit,
   type CorePort,
-} from "./opfs-host";
+} from "../runtime/host";
 import type {
   EditResult,
   SelectionContext,
@@ -16,9 +16,9 @@ import type {
   SyncPacket,
   TextEdit,
   Version,
-} from "./contract";
-import { RemoteTransport, type RemoteReceipt } from "./remote-transport";
-import { editsOf, sameVersion } from "./view-changes";
+} from "../contract";
+import { RemoteTransport, type RemoteReceipt } from "./transport";
+import { editsOf, sameVersion } from "../view-changes";
 
 interface Patch {
   before: Version;
@@ -27,7 +27,7 @@ interface Patch {
 }
 /** Private online replica: core owns history/undo; the transport carries
  * committed updates. Host file saves remain explicit. */
-export class RemoteEditorHost extends OpfsEditorHost {
+export class RemoteEditorHost extends EditorHost {
   private hosts = new Map<string, CoreDocument>();
   private unsupported = new Map<string, ServiceDocument>();
   private offline = true;

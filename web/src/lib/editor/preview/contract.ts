@@ -1,4 +1,4 @@
-import type { Version } from "./contract";
+import type { Version } from "../contract";
 
 /** Mirrors Rust preview.rs. UI input projections are never analysis snapshots. */
 export interface PreviewTicket {

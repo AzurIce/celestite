@@ -1,9 +1,9 @@
-import init, { MemoryEditorBinding } from "./generated/celestite_core";
-import { openHttpVault } from "../vault/http";
-import { VaultError } from "../vault/errors";
-import { RemoteEditorHost } from "./remote-host";
-import { serveEditorWorker } from "./worker-service";
-import { encodeError } from "./rpc";
+import init, { MemoryEditorBinding } from "../generated/celestite_core";
+import { openHttpVault } from "../../vault/http";
+import { VaultError } from "../../vault/errors";
+import { RemoteEditorHost } from "./host";
+import { serveEditorWorker } from "../runtime/service";
+import { encodeError } from "../rpc";
 let initialized = false;
 self.addEventListener("message", (event) => {
   if (event.data?.kind !== "initialize" || initialized) return;

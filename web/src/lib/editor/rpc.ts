@@ -1,5 +1,5 @@
 import { VaultError, VaultRenameError } from "../vault/errors";
-import type { PreviewEvent } from "./preview-contract";
+import type { PreviewEvent } from "./preview/contract";
 import type {
   ServiceMethods,
   InstanceIdentity,

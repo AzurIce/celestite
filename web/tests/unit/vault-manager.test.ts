@@ -6,7 +6,7 @@ import type { VaultBackend, VaultPath } from "../../src/lib/vault";
 import type { SettingsFile } from "../../src/lib/settings/app-file";
 import type { HttpVaultBackend } from "../../src/lib/vault/http";
 import { VaultDocuments } from "../../src/lib/editor/documents";
-import type { openRemoteEditor } from "../../src/lib/editor/worker-documents";
+import type { openRemoteEditor } from "../../src/lib/editor/client/documents";
 const fakeRemoteEditor: typeof openRemoteEditor = async (
   _url,
   _token,

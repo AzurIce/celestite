@@ -1,8 +1,8 @@
-import { VaultError } from "../vault/errors";
-import { vaultPath, type VaultPath } from "../vault/path";
-import type { VaultBackend } from "../vault/types";
-import { decodeError } from "./rpc";
-import type { PreviewCoreMethods } from "./preview-contract";
+import { VaultError } from "../../vault/errors";
+import { vaultPath, type VaultPath } from "../../vault/path";
+import type { VaultBackend } from "../../vault/types";
+import { decodeError } from "../rpc";
+import type { PreviewCoreMethods } from "../preview/contract";
 import type {
   ConnectionState,
   EditResult,
@@ -14,7 +14,7 @@ import type {
   TextSnapshot,
   UndoState,
   RpcError,
-} from "./contract";
+} from "../contract";
 
 export interface CorePort {
   execute(method: string, params: string): Promise<string>;
@@ -42,7 +42,7 @@ export interface CoreEdit {
   restoredSelection: SelectionContext | null;
 }
 /** Worker transport, view projections and timers; Rust owns all editor policy. */
-export class OpfsEditorHost {
+export class EditorHost {
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private previews = new Map<string, ServiceDocument>();
   private eventSequence = 0;

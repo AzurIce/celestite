@@ -312,7 +312,18 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 
 ## 默认 OPFS 编辑服务
 
-默认库的 Rust 编辑内核在 Dedicated Worker 中运行。`WorkerDocuments` 保留 UI 视图与待确认输入，`EditorClient` 承载异步请求 / 通知，`OpfsEditorHost` 只适配消息、视图状态与定时任务；Rust `EditorCore<Backend>` 统一执行文档、保存、冲突与目录恢复逻辑，`OpfsBackend` 通过浏览器 IO 桥访问 OPFS。server 的 native 后端使用同一个 core。CodeMirror 输入发送 UTF-16 增量，撤销 / 重做使用 Rust 内核。
+默认库的 Rust 编辑内核在 Dedicated Worker 中运行。`WorkerDocuments` 保留 UI 视图与待确认输入，`EditorClient` 承载异步请求 / 通知，`EditorHost` 只适配消息、视图状态与定时任务；Rust `EditorCore<Backend>` 统一执行文档、保存、冲突与目录恢复逻辑，`OpfsBackend` 通过浏览器 IO 桥访问 OPFS。server 的 native 后端使用同一个 core。CodeMirror 输入发送 UTF-16 增量，撤销 / 重做使用 Rust 内核。
+
+`src/lib/editor/` 按职责组织，共用的契约、RPC、文档状态和文本工具位于顶层：
+
+| 目录         | 职责                                                  |
+| ------------ | ----------------------------------------------------- |
+| `client/`    | UI 文档视图、待确认输入与本地 / 远端 Worker 连接      |
+| `runtime/`   | 本地与远端共用的 core host、Worker 命令队列与服务入口 |
+| `opfs/`      | OPFS 历史存储、浏览器 IO 桥与本地编辑 Worker          |
+| `remote/`    | 远端编辑 host、WebSocket 同步传输与远端编辑 Worker    |
+| `preview/`   | 预览契约、任务调度与独立分析 Worker                   |
+| `generated/` | 构建生成的 WASM 绑定                                  |
 
 普通文件位于 `vaults/default`，稳定身份和 CRDT 历史位于 `editor-instances/default`。每次接受编辑先提交私有增量日志，普通文件另行自动保存；文件写回失败后，已提交历史仍可在刷新时恢复。历史提交失败会暂停编辑，重试保存先提交历史。个人撤销栈只保留在本次 Worker 生命周期。
 

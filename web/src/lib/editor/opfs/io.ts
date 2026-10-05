@@ -1,8 +1,8 @@
-import { VaultError } from "../vault/errors";
-import { vaultPath } from "../vault/path";
-import type { VaultBackend } from "../vault/types";
-import { OpfsInstanceStore } from "./opfs-store";
-import { encodeError } from "./rpc";
+import { VaultError } from "../../vault/errors";
+import { vaultPath } from "../../vault/path";
+import type { VaultBackend } from "../../vault/types";
+import { OpfsInstanceStore } from "./store";
+import { encodeError } from "../rpc";
 
 /** Browser primitives for the Rust Backend. No editing or recovery policy here. */
 export function createOpfsIo(store: OpfsInstanceStore, backend: VaultBackend) {

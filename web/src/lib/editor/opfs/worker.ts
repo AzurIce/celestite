@@ -1,11 +1,11 @@
-import init, { EditorBinding } from "./generated/celestite_core";
-import { openOpfsVault } from "../vault/opfs";
-import { VaultError } from "../vault/errors";
-import { OpfsInstanceStore } from "./opfs-store";
-import { createOpfsIo } from "./opfs-io";
-import { OpfsEditorHost } from "./opfs-host";
-import { encodeError } from "./rpc";
-import { serveEditorWorker } from "./worker-service";
+import init, { EditorBinding } from "../generated/celestite_core";
+import { openOpfsVault } from "../../vault/opfs";
+import { VaultError } from "../../vault/errors";
+import { OpfsInstanceStore } from "./store";
+import { createOpfsIo } from "./io";
+import { EditorHost } from "../runtime/host";
+import { encodeError } from "../rpc";
+import { serveEditorWorker } from "../runtime/service";
 async function start() {
   await navigator.locks.request(
     "celestite.editor.instance:default",
@@ -26,7 +26,7 @@ async function start() {
         );
         return {
           identity: store.identity,
-          host: new OpfsEditorHost(binding, backend, emit, schedule),
+          host: new EditorHost(binding, backend, emit, schedule),
           dispose: () => binding.free(),
         };
       });

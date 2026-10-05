@@ -80,7 +80,7 @@ test("split click mapping preserves split mode and rejects stale or dragged cont
       private preview: boolean;
       constructor(url: string | URL, options?: WorkerOptions) {
         super(url, options);
-        this.preview = String(url).includes("preview-worker");
+        this.preview = String(url).includes("/preview/worker.ts");
       }
       postMessage(message: unknown) {
         if (this.preview && runtime.holdPreview)
@@ -588,7 +588,7 @@ test("preview executor failure leaves editing usable and retry creates a new Wor
     runtime.previewNativeWorker = Worker;
     runtime.Worker = class extends Worker {
       constructor(url: string | URL, options?: WorkerOptions) {
-        if (String(url).includes("preview-worker"))
+        if (String(url).includes("/preview/worker.ts"))
           throw new Error("Injected preview executor failure");
         super(url, options);
       }
@@ -636,7 +636,7 @@ test("a slow preview does not block saving and cannot publish an old snapshot", 
       private hold = true;
       constructor(url: string | URL, options?: WorkerOptions) {
         super(url, options);
-        this.preview = String(url).includes("preview-worker");
+        this.preview = String(url).includes("/preview/worker.ts");
         if (this.preview)
           runtime.releasePreview = () => {
             this.hold = false;

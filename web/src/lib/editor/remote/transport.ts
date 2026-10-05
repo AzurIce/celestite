@@ -1,8 +1,8 @@
-import { VaultError } from "../vault/errors";
-import { decodeError } from "./rpc";
-import type { RpcError } from "./contract";
-import type { CoreDocument } from "./opfs-host";
-import type { SyncPacket } from "./contract";
+import { VaultError } from "../../vault/errors";
+import { decodeError } from "../rpc";
+import type { RpcError } from "../contract";
+import type { CoreDocument } from "../runtime/host";
+import type { SyncPacket } from "../contract";
 
 export interface RemoteReceipt {
   kind: "document";

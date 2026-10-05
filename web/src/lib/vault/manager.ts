@@ -3,7 +3,7 @@ import { FileTreeModel } from "../file-tree/model";
 import type { EditorBuffer } from "../editor/buffer";
 import { openAppDocument, type SettingsFile } from "../settings/app-file";
 import { openHttpVault, normalizeVaultUrl } from "./http";
-import { openOpfsEditor, openRemoteEditor } from "../editor/worker-documents";
+import { openOpfsEditor, openRemoteEditor } from "../editor/client/documents";
 import type { EditorDocuments, InstanceIdentity } from "../editor/contract";
 import { VaultError } from "./errors";
 import type { VaultBackend } from "./types";

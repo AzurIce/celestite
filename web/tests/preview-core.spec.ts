@@ -3,7 +3,7 @@ import type {
   PreviewCompletion,
   PreviewCoreMethods,
   PreviewTask,
-} from "../src/lib/editor/preview-contract";
+} from "../src/lib/editor/preview/contract";
 type CoreModule = typeof import("../src/lib/editor/generated/celestite_core");
 
 test("WASM preview tasks execute in an independent Worker and reject stale results", async ({

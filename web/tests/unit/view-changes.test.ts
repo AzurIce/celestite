@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rebaseInputs } from "../../src/lib/editor/view-changes";
-import { applyEdits } from "../../src/lib/editor/worker-documents";
+import { applyEdits } from "../../src/lib/editor/client/documents";
 import type { ViewEdit } from "../../src/lib/editor/contract";
 const selection = (head: number) => ({
   ranges: [{ anchor: head, head }],

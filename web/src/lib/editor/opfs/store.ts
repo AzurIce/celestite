@@ -1,6 +1,6 @@
-import { VaultError, opfsError } from "../vault/errors";
-import { vaultPath } from "../vault/path";
-import type { InstanceIdentity } from "./contract";
+import { VaultError, opfsError } from "../../vault/errors";
+import { vaultPath } from "../../vault/path";
+import type { InstanceIdentity } from "../contract";
 
 /** Private state is outside /vaults/<id>; file tree never sees CRDT internals. */
 export class OpfsInstanceStore {

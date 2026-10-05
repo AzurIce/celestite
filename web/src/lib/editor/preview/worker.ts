@@ -1,5 +1,5 @@
-import init, { render_preview } from "./generated/celestite_core";
-import type { PreviewCompletion, PreviewTask } from "./preview-contract";
+import init, { render_preview } from "../generated/celestite_core";
+import type { PreviewCompletion, PreviewTask } from "./contract";
 
 const ready = init();
 // Attach a handler before initialization completes, so early tasks are retained.
