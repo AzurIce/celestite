@@ -10,12 +10,25 @@ import { createServer } from "node:net";
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
 import { packageFixture } from "./package-fixture";
 
-type Api = { url: string; root: string; token: string };
+type Api = { url: string; root: string; urls: Record<string, string> };
 const binary =
   process.env.CELESTITE_SERVER_BIN ??
   fileURLToPath(
     new URL("../../target/debug/celestite-server", import.meta.url),
   );
+function startupLinks(log: string) {
+  const line = log
+    .split("\n")
+    .find(
+      (line) =>
+        line.includes("Vault share links") && line.includes("readonly_url="),
+    );
+  const readonly = line?.match(/readonly_url=(\S+)/)?.[1];
+  const edit = line?.match(/edit_url=(\S+)/)?.[1];
+  expect(readonly, "readonly link is printed at startup").toBeTruthy();
+  expect(edit, "edit link is printed at startup").toBeTruthy();
+  return { readonly: readonly!, edit: edit! };
+}
 const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
   runtimeErrors: [
     async ({ page }, use) => {
@@ -33,12 +46,6 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
           "Build the server first: cargo build -p celestite-server",
         );
       const root = await mkdtemp(join(tmpdir(), "celestite-e2e-"));
-      const socket = createServer();
-      await new Promise<void>((resolve) =>
-        socket.listen(0, "127.0.0.1", resolve),
-      );
-      const port = (socket.address() as { port: number }).port;
-      await new Promise<void>((resolve) => socket.close(() => resolve()));
       for (const id of ["notes", "work", "readonly"]) {
         await mkdir(join(root, id));
         await writeFile(join(root, id, "a.md"), `# ${id} original\n`);
@@ -48,57 +55,60 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
         join(root, "notes", ".celestite", "settings.json"),
         '{"theme.mode":"dark"}',
       );
-      const config = join(root, "config.toml");
-      await writeFile(
-        config,
-        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\ntoken_env = "CELESTITE_E2E_TOKEN"\n\n` +
-          ["notes", "work", "readonly"]
-            .map(
-              (id) =>
-                `[[vaults]]\nid = "${id}"\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\nephemeral = true\n`,
-            )
-            .join("\n"),
-      );
-      const token = "browser-test-token";
-      let child: ChildProcess | undefined;
+      const children: ChildProcess[] = [];
       try {
-        child = spawn(binary, ["--config", config], {
-          env: { ...process.env, CELESTITE_E2E_TOKEN: token },
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let errors = "";
-        child.stderr?.on("data", (bytes) => (errors += String(bytes)));
-        const url = `http://127.0.0.1:${port}/api/v1/vaults/notes`;
-        for (let retry = 0; retry < 100; retry++) {
-          if (child.exitCode !== null)
-            throw new Error(`server exited: ${errors}`);
-          try {
-            const response = await fetch(url, {
-              headers: { Authorization: `Bearer ${token}` },
-            });
-            if (response.ok) break;
-          } catch {}
-          if (retry === 99) throw new Error("server startup timed out");
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-        await use({ url, root, token });
-      } finally {
-        child?.kill("SIGTERM");
-        if (child && child.exitCode === null)
-          await new Promise<void>((resolve) =>
-            child!.once("exit", () => resolve()),
+        const urls: Record<string, string> = {};
+        for (const id of ["notes", "work", "readonly"]) {
+          const config = join(root, `${id}.toml`);
+          await writeFile(
+            config,
+            `[server]\nlisten = "127.0.0.1:0"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\n\n[vault]\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\nephemeral = true\n`,
           );
+          const child = spawn(binary, ["--config", config], {
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          children.push(child);
+          let log = "";
+          child.stderr?.on("data", (bytes) => (log += String(bytes)));
+          await expect
+            .poll(
+              () => {
+                if (child.exitCode !== null || child.signalCode !== null)
+                  throw new Error(`server exited: ${log}`);
+                return log.includes("Celestite server listening");
+              },
+              { timeout: 10000 },
+            )
+            .toBe(true);
+          const links = startupLinks(log);
+          urls[id] = id === "readonly" ? links.readonly : links.edit;
+          if (id === "notes") urls.reader = links.readonly;
+        }
+        await use({ url: urls.notes, root, urls });
+      } finally {
+        await Promise.all(
+          children.map(async (child) => {
+            if (child.exitCode !== null || child.signalCode !== null) return;
+            await new Promise<void>((resolve) => {
+              const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
+              child.once("exit", () => {
+                clearTimeout(timeout);
+                resolve();
+              });
+              child.kill("SIGTERM");
+            });
+          }),
+        );
         await rm(root, { recursive: true, force: true });
       }
     },
     { scope: "worker" },
   ],
 });
-async function connect(page: Page, url: string, token: string) {
+async function connect(page: Page, url: string) {
   await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "管理 Vault", exact: true });
   await dialog.getByLabel("连接远端 Vault", { exact: true }).fill(url);
-  await dialog.getByLabel("访问令牌（可选）", { exact: true }).fill(token);
   await dialog.getByRole("button", { name: "连接", exact: true }).click();
   await expect(dialog).not.toBeVisible();
 }
@@ -139,7 +149,7 @@ test("external diff failures stay online, pause saving and can be retried", asyn
     );
   await writeFile(disk, original);
   await page.goto("/");
-  await connect(page, api.url.replace(/notes$/, "work"), api.token);
+  await connect(page, api.urls.work);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await expect.poll(async () => (await content()).length).toBe(original.length);
   // A long line with no shared scalars exhausts the fixed compute budget.
@@ -187,7 +197,7 @@ for (const intent of ["save", "close"] as const) {
     const disk = join(api.root, "work", name);
     await writeFile(disk, "original");
     await page.goto("/");
-    await connect(page, api.url.replace(/notes$/, "work"), api.token);
+    await connect(page, api.urls.work);
     await page.getByRole("treeitem", { name, exact: true }).click();
     await expect(editor(page)).toHaveText("original");
     await editor(page).focus();
@@ -223,10 +233,7 @@ async function hostDocuments(
   api: Api,
   vault = "notes",
 ): Promise<{ id: string; path: string; snapshot: { text: string } }[]> {
-  const response = await fetch(
-    api.url.replace(/notes$/, vault) + "/documents",
-    { headers: { Authorization: `Bearer ${api.token}` } },
-  );
+  const response = await fetch(api.urls[vault] + "/api/v1/documents");
   return response.json();
 }
 test("collaborative input commits history immediately while disk save stays explicit", async ({
@@ -237,7 +244,7 @@ test("collaborative input commits history immediately while disk save stays expl
   const disk = join(api.root, "notes", name);
   await writeFile(disk, "original");
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await editor(page).fill("live history");
   await expect
@@ -278,7 +285,7 @@ test("remote editing persists to disk; switching preserves independent undo and 
   await page
     .getByRole("treeitem", { name: "local-folder", exact: true })
     .click();
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor(page)).toContainText("notes original");
@@ -339,7 +346,7 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
     '@(id: "dest")\n= 远端 Notist\n\n😀中文 #unknown[ok]',
   );
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await page.getByRole("button", { name: "分栏", exact: true }).click();
   const preview = page.getByRole("region", { name: "文档预览" });
@@ -350,7 +357,7 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   });
   await page
     .context()
-    .route(api.url + "/documents/*/client-commit", async (route) => {
+    .route(api.url + "/api/v1/documents/*/client-commit", async (route) => {
       await blocked;
       await route.continue();
     });
@@ -436,7 +443,7 @@ test("remote packages load JS and WASM and invalidate on declaration changes wit
     await writeFile(target, data);
   }
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page
     .getByRole("treeitem", { name: "packaged", exact: true })
     .getByRole("button", { name: "展开" })
@@ -504,7 +511,7 @@ test("recursive external packages remain outside the Vault and update the previe
   );
   await writeFile(join(bridge, "lib.notc"), "fn unused() -> Content;");
   await page.goto("/");
-  await connect(page, api.url.replace(/notes$/, "work"), api.token);
+  await connect(page, api.urls.work);
   await page
     .getByRole("treeitem", { name: "external.not", exact: true })
     .click();
@@ -570,13 +577,13 @@ test("recursive external packages remain outside the Vault and update the previe
   ).toContainText("[package");
 });
 
-test("connection records survive reload without storing tokens; removing a connection keeps server files", async ({
+test("connection records restore share credentials on reload; removing a connection keeps server files", async ({
   page,
   api,
 }) => {
   await page.goto("/");
-  await connect(page, api.url, api.token);
-  await connect(page, api.url + "/", api.token);
+  await connect(page, api.url);
+  await connect(page, api.url + "/");
   await expect(
     page.getByRole("combobox", { name: "当前 Vault" }).locator("option"),
   ).toHaveCount(2);
@@ -586,7 +593,9 @@ test("connection records survive reload without storing tokens; removing a conne
     const file = await directory.getFileHandle("connections.json");
     return (await file.getFile()).text();
   });
-  expect(stored).not.toContain(api.token);
+  expect(stored).toContain(api.url);
+  expect(JSON.parse(stored).version).toBe(2);
+  expect(JSON.parse(stored).connections[0].id).not.toContain(api.url);
   await page.reload();
   await expect(page.getByRole("combobox", { name: "当前 Vault" })).toHaveValue(
     "opfs:default",
@@ -598,9 +607,8 @@ test("connection records survive reload without storing tokens; removing a conne
     .getByRole("combobox", { name: "当前 Vault" })
     .selectOption({ label: "notes" });
   await expect(
-    page.getByRole("alert").filter({ hasText: "连接失败" }),
+    page.getByRole("treeitem", { name: "a.md", exact: true }),
   ).toBeVisible();
-  await connect(page, api.url, api.token);
   await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "管理 Vault" });
   await expect(
@@ -622,12 +630,12 @@ test("remote backend implements binary IO, directories, move conflicts, conditio
 }) => {
   await page.goto("/");
   const result = await page.evaluate(
-    async ({ url, token }) => {
+    async ({ url }) => {
       const moduleUrl = "/src/lib/vault/index.ts";
       const { openHttpVault, vaultPath } = (await import(
         moduleUrl
       )) as typeof import("../src/lib/vault");
-      const { backend } = await openHttpVault(url, token);
+      const { backend } = await openHttpVault(url);
       const p = vaultPath;
       const code = async (task: () => Promise<unknown>) => {
         try {
@@ -656,7 +664,7 @@ test("remote backend implements binary IO, directories, move conflicts, conditio
       await backend.writeFile(p("contract/moved/binary"), new Uint8Array([2]), {
         mode: "replace",
       });
-      const other = await openHttpVault(url, token);
+      const other = await openHttpVault(url);
       await other.backend.readFile(p("contract/moved/binary"));
       await other.backend.writeFile(
         p("contract/moved/binary"),
@@ -686,7 +694,7 @@ test("remote backend implements binary IO, directories, move conflicts, conditio
         closed,
       };
     },
-    { url: api.url, token: api.token },
+    { url: api.url },
   );
   expect(result).toEqual({
     bytes: [0, 255, 128],
@@ -705,12 +713,12 @@ test("watch refreshes the tree after an external disk change, and read-only Vaul
   api,
 }) => {
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await writeFile(join(api.root, "notes", "external.md"), "external");
   await expect(
     page.getByRole("treeitem", { name: "external.md", exact: true }),
   ).toBeVisible();
-  await connect(page, api.url.replace("/notes", "/readonly"), api.token);
+  await connect(page, api.urls.readonly);
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
   await expect(
@@ -723,6 +731,158 @@ test("watch refreshes the tree after an external disk change, and read-only Vaul
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
 });
 
+test("startup readonly and edit links to one Vault synchronize with separate permissions", async ({
+  page,
+  api,
+}) => {
+  const name = "share-collaboration.md";
+  await writeFile(join(api.root, "notes", name), "# Initial");
+  const reader = await page.context().newPage();
+  const readerUrl = api.urls.reader;
+  try {
+    await page.goto("/");
+    await connect(page, api.url);
+    await page.getByRole("treeitem", { name, exact: true }).click();
+    await reader.goto("/");
+    await connect(reader, readerUrl);
+    await reader.getByRole("treeitem", { name, exact: true }).click();
+    await expect(editor(reader)).toHaveAttribute("contenteditable", "false");
+    await reader.getByRole("button", { name: "分栏", exact: true }).click();
+    await expect(
+      reader.getByRole("region", { name: "文档预览" }).locator("h1"),
+    ).toHaveText("Initial");
+    await editor(page).fill("# Shared update");
+    await expect(editor(reader)).toHaveText("# Shared update");
+    await expect(
+      reader.getByRole("region", { name: "文档预览" }).locator("h1"),
+    ).toHaveText("Shared update");
+    await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+    expect(
+      (await fetch(readerUrl.replace("/ro-", "/") + "/api/v1")).status,
+    ).toBe(404);
+    const denied = await fetch(
+      readerUrl + "/api/v1/file?path=" + name + "&mode=replace",
+      { method: "PUT", body: "forged write" },
+    );
+    expect(denied.status).toBe(403);
+    await page.keyboard.press("Control+s");
+    await expect
+      .poll(() => readFile(join(api.root, "notes", name), "utf8"))
+      .toBe("# Shared update");
+    await expect(editor(reader)).toHaveText("# Shared update");
+  } finally {
+    await reader.close();
+  }
+});
+
+test("changing share_key and restarting replaces both startup links without changing Vault history", async ({
+  page,
+  baseURL,
+}) => {
+  const root = await mkdtemp(join(tmpdir(), "celestite-rotation-"));
+  const reservation = createServer();
+  await new Promise<void>((resolve) =>
+    reservation.listen(0, "127.0.0.1", resolve),
+  );
+  const port = (reservation.address() as { port: number }).port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  const config = join(root, "config.toml");
+  const configuration = (key: string) =>
+    `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nstate_dir = "state"\nshare_key = "${key}"\n`;
+  let child: ChildProcess | undefined;
+  const stop = async () => {
+    if (!child || child.exitCode !== null) return;
+    const process = child;
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => process.kill("SIGKILL"), 5000);
+      process.once("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      process.kill("SIGTERM");
+    });
+    child = undefined;
+  };
+  const start = async () => {
+    let log = "";
+    child = spawn(binary, ["--config", config], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr?.on("data", (bytes) => (log += String(bytes)));
+    await expect
+      .poll(() => {
+        if (child!.exitCode !== null) throw new Error(`server exited: ${log}`);
+        return log.includes("readonly_url=");
+      })
+      .toBe(true);
+    return startupLinks(log);
+  };
+  try {
+    await mkdir(join(root, "notes"));
+    await mkdir(join(root, "state"));
+    await writeFile(join(root, "notes", "a.md"), "# Original");
+    await writeFile(
+      config,
+      configuration("random configuration secret value old 1234567890"),
+    );
+    const initialized = spawnSync(
+      binary,
+      ["--config", config, "--init-vault"],
+      { encoding: "utf8", timeout: 10000 },
+    );
+    expect(initialized.status, initialized.stderr).toBe(0);
+    const before = await start();
+    const identity = (await (await fetch(before.edit + "/api/v1")).json())
+      .vaultIdentity;
+    await page.goto("/");
+    await connect(page, before.edit);
+    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+    await editor(page).fill("# Preserved shared draft");
+    await expect
+      .poll(async () => {
+        const documents = await (
+          await fetch(before.edit + "/api/v1/documents")
+        ).json();
+        return documents.find((document: any) => document.path === "a.md")
+          .snapshot.text;
+      })
+      .toBe("# Preserved shared draft");
+    await stop();
+    await expect(
+      page.getByRole("region", { name: "远端连接状态" }),
+    ).toBeVisible();
+    await writeFile(
+      config,
+      configuration("random configuration secret value new 1234567890"),
+    );
+    const after = await start();
+    expect(after.readonly).not.toBe(before.readonly);
+    expect(after.edit).not.toBe(before.edit);
+    for (const old of [before.readonly, before.edit])
+      expect((await fetch(old + "/api/v1")).status).toBe(404);
+    expect(
+      (await (await fetch(after.edit + "/api/v1")).json()).vaultIdentity,
+    ).toEqual(identity);
+    await page
+      .getByRole("button", { name: "尝试重新连接", exact: true })
+      .click();
+    await expect(
+      page.getByRole("region", { name: "远端连接状态" }),
+    ).toContainText("Link not found");
+    await expect(editor(page)).toHaveText("# Preserved shared draft");
+    await connect(page, after.edit);
+    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+    await expect(editor(page)).toHaveText("# Preserved shared draft");
+    await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+    expect(await readFile(join(root, "notes", "a.md"), "utf8")).toBe(
+      "# Original",
+    );
+  } finally {
+    await stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("remote save failure retains the preview and draft, pauses editing and can be reauthenticated", async ({
   page,
   api,
@@ -731,7 +891,7 @@ test("remote save failure retains the preview and draft, pauses editing and can 
   await writeFile(join(api.root, "notes", name), "# Original\n\nbody");
   await installWorkerHarness(page, true);
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await page.getByRole("button", { name: "分栏", exact: true }).click();
   const preview = page.getByRole("region", { name: "文档预览" });
@@ -815,7 +975,7 @@ test("reauthentication rejects a changed host history and retains the client dra
   const name = "history-check.md";
   await writeFile(join(api.root, "notes", name), "# Original");
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await expect(editor(page)).toHaveText("# Original");
   await editor(page).focus();
@@ -827,7 +987,7 @@ test("reauthentication rejects a changed host history and retains the client dra
         (await hostDocuments(api)).find((d) => d.path === name)?.snapshot.text,
     )
     .toBe("# Keep this draft");
-  await page.context().route(api.url, async (route) => {
+  await page.context().route(api.url + "/api/v1", async (route) => {
     const response = await route.fetch();
     const descriptor = await response.json();
     descriptor.vaultIdentity.historyId = "another-host-history";
@@ -836,7 +996,6 @@ test("reauthentication rejects a changed host history and retains the client dra
   await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "管理 Vault", exact: true });
   await dialog.getByLabel("连接远端 Vault", { exact: true }).fill(api.url);
-  await dialog.getByLabel("访问令牌（可选）", { exact: true }).fill(api.token);
   await dialog.getByRole("button", { name: "连接", exact: true }).click();
   await expect(dialog).toContainText("远端 Vault 历史已改变");
   await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
@@ -845,9 +1004,9 @@ test("reauthentication rejects a changed host history and retains the client dra
   expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
     "# Original",
   );
-  await page.context().unroute(api.url);
+  await page.context().unroute(api.url + "/api/v1");
 
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await expect(editor(page)).toHaveAttribute("contenteditable", "true");
   await editor(page).focus();
   await page.keyboard.press("Control+s");
@@ -865,7 +1024,7 @@ test("unconfirmed input blocks removing the connection and remains copyable", as
 }) => {
   await installWorkerHarness(page, true);
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await workerEvaluate(
     page,
@@ -899,7 +1058,7 @@ test("reconnect accepts reused paths and opening a recreated path uses its new h
   await writeFile(join(api.root, "notes", b), "B");
   await installWorkerHarness(page, true);
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name: a, exact: true }).click();
   await expect(editor(page)).toHaveText("A");
   await workerEvaluate(
@@ -915,7 +1074,7 @@ test("reconnect accepts reused paths and opening a recreated path uses its new h
     async ({ api, a, b, c }) => {
       const moduleUrl = "/src/lib/vault/index.ts";
       const { openHttpVault, vaultPath } = await import(moduleUrl);
-      const { backend } = await openHttpVault(api.url, api.token);
+      const { backend } = await openHttpVault(api.url);
       await backend.rename(vaultPath(a), vaultPath(c));
       await backend.rename(vaultPath(b), vaultPath(a));
       await backend.close();
@@ -934,7 +1093,7 @@ test("reconnect accepts reused paths and opening a recreated path uses its new h
     async ({ api, a }) => {
       const moduleUrl = "/src/lib/vault/index.ts";
       const { openHttpVault, vaultPath } = await import(moduleUrl);
-      const { backend } = await openHttpVault(api.url, api.token);
+      const { backend } = await openHttpVault(api.url);
       await backend.remove(vaultPath(a));
       await backend.writeFile(vaultPath(a), new TextEncoder().encode("new A"), {
         mode: "create",
@@ -952,7 +1111,7 @@ test("reconnect accepts reused paths and opening a recreated path uses its new h
   await expect(editor(page)).toHaveText("new A");
   await expect(editor(page)).toHaveAttribute("contenteditable", "true");
   await page.reload();
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name: a, exact: true }).click();
   await expect(editor(page)).toHaveText("new A");
 });
@@ -965,7 +1124,7 @@ test("rejected input stays exportable and can be withdrawn without reconnecting"
   const disk = join(api.root, "notes", name);
   await writeFile(disk, "base");
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await expect(editor(page)).toHaveText("base");
   await editor(page).evaluate((element) => {
@@ -1009,7 +1168,7 @@ test("shared save conflicts offer retry without discarding shared history", asyn
   await writeFile(disk, "base");
   await installWorkerHarness(page, true);
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await editor(page).fill("shared draft");
   await expect
@@ -1058,14 +1217,14 @@ test("removing a confirmed shared connection preserves unsaved host files includ
   for (const name of names)
     await writeFile(join(api.root, "notes", name), "disk");
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name: names[0], exact: true }).click();
   await editor(page).fill("open shared draft");
   const otherContext = await browser.newContext();
   try {
     const other = await otherContext.newPage();
     await other.goto("/");
-    await connect(other, api.url, api.token);
+    await connect(other, api.url);
     await other.getByRole("treeitem", { name: names[1], exact: true }).click();
     await editor(other).fill("unopened shared draft");
     await expect
@@ -1093,7 +1252,7 @@ test("removing a confirmed shared connection preserves unsaved host files includ
         "disk",
       );
     await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
-    await connect(page, api.url, api.token);
+    await connect(page, api.url);
     await page.getByRole("treeitem", { name: names[0], exact: true }).click();
     await expect(editor(page)).toHaveText("open shared draft");
   } finally {
@@ -1104,7 +1263,7 @@ test("removing a confirmed shared connection preserves unsaved host files includ
 test("mobile connection controls fit the viewport", async ({ page, api }) => {
   await page.setViewportSize({ width: 360, height: 640 });
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor(page)).toBeVisible();
   await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
@@ -1124,7 +1283,7 @@ test("remote file-tree creation, folder rename and deletion coordinate editor bu
   api,
 }) => {
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("button", { name: "新建文件夹", exact: true }).click();
   await page.getByRole("textbox", { name: "名称", exact: true }).fill("drafts");
   await page.getByRole("button", { name: "确认", exact: true }).click();
@@ -1187,15 +1346,9 @@ test("remote file-tree creation, folder rename and deletion coordinate editor bu
   ).toHaveCount(0);
 });
 
-async function openSyncDebug(
-  page: Page,
-  api: Api,
-  path: string,
-  token = api.token,
-) {
+async function openSyncDebug(page: Page, api: Api, path: string) {
   await page.goto("/debug/sync");
   await page.getByLabel("Vault URL", { exact: true }).fill(api.url);
-  await page.getByLabel("访问令牌", { exact: true }).fill(token);
   await page.getByRole("button", { name: "连接 server", exact: true }).click();
   await page.getByLabel("调试文档", { exact: true }).selectOption(path);
   await page
@@ -1279,7 +1432,7 @@ test("sync debug keeps paused and failed transfers in memory and resumes explici
   await expect(b.getByRole("textbox")).toHaveValue("A😀B");
   await b.getByRole("textbox").fill("A😀twoB");
   await b.getByRole("button", { name: "恢复传输", exact: true }).click();
-  const pattern = `${api.url}/documents/**`;
+  const pattern = `${api.url}/api/v1/documents/**`;
   await page.route(pattern, (route) => route.abort());
   await b.getByRole("button", { name: "推送", exact: true }).click();
   await expect(page.getByRole("alert")).toBeVisible();
@@ -1295,7 +1448,7 @@ test("sync debug keeps paused and failed transfers in memory and resumes explici
   await expect(b.getByRole("textbox")).toHaveValue(merged);
 });
 
-test("sync debug honors bearer authentication and read-only vaults", async ({
+test("sync debug honors share credentials and read-only vaults", async ({
   page,
   api,
 }) => {
@@ -1304,10 +1457,10 @@ test("sync debug honors bearer authentication and read-only vaults", async ({
   await page.goto("/debug/sync");
   await page
     .getByLabel("Vault URL", { exact: true })
-    .fill(api.url.replace("/notes", "/readonly"));
+    .fill(api.urls.readonly.replace("/ro-", "/"));
   await page.getByRole("button", { name: "连接 server", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("PermissionDenied");
-  await page.getByLabel("访问令牌", { exact: true }).fill(api.token);
+  await expect(page.getByRole("alert")).toContainText("NotFound");
+  await page.getByLabel("Vault URL", { exact: true }).fill(api.urls.readonly);
   await page.getByRole("button", { name: "连接 server", exact: true }).click();
   await page.getByLabel("调试文档", { exact: true }).selectOption(path);
   await page
@@ -1405,7 +1558,7 @@ test("two online editors converge live and undo only their own writer", async ({
   try {
     for (const client of [page, other]) {
       await client.goto("/");
-      await connect(client, api.url, api.token);
+      await connect(client, api.url);
       await client.getByRole("treeitem", { name, exact: true }).click();
       await expect(editor(client)).toHaveText("left 🦀 middle right");
       await editor(client).focus();
@@ -1446,7 +1599,7 @@ test("remote changes preserve a cursor inside unchanged text and wait for IME co
   const disk = join(api.root, "notes", name);
   await writeFile(disk, "abc 🦀 middle xyz");
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await viewCommand(page, "middle");
   await writeFile(disk, "PREFIX abc 🦀 middle xyz SUFFIX");
@@ -1476,7 +1629,7 @@ test("remote updates rebase a burst of pending input without losing characters",
   await writeFile(disk, "base");
   await installWorkerHarness(page, true);
   await page.goto("/");
-  await connect(page, api.url, api.token);
+  await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
   await workerEvaluate(
     page,
@@ -1511,7 +1664,7 @@ for (const failure of ["before-send", "lost-ack"] as const) {
     await writeFile(disk, "base");
     await installWorkerHarness(page, true);
     await page.goto("/");
-    await connect(page, api.url, api.token);
+    await connect(page, api.url);
     await page.getByRole("treeitem", { name, exact: true }).click();
     await expect(editor(page)).toHaveText("base");
 
@@ -1597,7 +1750,7 @@ for (const surface of ["menu", "dialog", "mobile-editor"] as const) {
     await writeFile(disk, "original");
     await installWorkerHarness(page, true);
     await page.goto("/");
-    await connect(page, api.url, api.token);
+    await connect(page, api.url);
     const file = page.getByRole("treeitem", { name, exact: true });
     if (surface === "mobile-editor") {
       await file.click();
@@ -1704,11 +1857,11 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
     await new Promise<void>((resolve) => listener.close(() => resolve()));
     const api: Api = {
       root,
-      url: `http://127.0.0.1:${port}/api/v1/vaults/notes`,
-      token: "persistent-browser-token",
+      url: "",
+      urls: {},
     };
     const config = join(root, "config.toml");
-    const env = { ...process.env, CELESTITE_E2E_TOKEN: api.token };
+    const env = { ...process.env };
     const disk = join(root, "notes", "a.md");
     let child: ChildProcess | undefined;
     const context = await browser.newContext({ baseURL });
@@ -1727,11 +1880,12 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
               throw new Error(`server exited: ${errors}`);
             try {
               return (
-                await fetch(api.url, {
-                  headers: { Authorization: `Bearer ${api.token}` },
-                  signal: AbortSignal.timeout(1000),
-                })
-              ).ok;
+                (
+                  await fetch(`http://127.0.0.1:${port}/`, {
+                    signal: AbortSignal.timeout(1000),
+                  })
+                ).status === 404
+              );
             } catch {
               return false;
             }
@@ -1739,6 +1893,10 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
           { timeout: 10000 },
         )
         .toBe(true);
+      const links = startupLinks(errors);
+      if (api.url) expect(links.edit).toBe(api.url);
+      api.url = links.edit;
+      api.urls.notes = api.url;
     };
     const stop = async (signal: "SIGTERM" | "SIGKILL") => {
       const process = child;
@@ -1761,26 +1919,21 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       await writeFile(join(root, "notes", "unopened.md"), "unopened original");
       await writeFile(
         config,
-        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\ntoken_env = "CELESTITE_E2E_TOKEN"\n\n[[vaults]]\nid = "notes"\nname = "notes"\npath = "notes"\nstate_dir = "state"\n`,
+        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nstate_dir = "state"\n`,
       );
       const initialized = spawnSync(
         binary,
-        ["--config", config, "--init-vault", "notes"],
+        ["--config", config, "--init-vault"],
         { env, timeout: 10000, encoding: "utf8" },
       );
       expect(initialized.status, initialized.stderr).toBe(0);
       await start();
-      const identity = (
-        await (
-          await fetch(api.url, {
-            headers: { Authorization: `Bearer ${api.token}` },
-          })
-        ).json()
-      ).vaultIdentity;
+      const identity = (await (await fetch(api.url + "/api/v1", {})).json())
+        .vaultIdentity;
       for (const client of [page, other]) {
         await installWorkerHarness(client, true);
         await client.goto("/");
-        await connect(client, api.url, api.token);
+        await connect(client, api.url);
         await client
           .getByRole("treeitem", { name: "a.md", exact: true })
           .click();
@@ -1834,11 +1987,7 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       );
       await start();
       const recoveredIdentity = (
-        await (
-          await fetch(api.url, {
-            headers: { Authorization: `Bearer ${api.token}` },
-          })
-        ).json()
+        await (await fetch(api.url + "/api/v1", {})).json()
       ).vaultIdentity;
       expect(recoveredIdentity).toEqual(identity);
       const expected = "A:left 🦀 disk right:B";

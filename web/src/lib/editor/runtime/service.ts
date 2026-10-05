@@ -30,7 +30,7 @@ export type EditorWorkerHost = Pick<
   | "close"
   | "previewResources"
 > & {
-  authorize?: (token: string) => Promise<ServiceDocument[]>;
+  reconnect?: () => Promise<ServiceDocument[]>;
   observeFiles?: () => Promise<void>;
   setResourceScope?: (
     scope: import("../../vault/file-system-access").LocalDirectoryHandle,
@@ -90,10 +90,10 @@ export async function serveEditorWorker(
           return previews.invalidateProject();
         case "observe_files":
           return host.observeFiles?.();
-        case "authorize":
-          if (!host.authorize)
-            throw new VaultError("Unsupported", "连接不支持认证更新。");
-          return host.authorize(String(p.token));
+        case "reconnect":
+          if (!host.reconnect)
+            throw new VaultError("Unsupported", "连接不支持重新连接。");
+          return host.reconnect();
         case "preview_subscribe":
           return host.executePreview("preview_subscribe", {
             id: String(p.id),

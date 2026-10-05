@@ -1,7 +1,7 @@
 //! Profile lifecycle and isolation through the public server configuration/API.
 use axum::{body::Body, http::Request, Router};
 use celestite_core::SyncPacket;
-use celestite_server::{build_server, Config, HistoryMode, ServerConfig, VaultConfig};
+use celestite_server::{build_server, Config, HistoryMode, VaultConfig};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::{
@@ -9,6 +9,16 @@ use std::{
     path::{Path, PathBuf},
 };
 use tower::ServiceExt;
+
+struct Host {
+    router: Router,
+    key: String,
+}
+impl Host {
+    fn url(&self, tail: &str) -> String {
+        format!("/{}/api/v1{tail}", self.key)
+    }
+}
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -29,7 +39,6 @@ impl Fixture {
     }
     fn vault(&self, id: &str, mode: HistoryMode) -> VaultConfig {
         VaultConfig {
-            id: id.into(),
             name: id.into(),
             path: id.into(),
             state_dir: Some(format!("state-{id}").into()),
@@ -40,18 +49,27 @@ impl Fixture {
     fn config(&self, mode: HistoryMode) -> Config {
         Config {
             server: Default::default(),
-            vaults: vec![self.vault("a", mode)],
+            vault: self.vault("a", mode),
         }
     }
-    fn router(&self, config: Config) -> Router {
-        build_server(config, self.dir.path()).unwrap().router
+    fn router(&self, config: Config) -> Host {
+        let server = build_server(config, self.dir.path()).unwrap();
+        let key = server
+            .links
+            .key(celestite_server::Permission::Edit)
+            .to_owned();
+        Host {
+            router: server.router,
+            key,
+        }
     }
     fn rejects(&self, config: Config) {
         assert!(build_server(config, self.dir.path()).is_err());
     }
 }
-async fn request(router: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
+async fn request(router: &Host, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = router
+        .router
         .clone()
         .oneshot(
             Request::builder()
@@ -67,16 +85,16 @@ async fn request(router: &Router, method: &str, path: &str, body: Value) -> (u16
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&body).unwrap())
 }
-async fn ok(router: &Router, method: &str, path: &str, body: Value) -> Value {
+async fn ok(router: &Host, method: &str, path: &str, body: Value) -> Value {
     let (status, value) = request(router, method, path, body).await;
     assert_eq!(status, 200, "{value}");
     value
 }
-async fn open(router: &Router, vault: &str) -> Value {
+async fn open(router: &Host) -> Value {
     ok(
         router,
         "POST",
-        &format!("/api/v1/vaults/{vault}/documents/open"),
+        &router.url("/documents/open"),
         json!({"path":"note.md"}),
     )
     .await
@@ -88,7 +106,7 @@ fn recovery_never_initializes_missing_or_invalid_profiles() {
     f.rejects(f.config(HistoryMode::Recover));
     assert!(!f.path("state-a/history.redb").exists());
     let mut no_state = f.config(HistoryMode::Recover);
-    no_state.vaults[0].state_dir = None;
+    no_state.vault.state_dir = None;
     f.rejects(no_state);
     fs::write(f.path("state-a/history.redb"), "broken database").unwrap();
     f.rejects(f.config(HistoryMode::Recover));
@@ -103,27 +121,20 @@ fn recovery_never_initializes_missing_or_invalid_profiles() {
 }
 
 #[test]
-fn configuration_is_validated_before_any_profile_is_initialized() {
+fn configuration_is_validated_before_history_is_initialized() {
     let f = Fixture::new();
-    for state in ["state-a", "state-a/nested", "a/private", "web"] {
+    for state in ["a", "a/private", "web", "."] {
         fs::create_dir_all(f.path(state)).unwrap();
         let mut config = f.config(HistoryMode::Initialize);
-        let mut second = f.vault("b", HistoryMode::Initialize);
-        second.state_dir = Some(state.into());
-        config.vaults.push(second);
+        config.vault.state_dir = Some(state.into());
         config.server.web_dir = Some("web".into());
         f.rejects(config);
-        assert!(!f.path("state-a/history.redb").exists());
+        assert!(!f.path(state).join("history.redb").exists());
     }
-    // The first profile must also be checked against later Vault roots.
-    let mut config = f.config(HistoryMode::Initialize);
-    config.vaults[0].state_dir = Some("b".into());
-    config.vaults.push(f.vault("b", HistoryMode::Initialize));
-    f.rejects(config);
-    assert!(!f.path("b/history.redb").exists());
     let mut config = f.config(HistoryMode::Initialize);
     config.server.web_dir = Some("a".into());
     f.rejects(config);
+    assert!(!f.path("state-a/history.redb").exists());
 }
 
 #[test]
@@ -140,12 +151,41 @@ fn profiles_have_one_owner_and_initialization_cannot_overwrite() {
     drop(router);
     f.rejects(f.config(HistoryMode::Initialize));
     let mut other_root = f.config(HistoryMode::Recover);
-    other_root.vaults[0].path = "b".into();
+    other_root.vault.path = "b".into();
     f.rejects(other_root);
     drop(f.router(f.config(HistoryMode::Recover)));
     fs::remove_file(f.path("state-a/history.redb")).unwrap();
     f.rejects(f.config(HistoryMode::Recover));
     assert!(!f.path("state-a/history.redb").exists());
+}
+
+#[test]
+fn cli_share_keys_fail_before_initializing_history() {
+    let f = Fixture::new();
+    for key in [None, Some("short")] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_celestite-server"));
+        command.current_dir(f.dir.path()).args([
+            "--no-config",
+            "--vault",
+            "a",
+            "--state-dir",
+            "state-a",
+            "--init-vault",
+        ]);
+        if let Some(key) = key {
+            command.args(["--share-key", key]);
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        let expected = if key.is_none() {
+            "--share-key"
+        } else {
+            "at least 32 bytes"
+        };
+        assert!(error.contains(expected), "{error}");
+        assert!(!f.path("state-a/history.redb").exists());
+    }
 }
 
 #[test]
@@ -162,11 +202,12 @@ fn lifecycle_commands_exit_without_listening_and_cannot_repeat_initialization() 
                 "--listen",
                 &address,
                 "--vault",
-                "a=a",
-                "--vault-state-dir",
-                "a=state-a",
-                action,
                 "a",
+                "--share-key",
+                "0123456789abcdef0123456789abcdef",
+                "--state-dir",
+                "state-a",
+                action,
             ])
             .output()
             .unwrap()
@@ -183,20 +224,23 @@ fn lifecycle_commands_exit_without_listening_and_cannot_repeat_initialization() 
 }
 
 #[tokio::test]
-async fn each_vault_preserves_identity_and_unsaved_history_across_restart_and_url_changes() {
+async fn independent_servers_preserve_isolated_history_across_restart_and_rename() {
     let f = Fixture::new();
-    let mut config = f.config(HistoryMode::Initialize);
-    config.vaults.push(f.vault("b", HistoryMode::Initialize));
-    let router = f.router(config);
-    let a = open(&router, "a").await;
-    let b = open(&router, "b").await;
+    let router = f.router(f.config(HistoryMode::Initialize));
+    let other = f.router(Config {
+        server: Default::default(),
+        vault: f.vault("b", HistoryMode::Initialize),
+    });
+    let a = open(&router).await;
+    let b = open(&other).await;
     assert_ne!(
         a["snapshot"]["version"]["identity"],
         b["snapshot"]["version"]["identity"]
     );
-    let before = ok(&router, "GET", "/api/v1/vaults/a", Value::Null).await;
+    let before = ok(&router, "GET", &router.url(""), Value::Null).await;
     let route = format!(
-        "/api/v1/vaults/a/documents/{}/transact",
+        "{}/documents/{}/transact",
+        router.url(""),
         a["id"].as_str().unwrap()
     );
     let committed = ok(
@@ -216,30 +260,34 @@ async fn each_vault_preserves_identity_and_unsaved_history_across_restart_and_ur
     assert_eq!(fs::read_to_string(f.path("a/note.md")).unwrap(), "disk");
     drop(router);
     let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].id = "renamed-url".into();
-    config.vaults[0].name = "New display name".into();
-    config.vaults.push(f.vault("b", HistoryMode::Recover));
+    config.vault.name = "New display name".into();
     let router = f.router(config);
-    let after = ok(&router, "GET", "/api/v1/vaults/renamed-url", Value::Null).await;
+    let after = ok(&router, "GET", &router.url(""), Value::Null).await;
     assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
     assert_eq!(after["capabilities"]["persistentHistory"], true);
-    let restored = open(&router, "renamed-url").await;
+    let restored = open(&router).await;
     for key in ["id", "snapshot", "durableVersion", "savedVersion", "dirty"] {
         assert_eq!(restored[key], saved[key], "{key}");
     }
-    assert_eq!(open(&router, "b").await["snapshot"], b["snapshot"]);
+    assert_eq!(open(&other).await["snapshot"], b["snapshot"]);
+    drop(other);
+    let other = f.router(Config {
+        server: Default::default(),
+        vault: f.vault("b", HistoryMode::Recover),
+    });
+    assert_eq!(open(&other).await["snapshot"], b["snapshot"]);
 }
 
 #[tokio::test]
 async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
     let f = Fixture::new();
     let router = f.router(f.config(HistoryMode::Initialize));
-    let initial = open(&router, "a").await;
+    let initial = open(&router).await;
     let id = initial["id"].as_str().unwrap();
     ok(
         &router,
         "POST",
-        &format!("/api/v1/vaults/a/documents/{id}/transact"),
+        &router.url(&format!("/documents/{id}/transact")),
         json!({
             "expected_version":initial["snapshot"]["version"], "origin":"test",
             "edits":[{"from":0,"to":0,"insert":"old draft "}],
@@ -250,13 +298,13 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
     let packet = ok(
         &router,
         "GET",
-        &format!("/api/v1/vaults/a/documents/{id}/snapshot"),
+        &router.url(&format!("/documents/{id}/snapshot")),
         Value::Null,
     )
     .await;
     drop(router);
     let router = f.router(f.config(HistoryMode::Reset));
-    let new = open(&router, "a").await;
+    let new = open(&router).await;
     assert_ne!(new["id"], initial["id"]);
     assert_ne!(
         new["snapshot"]["version"]["identity"],
@@ -267,7 +315,8 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
         &router,
         "POST",
         &format!(
-            "/api/v1/vaults/a/documents/{}/import",
+            "{}/documents/{}/import",
+            router.url(""),
             new["id"].as_str().unwrap()
         ),
         packet.clone(),
@@ -281,37 +330,12 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
         .find(|path| path.is_dir())
         .unwrap();
     let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].state_dir = Some(archive);
+    config.vault.state_dir = Some(archive);
     let router = f.router(config);
-    let old = open(&router, "a").await;
+    let old = open(&router).await;
     assert_eq!(old["id"], initial["id"]);
     assert_eq!(old["snapshot"]["text"], "old draft disk");
     let _: SyncPacket = serde_json::from_value(packet).unwrap();
-}
-
-#[tokio::test]
-async fn legacy_shared_state_retains_existing_profiles() {
-    let f = Fixture::new();
-    let config = |mode| Config {
-        server: ServerConfig {
-            state_dir: Some("state-a".into()),
-            ..Default::default()
-        },
-        vaults: ["a", "b"]
-            .into_iter()
-            .map(|id| VaultConfig {
-                state_dir: None,
-                ..f.vault(id, mode)
-            })
-            .collect(),
-    };
-    let router = f.router(config(HistoryMode::Initialize));
-    let initial = open(&router, "a").await;
-    assert!(f.path("state-a/a.redb").exists());
-    assert!(f.path("state-a/b.redb").exists());
-    drop(router);
-    let router = f.router(config(HistoryMode::Recover));
-    assert_eq!(open(&router, "a").await["snapshot"], initial["snapshot"]);
 }
 
 #[test]
@@ -323,12 +347,12 @@ fn ephemeral_is_explicit_and_cannot_initialize_or_reset() {
         HistoryMode::Reset,
     ] {
         let mut config = f.config(mode);
-        config.vaults[0].ephemeral = true;
+        config.vault.ephemeral = true;
         f.rejects(config);
     }
     let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].ephemeral = true;
-    config.vaults[0].state_dir = None;
+    config.vault.ephemeral = true;
+    config.vault.state_dir = None;
     drop(f.router(config));
     assert!(!f.path("state-a/history.redb").exists());
 }
@@ -337,11 +361,9 @@ fn ephemeral_is_explicit_and_cannot_initialize_or_reset() {
 #[test]
 fn canonical_paths_prevent_aliases_and_history_symlinks() {
     let f = Fixture::new();
-    std::os::unix::fs::symlink(f.path("state-a"), f.path("state-alias")).unwrap();
+    std::os::unix::fs::symlink(f.path("a"), f.path("state-alias")).unwrap();
     let mut config = f.config(HistoryMode::Initialize);
-    let mut second = f.vault("b", HistoryMode::Initialize);
-    second.state_dir = Some("state-alias".into());
-    config.vaults.push(second);
+    config.vault.state_dir = Some("state-alias".into());
     f.rejects(config);
     drop(f.router(f.config(HistoryMode::Initialize)));
     fs::rename(

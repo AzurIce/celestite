@@ -1,14 +1,9 @@
 //! Read-only package IO. Notist discovers dependencies; Vault file/history IO stays separate.
 use crate::{
-    get_vault,
     vault::fs::{self, ChangeHint, Entry, FsVault, VaultError},
-    ApiError, ServerState,
+    ApiError, RemoteAccess, ServerState,
 };
-use axum::{
-    extract::{Path, State},
-    routing::post,
-    Json, Router,
-};
+use axum::{routing::post, Extension, Json, Router};
 use celestite_core::{PreviewResource, PreviewResourceKind, PreviewResourceRequest};
 use notify::{RecursiveMode, Watcher};
 use notist::{resources::ResourceKind, ResourceError, Resources};
@@ -326,15 +321,14 @@ impl PackageResources {
 }
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/api/v1/vaults/{id}/preview/resources", post(read))
-        .route("/api/v1/vaults/{id}/preview/directory", post(directory))
+        .route("/{id}/api/v1/preview/resources", post(read))
+        .route("/{id}/api/v1/preview/directory", post(directory))
 }
 async fn read(
-    State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
+    Extension(access): Extension<RemoteAccess>,
     Json(input): Json<ReadRequest>,
 ) -> Result<Json<PreviewResource>, ApiError> {
-    let vault = get_vault(&state, &id)?;
+    let vault = access.grant.vault.clone();
     tokio::task::spawn_blocking(move || vault.packages.read(input))
         .await
         .map_err(|_| crate::failure("IO", "Package IO failed"))?
@@ -342,11 +336,10 @@ async fn read(
         .map_err(Into::into)
 }
 async fn directory(
-    State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
+    Extension(access): Extension<RemoteAccess>,
     Json(input): Json<DirectoryRequest>,
 ) -> Result<Json<Vec<Entry>>, ApiError> {
-    let vault = get_vault(&state, &id)?;
+    let vault = access.grant.vault.clone();
     tokio::task::spawn_blocking(move || vault.packages.directory(input))
         .await
         .map_err(|_| crate::failure("IO", "Package IO failed"))?
@@ -357,6 +350,7 @@ async fn directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::Host;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -365,16 +359,17 @@ mod tests {
     use tower::ServiceExt;
 
     async fn call(
-        router: &Router,
+        router: &Host,
         route: &str,
         input: serde_json::Value,
     ) -> axum::response::Response {
         router
+            .router
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/v1/vaults/docs/preview/{route}"))
+                    .uri(router.uri(&format!("/preview/{route}")))
                     .header("content-type", "application/json")
                     .body(Body::from(input.to_string()))
                     .unwrap(),
@@ -425,15 +420,14 @@ mod tests {
         std::fs::write(package.join("private.txt"), "not a component").unwrap();
         let config = crate::Config {
             server: crate::ServerConfig::default(),
-            vaults: vec![crate::VaultConfig {
-                id: "docs".into(),
+            vault: crate::VaultConfig {
                 name: "Docs".into(),
                 path: root.clone(),
                 ephemeral: true,
                 ..Default::default()
-            }],
+            },
         };
-        let router = crate::app(config, repository.path()).unwrap();
+        let router = Host::new(crate::build_server(config, repository.path()).unwrap());
         let context = serde_json::json!({"documentPath": "a.not", "overlays": {}});
         let declaration = call(&router, "resources", serde_json::json!({"context":context, "request":{"path":package.join("lib.notc"), "read":true}})).await;
         assert_eq!(declaration.status(), StatusCode::OK);

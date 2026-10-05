@@ -35,25 +35,21 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let config: Config = cli::Cli::parse().load(&cwd)?;
+    let public_url = config.server.public_url.clone();
     let listen = config.server.listen;
-    let ids: Vec<_> = config.vaults.iter().map(|v| v.id.clone()).collect();
-    let setup = config
-        .vaults
-        .iter()
-        .any(|v| v.history_mode != HistoryMode::Recover);
+    let setup = config.vault.history_mode != HistoryMode::Recover;
     let server = build_server(config, &cwd)?;
     if setup {
         tracing::info!(
-            "Vault history setup complete; restart without --init-vault / --reset-vault to serve"
+            "Vault history setup complete; restart without initialization/reset flags to serve"
         );
         return Ok(());
     }
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let listen = listener.local_addr()?;
+    let base = celestite_server::connection_base_url(public_url.as_deref(), listen)?;
+    tracing::info!(readonly_url = %format!("{base}/{}", server.links.readonly), edit_url = %format!("{base}/{}", server.links.edit), "Vault share links");
     tracing::info!(address = %listen, "Celestite server listening");
-    for id in ids {
-        tracing::info!(vault_id = %id, url = %format!("http://{listen}/api/v1/vaults/{id}"), "Vault available");
-    }
     axum::serve(listener, server.router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;

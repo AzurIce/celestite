@@ -74,7 +74,7 @@ impl Reconciler {
                 }
                 let Some(vault) = vault.upgrade() else { break };
                 if let Err(error) = observe(&vault, &stopping) {
-                    tracing::error!(vault_id = %vault.id, code = %error.code, message = %error.message, "Background file reconciliation failed");
+                    tracing::error!(vault_identity = %vault.id, code = %error.code, message = %error.message, "Background file reconciliation failed");
                 }
             })?;
         Ok(Self {
@@ -116,7 +116,7 @@ fn with_documents<T>(
     // Also publish failures: a previously usable document can now require recovery.
     if documents.publish_changes()? {
         let _ = vault.events.send(ChangeHint::all());
-        tracing::debug!(vault_id = %vault.id, "Background document states changed");
+        tracing::debug!(vault_identity = %vault.id, "Background document states changed");
     }
     result
 }
@@ -142,7 +142,7 @@ fn observe_with(
             Ok(Some(task)) => task,
             Ok(None) => break,
             Err(error) => {
-                tracing::warn!(vault_id = %vault.id, path = %error.path, code = %error.code, message = %error.message, "File observation preparation failed; continuing other files");
+                tracing::warn!(vault_identity = %vault.id, path = %error.path, code = %error.code, message = %error.message, "File observation preparation failed; continuing other files");
                 continue;
             }
         };
@@ -154,10 +154,10 @@ fn observe_with(
         let accepted = with_documents(vault, |docs| docs.complete_file_observation(result));
         match accepted {
             Ok(accepted) => {
-                tracing::debug!(vault_id = %vault.id, %path, accepted, elapsed_ms = started.elapsed().as_millis(), "Filesystem diff completed")
+                tracing::debug!(vault_identity = %vault.id, %path, accepted, elapsed_ms = started.elapsed().as_millis(), "Filesystem diff completed")
             }
             Err(error) => {
-                tracing::warn!(vault_id = %vault.id, path = %error.path, code = %error.code, message = %error.message, "File observation failed; preserving history and continuing other files")
+                tracing::warn!(vault_identity = %vault.id, path = %error.path, code = %error.code, message = %error.message, "File observation failed; preserving history and continuing other files")
             }
         }
     }
@@ -193,7 +193,7 @@ mod tests {
         let (events, _) = broadcast::channel(128);
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
         let vault = Arc::new(HostedVault {
-            id: "notes".into(),
+            id: documents.identity.id.clone(),
             name: "Notes".into(),
             read_only: false,
             files: Mutex::new(FsVault::open(root.path()).unwrap()),
@@ -412,7 +412,7 @@ mod tests {
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
         let events = broadcast::channel(128).0;
         let vault = Arc::new(HostedVault {
-            id: "notes".into(),
+            id: documents.identity.id.clone(),
             name: "Notes".into(),
             read_only: false,
             packages: crate::package_resources::PackageResources::new(

@@ -4,7 +4,7 @@ use crate::vault::{
     documents::{DocumentState, Documents},
     fs::{ChangeHint, FsVault, Result, VaultError},
 };
-use crate::{failure, get_vault, ApiError, HostedVault, ServerState};
+use crate::{failure, ApiError, HostedVault, RemoteAccess, ServerState};
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
     response::{
@@ -12,7 +12,7 @@ use axum::{
         IntoResponse, Response,
     },
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use celestite_core::{ChangeEvent, ImportResult, SyncPacket, Transaction, UndoContext, Version};
 use serde::{Deserialize, Serialize};
@@ -21,51 +21,26 @@ use tokio_stream::StreamExt;
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/api/v1/vaults/{id}/documents", get(list))
-        .route("/api/v1/vaults/{id}/documents/events", get(events))
-        .route("/api/v1/vaults/{id}/documents/open", post(open))
-        .route("/api/v1/vaults/{id}/documents/{document}", get(state))
+        .route("/{id}/api/v1/documents", get(list))
+        .route("/{id}/api/v1/documents/events", get(events))
+        .route("/{id}/api/v1/documents/open", post(open))
+        .route("/{id}/api/v1/documents/{document}", get(state))
+        .route("/{id}/api/v1/documents/{document}/snapshot", get(snapshot))
+        .route("/{id}/api/v1/documents/{document}/updates", post(updates))
+        .route("/{id}/api/v1/documents/{document}/import", post(import))
+        .route("/{id}/api/v1/documents/{document}/transact", post(transact))
+        .route("/{id}/api/v1/documents/{document}/undo", post(undo))
+        .route("/{id}/api/v1/documents/{document}/redo", post(redo))
+        .route("/{id}/api/v1/documents/{document}/save", post(save))
         .route(
-            "/api/v1/vaults/{id}/documents/{document}/snapshot",
-            get(snapshot),
-        )
-        .route(
-            "/api/v1/vaults/{id}/documents/{document}/updates",
-            post(updates),
-        )
-        .route(
-            "/api/v1/vaults/{id}/documents/{document}/import",
-            post(import),
-        )
-        .route(
-            "/api/v1/vaults/{id}/documents/{document}/transact",
-            post(transact),
-        )
-        .route("/api/v1/vaults/{id}/documents/{document}/undo", post(undo))
-        .route("/api/v1/vaults/{id}/documents/{document}/redo", post(redo))
-        .route("/api/v1/vaults/{id}/documents/{document}/save", post(save))
-        .route(
-            "/api/v1/vaults/{id}/documents/{document}/retry-observation",
+            "/{id}/api/v1/documents/{document}/retry-observation",
             post(retry_observation),
         )
         .route(
-            "/api/v1/vaults/{id}/documents/{document}/client-commit",
+            "/{id}/api/v1/documents/{document}/client-commit",
             post(client_commit),
         )
         .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
-        .layer(axum::middleware::from_fn(no_cache))
-}
-
-async fn no_cache(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    response
 }
 
 pub(crate) async fn run_documents<T: Send + 'static>(
@@ -87,7 +62,7 @@ pub(crate) async fn run_documents_with_tree<T: Send + 'static>(
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
-        tracing::debug!(vault_id = %vault.id, mutation, "Running document operation");
+        tracing::debug!(vault_identity = %vault.id, mutation, "Running document operation");
         // Same order for every document/file operation.
         let files = vault
             .files
@@ -119,11 +94,10 @@ struct Reply<T: Serialize> {
 }
 
 async fn list(
-    State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
+    Extension(access): Extension<RemoteAccess>,
 ) -> std::result::Result<Json<Vec<DocumentState>>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, false, |files, docs| {
+        run_documents(access.grant.vault.clone(), false, |files, docs| {
             docs.list(files)
         })
         .await?,
@@ -131,11 +105,11 @@ async fn list(
 }
 
 async fn retry_observation(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
 ) -> std::result::Result<Json<DocumentState>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, false, move |files, docs| {
+        run_documents(access.grant.vault.clone(), false, move |files, docs| {
             docs.retry_file_observation(&document)?;
             docs.state(files, &document)
         })
@@ -148,12 +122,11 @@ struct Open {
     path: String,
 }
 async fn open(
-    State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
+    Extension(access): Extension<RemoteAccess>,
     Json(body): Json<Open>,
 ) -> std::result::Result<Json<DocumentState>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, false, move |files, docs| {
+        run_documents(access.grant.vault.clone(), false, move |files, docs| {
             let id = docs.open_file(files, &body.path)?;
             docs.state(files, &id)
         })
@@ -162,11 +135,11 @@ async fn open(
 }
 
 async fn state(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
 ) -> std::result::Result<Json<DocumentState>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, false, move |files, docs| {
+        run_documents(access.grant.vault.clone(), false, move |files, docs| {
             docs.refresh(files, &document)?;
             docs.state(files, &document)
         })
@@ -175,11 +148,11 @@ async fn state(
 }
 
 async fn snapshot(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
 ) -> std::result::Result<Json<SyncPacket>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, false, move |files, docs| {
+        run_documents(access.grant.vault.clone(), false, move |files, docs| {
             docs.refresh(files, &document)?;
             docs.snapshot(&document)
         })
@@ -188,12 +161,12 @@ async fn snapshot(
 }
 
 async fn updates(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(version): Json<Version>,
 ) -> std::result::Result<Json<SyncPacket>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, false, move |files, docs| {
+        run_documents(access.grant.vault.clone(), false, move |files, docs| {
             docs.refresh(files, &document)?;
             let packet = docs.updates(&document, &version)?;
             tracing::debug!(document_id = %document, bytes = packet.data.len(), "CRDT updates exported");
@@ -204,12 +177,12 @@ async fn updates(
 }
 
 async fn transact(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(transaction): Json<Transaction>,
 ) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, true, move |files, docs| {
+        run_documents(access.grant.vault.clone(), true, move |files, docs| {
             docs.refresh(files, &document)?;
             let result = docs.transact(&document, transaction)?;
             Ok(Reply {
@@ -222,12 +195,12 @@ async fn transact(
 }
 
 async fn import(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(packet): Json<SyncPacket>,
 ) -> std::result::Result<Json<Reply<ImportResult>>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, true, move |files, docs| {
+        run_documents(access.grant.vault.clone(), true, move |files, docs| {
             docs.refresh(files, &document)?;
             let bytes = packet.data.len();
             let kind = packet.kind;
@@ -245,28 +218,27 @@ async fn import(
 }
 
 async fn undo(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(context): Json<UndoContext>,
 ) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
-    history(state, id, document, context, false).await
+    history(access, document, context, false).await
 }
 async fn redo(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(context): Json<UndoContext>,
 ) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
-    history(state, id, document, context, true).await
+    history(access, document, context, true).await
 }
 async fn history(
-    state: Arc<ServerState>,
-    id: String,
+    access: RemoteAccess,
     document: String,
     context: UndoContext,
     redo: bool,
 ) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, true, move |files, docs| {
+        run_documents(access.grant.vault.clone(), true, move |files, docs| {
             docs.refresh(files, &document)?;
             let result = docs.undo(&document, context, redo)?;
             Ok(Reply {
@@ -279,12 +251,12 @@ async fn history(
 }
 
 async fn save(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(version): Json<Version>,
 ) -> std::result::Result<Json<DocumentState>, ApiError> {
     Ok(Json(
-        run_documents(get_vault(&state, &id)?, true, move |files, docs| {
+        run_documents(access.grant.vault.clone(), true, move |files, docs| {
             docs.refresh(files, &document)?;
             docs.save(files, &document, version)?;
             let state = docs.state(files, &document)?;
@@ -304,11 +276,11 @@ struct ClientCommit {
     action: String,
 }
 async fn client_commit(
-    State(state): State<Arc<ServerState>>,
-    Path((id, document)): Path<(String, String)>,
+    Extension(access): Extension<RemoteAccess>,
+    Path((_key, document)): Path<(String, String)>,
     Json(body): Json<ClientCommit>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(run_documents(get_vault(&state, &id)?, true, move |files, docs| {
+    Ok(Json(run_documents(access.grant.vault.clone(), true, move |files, docs| {
         docs.commit_replica(&document, body.packet, &body.expected_revision, &body.action)?;
         Ok(serde_json::json!({"document": docs.state(files, &document)?, "packet": docs.snapshot(&document)?}))
     }).await?))
@@ -324,9 +296,9 @@ fn event_frame(event: DocumentEvent) -> Event {
 
 async fn events(
     State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
+    Extension(access): Extension<RemoteAccess>,
 ) -> std::result::Result<Response, ApiError> {
-    let vault = get_vault(&state, &id)?;
+    let vault = access.grant.vault.clone();
     let subscription = run_documents(vault.clone(), false, |_, docs| docs.subscribe()).await?;
     let first = tokio_stream::once(Ok::<_, Infallible>(event_frame(subscription.initial)));
     let stopping = state.shutdown.subscribe();
@@ -370,18 +342,20 @@ async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::Host;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    async fn request(router: &Router, method: &str, path: &str, body: Value) -> Value {
+    async fn request(router: &Host, method: &str, path: &str, body: Value) -> Value {
         let response = router
+            .router
             .clone()
             .oneshot(
                 Request::builder()
                     .method(method)
-                    .uri(format!("/api/v1/vaults/notes{path}"))
+                    .uri(router.uri(path))
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
@@ -421,26 +395,27 @@ mod tests {
         let server = crate::build_server(
             crate::Config {
                 server: crate::ServerConfig::default(),
-                vaults: vec![crate::VaultConfig {
-                    id: "notes".into(),
+                vault: crate::VaultConfig {
                     name: "Notes".into(),
                     path: root.path().into(),
                     ephemeral: true,
                     ..Default::default()
-                }],
+                },
             },
             root.path(),
         )
         .unwrap();
-        let router = server.router;
+        let stopping = server.shutdown.clone();
+        let router = Host::new(server);
         let docs = request(&router, "GET", "/documents", Value::Null).await;
         let mut state = docs[0].clone();
         let id = state["id"].as_str().unwrap().to_owned();
         let response = router
+            .router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/vaults/notes/documents/events")
+                    .uri(router.uri("/documents/events"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -498,7 +473,7 @@ mod tests {
             changed["documents"][0]["version"],
             state["snapshot"]["version"]
         );
-        server.shutdown.send_replace(true);
+        stopping.send_replace(true);
         assert!(tokio::time::timeout(Duration::from_secs(5), body.frame())
             .await
             .unwrap()

@@ -26,30 +26,29 @@ impl Host {
         std::fs::write(root.path().join("unopened.md"), "untouched").unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let token_env = format!("CELESTITE_WS_TEST_{}", uuid::Uuid::new_v4().simple());
-        std::env::set_var(&token_env, "test-token");
         let server = build_server(
             Config {
                 server: ServerConfig {
                     listen: address,
-                    token_env: Some(token_env.clone()),
                     allowed_origins: vec!["http://allowed".into()],
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.path().into(),
                     state_dir: Some(state.path().into()),
                     history_mode: HistoryMode::Initialize,
                     read_only,
                     ..Default::default()
-                }],
+                },
             },
             root.path(),
         )
         .unwrap();
-        std::env::remove_var(token_env);
+        let key = server
+            .links
+            .key(celestite_server::Permission::Edit)
+            .to_owned();
         let stopping = server.shutdown;
         let mut signal = stopping.subscribe();
         let task = tokio::spawn(async move {
@@ -64,10 +63,9 @@ impl Host {
                 .await
                 .unwrap();
         });
-        let url = format!("http://{address}/api/v1/vaults/notes");
+        let url = format!("http://{address}/{key}/api/v1");
         let identity = reqwest::Client::new()
             .get(&url)
-            .bearer_auth("test-token")
             .send()
             .await
             .unwrap()
@@ -92,28 +90,24 @@ impl Host {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let token_env = format!("CELESTITE_WS_TEST_{}", uuid::Uuid::new_v4().simple());
-        std::env::set_var(&token_env, "test-token");
         let server = build_server(
             Config {
                 server: ServerConfig {
                     listen: address,
-                    token_env: Some(token_env.clone()),
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: self.root.path().into(),
                     state_dir: Some(self._state.path().into()),
                     history_mode: HistoryMode::Recover,
                     ..Default::default()
-                }],
+                },
             },
             self.root.path(),
         )
         .unwrap();
-        std::env::remove_var(token_env);
+        let key = self.url.split('/').nth(3).unwrap().to_string();
         self.stopping = server.shutdown;
         let mut signal = self.stopping.subscribe();
         self.task = tokio::spawn(async move {
@@ -128,7 +122,7 @@ impl Host {
                 .await
                 .unwrap();
         });
-        self.url = format!("http://{address}/api/v1/vaults/notes");
+        self.url = format!("http://{address}/{key}/api/v1");
     }
     async fn socket(&self) -> Socket {
         connect_async(self.url.replace("http:", "ws:") + "/sync")
@@ -140,7 +134,7 @@ impl Host {
         let mut socket = self.socket().await;
         send(
             &mut socket,
-            json!({"protocolVersion":1,"token":"test-token","vaultIdentity":self.identity}),
+            json!({"protocolVersion":1,"vaultIdentity":self.identity}),
         )
         .await;
         let hello = next(&mut socket).await;
@@ -340,12 +334,16 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
     let mut wrong = host.socket().await;
     send(
         &mut wrong,
-        json!({"protocolVersion":1,"token":"wrong","vaultIdentity":host.identity}),
+        json!({"protocolVersion":0,"vaultIdentity":host.identity}),
     )
     .await;
     assert_eq!(next(&mut wrong).await["code"], "PermissionDenied");
     let mut wrong = host.socket().await;
-    send(&mut wrong,json!({"protocolVersion":1,"token":"test-token","vaultIdentity":{"id":"wrong","historyId":"wrong"}})).await;
+    send(
+        &mut wrong,
+        json!({"protocolVersion":1,"vaultIdentity":{"id":"wrong","historyId":"wrong"}}),
+    )
+    .await;
     assert_eq!(next(&mut wrong).await["code"], "Conflict");
     let mut request = (host.url.replace("http:", "ws:") + "/sync")
         .into_client_request()
@@ -363,7 +361,7 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
         .send()
         .await
         .unwrap();
-    assert_eq!(bypass.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(bypass.status(), reqwest::StatusCode::NOT_FOUND);
     let mut readonly = host.client().await;
     let update = readonly.edit(0, 0, "forbidden");
     assert_eq!(
@@ -373,7 +371,6 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
     let response = reqwest::Client::new()
         .get(&host.url)
         .header("Origin", "http://evil")
-        .bearer_auth("test-token")
         .send()
         .await
         .unwrap();
@@ -396,7 +393,6 @@ async fn a_lost_receipt_can_be_proven_after_restart_without_replaying_the_old_se
         loop {
             let states = reqwest::Client::new()
                 .get(format!("{}/documents", host.url))
-                .bearer_auth("test-token")
                 .send()
                 .await
                 .unwrap()

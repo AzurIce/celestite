@@ -26,8 +26,7 @@ impl Host {
                     listen: address,
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.into(),
                     state_dir: Some(state.into()),
@@ -38,11 +37,15 @@ impl Host {
                         HistoryMode::Initialize
                     },
                     ..Default::default()
-                }],
+                },
             },
             root,
         )
         .unwrap();
+        let key = server
+            .links
+            .key(celestite_server::Permission::Edit)
+            .to_owned();
         let (shutdown, stopping) = oneshot::channel();
         let stop_events = server.shutdown;
         let task = tokio::spawn(async move {
@@ -55,7 +58,7 @@ impl Host {
         });
         Self {
             client: Client::new(),
-            url: format!("http://{address}/api/v1/vaults/notes"),
+            url: format!("http://{address}/{key}/api/v1"),
             shutdown,
             stopping: stop_events,
             task,

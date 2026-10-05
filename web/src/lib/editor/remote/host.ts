@@ -49,11 +49,10 @@ export class RemoteEditorHost extends EditorHost {
   ) {
     super(core, http, emit, scheduleRemote, http.packageResources(descriptor));
   }
-  async connect(token: string) {
+  async connect() {
     const identity = this.descriptor.vaultIdentity!;
     const transport = new RemoteTransport(
       this.http.url,
-      token,
       identity,
       (receipt) => {
         if (receipt.kind === "tree") {
@@ -501,8 +500,7 @@ export class RemoteEditorHost extends EditorHost {
       );
     return this.save(id);
   }
-  async authorize(token: string) {
-    this.http.authorize(token);
+  async reconnect() {
     let descriptor: RemoteVaultDescriptor;
     try {
       descriptor = await this.http.describe();
@@ -528,7 +526,7 @@ export class RemoteEditorHost extends EditorHost {
     this.descriptor = descriptor;
     this.resetting = true;
     try {
-      const documents = await this.connect(token);
+      const documents = await this.connect();
       this.publishConnection({ status: "online", error: null });
       await this.executePreview("preview_invalidate_project", {});
       this.publishTree();

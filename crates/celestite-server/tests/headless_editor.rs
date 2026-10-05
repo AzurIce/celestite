@@ -23,8 +23,7 @@ impl Server {
                     listen: address,
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.into(),
                     read_only,
@@ -35,11 +34,16 @@ impl Server {
                     } else {
                         HistoryMode::Recover
                     },
-                }],
+                    ..Default::default()
+                },
             },
             root,
         )
         .unwrap();
+        let key = server
+            .links
+            .key(celestite_server::Permission::Edit)
+            .to_owned();
         let (shutdown, stopping) = oneshot::channel();
         let task = tokio::spawn(async move {
             axum::serve(listener, server.router)
@@ -54,7 +58,7 @@ impl Server {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            url: format!("http://{address}/api/v1/vaults/notes"),
+            url: format!("http://{address}/{key}/api/v1"),
             shutdown,
             task,
         }

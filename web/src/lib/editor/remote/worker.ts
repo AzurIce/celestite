@@ -8,9 +8,9 @@ let initialized = false;
 self.addEventListener("message", (event) => {
   if (event.data?.kind !== "initialize" || initialized) return;
   initialized = true;
-  const { url, token } = event.data as { url: string; token: string };
+  const { url } = event.data as { url: string };
   void serveEditorWorker(async (emit, schedule) => {
-    const { backend, descriptor } = await openHttpVault(url, token);
+    const { backend, descriptor } = await openHttpVault(url);
     try {
       const vault = descriptor.vaultIdentity;
       if (
@@ -36,7 +36,7 @@ self.addEventListener("message", (event) => {
         schedule,
       );
       try {
-        await host.connect(token);
+        await host.connect();
       } catch (error) {
         binding.free();
         throw error;

@@ -244,7 +244,7 @@ export class WorkerDocuments {
     if (savedContent !== undefined) record.savedContent = savedContent;
     if (document.core?.historyError) record.error = document.core.historyError;
   }
-  async authorize(token: string, discardUnconfirmed = false) {
+  async reconnectSession(discardUnconfirmed = false) {
     if (this.replacingSession) throw new VaultError("Busy", "正在重新连接。");
     this.replacingSession = true;
     this.connection = {
@@ -262,7 +262,7 @@ export class WorkerDocuments {
           "Conflict",
           "存在未确认输入。重新连接将采用远端历史，请先导出正文或确认丢弃。",
         );
-      const documents = await this.client.request("authorize", { token });
+      const documents = await this.client.request("reconnect", {});
       for (const document of documents) {
         const record = this.records.get(document.id);
         if (!record) continue;
@@ -818,13 +818,11 @@ export async function openLocalEditor(
 
 export async function openRemoteEditor(
   url: string,
-  token: string,
   backend: VaultBackend,
 ): Promise<{
   identity: InstanceIdentity;
   documents: import("../contract").EditorDocuments;
   backend: VaultBackend;
-  authorize?: (token: string) => Promise<void>;
 }> {
   const worker = new Worker(new URL("../remote/worker.ts", import.meta.url), {
     type: "module",
@@ -836,7 +834,7 @@ export async function openRemoteEditor(
     );
   worker.addEventListener("error", error);
   worker.addEventListener("messageerror", error);
-  worker.postMessage({ kind: "initialize", url, token });
+  worker.postMessage({ kind: "initialize", url });
   try {
     const identity = await client.ready;
     const documents = new WorkerDocuments(
@@ -848,21 +846,13 @@ export async function openRemoteEditor(
       undefined,
       true,
     );
-    let currentToken = token;
     documents.reconnect = async (discardUnconfirmed = false) => {
-      await documents.authorize(currentToken, discardUnconfirmed);
+      await documents.reconnectSession(discardUnconfirmed);
     };
     return {
       identity,
       documents,
       backend: documents.treeBackend,
-      authorize: async (token) => {
-        await documents.authorize(token);
-        currentToken = token;
-        (backend as import("../../vault/http").HttpVaultBackend).authorize(
-          token,
-        );
-      },
     };
   } catch (error) {
     client.dispose();

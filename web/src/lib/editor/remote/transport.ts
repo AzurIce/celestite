@@ -41,17 +41,16 @@ export class RemoteTransport {
   private lastMessage = Date.now();
   constructor(
     url: string,
-    token: string,
     identity: { id: string; historyId: string },
     private receive: (receipt: RemoteReceipt | { kind: "tree" }) => void,
     private disconnected: (error: unknown) => void,
   ) {
-    const address = new URL(url + "/sync");
+    const address = new URL(url + "/api/v1/sync");
     address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
     this.socket = new WebSocket(address);
     this.socket.onopen = () =>
       this.socket.send(
-        JSON.stringify({ protocolVersion: 1, token, vaultIdentity: identity }),
+        JSON.stringify({ protocolVersion: 1, vaultIdentity: identity }),
       );
     this.socket.onmessage = (event) => {
       if (this.closed) return;
