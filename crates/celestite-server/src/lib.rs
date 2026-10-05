@@ -12,13 +12,12 @@ use axum::{
     Extension, Json, Router,
 };
 mod editor_api;
-mod management;
 mod package_resources;
 mod profiles;
 mod reconcile;
 mod shares;
 mod sync;
-pub use shares::{CreatedShare, Permission, Share};
+pub use shares::{Permission, VaultLinks};
 pub mod vault;
 use notify::Watcher;
 use serde::Deserialize;
@@ -58,8 +57,8 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub allowed_origins: Vec<String>,
-    /// Private Unix socket for host-only share management.
-    pub management_socket: Option<PathBuf>,
+    /// Public HTTP(S) origin/deployment prefix used in startup connection URLs.
+    pub public_url: Option<String>,
     pub web_dir: Option<PathBuf>,
     /// Legacy shared directory containing <configured-vault-id>.redb files.
     pub state_dir: Option<PathBuf>,
@@ -69,7 +68,7 @@ impl Default for ServerConfig {
         Self {
             listen: "127.0.0.1:7437".parse().unwrap(),
             allowed_origins: vec![],
-            management_socket: None,
+            public_url: None,
             web_dir: None,
             state_dir: None,
         }
@@ -91,8 +90,8 @@ pub struct VaultConfig {
     /// Initialization/reset is a one-shot CLI action, never a startup policy in TOML.
     #[serde(skip)]
     pub history_mode: HistoryMode,
-    #[serde(skip)]
-    pub initialize_shares: bool,
+    /// Optional random secret to derive and rotate the two capability links.
+    pub share_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,7 +105,6 @@ struct HostedVault {
     id: String,
     name: String,
     read_only: bool,
-    shares: shares::Store,
     files: Mutex<FsVault>,
     packages: package_resources::PackageResources,
     documents: Mutex<Documents>,
@@ -137,43 +135,14 @@ impl Drop for ServerState {
 pub struct Server {
     pub router: Router,
     pub shutdown: watch::Sender<bool>,
-    pub management: Router,
-    state: Arc<ServerState>,
+    pub links: Vec<VaultLinks>,
 }
 impl Server {
-    pub fn create_share(
-        &self,
-        vault: &str,
-        permission: Permission,
-        label: String,
-    ) -> Result<CreatedShare, Box<dyn std::error::Error + Send + Sync>> {
-        let vault = self
-            .state
-            .vaults
-            .get(vault)
-            .cloned()
-            .ok_or("Vault not found")?;
-        self.state.shares.create(vault, permission, label)
-    }
-    pub fn list_shares(
-        &self,
-        vault: &str,
-    ) -> Result<Vec<Share>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .state
-            .vaults
-            .get(vault)
-            .ok_or("Vault not found")?
-            .shares
-            .list())
-    }
-    pub async fn revoke_share(
-        &self,
-        vault: &str,
-        id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let vault = self.state.vaults.get(vault).ok_or("Vault not found")?;
-        self.state.shares.revoke(vault, id).await
+    pub fn connection_key(&self, vault: &str, permission: Permission) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|links| links.vault_id == vault)
+            .map(|links| links.key(permission))
     }
 }
 #[derive(Clone)]
@@ -259,10 +228,9 @@ async fn access_check(
         .map(|(_, tail)| tail)
         .unwrap_or("");
     let operation = request_operation(request.method(), tail);
-    let _admission = match grant.admit(operation).await {
-        Ok(guard) => guard,
-        Err(error) => return error.into_response(),
-    };
+    if let Err(error) = grant.check(operation) {
+        return error.into_response();
+    }
     request.extensions_mut().insert(RemoteAccess { grant });
     next.run(request).await
 }
@@ -290,11 +258,35 @@ fn log_path(path: &str) -> String {
     }
 }
 
+pub fn connection_base_url(
+    configured: Option<&str>,
+    listen: SocketAddr,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(configured) = configured else {
+        return Ok(format!("http://{listen}"));
+    };
+    let mut url = url::Url::parse(configured)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("public_url must be an HTTP(S) origin/deployment prefix without credentials, query or fragment".into());
+    }
+    url.set_path(url.path().trim_end_matches('/').to_owned().as_str());
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
 pub fn build_server(
     config: Config,
     base: &std::path::Path,
 ) -> Result<Server, Box<dyn std::error::Error>> {
+    connection_base_url(config.server.public_url.as_deref(), config.server.listen)?;
     let mut origins = config.server.allowed_origins.clone();
+    if let Some(public_url) = &config.server.public_url {
+        origins.push(url::Url::parse(public_url)?.origin().ascii_serialization());
+    }
     origins.push(format!("http://{}", config.server.listen));
     if config.server.listen.ip().is_loopback() {
         origins.push(format!("http://localhost:{}", config.server.listen.port()));
@@ -310,7 +302,8 @@ pub fn build_server(
         })
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
     let mut vaults = HashMap::new();
-    let shares = shares::Registry::default();
+    let mut shares = shares::Registry::default();
+    let mut links = Vec::new();
     let (prepared, web_dir) = profiles::prepare(
         config.vaults,
         config.server.state_dir.as_deref(),
@@ -325,28 +318,8 @@ pub fn build_server(
     {
         let files = FsVault::open(&root)?;
         let mut documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
-        let share_path = history_path.as_ref().map(|path| {
-            if path.file_name().is_some_and(|name| name == "history.redb") {
-                path.with_file_name("shares.redb")
-            } else {
-                path.with_extension("shares.redb")
-            }
-        });
-        if vault.history_mode == HistoryMode::Reset {
-            if let Some(path) = &share_path {
-                if path.exists() {
-                    std::fs::rename(
-                        path,
-                        path.with_extension(format!("revoked-{}.redb", uuid::Uuid::new_v4())),
-                    )?;
-                }
-            }
-        }
-        let share_store = shares::Store::open(
-            share_path.as_deref(),
-            &documents.identity.id,
-            vault.history_mode != HistoryMode::Recover || vault.initialize_shares,
-        )?;
+        let seed = shares::seed(vault.share_key.as_deref(), &documents.share_seed)?;
+        let identity = documents.identity.id.clone();
         let (trigger, observations) = reconcile::channel();
         let reconcile_signal = trigger.clone();
         let (events, _) = broadcast::channel(128);
@@ -374,7 +347,6 @@ pub fn build_server(
             id: vault.id.clone(),
             name: vault.name,
             read_only: vault.read_only,
-            shares: share_store,
             packages: package_resources::PackageResources::new(root.clone(), events.clone())?,
             files: Mutex::new(files),
             documents: Mutex::new(documents),
@@ -385,7 +357,7 @@ pub fn build_server(
         });
         let worker = reconcile::Reconciler::start(Arc::downgrade(&hosted), trigger, observations)?;
         *hosted.reconciler.lock().unwrap() = Some(worker);
-        shares.register(hosted.clone())?;
+        links.push(shares.register(hosted.clone(), &seed, &identity)?);
         vaults.insert(vault.id, hosted);
     }
     let (shutdown, _) = watch::channel(false);
@@ -459,12 +431,10 @@ pub fn build_server(
             )
             .on_failure(()),
     );
-    let management = management::routes().with_state(state.clone());
     Ok(Server {
         router,
         shutdown,
-        management,
-        state,
+        links,
     })
 }
 
@@ -514,7 +484,7 @@ async fn describe(
         .lock()
         .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "shareId": grant.share.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.root, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.root, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(
@@ -650,13 +620,7 @@ async fn events(
         .merge(stopping)
         .take_while(Option::is_some)
         .map(|hint| Ok::<_, Infallible>(Event::default().json_data(hint.unwrap()).unwrap()));
-    let grant = access.grant.clone();
-    let stream =
-        futures_util::StreamExt::take_until(
-            first.chain(stream),
-            async move { grant.cancelled().await },
-        );
-    Ok(Sse::new(stream)
+    Ok(Sse::new(first.chain(stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response())
 }
@@ -671,9 +635,9 @@ pub(crate) mod testing {
     impl Host {
         pub fn new(server: crate::Server, vault: &str) -> Self {
             let key = server
-                .create_share(vault, crate::Permission::Edit, "test".into())
+                .connection_key(vault, crate::Permission::Edit)
                 .unwrap()
-                .key;
+                .to_owned();
             Self {
                 router: server.router,
                 key,

@@ -47,9 +47,9 @@ impl Host {
         )
         .unwrap();
         let key = server
-            .create_share("notes", celestite_server::Permission::Edit, "test".into())
+            .connection_key("notes", celestite_server::Permission::Edit)
             .unwrap()
-            .key;
+            .to_owned();
         let stopping = server.shutdown;
         let mut signal = stopping.subscribe();
         let task = tokio::spawn(async move {

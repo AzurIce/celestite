@@ -11,14 +11,17 @@ use std::path::Path;
 pub type DocumentState = EditorDocument;
 pub(crate) struct Documents {
     pub identity: VaultIdentity,
+    pub share_seed: [u8; 32],
     core: EditorCore<NativeBackend>,
     feed: super::changes::DocumentFeed,
     writers: std::collections::HashSet<String>,
 }
 impl Documents {
     pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> Result<Self> {
+        let backend = NativeBackend::open(state, root, mode)?;
+        let share_seed = backend.share_seed()?;
         let core = block_on(EditorCore::open_with_options(
-            NativeBackend::open(state, root, mode)?,
+            backend,
             EditorOptions {
                 external_changes: ExternalChangePolicy::Merge,
                 defer_filesystem_diff: true,
@@ -33,6 +36,7 @@ impl Documents {
         let feed = super::changes::DocumentFeed::new(identity.clone(), core.persistent());
         Ok(Self {
             identity,
+            share_seed,
             core,
             feed,
             writers: Default::default(),

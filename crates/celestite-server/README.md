@@ -14,29 +14,29 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 ./target/debug/celestite-server --config /tmp/celestite-demo/config.toml
 ```
 
-在另一个终端为正在运行的宿主创建分享：
+正常启动时，每个 Vault 自动生成并在日志里打印一对链接：
 
-```sh
-./target/debug/celestite-server --config /tmp/celestite-demo/config.toml \
-  share create notes --permission readonly --label '阅读分享' --base-url http://127.0.0.1:7437
-./target/debug/celestite-server --config /tmp/celestite-demo/config.toml \
-  share create notes --permission edit --label '编辑分享' --base-url http://127.0.0.1:7437
-./target/debug/celestite-server --config /tmp/celestite-demo/config.toml share list notes
-# 用列表中的非秘密 ShareId 撤销某份分享：
-./target/debug/celestite-server --config /tmp/celestite-demo/config.toml share revoke notes <ShareId>
+```text
+Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://127.0.0.1:7437/<other-key>
 ```
 
-创建命令将完整链接输出到 stdout，原始 key 只返回一次；列表不能恢复原链接。打开 Web 客户端，在底部“管理 Vault”中粘贴输出的 `http://127.0.0.1:7437/<key>` 或 `http://127.0.0.1:7437/ro-<random>`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。
+打开 Web 客户端，在底部“管理 Vault”中粘贴其中一条完整 URL。链接到 key 为止，客户端自动追加 `/api/v1/...`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。没有分享初始化或分享管理命令。
 
 配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。配置 ID 用于宿主管理；分享绑定持久化的 Vault 身份，改名或修改配置 ID 保留已有链接。更改目录继续遵守 profile 的根目录迁移校验。
 
-## 分享状态与升级
+## 链接配置与轮换
 
-每个持久化 Vault 的私有状态目录保存 `shares.redb`，与 `history.redb` 分开。初始化 Vault 时同时创建空分享库，不自动发布默认链接；正常启动恢复凭证摘要和授权，分享库缺失或损坏时报错。临时内存 Vault 的分享随宿主退出丢失。
+每个 Vault 固定提供 readonly / edit 两条链接，由秘密值与持久化的逻辑 Vault 身份分别派生。`ro-` 属于完整凭证，两个权限使用不同派生域；增删前缀不能转换权限。`read_only = true` 仍限制整个 Vault，因此它的 edit 链接也只有读取能力。
 
-已有 `history.redb` 的宿主升级时，先停止旧进程，运行 `--init-shares notes` 创建空分享库，再正常启动并创建新链接。移除配置中的 `token_env`；旧的按配置 ID 连接 URL 已删除，客户端需要重新添加宿主提供的分享链接。`--reset-vault` 创建新身份并归档旧分享库，旧链接失效。
+不配置 `share_key` 时，宿主自动产生 32 字节随机秘密值，保存在 `history.redb` 的私有宿主元数据里，不进入正文 CRDT、编辑历史或文件树。已有历史库在正常启动时自动补齐，无需额外初始化。正常重启、显示名称或配置 ID 修改保留链接；临时 Vault 每次启动产生新逻辑身份和新链接。
 
-撤销先持久化并阻止新的操作，随后关闭对应 WebSocket 和 SSE；已经进入提交过程的操作允许完成。其他分享和宿主自己的文件监听 / 协调不受影响。完整链接是凭证，客户端连接记录为重连保存它；转发链接即转交权限。
+在 `[[vaults]]` 中配置可选的 `share_key` 可显式控制凭证。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白；显示名 `name` 不参与派生。修改 `share_key` 并重启，会同时使旧 readonly / edit 链接失效，不改变正文或历史身份。配置启动时读取，不支持动态热更新。相同秘密值与同一 Vault 身份派生相同链接：改回旧配置、移除覆盖值恢复默认秘密值或恢复旧状态备份，可能恢复相应旧链接。
+
+`[server] public_url` 可设置打印链接使用的公开 HTTP(S) 地址和反向代理前缀，例如 `https://notes.example.com/celestite`；默认使用实际监听地址。该选项只决定链接基址，其 Origin 自动允许，不改变 key 或监听地址。反向代理将该前缀后的请求转发给宿主，并转发 WebSocket upgrade。
+
+完整链接是凭证，按要求打印在启动日志中，日志的可读者也获得对应权限。普通请求日志继续脱敏 key。客户端连接记录为重连保存完整链接，转发链接即转交权限。宿主退出关闭 HTTP 监听与活动 WebSocket / SSE；轮换后需从新启动日志复制链接重新连接，客户端保留未确认正文供恢复。
+
+旧的按配置 ID 连接 URL、连接 token 和动态分享管理已删除。旧配置移除 `token_env` / `management_socket`；无需 `--init-shares`。本分支早期版本留下的 `shares.redb` 不再读取，可在停服后删除。`--reset-vault` 归档历史并创建新 Vault 身份，也会产生新链接。
 
 ## 命令行
 
@@ -49,8 +49,7 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
   --allowed-origin http://localhost:1420 \
   --vault notes=./notes --vault-name 'notes=我的笔记' \
   --vault reference=./reference --vault-read-only reference=true \
-  --ephemeral-vault notes --ephemeral-vault reference \
-  --management-socket ./private-management/socket
+  --ephemeral-vault notes --ephemeral-vault reference
 
 # 覆盖部分配置；其他 Vault 及设置保留
 ./target/debug/celestite-server --config ./config.toml \
@@ -64,6 +63,7 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 | ---------------------------------- | --------------------------------------------------------------- |
 | `-c, --config FILE`                | 读取指定 TOML 文件                                              |
 | `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                          |
+| `--public-url URL`                 | 覆盖启动链接的公开 HTTP(S) 基址；不改变监听地址                 |
 | `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                         |
 | `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名       |
 | `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                         |
@@ -73,8 +73,6 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 | `--ephemeral-vault ID`             | 可重复；明确使用临时内存历史，禁用该 Vault 的持久化             |
 | `--init-vault ID`                  | 可重复；首次初始化指定 Vault 的历史，完成后退出；已有数据库报错 |
 | `--reset-vault ID`                 | 可重复；归档指定 Vault 的旧历史，创建新身份，完成后退出         |
-| `--management-socket SOCKET`       | 覆盖本机分享管理 socket；父目录必须为 0700                      |
-| `--init-shares ID`                 | 为旧的持久化 Vault 显式创建空分享库，完成后退出                 |
 | `--no-web`                         | 禁用配置中的静态 Web 资源目录                                   |
 | `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                    |
 | `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                             |
@@ -84,7 +82,7 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 
 `ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。
 
-`server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；网络访问通过 URL 中的完整随机 key 鉴权，不依赖账号。readonly 的 `ro-` 属于凭证，修改前缀不会转换权限。HTTP 和 WebSocket 共用授权，readonly 允许读取、预览和实时更新，edit 允许正文及目录修改，仍受 Vault 级 `read_only` 限制。分享管理只在私有 Unix socket 上提供，编辑链接不能管理分享。默认 socket 位于首个持久化 Vault 的 `state_dir/management/socket`，可通过 `management_socket` 覆盖；父目录自动按 0700 创建，已有目录必须满足该权限，socket 为 0600。公网使用 HTTPS / WSS，反向代理需转发 WebSocket，并脱敏访问路径中的 key。应用日志脱敏 key，授权响应使用 `no-store` / `no-referrer`。CORS 支持 `If-Match`、`Content-Type` 和读取 `ETag`，有 Origin 的请求另行检查来源；CORS 不承担认证。
+`server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；网络访问通过 URL 中的完整随机 key 鉴权，不依赖账号。readonly 的 `ro-` 属于凭证，修改前缀不会转换权限。HTTP 和 WebSocket 共用授权，readonly 允许读取、预览和实时更新，edit 允许正文及目录修改，仍受 Vault 级 `read_only` 限制。每个 Vault 启动时固定提供两条链接，通过配置轮换，无独立分享管理接口。公网使用 HTTPS / WSS，反向代理需转发 WebSocket，并脱敏访问路径中的 key。普通请求日志脱敏 key，授权响应使用 `no-store` / `no-referrer`。CORS 支持 `If-Match`、`Content-Type` 和读取 `ETag`，有 Origin 的请求另行检查来源；CORS 不承担认证。
 
 ## 日志
 
@@ -96,7 +94,7 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
 
 `info` 记录启动、Vault 初始化、CRDT 导入结果、磁盘保存与关闭；`debug` 增加 HTTP 请求状态码和耗时、线程池操作、更新包大小与因果版本回执。4xx 请求记为 `warn`，5xx 和内部操作失败记为 `error`。每个 HTTP 请求有独立 `request_id`，线程池日志沿用请求上下文。SSE 的响应耗时表示建立响应所需时间。
 
-请求日志不包含查询串、请求头或正文；同步日志只记录包大小和状态。作为 library 使用时，由调用者初始化 subscriber。
+启动日志打印完整连接链接；普通请求日志脱敏 key 且不包含查询串、请求头或正文；同步日志只记录包大小和状态。作为 library 使用时，由调用者初始化 subscriber。
 
 ## API v1
 

@@ -71,23 +71,25 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
     let reader = server
-        .create_share("notes", Permission::Readonly, "Readers".into())
-        .unwrap();
+        .connection_key("notes", Permission::Readonly)
+        .unwrap()
+        .to_owned();
     let editor = server
-        .create_share("notes", Permission::Edit, "Editors".into())
-        .unwrap();
-    assert!(reader.key.starts_with("ro-"));
-    assert!(!editor.key.starts_with("ro-"));
-    let ro = read(response(&server.router, &reader.key, "GET", "", Value::Null).await).await;
-    let rw = read(response(&server.router, &editor.key, "GET", "", Value::Null).await).await;
+        .connection_key("notes", Permission::Edit)
+        .unwrap()
+        .to_owned();
+    assert!(reader.starts_with("ro-"));
+    assert!(!editor.starts_with("ro-"));
+    let ro = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
+    let rw = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
     assert_eq!(ro["vaultIdentity"], rw["vaultIdentity"]);
-    assert_eq!(ro["shareId"], reader.share.id);
+    assert_ne!(ro["shareId"], rw["shareId"]);
     assert_eq!(ro["readOnly"], true);
     assert_eq!(rw["readOnly"], false);
     assert!(ro.get("id").is_none());
     for invalid in [
-        reader.key.trim_start_matches("ro-").to_string(),
-        format!("ro-{}", editor.key),
+        reader.trim_start_matches("ro-").to_string(),
+        format!("ro-{}", editor),
         "notes".into(),
     ] {
         assert_eq!(
@@ -100,7 +102,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     let document = read(
         response(
             &server.router,
-            &reader.key,
+            &reader,
             "POST",
             "/documents/open",
             json!({"path":"a.md"}),
@@ -113,7 +115,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     let version = &document["snapshot"]["version"];
     let updates = response(
         &server.router,
-        &reader.key,
+        &reader,
         "POST",
         &format!("/documents/{id}/updates"),
         version.clone(),
@@ -132,7 +134,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
         assert_eq!(
             response(
                 &server.router,
-                &reader.key,
+                &reader,
                 "POST",
                 &format!("/documents/{id}/{tail}"),
                 json!({})
@@ -150,20 +152,20 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
         ("DELETE", "/entry?path=a.md"),
     ] {
         assert_eq!(
-            response(&server.router, &reader.key, method, tail, json!({}))
+            response(&server.router, &reader, method, tail, json!({}))
                 .await
                 .status(),
             StatusCode::FORBIDDEN
         );
     }
-    let edited = read(response(&server.router, &editor.key, "POST", &format!("/documents/{id}/transact"), json!({
+    let edited = read(response(&server.router, &editor, "POST", &format!("/documents/{id}/transact"), json!({
         "expected_version": version, "origin":"test", "edits":[{"from":0,"to":0,"insert":"edited "}], "undo_metadata":null,"undo_positions":[]
     })).await).await;
     assert_eq!(edited["document"]["snapshot"]["text"], "edited original");
     let visible = read(
         response(
             &server.router,
-            &reader.key,
+            &reader,
             "GET",
             &format!("/documents/{id}"),
             Value::Null,
@@ -191,116 +193,183 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
 }
 
 #[tokio::test]
-async fn revocation_closes_both_event_feeds_without_affecting_other_links() {
+async fn restart_and_config_rename_preserve_links_and_key_rotation_invalidates_both_roles() {
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
     let reader = server
-        .create_share("notes", Permission::Readonly, "Reader".into())
-        .unwrap();
-    let other = server
-        .create_share("notes", Permission::Edit, "Editor".into())
+        .connection_key("notes", Permission::Readonly)
+        .unwrap()
+        .to_owned();
+    let editor = server
+        .connection_key("notes", Permission::Edit)
+        .unwrap()
+        .to_owned();
+    let before = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
+    drop(server);
+    let mut config = f.config(HistoryMode::Recover);
+    config.vaults[0].id = "renamed".into();
+    config.vaults[0].name = "Renamed notes".into();
+    let server = build_server(config, f.dir.path()).unwrap();
+    assert_eq!(
+        server.connection_key("renamed", Permission::Readonly),
+        Some(reader.as_str())
+    );
+    assert_eq!(
+        server.connection_key("renamed", Permission::Edit),
+        Some(editor.as_str())
+    );
+    let after = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
+    assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
+    assert_eq!(before["shareId"], after["shareId"]);
+    drop(server);
+    let mut config = f.config(HistoryMode::Recover);
+    config.vaults[0].share_key = Some("new randomly chosen secret value 1234567890".into());
+    let server = build_server(config, f.dir.path()).unwrap();
+    for old in [&reader, &editor] {
+        assert_eq!(
+            response(&server.router, old, "GET", "", Value::Null)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    let rotated = server
+        .connection_key("notes", Permission::Edit)
+        .unwrap()
+        .to_owned();
+    let after = read(response(&server.router, &rotated, "GET", "", Value::Null).await).await;
+    assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
+    drop(server);
+    let mut config = f.config(HistoryMode::Recover);
+    config.vaults[0].share_key = Some("new randomly chosen secret value 1234567890".into());
+    let server = build_server(config, f.dir.path()).unwrap();
+    assert_eq!(
+        server.connection_key("notes", Permission::Edit),
+        Some(rotated.as_str())
+    );
+    drop(server);
+    let mut config = f.config(HistoryMode::Reset);
+    config.vaults[0].share_key = Some("new randomly chosen secret value 1234567890".into());
+    let server = build_server(config, f.dir.path()).unwrap();
+    assert_eq!(
+        response(&server.router, &rotated, "GET", "", Value::Null)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn shutdown_ends_both_event_feeds() {
+    let f = Fixture::new();
+    let server = f.start(HistoryMode::Initialize);
+    let reader = server
+        .connection_key("notes", Permission::Readonly)
         .unwrap();
     let mut feeds = Vec::new();
     for tail in ["/events", "/documents/events"] {
-        let response = response(&server.router, &reader.key, "GET", tail, Value::Null).await;
+        let response = response(&server.router, reader, "GET", tail, Value::Null).await;
         assert_eq!(response.headers()["cache-control"], "no-store");
         let mut body = response.into_body();
         body.frame().await.unwrap().unwrap();
         feeds.push(body);
     }
-    server
-        .revoke_share("notes", &reader.share.id)
-        .await
-        .unwrap();
+    server.shutdown.send_replace(true);
     for mut body in feeds {
         assert!(tokio::time::timeout(Duration::from_secs(1), body.frame())
             .await
             .unwrap()
             .is_none());
     }
-    assert_eq!(
-        response(&server.router, &reader.key, "GET", "", Value::Null)
-            .await
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        response(&server.router, &other.key, "GET", "", Value::Null)
-            .await
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(server.list_shares("notes").unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn restart_and_config_rename_preserve_links_and_durable_revocation() {
-    let f = Fixture::new();
-    let server = f.start(HistoryMode::Initialize);
-    let alive = server
-        .create_share("notes", Permission::Edit, "Keep".into())
-        .unwrap();
-    let revoked = server
-        .create_share("notes", Permission::Readonly, "Remove".into())
-        .unwrap();
-    server
-        .revoke_share("notes", &revoked.share.id)
-        .await
-        .unwrap();
-    let before = read(response(&server.router, &alive.key, "GET", "", Value::Null).await).await;
-    drop(server);
-    let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].id = "renamed".into();
-    config.vaults[0].name = "Renamed notes".into();
-    let server = build_server(config, f.dir.path()).unwrap();
-    let after = read(response(&server.router, &alive.key, "GET", "", Value::Null).await).await;
-    assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
-    assert_eq!(before["shareId"], after["shareId"]);
-    assert_eq!(after["name"], "Renamed notes");
-    assert_eq!(
-        response(&server.router, &revoked.key, "GET", "", Value::Null)
-            .await
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    drop(server);
-    let server = f.start(HistoryMode::Reset);
-    assert_eq!(
-        response(&server.router, &alive.key, "GET", "", Value::Null)
-            .await
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert!(server.list_shares("notes").unwrap().is_empty());
 }
 
 #[test]
-fn missing_share_store_requires_explicit_initialization() {
+fn existing_history_automatically_acquires_a_private_seed_without_share_initialization() {
+    use redb::TableDefinition;
     let f = Fixture::new();
     drop(f.start(HistoryMode::Initialize));
-    fs::remove_file(f.dir.path().join("state/shares.redb")).unwrap();
+    let path = f.dir.path().join("state/history.redb");
+    let db = redb::Database::open(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    tx.open_table(TableDefinition::<&str, &[u8]>::new("editor_metadata"))
+        .unwrap()
+        .remove("share-seed")
+        .unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let server = f.start(HistoryMode::Recover);
+    let key = server
+        .connection_key("notes", Permission::Edit)
+        .unwrap()
+        .to_owned();
+    assert_eq!(server.links.len(), 1);
+    assert!(!f.dir.path().join("state/shares.redb").exists());
+    drop(server);
+    assert!(!fs::read(&path)
+        .unwrap()
+        .windows(key.len())
+        .any(|part| part == key.as_bytes()));
+    let server = f.start(HistoryMode::Recover);
+    assert_eq!(
+        server.connection_key("notes", Permission::Edit),
+        Some(key.as_str())
+    );
+    drop(server);
+    let db = redb::Database::open(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    tx.open_table(TableDefinition::<&str, &[u8]>::new("editor_metadata"))
+        .unwrap()
+        .insert("share-seed", b"corrupted".as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+    drop(db);
     assert!(build_server(f.config(HistoryMode::Recover), f.dir.path()).is_err());
-    let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].initialize_shares = true;
-    let server = build_server(config, f.dir.path()).unwrap();
-    assert!(server.list_shares("notes").unwrap().is_empty());
+}
+
+#[test]
+fn public_url_and_configured_secrets_are_validated_before_initialization() {
+    let f = Fixture::new();
+    let mut config = f.config(HistoryMode::Initialize);
+    config.vaults[0].share_key = Some("a public name".into());
+    assert!(build_server(config, f.dir.path()).is_err());
+    assert!(!f.dir.path().join("state/history.redb").exists());
+    for invalid in [
+        "ftp://host",
+        "https://user:pass@host",
+        "https://host/?",
+        "https://host/#",
+    ] {
+        let mut config = f.config(HistoryMode::Initialize);
+        config.server.public_url = Some(invalid.into());
+        assert!(build_server(config, f.dir.path()).is_err());
+        assert!(!f.dir.path().join("state/history.redb").exists());
+    }
+    let listen = "127.0.0.1:7437".parse().unwrap();
+    assert_eq!(
+        celestite_server::connection_base_url(None, listen).unwrap(),
+        "http://127.0.0.1:7437"
+    );
+    assert_eq!(
+        celestite_server::connection_base_url(Some("https://host/deploy///"), listen).unwrap(),
+        "https://host/deploy"
+    );
 }
 
 #[tokio::test]
-async fn websocket_url_authenticates_before_upgrade_and_revocation_closes_the_session() {
+async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_session() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
     let reader = server
-        .create_share("notes", Permission::Readonly, "Socket reader".into())
-        .unwrap();
-    let description =
-        read(response(&server.router, &reader.key, "GET", "", Value::Null).await).await;
+        .connection_key("notes", Permission::Readonly)
+        .unwrap()
+        .to_owned();
+    let description = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
     let document = read(
         response(
             &server.router,
-            &reader.key,
+            &reader,
             "POST",
             "/documents/open",
             json!({"path":"a.md"}),
@@ -316,12 +385,12 @@ async fn websocket_url_authenticates_before_upgrade_and_revocation_closes_the_se
     });
     let invalid = format!(
         "ws://{address}{}/sync",
-        uri(reader.key.trim_start_matches("ro-"), "")
+        uri(reader.trim_start_matches("ro-"), "")
     );
     assert!(
         matches!(connect_async(invalid).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(reply) if reply.status()==404)
     );
-    let (mut socket, _) = connect_async(format!("ws://{address}{}/sync", uri(&reader.key, "")))
+    let (mut socket, _) = connect_async(format!("ws://{address}{}/sync", uri(&reader, "")))
         .await
         .unwrap();
     socket
@@ -362,10 +431,7 @@ async fn websocket_url_authenticates_before_upgrade_and_revocation_closes_the_se
             break;
         }
     }
-    server
-        .revoke_share("notes", &reader.share.id)
-        .await
-        .unwrap();
+    server.shutdown.send_replace(true);
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(frame) = socket.next().await {
             if matches!(frame, Ok(Message::Close(_)) | Err(_)) {
@@ -379,27 +445,31 @@ async fn websocket_url_authenticates_before_upgrade_and_revocation_closes_the_se
     let _ = task.await;
 }
 
-#[test]
-fn share_store_keeps_only_digests_and_rejects_corruption_or_another_vault_identity() {
+#[tokio::test]
+async fn public_url_origin_is_allowed_for_the_hosted_client() {
     let f = Fixture::new();
-    let other = Fixture::new();
-    let server = f.start(HistoryMode::Initialize);
-    let reader = server
-        .create_share("notes", Permission::Readonly, "Readers".into())
+    let mut config = f.config(HistoryMode::Initialize);
+    config.server.public_url = Some("https://host.example/deploy".into());
+    let server = build_server(config, f.dir.path()).unwrap();
+    let key = server
+        .connection_key("notes", Permission::Readonly)
         .unwrap();
-    let list = serde_json::to_value(server.list_shares("notes").unwrap()).unwrap();
-    assert!(list[0].get("key").is_none());
-    assert!(list[0].get("keyHash").is_none());
-    assert_eq!(list[0]["label"], "Readers");
-    drop(server);
-    let path = f.dir.path().join("state/shares.redb");
-    let bytes = fs::read(&path).unwrap();
-    assert!(!bytes
-        .windows(reader.key.len())
-        .any(|part| part == reader.key.as_bytes()));
-    drop(other.start(HistoryMode::Initialize));
-    fs::copy(other.dir.path().join("state/shares.redb"), &path).unwrap();
-    assert!(build_server(f.config(HistoryMode::Recover), f.dir.path()).is_err());
-    fs::write(&path, b"corrupted share database").unwrap();
-    assert!(build_server(f.config(HistoryMode::Recover), f.dir.path()).is_err());
+    for (origin, expected) in [
+        ("https://host.example", StatusCode::OK),
+        ("https://other.example", StatusCode::FORBIDDEN),
+    ] {
+        let reply = server
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri(key, ""))
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), expected);
+    }
 }

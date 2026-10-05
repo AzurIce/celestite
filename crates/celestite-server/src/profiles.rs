@@ -41,6 +41,7 @@ pub(crate) fn prepare(
     // Only legacy profiles may share an identical state directory: their file names are distinct.
     let mut states: Vec<(PathBuf, bool)> = vec![];
     for config in vaults {
+        crate::shares::seed(config.share_key.as_deref(), &[0; 32])?;
         if config.id.is_empty()
             || !config
                 .id
@@ -57,10 +58,7 @@ pub(crate) fn prepare(
             return Err("Vault directories must not overlap".into());
         }
         let history_path = if config.ephemeral {
-            if config.state_dir.is_some()
-                || config.history_mode != HistoryMode::Recover
-                || config.initialize_shares
-            {
+            if config.state_dir.is_some() || config.history_mode != HistoryMode::Recover {
                 return Err(format!("Vault {}: ephemeral cannot be combined with state_dir, initialization or reset", config.id).into());
             }
             None

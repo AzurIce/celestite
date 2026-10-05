@@ -61,13 +61,9 @@ impl Fixture {
             .into_iter()
             .map(|id| {
                 let key = server
-                    .create_share(
-                        &id,
-                        celestite_server::Permission::Edit,
-                        "profile-test".into(),
-                    )
+                    .connection_key(&id, celestite_server::Permission::Edit)
                     .unwrap()
-                    .key;
+                    .to_owned();
                 (id, key)
             })
             .collect();
@@ -315,8 +311,6 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
         .unwrap();
     let mut config = f.config(HistoryMode::Recover);
     config.vaults[0].state_dir = Some(archive);
-    // Recovering archived history starts a new sharing store; revoked links stay revoked.
-    config.vaults[0].initialize_shares = true;
     let router = f.router(config);
     let old = open(&router, "a").await;
     assert_eq!(old["id"], initial["id"]);
@@ -364,11 +358,6 @@ fn ephemeral_is_explicit_and_cannot_initialize_or_reset() {
     let mut config = f.config(HistoryMode::Recover);
     config.vaults[0].ephemeral = true;
     config.vaults[0].state_dir = None;
-    let mut invalid = f.config(HistoryMode::Recover);
-    invalid.vaults[0].ephemeral = true;
-    invalid.vaults[0].state_dir = None;
-    invalid.vaults[0].initialize_shares = true;
-    f.rejects(invalid);
     drop(f.router(config));
     assert!(!f.path("state-a/history.redb").exists());
 }

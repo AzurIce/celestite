@@ -16,29 +16,18 @@ const binary =
   fileURLToPath(
     new URL("../../target/debug/celestite-server", import.meta.url),
   );
-function createShare(
-  config: string,
-  vault: string,
-  permission: "readonly" | "edit",
-  baseUrl: string,
-) {
-  const result = spawnSync(
-    binary,
-    [
-      "--config",
-      config,
-      "share",
-      "create",
-      vault,
-      "--permission",
-      permission,
-      "--base-url",
-      baseUrl,
-    ],
-    { encoding: "utf8", timeout: 10000 },
-  );
-  expect(result.status, result.stderr).toBe(0);
-  return result.stdout.trim();
+function startupLinks(log: string, vault: string) {
+  const line = log
+    .split("\n")
+    .find(
+      (line) =>
+        line.includes(`vault_id=${vault} `) && line.includes("readonly_url="),
+    );
+  const readonly = line?.match(/readonly_url=(\S+)/)?.[1];
+  const edit = line?.match(/edit_url=(\S+)/)?.[1];
+  expect(readonly, "readonly link is printed at startup").toBeTruthy();
+  expect(edit, "edit link is printed at startup").toBeTruthy();
+  return { readonly: readonly!, edit: edit! };
 }
 const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
   runtimeErrors: [
@@ -75,7 +64,7 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
       const config = join(root, "config.toml");
       await writeFile(
         config,
-        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\nmanagement_socket = "private/socket"\n\n` +
+        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\n\n` +
           ["notes", "work", "readonly"]
             .map(
               (id) =>
@@ -102,14 +91,11 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
         const urls: Record<string, string> = {};
-        for (const id of ["notes", "work", "readonly"])
-          urls[id] = createShare(
-            config,
-            id,
-            id === "readonly" ? "readonly" : "edit",
-            baseUrl,
-          );
-        urls.reader = createShare(config, "notes", "readonly", baseUrl);
+        for (const id of ["notes", "work", "readonly"]) {
+          const links = startupLinks(errors, id);
+          urls[id] = id === "readonly" ? links.readonly : links.edit;
+        }
+        urls.reader = startupLinks(errors, "notes").readonly;
         await use({ url: urls.notes, root, urls });
       } finally {
         child?.kill("SIGTERM");
@@ -749,19 +735,14 @@ test("watch refreshes the tree after an external disk change, and read-only Vaul
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
 });
 
-test("readonly and edit links to one Vault synchronize while revocation freezes only the revoked session", async ({
+test("startup readonly and edit links to one Vault synchronize with separate permissions", async ({
   page,
   api,
 }) => {
   const name = "share-collaboration.md";
   await writeFile(join(api.root, "notes", name), "# Initial");
   const reader = await page.context().newPage();
-  const readerUrl = createShare(
-    join(api.root, "config.toml"),
-    "notes",
-    "readonly",
-    new URL(api.url).origin,
-  );
+  const readerUrl = api.urls.reader;
   try {
     await page.goto("/");
     await connect(page, api.url);
@@ -779,34 +760,130 @@ test("readonly and edit links to one Vault synchronize while revocation freezes 
     await expect(
       reader.getByRole("region", { name: "文档预览" }).locator("h1"),
     ).toHaveText("Shared update");
-    const descriptor = await (await fetch(readerUrl + "/api/v1")).json();
-    const result = spawnSync(
-      binary,
-      [
-        "--config",
-        join(api.root, "config.toml"),
-        "share",
-        "revoke",
-        "notes",
-        descriptor.shareId,
-      ],
-      { encoding: "utf8", timeout: 10000 },
+    await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+    expect(
+      (await fetch(readerUrl.replace("/ro-", "/") + "/api/v1")).status,
+    ).toBe(404);
+    const denied = await fetch(
+      readerUrl + "/api/v1/file?path=" + name + "&mode=replace",
+      { method: "PUT", body: "forged write" },
     );
-    expect(result.status, result.stderr).toBe(0);
-    await expect(
-      reader.getByRole("region", { name: "远端连接状态" }),
-    ).toContainText("远端连接已断开");
-    await expect(editor(reader)).toHaveText("# Shared update");
-    await editor(page).fill("# Editor remains online");
+    expect(denied.status).toBe(403);
     await page.keyboard.press("Control+s");
     await expect
       .poll(() => readFile(join(api.root, "notes", name), "utf8"))
-      .toBe("# Editor remains online");
-    expect((await fetch(readerUrl + "/api/v1")).status).toBe(404);
-    expect((await fetch(api.url + "/api/v1")).status).toBe(200);
+      .toBe("# Shared update");
     await expect(editor(reader)).toHaveText("# Shared update");
   } finally {
     await reader.close();
+  }
+});
+
+test("changing share_key and restarting replaces both startup links without changing Vault history", async ({
+  page,
+  baseURL,
+}) => {
+  const root = await mkdtemp(join(tmpdir(), "celestite-rotation-"));
+  const reservation = createServer();
+  await new Promise<void>((resolve) =>
+    reservation.listen(0, "127.0.0.1", resolve),
+  );
+  const port = (reservation.address() as { port: number }).port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  const config = join(root, "config.toml");
+  const configuration = (key: string) =>
+    `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[[vaults]]\nid = "notes"\nname = "notes"\npath = "notes"\nstate_dir = "state"\nshare_key = "${key}"\n`;
+  let child: ChildProcess | undefined;
+  const stop = async () => {
+    if (!child || child.exitCode !== null) return;
+    const process = child;
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => process.kill("SIGKILL"), 5000);
+      process.once("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      process.kill("SIGTERM");
+    });
+    child = undefined;
+  };
+  const start = async () => {
+    let log = "";
+    child = spawn(binary, ["--config", config], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr?.on("data", (bytes) => (log += String(bytes)));
+    await expect
+      .poll(() => {
+        if (child!.exitCode !== null) throw new Error(`server exited: ${log}`);
+        return log.includes("readonly_url=");
+      })
+      .toBe(true);
+    return startupLinks(log, "notes");
+  };
+  try {
+    await mkdir(join(root, "notes"));
+    await mkdir(join(root, "state"));
+    await writeFile(join(root, "notes", "a.md"), "# Original");
+    await writeFile(
+      config,
+      configuration("random configuration secret value old 1234567890"),
+    );
+    const initialized = spawnSync(
+      binary,
+      ["--config", config, "--init-vault", "notes"],
+      { encoding: "utf8", timeout: 10000 },
+    );
+    expect(initialized.status, initialized.stderr).toBe(0);
+    const before = await start();
+    const identity = (await (await fetch(before.edit + "/api/v1")).json())
+      .vaultIdentity;
+    await page.goto("/");
+    await connect(page, before.edit);
+    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+    await editor(page).fill("# Preserved shared draft");
+    await expect
+      .poll(async () => {
+        const documents = await (
+          await fetch(before.edit + "/api/v1/documents")
+        ).json();
+        return documents.find((document: any) => document.path === "a.md")
+          .snapshot.text;
+      })
+      .toBe("# Preserved shared draft");
+    await stop();
+    await expect(
+      page.getByRole("region", { name: "远端连接状态" }),
+    ).toBeVisible();
+    await writeFile(
+      config,
+      configuration("random configuration secret value new 1234567890"),
+    );
+    const after = await start();
+    expect(after.readonly).not.toBe(before.readonly);
+    expect(after.edit).not.toBe(before.edit);
+    for (const old of [before.readonly, before.edit])
+      expect((await fetch(old + "/api/v1")).status).toBe(404);
+    expect(
+      (await (await fetch(after.edit + "/api/v1")).json()).vaultIdentity,
+    ).toEqual(identity);
+    await page
+      .getByRole("button", { name: "尝试重新连接", exact: true })
+      .click();
+    await expect(
+      page.getByRole("region", { name: "远端连接状态" }),
+    ).toContainText("Link not found");
+    await expect(editor(page)).toHaveText("# Preserved shared draft");
+    await connect(page, after.edit);
+    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+    await expect(editor(page)).toHaveText("# Preserved shared draft");
+    await expect(editor(page)).toHaveAttribute("contenteditable", "true");
+    expect(await readFile(join(root, "notes", "a.md"), "utf8")).toBe(
+      "# Original",
+    );
+  } finally {
+    await stop();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -1820,15 +1897,10 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
           { timeout: 10000 },
         )
         .toBe(true);
-      if (!api.url) {
-        api.url = createShare(
-          config,
-          "notes",
-          "edit",
-          `http://127.0.0.1:${port}`,
-        );
-        api.urls.notes = api.url;
-      }
+      const links = startupLinks(errors, "notes");
+      if (api.url) expect(links.edit).toBe(api.url);
+      api.url = links.edit;
+      api.urls.notes = api.url;
     };
     const stop = async (signal: "SIGTERM" | "SIGKILL") => {
       const process = child;

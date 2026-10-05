@@ -334,11 +334,7 @@ async fn events(
             ))
         },
     );
-    let grant = access.grant.clone();
-    let stream = futures_util::StreamExt::take_until(first.chain(changes), async move {
-        grant.cancelled().await
-    });
-    Ok(Sse::new(stream)
+    Ok(Sse::new(first.chain(changes))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response())
 }

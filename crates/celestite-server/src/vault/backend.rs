@@ -42,6 +42,14 @@ pub(crate) struct NativeBackend {
     intent: Option<DirectoryIntent>,
 }
 impl NativeBackend {
+    pub fn share_seed(&self) -> fs::Result<[u8; 32]> {
+        if let Some(store) = &self.store {
+            return store.share_seed();
+        }
+        let mut seed = [0; 32];
+        getrandom::fill(&mut seed).map_err(super::store::storage_error)?;
+        Ok(seed)
+    }
     pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> fs::Result<Self> {
         let (store, identity) = if let Some(path) = state {
             let (store, identity) = match mode {

@@ -293,7 +293,7 @@ bun run test:ui tests/settings-ui.spec.ts
 
 `src/lib/vault/manager.ts` 的 `VaultManager` 持有连接记录和运行时对象。每个 `Vault` 包含 backend、`VaultDocuments`、文件树模型、编辑器视图缓存和树滚动状态。首页固定打开 `opfs:default`（“我的 Vault”），默认 Vault 不提供移除入口，管理器也拒绝移除；内部文件仍正常管理。
 
-底部“当前 Vault”切换器切换视图，“管理 Vault”打开连接面板。填写宿主生成的 `http(s)://<server>/<key>` 分享链接，客户端在其后追加 `/api/v1/...`。readonly 使用 `ro-` 前缀且具有独立随机凭证；权限由宿主记录和 Vault 级只读策略共同决定。无需单独的 token 输入。URL 去除尾部斜杠，不接受嵌入用户名 / 密码、查询参数或片段；相同链接复用实例，不同分享保持独立授权、Worker 与个人编辑会话，即使它们指向同一个 Vault。连接身份使用独立 UUID，描述返回 `shareId` 与 `vaultIdentity`，不要求它们等于 URL 的 key。
+底部“当前 Vault”切换器切换视图，“管理 Vault”打开连接面板。填写宿主启动日志中的 `http(s)://<server>/<key>` 分享链接，客户端在其后追加 `/api/v1/...`。readonly 使用 `ro-` 前缀且具有独立随机凭证；权限由宿主记录和 Vault 级只读策略共同决定。无需单独的 token 输入。URL 去除尾部斜杠，不接受嵌入用户名 / 密码、查询参数或片段；相同链接复用实例，不同分享保持独立授权、Worker 与个人编辑会话，即使它们指向同一个 Vault。连接身份使用独立 UUID，描述返回 `shareId` 与 `vaultIdentity`，不要求它们等于 URL 的 key。
 
 连接记录位于 OPFS `/celestite/connections.json`，schema 为 2，保存本地连接 ID、完整分享 URL 和显示名称；它是凭证存储，不混入全局 / 项目设置或普通诊断导出。刷新后按需打开并重新验证授权，列表展示服务器和有效权限，通过“复制链接”获取完整地址。旧 schema 的按配置 ID 连接需要重新添加分享链接。
 
@@ -355,7 +355,7 @@ HTML 在 ShadowRoot 中继承应用主题。展开底部诊断可跳转源码；
 
 ## 同步调试页
 
-运行 `bun run dev`，打开 `http://localhost:1420/debug/sync`。server 可由仓库根目录的 `just serve-notist` 启动；运行 `just share-notist` 创建分享，在页面连接命令输出的完整 URL，选择文本并点击“打开并重建实例”。使用其他 Vault 时填写宿主为该 Vault 创建的分享 URL。
+运行 `bun run dev`，打开 `http://localhost:1420/debug/sync`。server 可由仓库根目录的 `just serve-notist` 启动；在页面连接宿主启动日志中的完整 URL，选择文本并点击“打开并重建实例”。使用其他 Vault 时填写该 Vault 的启动链接。
 
 默认创建 A / B 两个独立 Worker 与 WASM `EditorCore<MemoryBackend>`，可增加至 6 个。分别修改正文，再点击“同步全部”；也可逐个推送、拉取、暂停传输，以及切换每秒同步。个人撤销由各自 core 产生 CRDT 更新。“保存到文件”只写 host 当前正文，未推送的客户端修改不会被保存。
 

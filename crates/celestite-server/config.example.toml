@@ -2,9 +2,9 @@
 listen = "127.0.0.1:7437"
 # Origins of your Web clients. Scheme, host and port must match exactly.
 allowed_origins = ["http://localhost:1420", "http://127.0.0.1:1420"]
-# Host-only share management; default: first Vault state_dir/management/socket.
-# Parent directory is private (0700), socket is 0600.
-# management_socket = "./state/notes/management/socket"
+# Optional public origin/deployment prefix for the URLs printed at startup.
+# Defaults to http://<actual listening address>. Its origin is allowed automatically.
+# public_url = "https://notes.example.com"
 # Optional built UI directory, relative to this config file:
 # web_dir = "../../web/dist"
 
@@ -17,4 +17,7 @@ path = "./notes"
 # Initialize once with --init-vault notes, then start without that flag.
 state_dir = "./state/notes"
 read_only = false
+# Optional random secret of at least 32 bytes. Changing it and restarting rotates both links.
+# Omit to use an automatically persisted secret; generate an override with: openssl rand -hex 32
+# share_key = "<random secret>"
 # For disposable tests only: remove state_dir and set ephemeral = true.

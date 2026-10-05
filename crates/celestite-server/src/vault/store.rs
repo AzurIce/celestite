@@ -32,6 +32,30 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// Host-only capability seed; deliberately outside the document journal.
+    pub fn share_seed(&self) -> Result<[u8; 32]> {
+        let tx = self.db.begin_write().map_err(storage_error)?;
+        let seed = {
+            let mut meta = tx.open_table(META).map_err(storage_error)?;
+            let existing = meta
+                .get("share-seed")
+                .map_err(storage_error)?
+                .map(|value| value.value().to_vec());
+            if let Some(bytes) = existing {
+                bytes
+                    .try_into()
+                    .map_err(|_| storage_error("Invalid share seed"))?
+            } else {
+                let mut seed = [0; 32];
+                getrandom::fill(&mut seed).map_err(storage_error)?;
+                meta.insert("share-seed", seed.as_slice())
+                    .map_err(storage_error)?;
+                seed
+            }
+        };
+        tx.commit().map_err(storage_error)?;
+        Ok(seed)
+    }
     pub fn instance_id(&self) -> Result<String> {
         let tx = self.db.begin_read().map_err(storage_error)?;
         let meta = tx.open_table(META).map_err(storage_error)?;

@@ -42,9 +42,9 @@ impl Server {
         )
         .unwrap();
         let key = server
-            .create_share("notes", celestite_server::Permission::Edit, "test".into())
+            .connection_key("notes", celestite_server::Permission::Edit)
             .unwrap()
-            .key;
+            .to_owned();
         let (shutdown, stopping) = oneshot::channel();
         let task = tokio::spawn(async move {
             axum::serve(listener, server.router)

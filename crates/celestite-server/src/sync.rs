@@ -185,7 +185,7 @@ async fn command(
         }
         Command::Open { .. } | Command::Probe { .. } | Command::Ping => Operation::Read,
     };
-    let _admission = grant.admit(operation).await?;
+    grant.check(operation)?;
     let notify_tree = matches!(request.command, Command::Open { .. } | Command::Save { .. });
     run_documents_with_tree(vault,operation == Operation::Edit,notify_tree,move |files,docs| {
         let mut session = session.lock().map_err(|_|VaultError::new("IO","Session lock failed",""))?;
@@ -254,7 +254,7 @@ async fn serve(
         _ => None,
     };
     let Some(hello) = parsed else { return };
-    if hello.protocol_version != 1 || access.grant.check(crate::shares::Operation::Read).is_err() {
+    if hello.protocol_version != 1 {
         let _=socket.send(Message::Text(json!({"kind":"fatal","code":"PermissionDenied","message":"Invalid handshake or authentication"}).to_string().into())).await;
         return;
     }
@@ -301,6 +301,7 @@ async fn serve(
         }
         reader_alive.store(false, Ordering::Release);
     });
+    let mut stopping = shutdown.clone();
     let outcome = async {
         send(
             &mut sink,
@@ -335,15 +336,11 @@ async fn serve(
         send(&mut sink, json!({"kind":"ready","sessionId":session_id})).await?;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
         loop {
-            if !alive.load(Ordering::Acquire)
-                || *shutdown.borrow()
-                || access.grant.check(crate::shares::Operation::Read).is_err()
-            {
+            if !alive.load(Ordering::Acquire) || *shutdown.borrow() {
                 break;
             }
             tokio::select! {
                 _=shutdown.changed()=>break,
-                _=access.grant.cancelled()=>break,
                 _=heartbeat.tick()=>{send(&mut sink,json!({"kind":"heartbeat"})).await?;},
                 request=rx.recv()=>{
                     let Some(request)=request else {break};
@@ -385,8 +382,7 @@ async fn serve(
         }
         Ok::<(), ()>(())
     };
-    let outcome =
-        tokio::select! { result = outcome => result, _ = access.grant.cancelled() => Err(()) };
+    let outcome = tokio::select! { result = outcome => result, _ = stopping.changed() => Err(()) };
     alive.store(false, Ordering::Release);
     reader.abort();
     let _ = sink.close().await;
