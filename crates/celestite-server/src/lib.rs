@@ -13,7 +13,7 @@ use axum::{
 };
 mod editor_api;
 mod package_resources;
-mod profiles;
+mod profile;
 mod reconcile;
 mod shares;
 mod sync;
@@ -50,7 +50,7 @@ use vault::fs::{revision, ChangeHint, FsVault, VaultError};
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
-    pub vaults: Vec<VaultConfig>,
+    pub vault: VaultConfig,
 }
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -60,8 +60,6 @@ pub struct ServerConfig {
     /// Public HTTP(S) origin/deployment prefix used in startup connection URLs.
     pub public_url: Option<String>,
     pub web_dir: Option<PathBuf>,
-    /// Legacy shared directory containing <configured-vault-id>.redb files.
-    pub state_dir: Option<PathBuf>,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -70,14 +68,13 @@ impl Default for ServerConfig {
             allowed_origins: vec![],
             public_url: None,
             web_dir: None,
-            state_dir: None,
         }
     }
 }
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultConfig {
-    pub id: String,
+    #[serde(default = "default_vault_name")]
     pub name: String,
     pub path: PathBuf,
     #[serde(default)]
@@ -92,6 +89,23 @@ pub struct VaultConfig {
     pub history_mode: HistoryMode,
     /// Optional random secret to derive and rotate the two capability links.
     pub share_key: Option<String>,
+}
+
+fn default_vault_name() -> String {
+    "Vault".into()
+}
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            name: default_vault_name(),
+            path: PathBuf::new(),
+            read_only: false,
+            state_dir: None,
+            ephemeral: false,
+            history_mode: HistoryMode::Recover,
+            share_key: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -114,20 +128,17 @@ struct HostedVault {
     reconciler: Mutex<Option<reconcile::Reconciler>>,
 }
 struct ServerState {
-    vaults: HashMap<String, Arc<HostedVault>>,
+    vault: Arc<HostedVault>,
     shares: shares::Registry,
     origins: Vec<String>,
     shutdown: watch::Sender<bool>,
 }
 impl Drop for ServerState {
     fn drop(&mut self) {
-        // Join while all Vaults are still strongly owned: shutdown/restart must not
-        // race a late history commit or leave a database temporarily locked.
-        for vault in self.vaults.values() {
-            if let Ok(mut worker) = vault.reconciler.lock() {
-                if let Some(worker) = worker.as_mut() {
-                    worker.stop();
-                }
+        // Join before releasing the Vault so restart cannot race a late history commit.
+        if let Ok(mut worker) = self.vault.reconciler.lock() {
+            if let Some(worker) = worker.as_mut() {
+                worker.stop();
             }
         }
     }
@@ -135,15 +146,7 @@ impl Drop for ServerState {
 pub struct Server {
     pub router: Router,
     pub shutdown: watch::Sender<bool>,
-    pub links: Vec<VaultLinks>,
-}
-impl Server {
-    pub fn connection_key(&self, vault: &str, permission: Permission) -> Option<&str> {
-        self.links
-            .iter()
-            .find(|links| links.vault_id == vault)
-            .map(|links| links.key(permission))
-    }
+    pub links: VaultLinks,
 }
 #[derive(Clone)]
 struct RemoteAccess {
@@ -301,68 +304,57 @@ pub fn build_server(
             Ok(header)
         })
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
-    let mut vaults = HashMap::new();
-    let mut shares = shares::Registry::default();
-    let mut links = Vec::new();
-    let (prepared, web_dir) = profiles::prepare(
-        config.vaults,
-        config.server.state_dir.as_deref(),
-        config.server.web_dir.as_deref(),
-        base,
-    )?;
-    for profiles::PreparedVault {
-        config: vault,
-        root,
-        history_path,
-    } in prepared
-    {
-        let files = FsVault::open(&root)?;
-        let mut documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
-        let seed = shares::seed(vault.share_key.as_deref(), &documents.share_seed)?;
-        let identity = documents.identity.id.clone();
-        let (trigger, observations) = reconcile::channel();
-        let reconcile_signal = trigger.clone();
-        let (events, _) = broadcast::channel(128);
-        let sender = events.clone();
-        let watched_vault = vault.id.clone();
-        // Hints are intentionally coarse. Watch errors and reconnects invalidate the entire tree.
-        let mut watcher = notify::recommended_watcher(
-            move |event: notify::Result<notify::Event>| {
-                if let Err(error) = &event {
-                    tracing::warn!(vault_id = %watched_vault, %error, "Vault watcher failed; invalidating file tree");
-                }
-                // Reads produce access events too; forwarding them causes refresh loops.
-                if !matches!(event, Ok(ref event) if event.kind.is_access()) {
-                    reconcile_signal.request();
-                    let _ = sender.send(ChangeHint::all());
-                }
-            },
-        )?;
-        watcher.watch(&root, notify::RecursiveMode::Recursive)?;
-        // Watch before discovering files so changes during the initial scan are queued.
-        documents.reconcile()?;
-        documents.publish_changes()?;
-        tracing::info!(vault_id = %vault.id, root = %root.display(), read_only = vault.read_only, persistent_history = documents.persistent(), "Vault initialized");
-        let hosted = Arc::new(HostedVault {
-            id: vault.id.clone(),
-            name: vault.name,
-            read_only: vault.read_only,
-            packages: package_resources::PackageResources::new(root.clone(), events.clone())?,
-            files: Mutex::new(files),
-            documents: Mutex::new(documents),
-            events,
-            _watcher: Mutex::new(watcher),
-            reconcile_trigger: trigger.clone(),
-            reconciler: Mutex::new(None),
-        });
-        let worker = reconcile::Reconciler::start(Arc::downgrade(&hosted), trigger, observations)?;
-        *hosted.reconciler.lock().unwrap() = Some(worker);
-        links.push(shares.register(hosted.clone(), &seed, &identity)?);
-        vaults.insert(vault.id, hosted);
-    }
+    let (
+        profile::PreparedVault {
+            config: vault,
+            root,
+            history_path,
+        },
+        web_dir,
+    ) = profile::prepare(config.vault, config.server.web_dir.as_deref(), base)?;
+    let files = FsVault::open(&root)?;
+    let mut documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
+    let seed = shares::seed(vault.share_key.as_deref(), &documents.share_seed)?;
+    let identity = documents.identity.id.clone();
+    let (trigger, observations) = reconcile::channel();
+    let reconcile_signal = trigger.clone();
+    let (file_events, _) = broadcast::channel(128);
+    let sender = file_events.clone();
+    let watched_vault = identity.clone();
+    // Hints are intentionally coarse. Watch errors and reconnects invalidate the entire tree.
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if let Err(error) = &event {
+            tracing::warn!(vault_identity = %watched_vault, %error, "Vault watcher failed; invalidating file tree");
+        }
+        // Reads produce access events too; forwarding them causes refresh loops.
+        if !matches!(event, Ok(ref event) if event.kind.is_access()) {
+            reconcile_signal.request();
+            let _ = sender.send(ChangeHint::all());
+        }
+    })?;
+    watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+    // Watch before discovering files so changes during the initial scan are queued.
+    documents.reconcile()?;
+    documents.publish_changes()?;
+    tracing::info!(vault_identity = %identity, root = %root.display(), read_only = vault.read_only, persistent_history = documents.persistent(), "Vault initialized");
+    let hosted = Arc::new(HostedVault {
+        id: identity.clone(),
+        name: vault.name,
+        read_only: vault.read_only,
+        packages: package_resources::PackageResources::new(root.clone(), file_events.clone())?,
+        files: Mutex::new(files),
+        documents: Mutex::new(documents),
+        events: file_events,
+        _watcher: Mutex::new(watcher),
+        reconcile_trigger: trigger.clone(),
+        reconciler: Mutex::new(None),
+    });
+    let worker = reconcile::Reconciler::start(Arc::downgrade(&hosted), trigger, observations)?;
+    *hosted.reconciler.lock().unwrap() = Some(worker);
+    let (shares, links) = shares::Registry::new(hosted.clone(), &seed, &identity)?;
     let (shutdown, _) = watch::channel(false);
     let state = Arc::new(ServerState {
-        vaults,
+        vault: hosted,
         shares,
         origins,
         shutdown: shutdown.clone(),
@@ -449,7 +441,7 @@ async fn run<T: Send + 'static>(
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
-        tracing::debug!(vault_id = %vault.id, mutation, "Running file operation");
+        tracing::debug!(vault_identity = %vault.id, mutation, "Running file operation");
         let files = vault
             .files
             .lock()
@@ -633,11 +625,8 @@ pub(crate) mod testing {
         pub key: String,
     }
     impl Host {
-        pub fn new(server: crate::Server, vault: &str) -> Self {
-            let key = server
-                .connection_key(vault, crate::Permission::Edit)
-                .unwrap()
-                .to_owned();
+        pub fn new(server: crate::Server) -> Self {
+            let key = server.links.key(crate::Permission::Edit).to_owned();
             Self {
                 router: server.router,
                 key,
@@ -677,16 +666,15 @@ mod tests {
                 allowed_origins: vec!["http://127.0.0.1:1432".into()],
                 ..Default::default()
             },
-            vaults: vec![VaultConfig {
-                id: "notes".into(),
+            vault: VaultConfig {
                 name: "Notes".into(),
                 path: root.path().into(),
                 read_only,
                 ephemeral: true,
                 ..Default::default()
-            }],
+            },
         };
-        let router = Host::new(build_server(config, root.path()).unwrap(), "notes");
+        let router = Host::new(build_server(config, root.path()).unwrap());
         (root, router)
     }
     async fn call(
@@ -934,19 +922,18 @@ mod tests {
                     allowed_origins: vec!["https://client.example".into()],
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "N".into(),
                     path: root.path().into(),
                     read_only: false,
                     ephemeral: true,
                     ..Default::default()
-                }],
+                },
             },
             root.path(),
         )
         .unwrap();
-        let router = Host::new(server, "notes");
+        let router = Host::new(server);
         let missing = router
             .router
             .clone()
@@ -1036,20 +1023,19 @@ mod tests {
         let server = build_server(
             Config {
                 server: Default::default(),
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "N".into(),
                     path: root.path().into(),
                     read_only: false,
                     ephemeral: true,
                     ..Default::default()
-                }],
+                },
             },
             root.path(),
         )
         .unwrap();
         let shutdown = server.shutdown.clone();
-        let router = Host::new(server, "notes");
+        let router = Host::new(server);
         let response = call(&router, "GET", "/events", b"", None).await;
         let mut body = response.into_body();
         body.frame().await.unwrap().unwrap();
@@ -1072,16 +1058,15 @@ mod tests {
                 web_dir: Some(web_dir.into()),
                 ..Default::default()
             },
-            vaults: vec![VaultConfig {
-                id: "notes".into(),
+            vault: VaultConfig {
                 name: "N".into(),
                 path: "vault".into(),
                 read_only: false,
                 ephemeral: true,
                 ..Default::default()
-            }],
+            },
         };
-        let router = Host::new(build_server(config("web"), root.path()).unwrap(), "notes");
+        let router = Host::new(build_server(config("web"), root.path()).unwrap());
         let ui = router
             .router
             .clone()
@@ -1125,52 +1110,29 @@ mod tests {
     #[test]
     fn invalid_configuration_is_rejected() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("nested")).unwrap();
-        let vault = |id: &str, path: PathBuf| VaultConfig {
-            id: id.into(),
-            name: "N".into(),
-            path,
-            read_only: false,
-            ephemeral: true,
-            ..Default::default()
-        };
-        assert!(build_server(
-            Config {
-                server: Default::default(),
-                vaults: vec![vault("bad/id", root.path().into())]
+        for vault in [
+            VaultConfig {
+                path: root.path().join("missing"),
+                ephemeral: true,
+                ..Default::default()
             },
-            root.path()
-        )
-        .is_err());
-        assert!(build_server(
-            Config {
-                server: Default::default(),
-                vaults: vec![
-                    vault("a", root.path().into()),
-                    vault("b", root.path().join("nested"))
-                ]
+            VaultConfig {
+                path: root.path().into(),
+                name: " ".into(),
+                ephemeral: true,
+                ..Default::default()
             },
-            root.path()
-        )
-        .is_err());
-        assert!(build_server(
-            Config {
-                server: ServerConfig {
-                    listen: "0.0.0.0:7437".parse().unwrap(),
-                    ..Default::default()
+        ] {
+            assert!(build_server(
+                Config {
+                    server: Default::default(),
+                    vault
                 },
-                vaults: vec![]
-            },
-            root.path()
-        )
-        .is_ok());
-        assert!(build_server(
-            Config {
-                server: Default::default(),
-                vaults: vec![vault("missing", root.path().join("missing"))]
-            },
-            root.path()
-        )
-        .is_err());
+                root.path()
+            )
+            .is_err());
+        }
+        assert!(toml::from_str::<Config>("[server]\n").is_err());
+        assert!(toml::from_str::<Config>("[[vaults]]\npath = \"notes\"\n").is_err());
     }
 }

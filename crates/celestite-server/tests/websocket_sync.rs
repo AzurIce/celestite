@@ -33,22 +33,21 @@ impl Host {
                     allowed_origins: vec!["http://allowed".into()],
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.path().into(),
                     state_dir: Some(state.path().into()),
                     history_mode: HistoryMode::Initialize,
                     read_only,
                     ..Default::default()
-                }],
+                },
             },
             root.path(),
         )
         .unwrap();
         let key = server
-            .connection_key("notes", celestite_server::Permission::Edit)
-            .unwrap()
+            .links
+            .key(celestite_server::Permission::Edit)
             .to_owned();
         let stopping = server.shutdown;
         let mut signal = stopping.subscribe();
@@ -97,14 +96,13 @@ impl Host {
                     listen: address,
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: self.root.path().into(),
                     state_dir: Some(self._state.path().into()),
                     history_mode: HistoryMode::Recover,
                     ..Default::default()
-                }],
+                },
             },
             self.root.path(),
         )

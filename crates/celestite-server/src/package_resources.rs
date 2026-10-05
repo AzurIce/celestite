@@ -420,18 +420,14 @@ mod tests {
         std::fs::write(package.join("private.txt"), "not a component").unwrap();
         let config = crate::Config {
             server: crate::ServerConfig::default(),
-            vaults: vec![crate::VaultConfig {
-                id: "docs".into(),
+            vault: crate::VaultConfig {
                 name: "Docs".into(),
                 path: root.clone(),
                 ephemeral: true,
                 ..Default::default()
-            }],
+            },
         };
-        let router = Host::new(
-            crate::build_server(config, repository.path()).unwrap(),
-            "docs",
-        );
+        let router = Host::new(crate::build_server(config, repository.path()).unwrap());
         let context = serde_json::json!({"documentPath": "a.not", "overlays": {}});
         let declaration = call(&router, "resources", serde_json::json!({"context":context, "request":{"path":package.join("lib.notc"), "read":true}})).await;
         assert_eq!(declaration.status(), StatusCode::OK);

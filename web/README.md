@@ -291,6 +291,8 @@ bun run test:ui tests/settings-ui.spec.ts
 
 ## 多 Vault 与远端连接
 
+每个 server 进程只托管一个 Vault，客户端可连接多个独立 server；同一 Vault 的 readonly / edit 链接也分别建立实例。集中多库托管留待 SaaS 场景再设计。
+
 `src/lib/vault/manager.ts` 的 `VaultManager` 持有连接记录和运行时对象。每个 `Vault` 包含 backend、`VaultDocuments`、文件树模型、编辑器视图缓存和树滚动状态。首页固定打开 `opfs:default`（“我的 Vault”），默认 Vault 不提供移除入口，管理器也拒绝移除；内部文件仍正常管理。
 
 底部“当前 Vault”切换器切换视图，“管理 Vault”打开连接面板。填写宿主启动日志中的 `http(s)://<server>/<key>` 分享链接，客户端在其后追加 `/api/v1/...`。readonly 使用 `ro-` 前缀且具有独立随机凭证；权限由宿主记录和 Vault 级只读策略共同决定。无需单独的 token 输入。URL 去除尾部斜杠，不接受嵌入用户名 / 密码、查询参数或片段；相同链接复用实例，不同分享保持独立授权、Worker 与个人编辑会话，即使它们指向同一个 Vault。连接身份使用独立 UUID，描述返回 `shareId` 与 `vaultIdentity`，不要求它们等于 URL 的 key。

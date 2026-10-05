@@ -24,14 +24,13 @@ impl Fixture {
     fn config(&self, mode: HistoryMode) -> Config {
         Config {
             server: Default::default(),
-            vaults: vec![VaultConfig {
-                id: "notes".into(),
+            vault: VaultConfig {
                 name: "Private notes".into(),
                 path: "notes".into(),
                 state_dir: Some("state".into()),
                 history_mode: mode,
                 ..Default::default()
-            }],
+            },
         }
     }
     fn start(&self, mode: HistoryMode) -> Server {
@@ -70,14 +69,8 @@ async fn read(response: axum::response::Response) -> Value {
 async fn independent_links_share_identity_and_readonly_blocks_every_write_entry() {
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
-    let reader = server
-        .connection_key("notes", Permission::Readonly)
-        .unwrap()
-        .to_owned();
-    let editor = server
-        .connection_key("notes", Permission::Edit)
-        .unwrap()
-        .to_owned();
+    let reader = server.links.key(Permission::Readonly).to_owned();
+    let editor = server.links.key(Permission::Edit).to_owned();
     assert!(reader.starts_with("ro-"));
     assert!(!editor.starts_with("ro-"));
     let ro = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
@@ -193,37 +186,24 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
 }
 
 #[tokio::test]
-async fn restart_and_config_rename_preserve_links_and_key_rotation_invalidates_both_roles() {
+async fn restart_and_display_rename_preserve_links_and_key_rotation_invalidates_both_roles() {
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
-    let reader = server
-        .connection_key("notes", Permission::Readonly)
-        .unwrap()
-        .to_owned();
-    let editor = server
-        .connection_key("notes", Permission::Edit)
-        .unwrap()
-        .to_owned();
+    let reader = server.links.key(Permission::Readonly).to_owned();
+    let editor = server.links.key(Permission::Edit).to_owned();
     let before = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
     drop(server);
     let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].id = "renamed".into();
-    config.vaults[0].name = "Renamed notes".into();
+    config.vault.name = "Renamed notes".into();
     let server = build_server(config, f.dir.path()).unwrap();
-    assert_eq!(
-        server.connection_key("renamed", Permission::Readonly),
-        Some(reader.as_str())
-    );
-    assert_eq!(
-        server.connection_key("renamed", Permission::Edit),
-        Some(editor.as_str())
-    );
+    assert_eq!(server.links.key(Permission::Readonly), reader.as_str());
+    assert_eq!(server.links.key(Permission::Edit), editor.as_str());
     let after = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
     assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
     assert_eq!(before["shareId"], after["shareId"]);
     drop(server);
     let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].share_key = Some("new randomly chosen secret value 1234567890".into());
+    config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
     let server = build_server(config, f.dir.path()).unwrap();
     for old in [&reader, &editor] {
         assert_eq!(
@@ -233,23 +213,17 @@ async fn restart_and_config_rename_preserve_links_and_key_rotation_invalidates_b
             StatusCode::NOT_FOUND
         );
     }
-    let rotated = server
-        .connection_key("notes", Permission::Edit)
-        .unwrap()
-        .to_owned();
+    let rotated = server.links.key(Permission::Edit).to_owned();
     let after = read(response(&server.router, &rotated, "GET", "", Value::Null).await).await;
     assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
     drop(server);
     let mut config = f.config(HistoryMode::Recover);
-    config.vaults[0].share_key = Some("new randomly chosen secret value 1234567890".into());
+    config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
     let server = build_server(config, f.dir.path()).unwrap();
-    assert_eq!(
-        server.connection_key("notes", Permission::Edit),
-        Some(rotated.as_str())
-    );
+    assert_eq!(server.links.key(Permission::Edit), rotated.as_str());
     drop(server);
     let mut config = f.config(HistoryMode::Reset);
-    config.vaults[0].share_key = Some("new randomly chosen secret value 1234567890".into());
+    config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
     let server = build_server(config, f.dir.path()).unwrap();
     assert_eq!(
         response(&server.router, &rotated, "GET", "", Value::Null)
@@ -263,9 +237,7 @@ async fn restart_and_config_rename_preserve_links_and_key_rotation_invalidates_b
 async fn shutdown_ends_both_event_feeds() {
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
-    let reader = server
-        .connection_key("notes", Permission::Readonly)
-        .unwrap();
+    let reader = server.links.key(Permission::Readonly);
     let mut feeds = Vec::new();
     for tail in ["/events", "/documents/events"] {
         let response = response(&server.router, reader, "GET", tail, Value::Null).await;
@@ -298,11 +270,8 @@ fn existing_history_automatically_acquires_a_private_seed_without_share_initiali
     tx.commit().unwrap();
     drop(db);
     let server = f.start(HistoryMode::Recover);
-    let key = server
-        .connection_key("notes", Permission::Edit)
-        .unwrap()
-        .to_owned();
-    assert_eq!(server.links.len(), 1);
+    let key = server.links.key(Permission::Edit).to_owned();
+    assert_ne!(server.links.readonly, server.links.edit);
     assert!(!f.dir.path().join("state/shares.redb").exists());
     drop(server);
     assert!(!fs::read(&path)
@@ -310,10 +279,7 @@ fn existing_history_automatically_acquires_a_private_seed_without_share_initiali
         .windows(key.len())
         .any(|part| part == key.as_bytes()));
     let server = f.start(HistoryMode::Recover);
-    assert_eq!(
-        server.connection_key("notes", Permission::Edit),
-        Some(key.as_str())
-    );
+    assert_eq!(server.links.key(Permission::Edit), key.as_str());
     drop(server);
     let db = redb::Database::open(&path).unwrap();
     let tx = db.begin_write().unwrap();
@@ -330,7 +296,7 @@ fn existing_history_automatically_acquires_a_private_seed_without_share_initiali
 fn public_url_and_configured_secrets_are_validated_before_initialization() {
     let f = Fixture::new();
     let mut config = f.config(HistoryMode::Initialize);
-    config.vaults[0].share_key = Some("a public name".into());
+    config.vault.share_key = Some("a public name".into());
     assert!(build_server(config, f.dir.path()).is_err());
     assert!(!f.dir.path().join("state/history.redb").exists());
     for invalid in [
@@ -361,10 +327,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     let f = Fixture::new();
     let server = f.start(HistoryMode::Initialize);
-    let reader = server
-        .connection_key("notes", Permission::Readonly)
-        .unwrap()
-        .to_owned();
+    let reader = server.links.key(Permission::Readonly).to_owned();
     let description = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
     let document = read(
         response(
@@ -451,9 +414,7 @@ async fn public_url_origin_is_allowed_for_the_hosted_client() {
     let mut config = f.config(HistoryMode::Initialize);
     config.server.public_url = Some("https://host.example/deploy".into());
     let server = build_server(config, f.dir.path()).unwrap();
-    let key = server
-        .connection_key("notes", Permission::Readonly)
-        .unwrap();
+    let key = server.links.key(Permission::Readonly);
     for (origin, expected) in [
         ("https://host.example", StatusCode::OK),
         ("https://other.example", StatusCode::FORBIDDEN),

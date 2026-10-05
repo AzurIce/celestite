@@ -95,9 +95,9 @@ impl Store {
     pub fn open(path: &Path, root: &Path) -> Result<(Self, VaultIdentity)> {
         let metadata = fs::symlink_metadata(path).map_err(|error| {
             storage_error(format!(
-            "Cannot recover {}: {error}; initialize a new profile explicitly with --init-vault ID",
-            path.display()
-        ))
+                "Cannot recover {}: {error}; initialize a new profile explicitly with --init-vault",
+                path.display()
+            ))
         })?;
         if !metadata.is_file() {
             return Err(storage_error(

@@ -11,11 +11,13 @@ Celestite 使用统一的 Rust EditorCore。每个 VaultInstance 构造自己的
 
 本机存储、普通目录映射和协作连接分别配置。URL 是连接入口，路径是文件位置，都不承担 Vault 身份。Web 默认 Vault 独立存在且不可从列表删除；加入远端 Vault 创建或复用另一实例。
 
-### 远端分享与权限
+### server 托管边界与远端权限
 
-远端连接使用 `https://host/<key>` 作为基址，接口追加 `/api/v1/...`。每个 Vault 固定提供 readonly / edit 两条链接，由秘密值、持久化的逻辑 Vault 身份和独立权限域派生；readonly 使用 `ro-` 前缀，完整 key 参与凭证查找，URL 不含 Vault 名称、配置 ID 或磁盘路径。
+每个 server 进程只服务一个 Vault，以 `[vault]` 配置目录、状态目录和权限；客户端可以连接多个独立 server。集中托管多个 Vault 留待 SaaS 场景再设计。
 
-配置文件可省略 `share_key`，由宿主自动保存随机秘密值；纯 CLI 配置为每个 Vault 显式提供 `--vault-share-key ID=KEY`。配置启动时读取，修改秘密值并重启轮换两种链接，正文与历史身份保持独立。`public_url` 决定公开基址。宿主启动日志输出完整链接，普通请求与诊断脱敏 key。没有动态分享管理或分享初始化流程。
+远端连接使用 `https://host/<key>` 作为基址，接口追加 `/api/v1/...`。每个 Vault 固定提供 readonly / edit 两条链接，由秘密值、持久化的逻辑 Vault 身份和独立权限域派生；readonly 使用 `ro-` 前缀，完整 key 参与凭证查找，URL 不含 Vault 名称或磁盘路径。
+
+配置文件可省略 `share_key`，由宿主自动保存随机秘密值；纯 CLI 配置显式提供 `--vault PATH` 和 `--share-key KEY`。配置启动时读取，修改秘密值并重启轮换两种链接，正文与历史身份保持独立。`public_url` 决定公开基址。宿主启动日志输出完整链接，普通请求与诊断脱敏 key。没有动态分享管理或分享初始化流程。
 
 HTTP、WebSocket 和持续订阅共用授权上下文。readonly 允许读取、预览和实时更新；edit 允许正文与目录修改，仍受 Vault 级只读限制。宿主退出关闭持续连接，客户端保留未确认正文及恢复能力。两种链接分别建立客户端实例与编辑会话，不合并权限；完整链接按凭证保存。core 不处理分享凭证，宿主文件观察与协调独立运行。
 
@@ -166,7 +168,7 @@ OPFS watch 可以不发事件，应用内操作由 core 发布领域事件。普
 | host     | host 托管目录                   | host 文件 |
 | client   | 无本地目录镜像，仅会话缓存      | host 文件 |
 
-host 通过配置登记 Vault，client 通过 URL 加入。目录创建、移动、重命名和删除由 host 在线校验、排序执行。每个 VaultInstance 使用一条 WebSocket 连接，以稳定文档 ID 多路传递 CRDT 增量、目录状态、操作确认、保存命令和心跳；host 持久提交后确认并广播，普通文件写回独立完成。HTTP 用于 Vault 发现、附件与普通文件传输。认证令牌在首个握手消息中提交，不放入 URL。
+host 通过配置指定唯一的 Vault，client 通过 URL 加入。目录创建、移动、重命名和删除由 host 在线校验、排序执行。每个 VaultInstance 使用一条 WebSocket 连接，以稳定文档 ID 多路传递 CRDT 增量、目录状态、操作确认、保存命令和心跳；host 持久提交后确认并广播，普通文件写回独立完成。HTTP 用于 Vault 发现、附件与普通文件传输。完整链接赋予权限，HTTP 与 WebSocket 在入口处验证 key；握手核对协议与历史身份。
 
 客户端 UI 输入由本地 core 接受并生成增量；远端更新先由 Worker 中的 core 导入，再将正文变化事件交给 UI。导入保留 writer 和个人撤销；UI 增量更新正文和选区，对待确认输入重新映射，IME 组合输入期间保留本地投影，不直接覆盖编辑器 buffer。host 快照、订阅和补齐屏障在同一串行边界建立；补齐完成后才开放编辑。正文接受、本机历史提交、host 确认与文件写回分别报告状态；core 的串行修改边界不等待网络确认，传输层按因果依赖有序发送并使用有界队列。保存等待目标版本的 host 确认，资源读取不占用编辑队列。
 

@@ -386,5 +386,5 @@ async fn serve(
     alive.store(false, Ordering::Release);
     reader.abort();
     let _ = sink.close().await;
-    tracing::debug!(vault_id=%vault.id,session_id=%session_id,success=outcome.is_ok(),"WebSocket session ended");
+    tracing::debug!(vault_identity=%vault.id,session_id=%session_id,success=outcome.is_ok(),"WebSocket session ended");
 }

@@ -16,12 +16,12 @@ const binary =
   fileURLToPath(
     new URL("../../target/debug/celestite-server", import.meta.url),
   );
-function startupLinks(log: string, vault: string) {
+function startupLinks(log: string) {
   const line = log
     .split("\n")
     .find(
       (line) =>
-        line.includes(`vault_id=${vault} `) && line.includes("readonly_url="),
+        line.includes("Vault share links") && line.includes("readonly_url="),
     );
   const readonly = line?.match(/readonly_url=(\S+)/)?.[1];
   const edit = line?.match(/edit_url=(\S+)/)?.[1];
@@ -46,12 +46,6 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
           "Build the server first: cargo build -p celestite-server",
         );
       const root = await mkdtemp(join(tmpdir(), "celestite-e2e-"));
-      const socket = createServer();
-      await new Promise<void>((resolve) =>
-        socket.listen(0, "127.0.0.1", resolve),
-      );
-      const port = (socket.address() as { port: number }).port;
-      await new Promise<void>((resolve) => socket.close(() => resolve()));
       for (const id of ["notes", "work", "readonly"]) {
         await mkdir(join(root, id));
         await writeFile(join(root, id, "a.md"), `# ${id} original\n`);
@@ -61,48 +55,50 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
         join(root, "notes", ".celestite", "settings.json"),
         '{"theme.mode":"dark"}',
       );
-      const config = join(root, "config.toml");
-      await writeFile(
-        config,
-        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\n\n` +
-          ["notes", "work", "readonly"]
-            .map(
-              (id) =>
-                `[[vaults]]\nid = "${id}"\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\nephemeral = true\n`,
-            )
-            .join("\n"),
-      );
-      let child: ChildProcess | undefined;
+      const children: ChildProcess[] = [];
       try {
-        child = spawn(binary, ["--config", config], {
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let errors = "";
-        child.stderr?.on("data", (bytes) => (errors += String(bytes)));
-        const baseUrl = `http://127.0.0.1:${port}`;
-        for (let retry = 0; retry < 100; retry++) {
-          if (child.exitCode !== null)
-            throw new Error(`server exited: ${errors}`);
-          try {
-            await fetch(baseUrl);
-            break;
-          } catch {}
-          if (retry === 99) throw new Error("server startup timed out");
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
         const urls: Record<string, string> = {};
         for (const id of ["notes", "work", "readonly"]) {
-          const links = startupLinks(errors, id);
+          const config = join(root, `${id}.toml`);
+          await writeFile(
+            config,
+            `[server]\nlisten = "127.0.0.1:0"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\n\n[vault]\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\nephemeral = true\n`,
+          );
+          const child = spawn(binary, ["--config", config], {
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          children.push(child);
+          let log = "";
+          child.stderr?.on("data", (bytes) => (log += String(bytes)));
+          await expect
+            .poll(
+              () => {
+                if (child.exitCode !== null || child.signalCode !== null)
+                  throw new Error(`server exited: ${log}`);
+                return log.includes("Celestite server listening");
+              },
+              { timeout: 10000 },
+            )
+            .toBe(true);
+          const links = startupLinks(log);
           urls[id] = id === "readonly" ? links.readonly : links.edit;
+          if (id === "notes") urls.reader = links.readonly;
         }
-        urls.reader = startupLinks(errors, "notes").readonly;
         await use({ url: urls.notes, root, urls });
       } finally {
-        child?.kill("SIGTERM");
-        if (child && child.exitCode === null)
-          await new Promise<void>((resolve) =>
-            child!.once("exit", () => resolve()),
-          );
+        await Promise.all(
+          children.map(async (child) => {
+            if (child.exitCode !== null || child.signalCode !== null) return;
+            await new Promise<void>((resolve) => {
+              const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
+              child.once("exit", () => {
+                clearTimeout(timeout);
+                resolve();
+              });
+              child.kill("SIGTERM");
+            });
+          }),
+        );
         await rm(root, { recursive: true, force: true });
       }
     },
@@ -792,7 +788,7 @@ test("changing share_key and restarting replaces both startup links without chan
   await new Promise<void>((resolve) => reservation.close(() => resolve()));
   const config = join(root, "config.toml");
   const configuration = (key: string) =>
-    `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[[vaults]]\nid = "notes"\nname = "notes"\npath = "notes"\nstate_dir = "state"\nshare_key = "${key}"\n`;
+    `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nstate_dir = "state"\nshare_key = "${key}"\n`;
   let child: ChildProcess | undefined;
   const stop = async () => {
     if (!child || child.exitCode !== null) return;
@@ -819,7 +815,7 @@ test("changing share_key and restarting replaces both startup links without chan
         return log.includes("readonly_url=");
       })
       .toBe(true);
-    return startupLinks(log, "notes");
+    return startupLinks(log);
   };
   try {
     await mkdir(join(root, "notes"));
@@ -831,7 +827,7 @@ test("changing share_key and restarting replaces both startup links without chan
     );
     const initialized = spawnSync(
       binary,
-      ["--config", config, "--init-vault", "notes"],
+      ["--config", config, "--init-vault"],
       { encoding: "utf8", timeout: 10000 },
     );
     expect(initialized.status, initialized.stderr).toBe(0);
@@ -1897,7 +1893,7 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
           { timeout: 10000 },
         )
         .toBe(true);
-      const links = startupLinks(errors, "notes");
+      const links = startupLinks(errors);
       if (api.url) expect(links.edit).toBe(api.url);
       api.url = links.edit;
       api.urls.notes = api.url;
@@ -1923,11 +1919,11 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       await writeFile(join(root, "notes", "unopened.md"), "unopened original");
       await writeFile(
         config,
-        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[[vaults]]\nid = "notes"\nname = "notes"\npath = "notes"\nstate_dir = "state"\n`,
+        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nstate_dir = "state"\n`,
       );
       const initialized = spawnSync(
         binary,
-        ["--config", config, "--init-vault", "notes"],
+        ["--config", config, "--init-vault"],
         { env, timeout: 10000, encoding: "utf8" },
       );
       expect(initialized.status, initialized.stderr).toBe(0);

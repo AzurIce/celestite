@@ -15,7 +15,6 @@ pub(crate) enum Operation {
 }
 
 pub struct VaultLinks {
-    pub vault_id: String,
     pub readonly: String,
     pub edit: String,
 }
@@ -104,17 +103,16 @@ fn digest(key: &str) -> String {
     blake3::hash(key.as_bytes()).to_hex().to_string()
 }
 
-#[derive(Default)]
 pub(crate) struct Registry {
     grants: HashMap<String, Arc<Grant>>,
 }
 impl Registry {
-    pub fn register(
-        &mut self,
+    pub fn new(
         vault: Arc<HostedVault>,
         seed: &[u8; 32],
         identity: &str,
-    ) -> Result<VaultLinks, Box<dyn std::error::Error>> {
+    ) -> Result<(Self, VaultLinks), Box<dyn std::error::Error>> {
+        let mut grants = HashMap::new();
         let readonly = derive(seed, identity, Permission::Readonly);
         let edit = derive(seed, identity, Permission::Edit);
         for (key, permission) in [(&readonly, Permission::Readonly), (&edit, Permission::Edit)] {
@@ -124,15 +122,11 @@ impl Registry {
                 permission,
                 vault: vault.clone(),
             });
-            if self.grants.insert(digest(key), grant).is_some() {
+            if grants.insert(digest(key), grant).is_some() {
                 return Err("Duplicate Vault capability".into());
             }
         }
-        Ok(VaultLinks {
-            vault_id: vault.id.clone(),
-            readonly,
-            edit,
-        })
+        Ok((Self { grants }, VaultLinks { readonly, edit }))
     }
     pub fn resolve(&self, key: &str) -> Result<Arc<Grant>, ApiError> {
         let permission =

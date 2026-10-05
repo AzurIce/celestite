@@ -62,7 +62,7 @@ pub(crate) async fn run_documents_with_tree<T: Send + 'static>(
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
-        tracing::debug!(vault_id = %vault.id, mutation, "Running document operation");
+        tracing::debug!(vault_identity = %vault.id, mutation, "Running document operation");
         // Same order for every document/file operation.
         let files = vault
             .files
@@ -395,19 +395,18 @@ mod tests {
         let server = crate::build_server(
             crate::Config {
                 server: crate::ServerConfig::default(),
-                vaults: vec![crate::VaultConfig {
-                    id: "notes".into(),
+                vault: crate::VaultConfig {
                     name: "Notes".into(),
                     path: root.path().into(),
                     ephemeral: true,
                     ..Default::default()
-                }],
+                },
             },
             root.path(),
         )
         .unwrap();
         let stopping = server.shutdown.clone();
-        let router = Host::new(server, "notes");
+        let router = Host::new(server);
         let docs = request(&router, "GET", "/documents", Value::Null).await;
         let mut state = docs[0].clone();
         let id = state["id"].as_str().unwrap().to_owned();

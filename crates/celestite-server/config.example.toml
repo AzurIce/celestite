@@ -8,13 +8,13 @@ allowed_origins = ["http://localhost:1420", "http://127.0.0.1:1420"]
 # Optional built UI directory, relative to this config file:
 # web_dir = "../../web/dist"
 
-[[vaults]]
-id = "notes"
+# Each server process hosts exactly one Vault.
+[vault]
 name = "笔记"
 # Existing directory; relative paths are relative to this config file.
 path = "./notes"
-# Existing private directory outside all Vaults and web_dir.
-# Initialize once with --init-vault notes, then start without that flag.
+# Existing private directory outside the Vault and web_dir.
+# Initialize once with --init-vault, then start without that flag.
 state_dir = "./state/notes"
 read_only = false
 # Optional random secret of at least 32 bytes. Changing it and restarting rotates both links.

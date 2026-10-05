@@ -1,6 +1,6 @@
 # Celestite server MVP
 
-独立 Rust 可执行程序。Vault 由配置文件或 server 命令行注册，Web 客户端通过 Vault URL 连接；客户端没有创建或删除远端 Vault 的接口。Tauri 尚未接入。目录操作位于 server 的 `vault/fs.rs`；`celestite-core::EditorCore<Backend>` 提供统一 Rust / WASM 编辑内核，server 使用 native 后端，默认 Web Vault 使用 OPFS 后端。
+独立 Rust 可执行程序。每个 server 进程服务一个 Vault，由配置文件或命令行指定。Web 客户端通过分享 URL 连接，可以连接多个独立 server，没有创建或删除远端 Vault 的接口。Tauri 尚未接入。目录操作位于 server 的 `vault/fs.rs`；`celestite-core::EditorCore<Backend>` 提供统一 Rust / WASM 编辑内核，server 使用 native 后端，默认 Web Vault 使用 OPFS 后端。
 
 ## 启动
 
@@ -10,27 +10,27 @@
 cargo build -p celestite-server
 mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
 cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
-./target/debug/celestite-server --config /tmp/celestite-demo/config.toml --init-vault notes
+./target/debug/celestite-server --config /tmp/celestite-demo/config.toml --init-vault
 ./target/debug/celestite-server --config /tmp/celestite-demo/config.toml
 ```
 
-正常启动时，每个 Vault 自动生成并在日志里打印一对链接：
+正常启动时，自动生成并在日志里打印一对链接：
 
 ```text
-Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://127.0.0.1:7437/<other-key>
+Vault share links readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://127.0.0.1:7437/<other-key>
 ```
 
 打开 Web 客户端，在底部“管理 Vault”中粘贴其中一条完整 URL。链接到 key 为止，客户端自动追加 `/api/v1/...`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。没有分享初始化或分享管理命令。
 
-配置内目录必须已经存在；相对路径以配置文件目录为基准。Vault ID 只接受 ASCII 字母、数字、`-`、`_`。ID 唯一，根目录不得相同或互相嵌套。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。配置 ID 用于宿主管理；分享绑定持久化的 Vault 身份，改名或修改配置 ID 保留已有链接。更改目录继续遵守 profile 的根目录迁移校验。
+配置内目录必须已经存在；相对路径以配置文件目录为基准。`[vault]` 指定唯一的 Vault，无配置 ID。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。分享绑定持久化的 Vault 身份，修改显示名称保留已有链接。更改目录继续遵守 profile 的根目录迁移校验。多 Vault 的集中托管留待 SaaS 场景再设计。
 
 ## 链接配置与轮换
 
 每个 Vault 固定提供 readonly / edit 两条链接，由秘密值与持久化的逻辑 Vault 身份分别派生。`ro-` 属于完整凭证，两个权限使用不同派生域；增删前缀不能转换权限。`read_only = true` 仍限制整个 Vault，因此它的 edit 链接也只有读取能力。
 
-使用配置文件且不配置 `share_key` 时，宿主自动产生 32 字节随机秘密值，保存在 `history.redb` 的私有宿主元数据里，不进入正文 CRDT、编辑历史或文件树。已有历史库在正常启动时自动补齐，无需额外初始化。正常重启、显示名称或配置 ID 修改保留链接；临时 Vault 每次启动产生新逻辑身份和新链接。
+使用配置文件且不配置 `share_key` 时，宿主自动产生 32 字节随机秘密值，保存在 `history.redb` 的私有宿主元数据里，不进入正文 CRDT、编辑历史或文件树。已有历史库在正常启动时自动补齐，无需额外初始化。正常重启和修改显示名称保留链接；临时 Vault 每次启动产生新逻辑身份和新链接。
 
-在 `[[vaults]]` 中配置可选的 `share_key` 可显式控制凭证。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白；显示名 `name` 不参与派生。修改 `share_key` 并重启，会同时使旧 readonly / edit 链接失效，不改变正文或历史身份。配置启动时读取，不支持动态热更新。纯 CLI 配置必须显式传入同样要求的秘密值，重启时复用；传入新值并重启同样轮换两种链接。相同秘密值与同一 Vault 身份派生相同链接：改回旧配置、移除覆盖值恢复默认秘密值或恢复旧状态备份，可能恢复相应旧链接。
+在 `[vault]` 中配置可选的 `share_key` 可显式控制凭证。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白；显示名 `name` 不参与派生。修改 `share_key` 并重启，会同时使旧 readonly / edit 链接失效，不改变正文或历史身份。配置启动时读取，不支持动态热更新。纯 CLI 配置必须显式传入同样要求的秘密值，重启时复用；传入新值并重启同样轮换两种链接。相同秘密值与同一 Vault 身份派生相同链接：改回旧配置、移除覆盖值恢复默认秘密值或恢复旧状态备份，可能恢复相应旧链接。
 
 `[server] public_url` 可设置打印链接使用的公开 HTTP(S) 地址和反向代理前缀，例如 `https://notes.example.com/celestite`；默认使用实际监听地址。该选项只决定链接基址，其 Origin 自动允许，不改变 key 或监听地址。反向代理将该前缀后的请求转发给宿主，并转发 WebSocket upgrade。
 
@@ -40,54 +40,48 @@ Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edi
 
 ## 命令行
 
-使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，通过 `--vault` 声明 Vault，并为每个 Vault 提供 `--vault-share-key ID=KEY`；缺少任何一个都会报错，包括初始化 / 重置命令。读取默认或显式指定的配置文件时，`share_key` 仍为可选，CLI 可覆盖文件配置。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
+使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，必须提供 `--vault PATH` 和 `--share-key KEY`，包括初始化 / 重置命令。读取默认或显式指定的配置文件时，`share_key` 仍为可选，CLI 可覆盖文件配置。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
 
 ```sh
-# 完全通过命令行启动，目录必须已经存在；保存秘密值供重启时复用
-notes_key=$(openssl rand -hex 32)
-reference_key=$(openssl rand -hex 32)
+# 完全通过命令行启动临时 Vault，目录必须已经存在
+# 保存秘密值供后续启动复用；临时 Vault 的身份仍会在重启时改变
+share_key=$(openssl rand -hex 32)
 ./target/debug/celestite-server --no-config \
   --listen 127.0.0.1:7437 \
   --allowed-origin http://localhost:1420 \
-  --vault notes=./notes --vault-name 'notes=我的笔记' \
-  --vault-share-key "notes=$notes_key" \
-  --vault reference=./reference --vault-read-only reference=true \
-  --vault-share-key "reference=$reference_key" \
-  --ephemeral-vault notes --ephemeral-vault reference
+  --vault ./notes --name '我的笔记' \
+  --share-key "$share_key" --ephemeral
 
-# 覆盖部分配置；其他 Vault 及设置保留
+# 覆盖部分配置
 ./target/debug/celestite-server --config ./config.toml \
   --listen 127.0.0.1:8080 \
   --web-dir ./web/dist \
-  --vault notes=./another-directory \
-  --vault-read-only notes=false
+  --vault ./another-directory \
+  --read-only false
 ```
 
-| 参数                               | 行为                                                            |
-| ---------------------------------- | --------------------------------------------------------------- |
-| `-c, --config FILE`                | 读取指定 TOML 文件                                              |
-| `--no-config`                      | 不读取默认配置文件，与 `--config` 互斥                          |
-| `--public-url URL`                 | 覆盖启动链接的公开 HTTP(S) 基址；不改变监听地址                 |
-| `--listen IP:PORT`                 | 覆盖监听地址；内置默认 `127.0.0.1:7437`                         |
-| `--allowed-origin ORIGIN`          | 可重复；整体替换配置中的来源列表，`--allow-origin` 是别名       |
-| `--clear-allowed-origins`          | 清空显式来源列表；server 自身来源仍允许                         |
-| `--web-dir DIRECTORY`              | 覆盖静态 Web 资源目录                                           |
-| `--state-dir DIRECTORY`            | 兼容旧的共享状态目录布局 `<id>.redb`                            |
-| `--vault-state-dir ID=DIRECTORY`   | 可重复；覆盖指定 Vault 的私有状态目录，使用 `history.redb`      |
-| `--ephemeral-vault ID`             | 可重复；明确使用临时内存历史，禁用该 Vault 的持久化             |
-| `--init-vault ID`                  | 可重复；首次初始化指定 Vault 的历史，完成后退出；已有数据库报错 |
-| `--reset-vault ID`                 | 可重复；归档指定 Vault 的旧历史，创建新身份，完成后退出         |
-| `--no-web`                         | 禁用配置中的静态 Web 资源目录                                   |
-| `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                    |
-| `--vault-share-key ID=KEY`         | 可重复；设置分享秘密值；未加载配置文件时每个 Vault 必须提供     |
-| `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                             |
-| `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                             |
+| 参数                      | 行为                                                             |
+| ------------------------- | ---------------------------------------------------------------- |
+| `-c, --config FILE`       | 读取指定 TOML 文件                                               |
+| `--no-config`             | 不读取默认配置文件，与 `--config` 互斥                           |
+| `--public-url URL`        | 覆盖启动链接的公开 HTTP(S) 基址；不改变监听地址                  |
+| `--listen IP:PORT`        | 覆盖监听地址；内置默认 `127.0.0.1:7437`                          |
+| `--allowed-origin ORIGIN` | 可重复；整体替换配置中的来源列表                                 |
+| `--clear-allowed-origins` | 清空显式来源列表；server 自身来源仍允许                          |
+| `--web-dir DIRECTORY`     | 覆盖静态 Web 资源目录                                            |
+| `--no-web`                | 禁用配置中的静态 Web 资源目录                                    |
+| `--vault PATH`            | 指定或覆盖唯一 Vault 的目录                                      |
+| `--name NAME`             | 覆盖显示名称；默认 `Vault`                                       |
+| `--share-key KEY`         | 设置分享秘密值；未加载配置文件时必须提供                         |
+| `--read-only true\|false` | 覆盖 Vault 的只读状态                                            |
+| `--state-dir DIRECTORY`   | 设置 Vault 的私有状态目录，使用 `history.redb`；覆盖临时历史配置 |
+| `--ephemeral`             | 明确使用临时内存历史，清除配置中的状态目录                       |
+| `--init-vault`            | 首次初始化历史，完成后退出；已有数据库报错                       |
+| `--reset-vault`           | 归档旧历史，创建新身份，完成后退出                               |
 
-命令行目录路径以**当前工作目录**为基准，配置文件中的路径仍以**配置文件所在目录**为基准。新增 Vault 默认名称为 ID、可写；覆盖已有 Vault 目录保留其名称与只读状态，除非另行覆盖。不支持通过命令行移除配置中的 Vault，完全替换注册列表可使用 `--no-config` 加多个 `--vault`。
+命令行目录路径以**当前工作目录**为基准，配置文件中的路径以**配置文件所在目录**为基准。覆盖目录保留显示名称、秘密值与只读状态，除非另行覆盖。路径和秘密值中的 `=` 为普通字符，不再使用 `ID=VALUE`。包含空格的参数应加引号。重复的单值参数、互斥设置都会报错；只有允许来源列表接受重复参数。
 
-`ID=VALUE` 仅按第一个 `=` 分隔，路径、名称和秘密值可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。
-
-`server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；网络访问通过 URL 中的完整随机 key 鉴权，不依赖账号。readonly 的 `ro-` 属于凭证，修改前缀不会转换权限。HTTP 和 WebSocket 共用授权，readonly 允许读取、预览和实时更新，edit 允许正文及目录修改，仍受 Vault 级 `read_only` 限制。每个 Vault 启动时固定提供两条链接，通过配置轮换，无独立分享管理接口。公网使用 HTTPS / WSS，反向代理需转发 WebSocket，并脱敏访问路径中的 key。普通请求日志脱敏 key，授权响应使用 `no-store` / `no-referrer`。CORS 支持 `If-Match`、`Content-Type` 和读取 `ETag`，有 Origin 的请求另行检查来源；CORS 不承担认证。
+`server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；网络访问通过 URL 中的完整随机 key 鉴权，不依赖账号。readonly 的 `ro-` 属于凭证，修改前缀不会转换权限。HTTP 和 WebSocket 共用授权，readonly 允许读取、预览和实时更新，edit 允许正文及目录修改，仍受 Vault 级 `read_only` 限制。Vault 启动时固定提供两条链接，通过配置轮换，无独立分享管理接口。公网使用 HTTPS / WSS，反向代理需转发 WebSocket，并脱敏访问路径中的 key。普通请求日志脱敏 key，授权响应使用 `no-store` / `no-referrer`。CORS 支持 `If-Match`、`Content-Type` 和读取 `ETag`，有 Origin 的请求另行检查来源；CORS 不承担认证。
 
 ## 日志
 
@@ -203,32 +197,32 @@ host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修
 
 ### 持久化和磁盘保存
 
-每个正式 Vault 在 `[[vaults]]` 中配置 `state_dir`；正常启动仅打开已有历史。以下两条命令分别初始化和运行：
+每个正式 Vault 在 `[vault]` 中配置 `state_dir`；正常启动仅打开已有历史。以下两条命令分别初始化和运行：
 
 ```sh
 mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
 share_key=$(openssl rand -hex 32)  # 保存该值，后续启动复用
 cargo run -p celestite-server -- --no-config \
-  --vault notes=/tmp/celestite-demo/notes \
-  --vault-share-key "notes=$share_key" \
-  --vault-state-dir notes=/tmp/celestite-demo/state/notes --init-vault notes
+  --vault /tmp/celestite-demo/notes \
+  --share-key "$share_key" \
+  --state-dir /tmp/celestite-demo/state/notes --init-vault
 cargo run -p celestite-server -- --no-config \
-  --vault notes=/tmp/celestite-demo/notes \
-  --vault-share-key "notes=$share_key" \
-  --vault-state-dir notes=/tmp/celestite-demo/state/notes
+  --vault /tmp/celestite-demo/notes \
+  --share-key "$share_key" \
+  --state-dir /tmp/celestite-demo/state/notes
 
 # 仓库内 ../notist/docs 的开发入口：
 just init-notist "$share_key"  # 首次执行，已有历史时拒绝覆盖
 just serve-notist "$share_key"
 ```
 
-状态目录必须存在，不能与任何 Vault、其他私有状态目录或静态资源目录重叠；符号链接别名按实际路径校验。一个 profile 同时只允许一个 host 打开。状态库包含稳定 Vault / 文档 / host 实例身份、初始快照、追加更新日志、pending 依赖包、磁盘基线和恢复意图；每次历史事务提交成功后才报告 `durableVersion`。更改名称或 URL 配置 ID，保留相同物理目录与私有状态目录时保留内部身份。更改物理目录则拒绝恢复，需要另行迁移。
+状态目录必须存在，不能与 Vault 或静态资源目录重叠；符号链接别名按实际路径校验。一个 profile 同时只允许一个 host 打开。状态库包含稳定 Vault / 文档 / host 实例身份、初始快照、追加更新日志、pending 依赖包、磁盘基线和恢复意图；每次历史事务提交成功后才报告 `durableVersion`。更改显示名称，保留相同物理目录与私有状态目录时保留内部身份。更改物理目录则拒绝恢复，需要另行迁移。
 
-未指定状态目录时拒绝启动。临时测试可显式配置 `ephemeral = true` 或 `--ephemeral-vault ID`：重启建立新身份和历史，`durableVersion` 为 null。初始化 / 重置是一次性 CLI 操作，不能配置为每次启动执行。多个 Vault 的配置会在操作前统一校验，但历史初始化 / 重置按 Vault 执行，不提供跨 Vault 事务；发生失败后核对各 profile，再仅初始化尚未完成的 Vault。
+未指定状态目录时拒绝启动。临时测试可显式配置 `ephemeral = true` 或 `--ephemeral`：重启建立新身份和历史，`durableVersion` 为 null。初始化 / 重置是一次性 CLI 操作，不能配置为每次启动执行。目录与参数会在打开或初始化历史之前统一校验。
 
-正常恢复遇到数据库缺失、损坏、身份 / schema / 根目录不匹配时失败，不从普通文件静默重建。`--init-vault ID` 使用独占创建，不覆盖任何已有文件。`--reset-vault ID` 要求原 profile 可校验且没有其他 owner，先将完整旧数据库移入同一状态目录的 `reset-<uuid>/history.redb`，同步归档目录后创建新身份；普通文件保持原样，未写回的旧正文仍在归档内。重置中断或失败时保留归档和任何已创建文件，不自动推断恢复；损坏库应先单独保留并处理，不通过 reset 忽略损坏。
+正常恢复遇到数据库缺失、损坏、身份 / schema / 根目录不匹配时失败，不从普通文件静默重建。`--init-vault` 使用独占创建，不覆盖任何已有文件。`--reset-vault` 要求原 profile 可校验且没有其他 owner，先将完整旧数据库移入同一状态目录的 `reset-<uuid>/history.redb`，同步归档目录后创建新身份；普通文件保持原样，未写回的旧正文仍在归档内。重置中断或失败时保留归档和任何已创建文件，不自动推断恢复；损坏库应先单独保留并处理，不通过 reset 忽略损坏。
 
-兼容旧 `[server].state_dir` / `--state-dir`：没有私有 `state_dir` 的持久化 Vault 继续打开其下的 `<配置 id>.redb`，不改名或重新 seed。私有配置优先。迁移布局时停止 host，保留备份，将该数据库迁入私有目录并命名为 `history.redb`，再修改配置；旧布局更改 URL ID 需要同时明确迁移对应文件。
+迁移旧配置时，将 `[[vaults]]` 改为 `[vault]`，删除 `id`，每个 Vault 使用独立进程。旧 `[server].state_dir` 已删除；先停服并备份，将原 `<配置 id>.redb` 移入该 Vault 的私有状态目录并命名为 `history.redb`，在 `[vault].state_dir` 指定目录。保留原物理 Vault 根目录与数据库即可恢复原内部身份和历史，无需重新初始化。
 
 `dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）；`durableVersion` 是已提交历史的应用版本。持久化历史不等于写回 `.md`，`/save` 是显式动作。没有可见文本变化的导入也可能推进因果版本。等待依赖的包已经写入日志，但不会被虚报为已应用版本。
 

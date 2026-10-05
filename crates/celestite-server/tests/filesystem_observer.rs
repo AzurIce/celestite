@@ -26,8 +26,7 @@ impl Host {
                     listen: address,
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.into(),
                     state_dir: Some(state.into()),
@@ -38,14 +37,14 @@ impl Host {
                         HistoryMode::Initialize
                     },
                     ..Default::default()
-                }],
+                },
             },
             root,
         )
         .unwrap();
         let key = server
-            .connection_key("notes", celestite_server::Permission::Edit)
-            .unwrap()
+            .links
+            .key(celestite_server::Permission::Edit)
             .to_owned();
         let (shutdown, stopping) = oneshot::channel();
         let stop_events = server.shutdown;

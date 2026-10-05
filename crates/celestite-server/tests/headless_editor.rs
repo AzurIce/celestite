@@ -23,8 +23,7 @@ impl Server {
                     listen: address,
                     ..Default::default()
                 },
-                vaults: vec![VaultConfig {
-                    id: "notes".into(),
+                vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.into(),
                     read_only,
@@ -36,14 +35,14 @@ impl Server {
                         HistoryMode::Recover
                     },
                     ..Default::default()
-                }],
+                },
             },
             root,
         )
         .unwrap();
         let key = server
-            .connection_key("notes", celestite_server::Permission::Edit)
-            .unwrap()
+            .links
+            .key(celestite_server::Permission::Edit)
             .to_owned();
         let (shutdown, stopping) = oneshot::channel();
         let task = tokio::spawn(async move {
