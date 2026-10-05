@@ -245,6 +245,7 @@ export default function VaultWorkspace() {
                   <span class="workspace-divider-line" />
                 </div>
                 <VaultEditor
+                  authorizeResources={workspace.authorizeResources}
                   documents={workspace.documents}
                   buffers={workspace.editorBuffers}
                   statusMount={editorStatusMount}

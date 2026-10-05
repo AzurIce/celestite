@@ -775,6 +775,7 @@ export async function openLocalEditor(
   identity: InstanceIdentity;
   documents: WorkerDocuments;
   backend: VaultBackend;
+  setResourceScope?: (scope: FileSystemDirectoryHandle) => Promise<void>;
 }> {
   const worker = new Worker(new URL("../local/worker.ts", import.meta.url), {
     type: "module",
@@ -796,7 +797,18 @@ export async function openLocalEditor(
     });
     if (source.kind === "directory") detach = observeDirectory(documents);
 
-    return { identity, documents, backend: documents.treeBackend };
+    return {
+      identity,
+      documents,
+      backend: documents.treeBackend,
+      ...(source.kind === "directory"
+        ? {
+            setResourceScope: async (scope: FileSystemDirectoryHandle) => {
+              await client.request("set_resource_scope", { scope });
+            },
+          }
+        : {}),
+    };
   } catch (error) {
     client.dispose();
     worker.terminate();

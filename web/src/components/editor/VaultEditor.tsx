@@ -7,7 +7,6 @@ import {
   lazy,
   onCleanup,
   onSettled,
-  untrack,
 } from "solid-js";
 import {
   Button,
@@ -31,6 +30,7 @@ import type {
   ExternalChangeStatus,
 } from "@/lib/editor/contract";
 import { setSetting, settings } from "@/lib/settings";
+import type { PreviewModeSetting } from "@/lib/settings/schema";
 import type { EditorBuffer } from "./CodeEditor";
 import { languageName } from "./languages";
 
@@ -48,13 +48,13 @@ function externalChangeMessage(status: ExternalChangeStatus) {
 }
 
 const CodeEditor = lazy(() => import("./CodeEditor"));
-type PreviewMode = "source" | "split" | "preview";
-const previewViews = new WeakMap<
+const previewScrollPositions = new WeakMap<
   EditorDocuments,
-  Map<string, { mode: PreviewMode; scrollTop: number }>
+  Map<string, number>
 >();
 interface VaultEditorProps {
   documents: EditorDocuments;
+  authorizeResources?: () => Promise<void>;
   buffers?: Map<string, EditorBuffer>;
   statusMount?: Element;
 }
@@ -69,7 +69,7 @@ export function VaultEditor(props: VaultEditorProps) {
   const [vimMode, setVimMode] = createSignal<VimMode | null>(null);
   const [closingTabs, setClosingTabs] = createSignal(false);
   const [contextTab, setContextTab] = createSignal<string | null>(null);
-  const [mode, setMode] = createSignal<PreviewMode>("source");
+  const mode = () => settings().values["editor.previewMode"];
   const previewMedia = window.matchMedia("(max-width: 639px)");
   const [narrowScreen, setNarrowScreen] = createSignal(previewMedia.matches);
   const onPreviewResize = () => setNarrowScreen(previewMedia.matches);
@@ -80,9 +80,8 @@ export function VaultEditor(props: VaultEditorProps) {
   }>();
   const [fragment, setFragment] = createSignal<{ id: string; value: string }>();
   const views =
-    previewViews.get(props.documents) ??
-    new Map<string, { mode: PreviewMode; scrollTop: number }>();
-  previewViews.set(props.documents, views);
+    previewScrollPositions.get(props.documents) ?? new Map<string, number>();
+  previewScrollPositions.set(props.documents, views);
   const wrap = () => settings().values["editor.wordWrap"];
   /** 项目级文件提供时界面不改写，避免“点了没反应”。 */
   const wrapFromProject = () =>
@@ -105,16 +104,12 @@ export function VaultEditor(props: VaultEditorProps) {
     () => displayMode() === "split" && scrollSync(),
     (enabled) => previewSync.setEnabled(enabled),
   );
-  function chooseMode(value: PreviewMode) {
-    const id = state().activeId;
-    if (id)
-      views.set(id, { mode: value, scrollTop: views.get(id)?.scrollTop ?? 0 });
-    setMode(value);
+  function chooseMode(value: PreviewModeSetting) {
+    void setSetting("editor.previewMode", value);
   }
   createEffect(
     () => state().activeId,
-    (id) => {
-      setMode(id ? (views.get(id)?.mode ?? "source") : "source");
+    () => {
       setReveal(undefined);
       setVimMode(null);
     },
@@ -641,15 +636,14 @@ export function VaultEditor(props: VaultEditorProps) {
                           sync={previewSync}
                           document={active()!}
                           documents={props.documents}
-                          scrollTop={views.get(id)?.scrollTop ?? 0}
+                          authorizeResources={props.authorizeResources}
+                          scrollTop={views.get(id) ?? 0}
                           fragment={
                             fragment()?.id === id
                               ? fragment()?.value
                               : undefined
                           }
-                          onScroll={(scrollTop) =>
-                            views.set(id, { mode: mode(), scrollTop })
-                          }
+                          onScroll={(scrollTop) => views.set(id, scrollTop)}
                           onDiagnostic={async (diagnostic) => {
                             if (
                               !(await props.documents.open(
@@ -689,17 +683,11 @@ export function VaultEditor(props: VaultEditorProps) {
                             });
                           }}
                           onNavigate={async (path, anchor) => {
-                            const targetMode = untrack(mode);
                             if (!(await props.documents.open(vaultPath(path))))
                               return false;
                             const targetId =
                               props.documents.snapshot().activeId;
                             if (targetId) {
-                              views.set(targetId, {
-                                mode: targetMode,
-                                scrollTop: views.get(targetId)?.scrollTop ?? 0,
-                              });
-                              setMode(targetMode);
                               setFragment(
                                 anchor === null
                                   ? undefined

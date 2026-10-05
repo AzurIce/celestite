@@ -24,9 +24,11 @@ export interface VaultConnection {
   kind: "opfs" | "directory" | "remote";
   name: string;
   url?: string;
+  directoryPath?: string;
 }
 export interface VaultInstance {
   authorize?: (token: string) => Promise<void>;
+  authorizeResources?: () => Promise<void>;
   identity?: InstanceIdentity;
   id: string;
   name: string;
@@ -56,6 +58,7 @@ interface ManagerOptions {
     identity: InstanceIdentity;
     backend: VaultBackend;
     documents: EditorDocuments;
+    setResourceScope?: (scope: FileSystemDirectoryHandle) => Promise<void>;
   }>;
 }
 const defaultConnection = (): VaultConnection => ({
@@ -82,6 +85,11 @@ export class VaultManager {
   private initialization?: Promise<void>;
   private directories?: DirectoryRegistry;
   private directoryHandles = new Map<string, LocalDirectoryHandle>();
+  private resourceScopes = new Map<string, LocalDirectoryHandle>();
+  private resourceSetters = new Map<
+    string,
+    (scope: FileSystemDirectoryHandle) => Promise<void>
+  >();
   private directoryError: string | null = null;
   constructor(private options: ManagerOptions = {}) {
     this.file = options.file;
@@ -153,10 +161,16 @@ export class VaultManager {
     try {
       for (const record of (await this.directories?.list()) ?? []) {
         this.directoryHandles.set(record.id, record.handle);
+        if (record.resourceScope)
+          this.resourceScopes.set(record.id, record.resourceScope);
         this.connections.push({
           id: record.id,
           kind: "directory",
           name: record.name,
+          directoryPath: await directoryDisplayPath(
+            record.handle,
+            record.resourceScope,
+          ),
         });
       }
     } catch (error) {
@@ -190,6 +204,8 @@ export class VaultManager {
     if (pending) return pending;
     const operation = (async () => {
       let vault: VaultInstance;
+      let resourceSetter:
+        ((scope: FileSystemDirectoryHandle) => Promise<void>) | undefined;
       if (connection.kind !== "remote") {
         if (connection.kind === "opfs" && this.options.openLocal)
           vault = this.build(connection, await this.options.openLocal());
@@ -201,10 +217,12 @@ export class VaultManager {
                   kind: "directory",
                   id: connection.id,
                   handle: this.directoryHandle(connection.id),
+                  resourceScope: this.resourceScopes.get(connection.id),
                 };
-          const { identity, backend, documents } = await (
+          const { identity, backend, documents, setResourceScope } = await (
             this.options.openLocalEditor ?? openLocalEditor
           )(source);
+          resourceSetter = setResourceScope;
           vault = {
             id: connection.id,
             name: connection.name,
@@ -215,6 +233,12 @@ export class VaultManager {
             editorBuffers: new Map(),
             treeView: { scrollTop: 0 },
             readOnly: false,
+            ...(setResourceScope
+              ? {
+                  authorizeResources: () =>
+                    this.authorizeResources(connection.id, setResourceScope),
+                }
+              : {}),
           };
         }
       } else {
@@ -234,6 +258,8 @@ export class VaultManager {
         throw new VaultError("Closed", "Vault is closed");
       }
       this.runtimes.set(connection.id, vault);
+      if (resourceSetter)
+        this.resourceSetters.set(connection.id, resourceSetter);
       this.notify();
       return vault;
     })();
@@ -251,13 +277,26 @@ export class VaultManager {
       connection.kind === "directory"
         ? authorizeDirectory(this.directoryHandle(id))
         : undefined;
+    // Start both prompts during the click; losing an optional resource grant must not block editing.
+    const scope = this.resourceScopes.get(id);
+    const resourceAuthorization = scope
+      ? authorizeDirectory(scope, "read").then(
+          () => true,
+          () => false,
+        )
+      : undefined;
     const request = ++this.selection;
     this.opening = true;
     this.error = null;
     this.notify();
     try {
       await authorization;
+      const restoreResources = await resourceAuthorization;
       const vault = await this.open(connection);
+      if (restoreResources && scope)
+        await this.resourceSetters
+          .get(id)?.(scope)
+          .catch(() => {});
       if (connection.kind === "directory")
         await vault.documents.observeFiles?.();
       if (request !== this.selection || this.disposed) return false;
@@ -296,12 +335,18 @@ export class VaultManager {
       const record = await this.directories.remember(handle);
       if (this.disposed || this.removals.has(record.id)) return false;
       this.directoryHandles.set(record.id, record.handle);
+      if (record.resourceScope)
+        this.resourceScopes.set(record.id, record.resourceScope);
       let connection = this.connections.find((entry) => entry.id === record.id);
       if (!connection) {
         connection = { id: record.id, name: record.name, kind: "directory" };
         this.connections.push(connection);
       }
       connection.name = record.name;
+      connection.directoryPath = await directoryDisplayPath(
+        record.handle,
+        record.resourceScope,
+      );
       this.directoryError = null;
       const vault = await this.open(connection);
       vault.name = record.name;
@@ -368,6 +413,35 @@ export class VaultManager {
       this.notify();
     }
   }
+  private async authorizeResources(
+    id: string,
+    update: (scope: FileSystemDirectoryHandle) => Promise<void>,
+  ) {
+    if (this.disposed || this.removals.has(id))
+      throw new VaultError("Closed", "Vault 正在关闭。");
+    const scope = await (this.options.pickDirectory ?? pickLocalDirectory)(
+      "read",
+    );
+    if (!scope || this.disposed || this.removals.has(id)) return;
+    const relative = await scope.resolve(this.directoryHandle(id));
+    if (relative === null)
+      throw new VaultError("InvalidPath", "请选择包含当前 Vault 的目录。");
+    await update(scope);
+    if (this.disposed || this.removals.has(id)) return;
+    this.resourceScopes.set(id, scope);
+    const connection = this.connections.find((entry) => entry.id === id);
+    if (connection)
+      connection.directoryPath = [scope.name, ...relative].join("/");
+    try {
+      await this.directories!.setResourceScope(id, scope);
+      this.directoryError = null;
+    } catch (error) {
+      this.directoryError = `依赖目录授权仅保留在本次会话：${message(error)}`;
+      throw new VaultError("IO", this.directoryError);
+    } finally {
+      this.notify();
+    }
+  }
   private async buildRemote(
     connection: VaultConnection,
     http: VaultBackend,
@@ -422,9 +496,11 @@ export class VaultManager {
         this.active = fallback;
       }
       this.runtimes.delete(id);
+      this.resourceSetters.delete(id);
       if (this.directoryHandles.has(id)) {
         await this.directories!.forget(id);
         this.directoryHandles.delete(id);
+        this.resourceScopes.delete(id);
       }
       this.connections = this.connections.filter((c) => c.id !== id);
       await this.persist();
@@ -468,9 +544,22 @@ export class VaultManager {
       vault.editorBuffers.clear();
     }
     await this.persistence;
+    this.resourceSetters.clear();
     this.listeners.clear();
   }
 }
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+async function directoryDisplayPath(
+  handle: FileSystemDirectoryHandle,
+  scope?: FileSystemDirectoryHandle,
+) {
+  if (!scope) return;
+  try {
+    const relative = await scope.resolve(handle);
+    if (relative !== null) return [scope.name, ...relative].join("/");
+  } catch {
+    // Optional resource capabilities must not prevent loading the Vault connection.
+  }
 }

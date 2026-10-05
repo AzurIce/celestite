@@ -12,10 +12,16 @@ import { EditorHost } from "../runtime/host";
 import { DirectoryEditorHost } from "./host";
 import { encodeError } from "../rpc";
 import { serveEditorWorker } from "../runtime/service";
+import { DirectoryPackageResources } from "./package-resources";
 
 export type LocalEditorSource =
   | { kind: "opfs"; id: "default" }
-  | { kind: "directory"; id: string; handle: LocalDirectoryHandle };
+  | {
+      kind: "directory";
+      id: string;
+      handle: LocalDirectoryHandle;
+      resourceScope?: LocalDirectoryHandle;
+    };
 
 async function start(source: LocalEditorSource) {
   const storeId =
@@ -45,13 +51,41 @@ async function start(source: LocalEditorSource) {
             createBrowserIo(store, backend),
             source.kind === "directory",
           );
+          // A stale optional resource capability must not prevent opening the Vault.
+          const packages =
+            source.kind === "directory" && source.resourceScope
+              ? await DirectoryPackageResources.open(
+                  source.resourceScope,
+                  source.handle,
+                ).catch(() => undefined)
+              : undefined;
           const host =
             source.kind === "directory"
-              ? new DirectoryEditorHost(binding, backend, emit, schedule)
+              ? new DirectoryEditorHost(
+                  binding,
+                  backend,
+                  emit,
+                  schedule,
+                  packages,
+                )
               : new EditorHost(binding, backend, emit, schedule);
           return {
             identity: store.identity,
-            host,
+            host: Object.assign(
+              host,
+              source.kind === "directory"
+                ? {
+                    setResourceScope: async (scope: LocalDirectoryHandle) => {
+                      host.previewResources.setPackages(
+                        await DirectoryPackageResources.open(
+                          scope,
+                          source.handle,
+                        ),
+                      );
+                    },
+                  }
+                : {},
+            ),
             dispose: () => binding.free(),
           };
         } catch (error) {

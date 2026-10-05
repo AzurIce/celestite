@@ -69,11 +69,15 @@ test("defaults come from the schema and unknown keys survive a rewrite", () => {
 
 test("app overrides defaults and project overrides app per key", () => {
   const app = parseSettingsText(
-    JSON.stringify({ "theme.mode": "light", "editor.wordWrap": true }),
+    JSON.stringify({
+      "theme.mode": "light",
+      "editor.wordWrap": true,
+      "editor.previewMode": "split",
+    }),
     "app",
   );
   const project = parseSettingsText(
-    JSON.stringify({ "theme.mode": "dark" }),
+    JSON.stringify({ "theme.mode": "dark", "editor.previewMode": "source" }),
     "project",
   );
   const resolved = resolveSettings(app, project);
@@ -82,10 +86,20 @@ test("app overrides defaults and project overrides app per key", () => {
     "sidebar.width": DEFAULT_SETTINGS["sidebar.width"],
     "editor.wordWrap": true,
     "editor.vimMode": false,
+    "editor.previewMode": "split",
   });
   assert.equal(resolved.source["theme.mode"], "project");
   assert.equal(resolved.source["editor.wordWrap"], "app");
   assert.equal(resolved.source["sidebar.width"], "default");
+  assert.equal(resolved.source["editor.previewMode"], "app");
+  assert.equal(project.document["editor.previewMode"], "source");
+  assert.ok(
+    project.problems.some(
+      (problem) =>
+        problem.key === "editor.previewMode" &&
+        problem.reason === "此设置仅支持全局配置",
+    ),
+  );
 });
 
 test("invalid values fall back to the layer below and record a problem", () => {

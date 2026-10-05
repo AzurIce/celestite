@@ -1,6 +1,8 @@
 /** 设置键定义：默认值 + 运行时解析。未知键一律保留，坏值逐键回退。 */
 
 export interface SettingDefinition<T> {
+  /** 默认为 true；全局视图偏好不接受 Vault 配置覆盖。 */
+  projectOverride?: boolean;
   /** 默认值；故意不推断成字面量类型，方便消费端读写普通值。 */
   default: T;
   /** 可选取值；用于报错信息与将来的设置面板。 */
@@ -65,11 +67,22 @@ const vimEntry: SettingDefinition<boolean> = {
   describe: "编辑器 Vim 模式",
 };
 
+const previewModes = ["source", "split", "preview"] as const;
+export type PreviewModeSetting = (typeof previewModes)[number];
+const previewModeEntry: SettingDefinition<PreviewModeSetting> = {
+  default: "source",
+  choices: previewModes,
+  parse: parseChoice(previewModes),
+  projectOverride: false,
+  describe: "所有文档共用的源码 / 分栏 / 预览显示模式",
+};
+
 export const SETTINGS_SCHEMA = {
   "theme.mode": themeEntry,
   "sidebar.width": sidebarEntry,
   "editor.wordWrap": wrapEntry,
   "editor.vimMode": vimEntry,
+  "editor.previewMode": previewModeEntry,
 };
 
 export type SettingKey = keyof typeof SETTINGS_SCHEMA;
@@ -82,6 +95,7 @@ export const DEFAULT_SETTINGS: Settings = {
   "sidebar.width": sidebarEntry.default,
   "editor.wordWrap": wrapEntry.default,
   "editor.vimMode": vimEntry.default,
+  "editor.previewMode": previewModeEntry.default,
 };
 
 /**

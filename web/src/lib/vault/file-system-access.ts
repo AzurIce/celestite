@@ -2,13 +2,17 @@ import { DirectoryHandleVaultBackend } from "./directory-handle";
 import { fileSystemError, VaultError } from "./errors";
 
 export type LocalDirectoryHandle = FileSystemDirectoryHandle & {
-  queryPermission(options: { mode: "readwrite" }): Promise<PermissionState>;
-  requestPermission(options: { mode: "readwrite" }): Promise<PermissionState>;
+  queryPermission(options: {
+    mode: "read" | "readwrite";
+  }): Promise<PermissionState>;
+  requestPermission(options: {
+    mode: "read" | "readwrite";
+  }): Promise<PermissionState>;
 };
 type DirectoryPickerWindow = Window & {
   showDirectoryPicker?: (options: {
     id: string;
-    mode: "readwrite";
+    mode: "read" | "readwrite";
   }) => Promise<LocalDirectoryHandle>;
 };
 
@@ -21,13 +25,15 @@ export function supportsLocalDirectories(): boolean {
 }
 
 /** Call directly from a user gesture, before other asynchronous work. */
-export async function pickLocalDirectory(): Promise<LocalDirectoryHandle | null> {
+export async function pickLocalDirectory(
+  mode: "read" | "readwrite" = "readwrite",
+): Promise<LocalDirectoryHandle | null> {
   if (!supportsLocalDirectories())
     throw new VaultError("Unsupported", "此浏览器不支持打开本机目录。");
   try {
     return await (window as DirectoryPickerWindow).showDirectoryPicker!({
-      id: "celestite-vault",
-      mode: "readwrite",
+      id: mode === "read" ? "celestite-resources" : "celestite-vault",
+      mode,
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError")
@@ -39,12 +45,15 @@ export async function pickLocalDirectory(): Promise<LocalDirectoryHandle | null>
 /** The handle is already cached: requesting permission must retain activation. */
 export async function authorizeDirectory(
   handle: LocalDirectoryHandle,
+  mode: "read" | "readwrite" = "readwrite",
 ): Promise<void> {
   try {
-    if ((await handle.requestPermission({ mode: "readwrite" })) !== "granted")
+    if ((await handle.requestPermission({ mode })) !== "granted")
       throw new VaultError(
         "PermissionDenied",
-        "需要目录的读写权限，请再次打开并授权。",
+        mode === "read"
+          ? "依赖目录需要读取权限，请重新授权。"
+          : "需要目录的读写权限，请再次打开并授权。",
       );
   } catch (error) {
     throw fileSystemError(error, "授权本机目录");

@@ -238,6 +238,10 @@ function localDirectorySetup(registryFailure = false) {
       async forget(id) {
         records.delete(id);
       },
+      async setResourceScope(id, scope) {
+        const record = records.get(id)!;
+        records.set(id, { ...record, resourceScope: scope });
+      },
     };
   const create = () =>
     new VaultManager({

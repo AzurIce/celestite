@@ -67,6 +67,70 @@ test.beforeEach(async ({ page }) => {
   ).toBeVisible();
 });
 
+test("display mode is shared across files and Vaults and persists through settings and reload", async ({
+  page,
+}) => {
+  const preview = page.getByRole("region", { name: "文档预览" });
+  const editor = page.getByRole("textbox", { name: "代码编辑器" });
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await page.getByRole("treeitem", { name: "a.not", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "分栏", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(preview.locator("h1")).toHaveText("Notist");
+  await page.getByRole("button", { name: "预览", exact: true }).click();
+  await page.getByRole("tab", { name: "a.md", exact: true }).click();
+  await expect(preview.locator("h1")).toHaveText("First");
+  await expect(editor).toHaveCount(0);
+  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await page.getByRole("tab", { name: "a.not", exact: true }).click();
+  await expect(preview).toHaveCount(0);
+  await expect(editor).toBeVisible();
+  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await page.reload();
+  await page.getByRole("treeitem", { name: "range.md", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "分栏", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(preview.locator("h1")).toHaveText("Range");
+  await page.evaluate(async () => {
+    const root = await (
+      await navigator.storage.getDirectory()
+    ).getDirectoryHandle("Shared Mode", { create: true });
+    const stream = await (
+      await root.getFileHandle("local.md", { create: true })
+    ).createWritable();
+    await stream.write("# Local Vault");
+    await stream.close();
+    Object.assign(window, { showDirectoryPicker: async () => root });
+  });
+  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await page.getByRole("button", { name: "打开本机目录", exact: true }).click();
+  await page.getByRole("treeitem", { name: "local.md", exact: true }).click();
+  await expect(preview.locator("h1")).toHaveText("Local Vault");
+  await expect(
+    page.getByRole("button", { name: "分栏", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "全局设置", exact: true }).click();
+  await page
+    .getByRole("combobox", { name: "文档显示模式", exact: true })
+    .selectOption("preview");
+  await expect(page.getByRole("status", { name: "设置保存状态" })).toHaveText(
+    "已保存",
+  );
+  await page.keyboard.press("Escape");
+  await page
+    .getByRole("combobox", { name: "当前 Vault" })
+    .selectOption("opfs:default");
+  await expect(preview.locator("h1")).toHaveText("Range");
+  await expect(editor).toHaveCount(0);
+  await page.reload();
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await expect(preview.locator("h1")).toHaveText("First");
+  await expect(editor).toHaveCount(0);
+});
+
 test("split click mapping preserves split mode and rejects stale or dragged content", async ({
   page,
 }, testInfo) => {

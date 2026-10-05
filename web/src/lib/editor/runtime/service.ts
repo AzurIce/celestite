@@ -32,6 +32,9 @@ export type EditorWorkerHost = Pick<
 > & {
   authorize?: (token: string) => Promise<ServiceDocument[]>;
   observeFiles?: () => Promise<void>;
+  setResourceScope?: (
+    scope: import("../../vault/file-system-access").LocalDirectoryHandle,
+  ) => Promise<void>;
 };
 export async function serveEditorWorker(
   create: (
@@ -75,6 +78,16 @@ export async function serveEditorWorker(
         throw new VaultError("Closed", "编辑服务会话无效或正在关闭。");
       const p = request.params;
       switch (request.method) {
+        case "set_resource_scope":
+          if (!host.setResourceScope)
+            throw new VaultError(
+              "Unsupported",
+              "此 Vault 不支持目录资源授权。",
+            );
+          await host.setResourceScope(
+            p.scope as import("../../vault/file-system-access").LocalDirectoryHandle,
+          );
+          return previews.invalidateProject();
         case "observe_files":
           return host.observeFiles?.();
         case "authorize":

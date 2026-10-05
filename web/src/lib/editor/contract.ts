@@ -199,6 +199,10 @@ export interface ServiceMethods {
   save: { params: { id: string }; result: ServiceDocument };
   retry_history: { params: { id: string }; result: ServiceDocument };
   observe_files: { params: Record<string, never>; result: void };
+  set_resource_scope: {
+    params: { scope: FileSystemDirectoryHandle };
+    result: void;
+  };
   retry_observation: { params: { id: string }; result: ServiceDocument };
   resolve: {
     params: { id: string; action: "overwrite" | "discard" | "retry" };

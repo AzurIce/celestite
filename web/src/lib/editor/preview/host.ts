@@ -283,6 +283,11 @@ export class PreviewHost {
     this.stopWorker();
     return this.execute("preview_retry", { id });
   }
+  async invalidateProject() {
+    this.stopWorker();
+    this.assetSnapshots.clear();
+    await this.execute("preview_invalidate_project", {});
+  }
   private stopWorker() {
     clearTimeout(this.timeout);
     this.timeout = undefined;

@@ -60,6 +60,11 @@ export function parseDocument(
   for (const [key, value] of Object.entries(raw as SettingsDocument)) {
     document[key] = value;
     if (!isSettingKey(key)) continue;
+    const definition = settingDefinition(key);
+    if (source === "project" && definition.projectOverride === false) {
+      problems.push({ key, source, value, reason: "此设置仅支持全局配置" });
+      continue;
+    }
     if (value === undefined) {
       problems.push({ key, source, value, reason: "值缺失" });
       continue;
@@ -69,7 +74,6 @@ export function parseDocument(
       problems.push({ key, source, value, reason: invalid });
       continue;
     }
-    const definition = settingDefinition(key);
     values[key] = definition.parse(value, definition.default);
   }
   return { values: values as Partial<Settings>, document, problems };

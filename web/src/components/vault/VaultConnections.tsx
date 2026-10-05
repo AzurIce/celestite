@@ -117,11 +117,20 @@ export function VaultConnections(props: {
                 <li>
                   <div class="min-w-0 flex-1">
                     <p class="text-ui-sm font-medium">{connection.name}</p>
-                    <p class="mt-1 break-all text-ui-sm text-secondary">
+                    <p
+                      class="mt-1 break-all text-ui-sm text-secondary"
+                      title={
+                        connection.directoryPath
+                          ? "从已授权目录开始的路径"
+                          : undefined
+                      }
+                    >
                       {connection.kind === "opfs"
                         ? "默认本地 Vault · 不可移除"
                         : connection.kind === "directory"
-                          ? "本机目录 · 文件直接保存到此目录"
+                          ? connection.directoryPath
+                            ? `本机目录 · ${connection.directoryPath}`
+                            : "本机目录 · 文件直接保存到此目录"
                           : connection.url}
                     </p>
                   </div>

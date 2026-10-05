@@ -23,6 +23,7 @@ import {
   type SettingKey,
   type Settings,
   type ThemeModeSetting,
+  type PreviewModeSetting,
 } from "@/lib/settings/schema";
 import "./settings.css";
 
@@ -31,10 +32,17 @@ const themeLabels: Record<ThemeModeSetting, string> = {
   light: "浅色",
   dark: "深色",
 };
+const previewLabels: Record<PreviewModeSetting, string> = {
+  source: "源码",
+  split: "分栏",
+  preview: "预览",
+};
 
 function valueLabel(key: SettingKey, value: Settings[SettingKey]) {
   if (key === "theme.mode") return themeLabels[value as ThemeModeSetting];
   if (key === "sidebar.width") return `${value} px`;
+  if (key === "editor.previewMode")
+    return previewLabels[value as PreviewModeSetting];
   return value ? "开启" : "关闭";
 }
 
@@ -244,6 +252,31 @@ function SettingsFields() {
       </section>
       <section class="settings-group" aria-labelledby={`${id}-editor`}>
         <h3 id={`${id}-editor`}>编辑器</h3>
+        <div class="settings-row">
+          <div class="settings-copy">
+            <label for={`${id}-preview`}>文档显示模式</label>
+            <p id={`${id}-preview-help`}>所有文件和 Vault 共用，刷新后保留。</p>
+          </div>
+          <div class="settings-control">
+            <select
+              id={`${id}-preview`}
+              class="ui-input settings-select"
+              aria-describedby={`${id}-preview-help`}
+              value={global()["editor.previewMode"]}
+              onChange={(event) =>
+                void save(
+                  "editor.previewMode",
+                  event.currentTarget.value as PreviewModeSetting,
+                )
+              }
+            >
+              <option value="source">源码</option>
+              <option value="split">分栏</option>
+              <option value="preview">预览</option>
+            </select>
+            <Reset setting="editor.previewMode" label="文档显示模式" />
+          </div>
+        </div>
         <div class="settings-row">
           <div class="settings-copy">
             <label for={`${id}-wrap`}>自动换行</label>

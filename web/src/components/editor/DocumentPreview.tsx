@@ -36,6 +36,7 @@ function sameVersion(a: Version, b: Version) {
 export function DocumentPreview(props: {
   document: EditorDocument;
   documents: EditorDocuments;
+  authorizeResources?: () => Promise<void>;
   scrollTop: number;
   fragment?: string;
   sync: PreviewSync;
@@ -64,6 +65,7 @@ export function DocumentPreview(props: {
   const [error, setError] = createSignal<string | null>(null);
   const [unavailable, setUnavailable] = createSignal(false);
   const [loadingComponents, setLoadingComponents] = createSignal(false);
+  const [authorizing, setAuthorizing] = createSignal(false);
   let loadingTask: string | undefined;
   const unsubscribe = documents.previews!.subscribe(documentId, (value) => {
     setUnavailable(value === null);
@@ -269,7 +271,42 @@ export function DocumentPreview(props: {
             重试预览
           </Button>
         </Show>
+        <Show when={props.authorizeResources}>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={authorizing()}
+            title="选择包含当前 Vault 和依赖的共同父目录，Vault 根目录保持不变"
+            onClick={() => {
+              setError(null);
+              setAuthorizing(true);
+              void props.authorizeResources!()
+                .catch((error) =>
+                  setError(
+                    error instanceof Error ? error.message : String(error),
+                  ),
+                )
+                .finally(() => setAuthorizing(false));
+            }}
+          >
+            {authorizing() ? "正在授权…" : "授权依赖目录"}
+          </Button>
+        </Show>
       </div>
+      <Show
+        when={
+          props.authorizeResources &&
+          state()?.status === "failed" &&
+          /外部 package|授权目录|读取权限|NotAllowedError/.test(
+            state()?.error ?? "",
+          )
+        }
+      >
+        <p class="preview-error">
+          依赖超出当前授权范围或授权已失效，请选择包含 Vault
+          和依赖的共同父目录。
+        </p>
+      </Show>
       <Show when={state()?.error || error()}>
         <p class="preview-error" role="alert">
           {error() ?? state()?.error}

@@ -164,7 +164,11 @@ bun run test:ui tests/vault.spec.ts
 
 `directory-handle.ts` 共用 OPFS 与本机目录的文件操作；`file-system-access.ts` 管理选择、授权和后端构造。目录连接及 handle 存在 IndexedDB `celestite-local-directories`，登记时通过 `isSameEntry()` 去重，并用 Web Locks 协调跨标签页登记。不同位置的同名目录分别登记。刷新只恢复连接列表，点击打开时直接申请权限；权限失效保留正文，可从“管理 Vault”再次打开并授权。
 
+连接列表在另行授权共同父目录后显示从该目录开始的路径，例如 `notist/docs`，刷新后重新解析目录关系。浏览器 API 不提供完整系统路径；仅选择 Vault 时只能取得其名称。
+
 普通文件直接写回所选目录；实例身份和历史存于 OPFS `/editor-instances/directory-<uuid>`，不在本机目录里创建私有历史文件。每个目录实例独占打开，不允许另一标签页同时写入同一份私有历史。移除连接先保存正文、释放 Worker，再删除 IndexedDB handle 记录；普通文件和 OPFS 私有历史保留。重新登记已移除的目录会分配新的实例。
+
+预览的“授权依赖目录”允许手动选择包含当前 Vault 与依赖的共同父目录，仅申请读取权限。通过 `scope.resolve(vaultHandle)` 验证包含关系，以 `/workspace` 作为授权范围的虚拟根，Vault 的编译资源根由其实际相对位置确定；`../packages` 等相对依赖据此解析。文件树、保存和历史继续使用原来的 Vault 根与身份，外部 package 由 `local/package-resources.ts` 独立只读加载，包括相对 JS 与 WASM。取消或选择无关目录保留原授权；授权 handle 与目录连接一同存于 IndexedDB，重新打开时请求恢复读取权限，资源授权失效不阻止 Vault 编辑。浏览器不会提供操作系统绝对路径，也不能从 Vault handle 自动取得父目录；配置中的绝对路径属于虚拟资源命名空间，不能直接对应本机绝对路径。
 
 前台每三秒、页面恢复可见与窗口恢复焦点时核对已登记文档，并提示文件树重新读取已缓存目录。Rust core 从磁盘基线合并外部变化，保留本地编辑与个人撤销；IME 期间延后该文档的后台核对。保存前再次核对，使用内容 revision 条件写入；观察或权限失败可见，保留历史与编辑正文。目录监听不依赖实验性 `FileSystemObserver`，不会捕获每个瞬间状态，也不预先把整库正文加入历史。
 
@@ -254,11 +258,13 @@ bun run test:ui tests/settings.spec.ts   # 设置文件、项目级覆盖与迁�
 
 当前键与默认值：
 
-| 键                | 类型 / 范围                 | 默认     |
-| ----------------- | --------------------------- | -------- |
-| `theme.mode`      | `system` / `light` / `dark` | `system` |
-| `sidebar.width`   | 200–560，越界夹取           | 300      |
-| `editor.wordWrap` | 布尔                        | `false`  |
+| 键                   | 类型 / 范围                            | 默认     |
+| -------------------- | -------------------------------------- | -------- |
+| `theme.mode`         | `system` / `light` / `dark`            | `system` |
+| `sidebar.width`      | 200–560，越界夹取                      | 300      |
+| `editor.wordWrap`    | 布尔                                   | `false`  |
+| `editor.vimMode`     | 布尔                                   | `false`  |
+| `editor.previewMode` | `source` / `split` / `preview`，仅全局 | `source` |
 
 `src/lib/settings/schema.ts` 是唯一权威：默认值、取值解析与范围、键说明都在那里；新增设置只需加一项，界面读取 `settings().values[...]`，写入用 `setSetting(...)`。`settings()` 在 JSX 里是响应式的；`src/lib/settings/document.ts` 负责解析、合并与来源标记，`snapshot().source[key]` 说明某个键来自 default / app / project，设置面板据此提示当前 Vault 的覆盖值。
 
@@ -268,7 +274,7 @@ bun run test:ui tests/settings.spec.ts   # 设置文件、项目级覆盖与迁�
 
 ## 全局设置界面
 
-从底部状态栏的“全局设置”按钮打开。面板展示全局文档中的主题、侧栏宽度和自动换行，未配置的选项展示 schema 默认值；当前 Vault 的覆盖值另行提示，仍可编辑全局默认值，写入只影响全局文件。
+从底部状态栏的“全局设置”按钮打开。面板展示全局文档中的主题、侧栏宽度、自动换行、Vim 模式和文档显示模式，未配置的选项展示 schema 默认值；当前 Vault 的覆盖值另行提示，仍可编辑全局默认值，写入只影响全局文件。文档显示模式由所有文件与 Vault 共用，工具栏和设置面板同步修改同一偏好，刷新后恢复；该键不接受项目级覆盖。不支持预览的文件显示源码，窄屏将分栏呈现为单独预览，两者均保留全局偏好。各文件的预览滚动位置独立保留。
 
 主题和换行选择后自动保存；宽度在按 Enter 或离开输入框时校验并保存，范围取自 schema。每项可独立恢复默认值，保存保留其他设置和未知键。底部显示保存状态，失败保留本次会话的修改并提供重试；存储后端只能使用内存时明确说明不会持久保存。无效全局配置也在面板中提示，修正对应选项后清除其问题记录。面板支持深浅主题、键盘和窄屏滚动。
 

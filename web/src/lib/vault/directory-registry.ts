@@ -5,11 +5,13 @@ export interface DirectoryConnection {
   id: string;
   name: string;
   handle: LocalDirectoryHandle;
+  resourceScope?: LocalDirectoryHandle;
 }
 export interface DirectoryRegistry {
   list(): Promise<DirectoryConnection[]>;
   remember(handle: LocalDirectoryHandle): Promise<DirectoryConnection>;
   forget(id: string): Promise<void>;
+  setResourceScope(id: string, scope: LocalDirectoryHandle): Promise<void>;
 }
 
 function result<T>(request: IDBRequest<T>): Promise<T> {
@@ -52,7 +54,9 @@ export class IndexedDbDirectoryRegistry implements DirectoryRegistry {
         if (
           !/^directory:[0-9a-f-]{36}$/.test(record.id) ||
           typeof record.name !== "string" ||
-          record.handle?.kind !== "directory"
+          record.handle?.kind !== "directory" ||
+          (record.resourceScope !== undefined &&
+            record.resourceScope?.kind !== "directory")
         )
           throw new VaultError("IO", "本机目录记录无效，未覆盖已有数据。");
       return records;
@@ -72,6 +76,7 @@ export class IndexedDbDirectoryRegistry implements DirectoryRegistry {
         }
       }
       record = {
+        ...record,
         id: record?.id ?? `directory:${crypto.randomUUID()}`,
         name: handle.name,
         handle,
@@ -84,6 +89,16 @@ export class IndexedDbDirectoryRegistry implements DirectoryRegistry {
     await navigator.locks.request("celestite.local-directories", () =>
       this.write((store) => store.delete(id)),
     );
+  }
+  async setResourceScope(id: string, scope: LocalDirectoryHandle) {
+    await navigator.locks.request("celestite.local-directories", async () => {
+      const record = (await this.list()).find((entry) => entry.id === id);
+      if (!record)
+        throw new VaultError("NotFound", "目录记录已不存在，请重新选择目录。");
+      await this.write((store) =>
+        store.put({ ...record, resourceScope: scope }),
+      );
+    });
   }
   private async write(change: (store: IDBObjectStore) => IDBRequest) {
     const database = await this.database();

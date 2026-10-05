@@ -25,6 +25,9 @@ export class PreviewResources {
   get root() {
     return this.packages?.root ?? "/vault";
   }
+  setPackages(packages: PackageResourceProvider) {
+    this.packages = packages;
+  }
   private async *entries(path: string, task: PreviewTask) {
     if (path.startsWith("/")) {
       if (!this.packages)
