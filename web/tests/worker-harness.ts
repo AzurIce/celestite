@@ -62,6 +62,10 @@ export async function installWorkerHarness(page: Page, remote = false) {
                 )
               : url;
           super(injected, options);
+          if (
+            !/\/lib\/editor\/(?:local|remote)\/worker\.ts(?:\?|$)/.test(address)
+          )
+            return;
           root.editorWorkers.push(this);
           this.addEventListener("message", (event) =>
             root.editorMessages.push(event.data),

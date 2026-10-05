@@ -1,0 +1,11 @@
+{
+  "source": "tree-sitter-notist",
+  "sourceSha256": "6d8780e29cde57dc71493f1005ebf1290a43c31e27fe508a19ddb635e3570207",
+  "compiler": "tree-sitter-cli 0.26.11",
+  "grammars": [
+    "notist",
+    "notist_code",
+    "notist_markdown",
+    "notist_markdown_inline"
+  ]
+}

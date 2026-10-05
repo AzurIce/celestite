@@ -53,6 +53,7 @@ import type {
   SelectionContext,
 } from "@/lib/editor/contract";
 import { languageSupport } from "./languages";
+import { syntaxFolds } from "./tree-sitter";
 import { vimExtension, vimNormalMode, vimUserEvent, type VimMode } from "./vim";
 import "./editor.css";
 
@@ -286,7 +287,9 @@ export default function CodeEditor(props: CodeEditorProps) {
     const request = ++languageRequest;
     setLanguageError(false);
     try {
-      const extension = await languageSupport(path);
+      const extension = await languageSupport(path, () => {
+        if (!disposed && request === languageRequest) setLanguageError(true);
+      });
       if (!disposed && request === languageRequest && view)
         view.dispatch({ effects: buffer.language.reconfigure(extension) });
     } catch {
@@ -373,7 +376,12 @@ export default function CodeEditor(props: CodeEditorProps) {
             autocompletion(),
             highlightActiveLine(),
             highlightSelectionMatches(),
-            foldGutter(),
+            foldGutter({
+              foldingChanged: (update) =>
+                update.transactions.some((transaction) =>
+                  transaction.effects.some((effect) => effect.is(syntaxFolds)),
+                ),
+            }),
             syntaxHighlighting(highlight),
             keymap.of([
               ...closeBracketsKeymap,

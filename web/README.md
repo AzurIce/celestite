@@ -286,7 +286,9 @@ bun run test:ui tests/settings-ui.spec.ts
 
 ## 编辑与保存
 
-首页单击文件或按 Enter 打开 CodeMirror 6 编辑器。支持行号、语法高亮、折叠、自动补全、缩进、撤销重做、多光标、搜索替换和可切换的自动换行。Markdown、JavaScript / JSX、TypeScript / TSX、JSON、CSS、HTML 的语言包按需加载；其他 UTF-8 文本也可以编辑和保存。编辑器颜色跟随应用主题。
+首页单击文件或按 Enter 打开 CodeMirror 6 编辑器。支持行号、语法高亮、折叠、自动补全、缩进、撤销重做、多光标、搜索替换和可切换的自动换行。`.md`、`.markdown`、`.nmd`、`.notmd` 使用 Notist Markdown 语法，`.not` 使用原生正文语法，`.notc` 使用声明语法；高亮与折叠由独立 Tree-sitter Worker 执行，包含 Notist 调用中的递归 Markdown 内容。JavaScript / JSX、TypeScript / TSX、JSON、CSS、HTML 的 CodeMirror 语言包按需加载；其他 UTF-8 文本也可以编辑和保存。编辑器颜色跟随应用主题。
+
+Tree-sitter runtime 与编译 CLI 固定为 `0.26.11`。语法 WASM、queries 与来源指纹快照位于 `src/lib/syntax/grammars/`，许可证位于 `public/tree-sitter-notist-LICENSE.txt`，一起随前端发布；正常开发、构建和 CI 不需要语法仓库。更新相邻的 `../tree-sitter-notist` 后，在根目录运行 `bun run --cwd web syntax:update`，再运行格式化与测试；也可传入相对于 `web/` 的语法仓库路径。此命令编译仓库中已生成的 C parser，不修改来源仓库；Tree-sitter CLI 首次构建会自动下载 WASI SDK，需要网络。
 
 打开的文件显示为标签。切换文件保留内容、撤销历史、光标和滚动位置；移动或重命名文件和父目录时，标签同步路径并保留同一个编辑缓冲区。移动端返回文件树不会关闭文档，再次打开同一文件可继续编辑。
 

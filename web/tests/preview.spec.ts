@@ -91,12 +91,19 @@ test("display mode is shared across files and Vaults and persists through settin
   await expect
     .poll(() =>
       page.evaluate(async () => {
-        const root = await navigator.storage.getDirectory();
-        const directory = await root.getDirectoryHandle("celestite");
-        const file = await directory.getFileHandle("settings.json");
-        return JSON.parse(await (await file.getFile()).text())[
-          "editor.previewMode"
-        ];
+        try {
+          const root = await navigator.storage.getDirectory();
+          const directory = await root.getDirectoryHandle("celestite");
+          const file = await directory.getFileHandle("settings.json");
+          return JSON.parse(await (await file.getFile()).text())[
+            "editor.previewMode"
+          ];
+        } catch (error) {
+          // The first poll can precede asynchronous settings file creation.
+          if (error instanceof DOMException && error.name === "NotFoundError")
+            return null;
+          throw error;
+        }
       }),
     )
     .toBe("split");

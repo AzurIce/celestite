@@ -164,6 +164,21 @@
   color: var(--color-accent);
   text-decoration: underline;
 }
+.code-editor .cm-token-function {
+  color: var(--editor-type);
+}
+.code-editor .cm-token-property {
+  color: var(--editor-number);
+}
+.code-editor .cm-token-punctuation {
+  color: var(--color-secondary);
+}
+.code-editor .cm-token-strike {
+  text-decoration: line-through;
+}
+.code-editor .cm-token-none {
+  color: var(--color-foreground);
+}
 .editor-tabs {
   --uno: "flex min-h-12 shrink-0 items-center gap-1 overflow-x-auto border-b border-solid border-border bg-surface px-3 py-2";
 }
