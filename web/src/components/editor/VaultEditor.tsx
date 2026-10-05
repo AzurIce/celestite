@@ -9,7 +9,15 @@ import {
   onSettled,
   untrack,
 } from "solid-js";
-import { Button, IconButton } from "@/components/ui";
+import {
+  Button,
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+  IconButton,
+} from "@/components/ui";
 import { StatusSlot } from "@/components/ui/status-slot";
 import {
   ChevronLeft,
@@ -22,6 +30,7 @@ import type { EditorDocuments } from "@/lib/editor/contract";
 import { setSetting, settings } from "@/lib/settings";
 import type { EditorBuffer } from "./CodeEditor";
 import { languageName } from "./languages";
+import type { VimMode } from "./vim";
 import { SaveConflict } from "./SaveConflict";
 import { DocumentPreview } from "./DocumentPreview";
 import { PreviewSync } from "./preview-sync";
@@ -47,6 +56,9 @@ export function VaultEditor(props: VaultEditorProps) {
   const unsubscribe = props.documents.subscribe(setState);
   const [mobileVisible, setMobileVisible] = createSignal(false);
   const [cursor, setCursor] = createSignal({ line: 1, column: 1 });
+  const [vimMode, setVimMode] = createSignal<VimMode | null>(null);
+  const [closingTabs, setClosingTabs] = createSignal(false);
+  const [contextTab, setContextTab] = createSignal<string | null>(null);
   const [mode, setMode] = createSignal<PreviewMode>("source");
   const previewMedia = window.matchMedia("(max-width: 639px)");
   const [narrowScreen, setNarrowScreen] = createSignal(previewMedia.matches);
@@ -94,6 +106,7 @@ export function VaultEditor(props: VaultEditorProps) {
     (id) => {
       setMode(id ? (views.get(id)?.mode ?? "source") : "source");
       setReveal(undefined);
+      setVimMode(null);
     },
   );
   const tabId = (id: string) => `${panelId}-${id}`;
@@ -179,6 +192,52 @@ export function VaultEditor(props: VaultEditorProps) {
     props.documents.activate(ids[next]);
     onSettled(() => document.getElementById(tabId(ids[next]))?.focus());
   }
+  function canCloseTabs(ids: string[]) {
+    return (
+      !closingTabs() &&
+      !state().conflictPrompt &&
+      ids.length > 0 &&
+      ids.every((id) => {
+        const file = state().documents.find((document) => document.id === id);
+        return file && !file.locked && !file.saving;
+      })
+    );
+  }
+  async function closeTabs(ids: string[]) {
+    if (!canCloseTabs(ids)) return;
+    setClosingTabs(true);
+    try {
+      // Snapshot the targets and close in order; a failed save or conflict
+      // stops the batch so later tabs and their drafts remain open.
+      for (const id of ids) {
+        if (!props.documents.has(id)) continue;
+        if (!(await props.documents.requestCloseDocument(id))) {
+          props.documents.activate(id);
+          break;
+        }
+      }
+    } finally {
+      setClosingTabs(false);
+    }
+  }
+  function contextIds(scope: "current" | "others" | "left" | "right" | "all") {
+    const files = state().documents;
+    const index = files.findIndex((file) => file.id === contextTab());
+    if (index < 0) return [];
+    return files
+      .filter((_, position) =>
+        scope === "current"
+          ? position === index
+          : scope === "others"
+            ? position !== index
+            : scope === "left"
+              ? position < index
+              : scope === "right"
+                ? position > index
+                : true,
+      )
+      .map((file) => file.id);
+  }
   return (
     <section
       aria-label="文件编辑器"
@@ -214,58 +273,121 @@ export function VaultEditor(props: VaultEditorProps) {
             {state().openError}
           </p>
         </Show>
-        <Show when={state().documents.length}>
-          <div role="tablist" aria-label="打开的文件" class="editor-tabs">
-            <For each={state().documents.map((document) => document.id)}>
-              {(id) => {
-                const file = () =>
-                  state().documents.find((document) => document.id === id)!;
-                return (
-                  <div
-                    class="editor-tab"
-                    data-active={state().activeId === id ? "true" : "false"}
-                  >
-                    <button
-                      id={tabId(id)}
-                      type="button"
-                      role="tab"
-                      class="editor-tab-label"
-                      aria-label={file().path}
-                      aria-controls={panelId}
-                      aria-selected={state().activeId === id ? "true" : "false"}
-                      tabindex={state().activeId === id ? 0 : -1}
-                      title={file().path}
-                      onClick={() => {
-                        props.documents.activate(id);
-                        setMobileVisible(true);
+        <ContextMenu>
+          <Show when={state().documents.length}>
+            <div role="tablist" aria-label="打开的文件" class="editor-tabs">
+              <For each={state().documents.map((document) => document.id)}>
+                {(id) => {
+                  const file = () =>
+                    state().documents.find((document) => document.id === id)!;
+                  return (
+                    <ContextMenuTrigger
+                      id={`${tabId(id)}-context`}
+                      as="div"
+                      class="editor-tab"
+                      data-active={state().activeId === id ? "true" : "false"}
+                      onContextMenu={() => setContextTab(id)}
+                      onPointerDown={(event) => {
+                        if (
+                          event.pointerType === "touch" ||
+                          event.pointerType === "pen"
+                        )
+                          setContextTab(id);
                       }}
-                      onKeyDown={(event) => tabKeyboard(event, id)}
+                      onMouseDown={(event) => {
+                        if (event.button === 1) event.preventDefault();
+                      }}
+                      onAuxClick={(event) => {
+                        if (event.button !== 1) return;
+                        event.preventDefault();
+                        void closeTabs([id]);
+                      }}
                     >
-                      <FileText size={14} class="shrink-0 text-secondary" />
-                      <span class="min-w-0 truncate">
-                        {file().path.split("/").pop()}
-                      </span>
-                      <Show when={file().dirty}>
-                        <span class="editor-dirty" aria-label="未保存" />
-                      </Show>
-                    </button>
-                    <button
-                      type="button"
-                      class="editor-tab-close"
-                      aria-label={`关闭 ${file().path}`}
-                      disabled={file().locked || file().saving}
-                      onClick={() =>
-                        void props.documents.requestCloseDocument(id)
-                      }
-                    >
-                      <X size={13} />
-                    </button>
-                  </div>
-                );
-              }}
-            </For>
-          </div>
-        </Show>
+                      <button
+                        id={tabId(id)}
+                        type="button"
+                        role="tab"
+                        class="editor-tab-label"
+                        aria-label={file().path}
+                        aria-controls={panelId}
+                        aria-selected={
+                          state().activeId === id ? "true" : "false"
+                        }
+                        tabindex={state().activeId === id ? 0 : -1}
+                        title={file().path}
+                        onClick={() => {
+                          props.documents.activate(id);
+                          setMobileVisible(true);
+                        }}
+                        onKeyDown={(event) => tabKeyboard(event, id)}
+                      >
+                        <FileText size={14} class="shrink-0 text-secondary" />
+                        <span class="min-w-0 truncate">
+                          {file().path.split("/").pop()}
+                        </span>
+                        <Show when={file().dirty}>
+                          <span class="editor-dirty" aria-label="未保存" />
+                        </Show>
+                      </button>
+                      <button
+                        type="button"
+                        class="editor-tab-close"
+                        aria-label={`关闭 ${file().path}`}
+                        disabled={!canCloseTabs([id])}
+                        onClick={() => void closeTabs([id])}
+                      >
+                        <X size={13} />
+                      </button>
+                    </ContextMenuTrigger>
+                  );
+                }}
+              </For>
+            </div>
+          </Show>
+          <ContextMenuContent
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              if (state().conflictPrompt) return;
+              const id = contextTab();
+              const focusId =
+                id && props.documents.has(id) ? id : state().activeId;
+              if (focusId) document.getElementById(tabId(focusId))?.focus();
+            }}
+          >
+            <ContextMenuItem
+              disabled={!canCloseTabs(contextIds("current"))}
+              onSelect={() => void closeTabs(contextIds("current"))}
+            >
+              关闭标签页
+            </ContextMenuItem>
+            <ContextMenuItem
+              disabled={!canCloseTabs(contextIds("others"))}
+              onSelect={() => void closeTabs(contextIds("others"))}
+            >
+              关闭其他标签页
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              disabled={!canCloseTabs(contextIds("left"))}
+              onSelect={() => void closeTabs(contextIds("left"))}
+            >
+              关闭左侧标签页
+            </ContextMenuItem>
+            <ContextMenuItem
+              disabled={!canCloseTabs(contextIds("right"))}
+              onSelect={() => void closeTabs(contextIds("right"))}
+            >
+              关闭右侧标签页
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              disabled={!canCloseTabs(contextIds("all"))}
+              onSelect={() => void closeTabs(contextIds("all"))}
+            >
+              关闭全部标签页
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
         <Show
           when={!state().loadingPath}
           fallback={
@@ -434,6 +556,8 @@ export function VaultEditor(props: VaultEditorProps) {
                                 document={active()!}
                                 cached={buffers.get(id)}
                                 wrap={wrap()}
+                                vim={settings().values["editor.vimMode"]}
+                                onVimMode={setVimMode}
                                 onChange={(content) =>
                                   props.documents.update(id, content)
                                 }
@@ -460,6 +584,7 @@ export function VaultEditor(props: VaultEditorProps) {
                                 onSave={() => {
                                   void props.documents.requestSave(id);
                                 }}
+                                onClose={() => void closeTabs([id])}
                                 onCursor={(line, column) =>
                                   setCursor({ line, column })
                                 }
@@ -521,6 +646,21 @@ export function VaultEditor(props: VaultEditorProps) {
                   </Show>
                 </div>
                 <StatusSlot mount={props.statusMount} class="editor-statusbar">
+                  <Show
+                    when={
+                      settings().values["editor.vimMode"] &&
+                      !active()?.readOnlyReason &&
+                      displayMode() !== "preview"
+                    }
+                  >
+                    <span
+                      role="status"
+                      aria-label="Vim 模式"
+                      class="font-mono text-accent"
+                    >
+                      {vimMode() ?? "NORMAL"}
+                    </span>
+                  </Show>
                   <span
                     role="status"
                     aria-label="保存状态"

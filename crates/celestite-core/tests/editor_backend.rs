@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 #[derive(Default)]
 struct Storage {
+    now: u64,
     files: BTreeMap<String, Vec<u8>>,
     documents: BTreeMap<String, StoredDocument>,
     intent: Option<DirectoryIntent>,
@@ -163,7 +164,7 @@ impl Backend for MemoryBackend {
         self.projection
     }
     fn now_ms(&self) -> u64 {
-        1000
+        1000 + self.storage.borrow().now
     }
     fn new_id(&self) -> EditorResult<String> {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -442,6 +443,45 @@ fn private_history_does_not_require_an_ordinary_directory() {
         assert!(state.dirty);
         assert!(state.autosave_delay.is_none());
         assert!(state.durable_version.is_some());
+    });
+}
+
+#[test]
+fn vim_undo_groups_follow_commands_and_insert_sessions_instead_of_timeouts() {
+    block_on(async {
+        let backend = MemoryBackend::new(b"");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        for (text, group, elapsed) in [
+            ("a", "input.vim.insert-1", 0),
+            ("b", "input.vim.insert-1", 2000),
+            ("c", "input.vim.insert-2", 2001),
+        ] {
+            backend.storage.borrow_mut().now = elapsed;
+            let state = core.read(&id).unwrap().snapshot;
+            let end = state.text.encode_utf16().count();
+            core.edit(
+                &id,
+                state.version,
+                vec![TextEdit {
+                    from: end,
+                    to: end,
+                    insert: text.into(),
+                }],
+                SelectionContext::default(),
+                group.into(),
+            )
+            .await
+            .unwrap();
+        }
+        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "ab");
+        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "");
+        core.undo(&id, UndoContext::default(), true).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "ab");
+        core.undo(&id, UndoContext::default(), true).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text, "abc");
     });
 }
 

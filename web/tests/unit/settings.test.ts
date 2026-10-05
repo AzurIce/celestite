@@ -81,6 +81,7 @@ test("app overrides defaults and project overrides app per key", () => {
     "theme.mode": "dark",
     "sidebar.width": DEFAULT_SETTINGS["sidebar.width"],
     "editor.wordWrap": true,
+    "editor.vimMode": false,
   });
   assert.equal(resolved.source["theme.mode"], "project");
   assert.equal(resolved.source["editor.wordWrap"], "app");

@@ -53,6 +53,7 @@ import type {
   SelectionContext,
 } from "@/lib/editor/contract";
 import { languageSupport } from "./languages";
+import { vimExtension, vimNormalMode, vimUserEvent, type VimMode } from "./vim";
 import "./editor.css";
 
 import type { EditorBuffer } from "@/lib/editor/buffer";
@@ -66,9 +67,12 @@ interface CodeEditorProps {
   onComposition?: (active: boolean) => void;
   onUndo?: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
+  vim: boolean;
   cached?: EditorBuffer;
   onChange: (content: string) => boolean;
   onSave: () => void;
+  onClose: () => void;
+  onVimMode: (mode: VimMode | null) => void;
   onCursor: (line: number, column: number) => void;
   onCache: (buffer: EditorBuffer) => void;
 }
@@ -217,11 +221,13 @@ export default function CodeEditor(props: CodeEditorProps) {
               before: selectionContext(update.startState),
               after: selectionContext(update.state),
               userEvent:
+                vimUserEvent(update.view) ??
                 update.transactions
                   .map((transaction) =>
                     transaction.annotation(Transaction.userEvent),
                   )
-                  .find(Boolean) ?? "view",
+                  .find(Boolean) ??
+                "view",
             })
           : props.onChange(content);
         if (!accepted)
@@ -255,6 +261,26 @@ export default function CodeEditor(props: CodeEditorProps) {
         !props.document.core?.historyError,
     ),
   ];
+  const vimBindings = () =>
+    props.vim
+      ? vimExtension({
+          save: () => props.onSave(),
+          close: () => props.onClose(),
+          unsaved: () =>
+            !!(
+              props.document.dirty ||
+              props.document.pending ||
+              props.document.saving ||
+              props.document.core?.historyError
+            ),
+          undo: props.onUndo
+            ? (redo) => {
+                if (view) undo(redo)(view);
+              }
+            : undefined,
+          onMode: (mode) => props.onVimMode(mode),
+        })
+      : [];
   async function configureLanguage(path: string) {
     const request = ++languageRequest;
     setLanguageError(false);
@@ -297,6 +323,7 @@ export default function CodeEditor(props: CodeEditorProps) {
       bindings: new Compartment(),
       editable: new Compartment(),
       wrap: new Compartment(),
+      vim: new Compartment(),
       scrollTop: 0,
       scrollLeft: 0,
     };
@@ -308,11 +335,13 @@ export default function CodeEditor(props: CodeEditorProps) {
             buffer.theme.reconfigure(darkTheme()),
             buffer.editable.reconfigure(editable()),
             buffer.wrap.reconfigure(wrap),
+            buffer.vim.reconfigure(vimBindings()),
           ],
         }).state
       : EditorState.create({
           doc: props.document.content,
           extensions: [
+            buffer.vim.of(vimBindings()),
             lineNumbers(),
             highlightActiveLineGutter(),
             highlightSpecialChars(),
@@ -394,6 +423,14 @@ export default function CodeEditor(props: CodeEditorProps) {
     },
   );
   createEffect(
+    () => props.vim,
+    (enabled) => {
+      if (view)
+        view.dispatch({ effects: buffer.vim.reconfigure(vimBindings()) });
+      if (!enabled) props.onVimMode(null);
+    },
+  );
+  createEffect(
     () => props.wrap,
     (wrap) => {
       if (view)
@@ -430,7 +467,12 @@ export default function CodeEditor(props: CodeEditorProps) {
           ? {
               selection: EditorSelection.create(
                 selection.ranges.map((range) =>
-                  EditorSelection.range(range.anchor, range.head),
+                  // Core undo restores the operator's original selection.
+                  // Vim normal mode needs its start cursor, or a restored dd
+                  // range enters visual mode and the next u lowercases it.
+                  vimNormalMode(view!)
+                    ? EditorSelection.cursor(Math.min(range.anchor, range.head))
+                    : EditorSelection.range(range.anchor, range.head),
                 ),
                 selection.mainIndex,
               ),

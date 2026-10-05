@@ -89,6 +89,22 @@
   font-family: var(--font-ui);
   font-size: var(--font-size-ui-sm);
 }
+.code-editor .cm-vim-panel {
+  padding: 6px 16px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-ui-sm);
+  color: var(--color-foreground);
+}
+.code-editor .cm-vim-panel input {
+  min-width: 0;
+  flex: 1;
+  font: inherit;
+  color: inherit;
+  caret-color: var(--color-foreground);
+}
+.code-editor .cm-vim-panel [role="alert"] {
+  color: var(--color-danger);
+}
 .code-editor .cm-search .cm-textfield,
 .code-editor .cm-search .cm-button {
   min-height: var(--height-control-sm);

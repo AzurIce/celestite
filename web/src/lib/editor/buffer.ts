@@ -9,6 +9,7 @@ export interface EditorBuffer {
   bindings: Compartment;
   editable: Compartment;
   wrap: Compartment;
+  vim: Compartment;
   scrollTop: number;
   scrollLeft: number;
 }

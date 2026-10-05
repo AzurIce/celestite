@@ -264,6 +264,28 @@ function SettingsFields() {
           </div>
           <OverrideNotice setting="editor.wordWrap" />
         </div>
+        <div class="settings-row">
+          <div class="settings-copy">
+            <label for={`${id}-vim`}>Vim 模式</label>
+            <p id={`${id}-vim-help`}>
+              i 进入插入模式，Esc 返回普通模式；:w 保存。
+            </p>
+          </div>
+          <div class="settings-control">
+            <input
+              id={`${id}-vim`}
+              class="settings-checkbox"
+              type="checkbox"
+              checked={global()["editor.vimMode"]}
+              aria-describedby={`${id}-vim-help`}
+              onChange={(event) =>
+                void save("editor.vimMode", event.currentTarget.checked)
+              }
+            />
+            <Reset setting="editor.vimMode" label="Vim 模式" />
+          </div>
+          <OverrideNotice setting="editor.vimMode" />
+        </div>
       </section>
       <Show
         when={settings().problems.some((problem) => problem.source === "app")}

@@ -181,6 +181,47 @@ test("invalid widths do not save, and each control can restore its default", asy
   });
 });
 
+test("Vim defaults off, persists globally and respects the Vault override", async ({
+  page,
+}) => {
+  await seed(page, {}, { "editor.vimMode": true });
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await expect(
+    page.getByRole("status", { name: "Vim 模式", exact: true }),
+  ).toHaveText("NORMAL");
+  const dialog = await open(page);
+  const checkbox = dialog.getByRole("checkbox", {
+    name: "Vim 模式",
+    exact: true,
+  });
+  await expect(checkbox).not.toBeChecked();
+  await expect(dialog.locator(".settings-override")).toContainText(
+    "当前 Vault 覆盖为：开启",
+  );
+  await checkbox.check();
+  await expect(dialog.getByRole("status", { name: "设置保存状态" })).toHaveText(
+    "已保存",
+  );
+  expect((await readApp(page))["editor.vimMode"]).toBe(true);
+  await dialog
+    .getByRole("button", { name: "恢复默认Vim 模式", exact: true })
+    .click();
+  await expect(checkbox).not.toBeChecked();
+  await expect(dialog.getByRole("status", { name: "设置保存状态" })).toHaveText(
+    "已保存",
+  );
+  expect((await readApp(page))["editor.vimMode"]).toBe(false);
+  await dialog.getByRole("button", { name: "关闭弹窗" }).click();
+  await expect(
+    page.getByRole("status", { name: "Vim 模式", exact: true }),
+  ).toHaveText("NORMAL");
+  await page.reload();
+  const reopened = await open(page);
+  await expect(
+    reopened.getByRole("checkbox", { name: "Vim 模式", exact: true }),
+  ).not.toBeChecked();
+});
+
 test("global values remain editable when a Vault overrides them, and project bytes stay unchanged", async ({
   page,
 }) => {

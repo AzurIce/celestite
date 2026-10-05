@@ -1122,7 +1122,11 @@ impl<B: Backend> EditorCore<B> {
     ) -> EditorResult<EditorEditResult> {
         self.live(id)?;
         let now = self.backend.now_ms();
-        let group = if user_event.starts_with("input.type") || user_event.starts_with("delete.") {
+        let vim_group = user_event.starts_with("input.vim.");
+        let group = if vim_group
+            || user_event.starts_with("input.type")
+            || user_event.starts_with("delete.")
+        {
             user_event.clone()
         } else {
             String::new()
@@ -1130,7 +1134,7 @@ impl<B: Backend> EditorCore<B> {
         let record = self.records.get_mut(id).unwrap();
         if group.is_empty()
             || group != record.last_group
-            || now.saturating_sub(record.last_edit) > 500
+            || (!vim_group && now.saturating_sub(record.last_edit) > 500)
         {
             record.document.end_undo_group();
             if !group.is_empty() {

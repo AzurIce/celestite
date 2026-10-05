@@ -31,6 +31,7 @@
     "@codemirror/view": "6.39.14",
     "@kobalte/core": "2.0.0-alpha.2",
     "@lezer/highlight": "1.2.1",
+    "@replit/codemirror-vim": "6.4.0",
     "@solidjs/web": "2.0.0-rc.13",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",

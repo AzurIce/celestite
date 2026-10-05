@@ -59,10 +59,17 @@ const wrapEntry: SettingDefinition<boolean> = {
   describe: "编辑器自动换行",
 };
 
+const vimEntry: SettingDefinition<boolean> = {
+  default: false,
+  parse: parseBoolean(),
+  describe: "编辑器 Vim 模式",
+};
+
 export const SETTINGS_SCHEMA = {
   "theme.mode": themeEntry,
   "sidebar.width": sidebarEntry,
   "editor.wordWrap": wrapEntry,
+  "editor.vimMode": vimEntry,
 };
 
 export type SettingKey = keyof typeof SETTINGS_SCHEMA;
@@ -74,6 +81,7 @@ export const DEFAULT_SETTINGS: Settings = {
   "theme.mode": themeEntry.default,
   "sidebar.width": sidebarEntry.default,
   "editor.wordWrap": wrapEntry.default,
+  "editor.vimMode": vimEntry.default,
 };
 
 /**

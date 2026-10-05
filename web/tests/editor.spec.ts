@@ -42,6 +42,154 @@ test.beforeEach(async ({ page }) => {
   ).toBeVisible();
 });
 
+async function openTestTabs(page: import("@playwright/test").Page) {
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await page.getByRole("button", { name: "展开 notes", exact: true }).click();
+  await page.getByRole("treeitem", { name: "b.ts", exact: true }).click();
+  await page.getByRole("treeitem", { name: "binary.bin", exact: true }).click();
+  await expect(page.getByRole("tab")).toHaveCount(3);
+}
+
+for (const { action, remaining } of [
+  { action: "关闭标签页", remaining: ["a.md", "binary.bin"] },
+  { action: "关闭其他标签页", remaining: ["notes/b.ts"] },
+  { action: "关闭左侧标签页", remaining: ["notes/b.ts", "binary.bin"] },
+  { action: "关闭右侧标签页", remaining: ["a.md", "notes/b.ts"] },
+  { action: "关闭全部标签页", remaining: [] },
+]) {
+  test(`tab context menu ${action} uses the clicked tab and preserves order`, async ({
+    page,
+  }) => {
+    await openTestTabs(page);
+    await page
+      .getByRole("tab", { name: "notes/b.ts", exact: true })
+      .click({ button: "right" });
+    await expect(
+      page.getByRole("tab", {
+        name: "binary.bin",
+        exact: true,
+        includeHidden: true,
+      }),
+    ).toHaveAttribute("aria-selected", "true");
+    await page.getByRole("menuitem", { name: action, exact: true }).click();
+    const tabs = page.getByRole("tab", { includeHidden: true });
+    await expect(tabs).toHaveCount(remaining.length);
+    expect(
+      await tabs.evaluateAll((elements) =>
+        elements.map((tab) => tab.getAttribute("aria-label")),
+      ),
+    ).toEqual(remaining);
+    if (remaining.length) {
+      await expect(
+        page.locator('[role="tab"][aria-selected="true"]'),
+      ).toHaveCount(1);
+    } else {
+      await expect(
+        page.getByRole("heading", { name: "打开一份文件" }),
+      ).toBeVisible();
+    }
+  });
+}
+
+test("tab context menu disables empty groups and Escape restores tab focus", async ({
+  page,
+}) => {
+  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  const tab = page.getByRole("tab", { name: "a.md", exact: true });
+  await tab.click({ button: "right" });
+  for (const action of ["关闭其他标签页", "关闭左侧标签页", "关闭右侧标签页"]) {
+    await expect(
+      page.getByRole("menuitem", { name: action, exact: true }),
+    ).toBeDisabled();
+  }
+  await expect(
+    page.getByRole("menuitem", { name: "关闭标签页", exact: true }),
+  ).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toBeHidden();
+  await expect(tab).toBeFocused();
+});
+
+test("middle-click closes an inactive tab without changing the active file", async ({
+  page,
+}) => {
+  await openTestTabs(page);
+  await page
+    .getByRole("tab", { name: "notes/b.ts", exact: true })
+    .click({ button: "middle" });
+  await expect(page.getByRole("tab")).toHaveCount(2);
+  await expect(
+    page.getByRole("tab", { name: "binary.bin", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("menu")).toHaveCount(0);
+});
+
+test("closing other tabs saves an edited file before removing it", async ({
+  page,
+}) => {
+  await openTestTabs(page);
+  await page.getByRole("tab", { name: "notes/b.ts", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "代码编辑器" })
+    .fill("const savedOnClose = true;");
+  await page
+    .getByRole("tab", { name: "a.md", exact: true })
+    .click({ button: "right" });
+  await page
+    .getByRole("menuitem", { name: "关闭其他标签页", exact: true })
+    .click();
+  await expect(page.getByRole("tab")).toHaveCount(1);
+  await expect(
+    page.getByRole("tab", { name: "a.md", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  const content = await page.evaluate(async () => {
+    const { openOpfsVault, vaultPath } = (await import(
+      "/src/lib/vault/index.ts" as string
+    )) as VaultModule;
+    const vault = await openOpfsVault();
+    const bytes = await vault.readFile(vaultPath("notes/b.ts"));
+    await vault.close();
+    return new TextDecoder().decode(bytes);
+  });
+  expect(content).toBe("const savedOnClose = true;");
+});
+
+test("batch closing stops at a conflict and cancellation keeps the draft and later tabs", async ({
+  page,
+}) => {
+  await openTestTabs(page);
+  await page.getByRole("tab", { name: "a.md", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "代码编辑器" });
+  await expect(editor).toBeVisible();
+  await page.evaluate(async () => {
+    const { openOpfsVault, vaultPath } = (await import(
+      "/src/lib/vault/index.ts" as string
+    )) as VaultModule;
+    const vault = await openOpfsVault();
+    await vault.writeFile(
+      vaultPath("a.md"),
+      new TextEncoder().encode("external change"),
+      { mode: "replace" },
+    );
+    await vault.close();
+  });
+  await editor.fill("keep this local draft");
+  await page
+    .getByRole("tab", { name: "binary.bin", exact: true })
+    .click({ button: "right" });
+  await page
+    .getByRole("menuitem", { name: "关闭全部标签页", exact: true })
+    .click();
+  await expect(page.getByRole("dialog")).toContainText("文件已在磁盘上修改");
+  await expect(
+    page.getByRole("button", { name: "取消", exact: true }),
+  ).toBeFocused();
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await expect(page.getByRole("tab")).toHaveCount(3);
+  await expect(editor).toContainText("keep this local draft");
+});
+
 test("opening a file shows a spinner in the editor area instead of a banner above the tabs", async ({
   page,
 }) => {
