@@ -169,7 +169,8 @@ test("preview Worker applies package default transforms and retains Unicode diag
           "future_option = true\n[dependencies]\nkatex = {path = 'packages/katex'}\n",
         "packages/katex/Notist.toml":
           "[package]\nname = 'katex'\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'katex::math'\n",
-        "packages/katex/lib.notc": "fn math(text: String) -> InlineContent;",
+        "packages/katex/lib.notc":
+          "fn math(text: String, block?: Bool) -> Content<block>;",
         "packages/katex/components/math.js":
           "export default class extends HTMLElement {}",
       },

@@ -692,7 +692,7 @@ fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnost
         );
         task.overlays.insert(
             "packages/katex/lib.notc".into(),
-            "fn math(text: String) -> InlineContent;".into(),
+            "fn math(text: String, block?: Bool) -> Content<block>;".into(),
         );
         task.overlays.insert(
             "packages/katex/components/math.js".into(),

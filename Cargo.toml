@@ -3,8 +3,8 @@ members = ["crates/celestite-core", "crates/celestite-server"]
 resolver = "2"
 
 [workspace.dependencies]
-notist = { git = "https://github.com/AzurIce/notist.git", rev = "46d650aa88e23b96f7e4be725c5a8c75ab63636d" }
-notist-html = { git = "https://github.com/AzurIce/notist.git", rev = "46d650aa88e23b96f7e4be725c5a8c75ab63636d" }
+notist = { git = "https://github.com/AzurIce/notist.git", rev = "5194d13249b5648a58e327313e6c9d35d8d76b32" }
+notist-html = { git = "https://github.com/AzurIce/notist.git", rev = "5194d13249b5648a58e327313e6c9d35d8d76b32" }
 
 [package]
 name = "celestite"
