@@ -63,6 +63,9 @@ pub struct Cli {
     /// Override a Vault's display name; repeat for multiple Vaults
     #[arg(long, value_name = "ID=NAME", value_parser = parse_assignment)]
     vault_name: Vec<Assignment>,
+    /// Set a Vault's share secret; required for every Vault without a config file
+    #[arg(long, value_name = "ID=KEY", value_parser = parse_assignment)]
+    vault_share_key: Vec<Assignment>,
     /// Override a Vault's read-only state; repeat for multiple Vaults
     #[arg(long, value_name = "ID=true|false", value_parser = parse_read_only)]
     vault_read_only: Vec<ReadOnly>,
@@ -124,6 +127,7 @@ impl Cli {
             }
             None => None,
         };
+        let cli_only = path.is_none();
         let mut config = if let Some(path) = path {
             let path = path.canonicalize()?;
             let text = std::fs::read_to_string(&path).map_err(|error| {
@@ -195,6 +199,13 @@ impl Cli {
             find_vault(&mut config, &id)?.name = value;
         }
         let mut seen = HashSet::new();
+        for Assignment { id, value } in self.vault_share_key {
+            if !seen.insert(id.clone()) {
+                return Err(format!("Duplicate --vault-share-key ID: {id}").into());
+            }
+            find_vault(&mut config, &id)?.share_key = Some(value);
+        }
+        let mut seen = HashSet::new();
         for ReadOnly { id, value } in self.vault_read_only {
             if !seen.insert(id.clone()) {
                 return Err(format!("Duplicate --vault-read-only ID: {id}").into());
@@ -243,6 +254,20 @@ impl Cli {
                 vault.history_mode = mode;
             }
         }
+        if cli_only {
+            let missing: Vec<_> = config
+                .vaults
+                .iter()
+                .filter(|vault| vault.share_key.is_none())
+                .map(|vault| vault.id.as_str())
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "CLI-only configuration requires --vault-share-key ID=KEY for every Vault; missing: {}",
+                    missing.join(", ")
+                ).into());
+            }
+        }
         Ok(config)
     }
 }
@@ -264,6 +289,9 @@ fn find_vault<'a>(
 mod tests {
     use super::*;
     use clap::{error::ErrorKind, CommandFactory};
+
+    const NOTES_KEY: &str = "notes=0123456789abcdef0123456789abcdef";
+    const WORK_KEY: &str = "work=abcdef0123456789abcdef0123456789ab";
 
     fn config_file(base: &Path) {
         std::fs::write(
@@ -306,6 +334,8 @@ read_only = true
             vec!["server", "--listen", "invalid"],
             vec!["server", "--vault", "bad/id=notes"],
             vec!["server", "--vault", "notes="],
+            vec!["server", "--vault-share-key", "notes="],
+            vec!["server", "--vault-share-key", "bad/id=secret"],
             vec!["server", "--vault-read-only", "notes=maybe"],
             vec!["server", "--config", "config.toml", "--no-config"],
             vec!["server", "--token-env", "TOKEN"],
@@ -330,6 +360,10 @@ read_only = true
             "notes=notes",
             "--vault",
             "work=path=with=equals",
+            "--vault-share-key",
+            NOTES_KEY,
+            "--vault-share-key",
+            WORK_KEY,
             "--vault-name",
             "notes=我的笔记",
             "--vault-read-only",
@@ -341,11 +375,90 @@ read_only = true
         assert_eq!(config.server.listen, ServerConfig::default().listen);
         assert!(config.server.public_url.is_none());
         assert_eq!(config.vaults.len(), 2);
+        assert_eq!(
+            config.vaults[0].share_key.as_deref(),
+            Some(NOTES_KEY.split_once('=').unwrap().1)
+        );
+        assert_eq!(
+            config.vaults[1].share_key.as_deref(),
+            Some(WORK_KEY.split_once('=').unwrap().1)
+        );
         assert_eq!(config.vaults[0].name, "我的笔记");
         assert_eq!(config.vaults[0].path, cwd.path().join("notes"));
         assert!(!config.vaults[0].read_only);
         assert_eq!(config.vaults[1].path, cwd.path().join("path=with=equals"));
         assert!(config.vaults[1].read_only);
+    }
+
+    #[test]
+    fn cli_only_requires_a_key_for_each_vault_even_for_setup() {
+        let cwd = tempfile::tempdir().unwrap();
+        let load = |extra: &[&str]| {
+            let mut args = vec!["server", "--vault", "notes=notes", "--vault", "work=work"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).unwrap().load(cwd.path())
+        };
+        let error = load(&[]).err().unwrap().to_string();
+        assert!(error.contains("missing: notes, work"), "{error}");
+        let error = load(&["--vault-share-key", NOTES_KEY])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("missing: work"), "{error}");
+        for action in ["--init-vault", "--reset-vault"] {
+            let error = load(&[action, "notes"]).err().unwrap().to_string();
+            assert!(error.contains("--vault-share-key"), "{error}");
+        }
+        config_file(cwd.path());
+        assert!(load(&[]).is_ok());
+        let error = load(&["--no-config"]).err().unwrap().to_string();
+        assert!(error.contains("missing: notes, work"), "{error}");
+    }
+
+    #[test]
+    fn share_key_overrides_reject_unknown_and_duplicate_ids() {
+        let cwd = tempfile::tempdir().unwrap();
+        config_file(cwd.path());
+        let load = |extra: &[&str]| {
+            let mut args = vec!["server"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).unwrap().load(cwd.path())
+        };
+        let overridden = load(&["--vault-share-key", NOTES_KEY]).unwrap();
+        assert_eq!(
+            overridden.vaults[0].share_key.as_deref(),
+            Some(NOTES_KEY.split_once('=').unwrap().1)
+        );
+        assert!(load(&["--vault-share-key", WORK_KEY])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unknown Vault ID: work"));
+        assert!(load(&[
+            "--vault-share-key",
+            NOTES_KEY,
+            "--vault-share-key",
+            NOTES_KEY
+        ])
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("Duplicate --vault-share-key ID: notes"));
+        let file = cwd.path().join("config.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(
+            &file,
+            text + "share_key = \"configured secret 0123456789abcdef\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(&[]).unwrap().vaults[0].share_key.as_deref(),
+            Some("configured secret 0123456789abcdef")
+        );
+        assert_eq!(
+            load(&["--vault-share-key", NOTES_KEY]).unwrap().vaults[0].share_key,
+            overridden.vaults[0].share_key
+        );
     }
 
     #[test]
@@ -419,6 +532,7 @@ read_only = true
             .load(cwd.path())
             .unwrap();
         assert_eq!(config.vaults[0].path, cwd.path().join("notes"));
+        assert!(config.vaults[0].share_key.is_none());
         let config = Cli::try_parse_from(["server", "--no-web", "--clear-allowed-origins"])
             .unwrap()
             .load(cwd.path())
@@ -429,10 +543,17 @@ read_only = true
         );
         assert!(config.server.web_dir.is_none());
         assert!(config.server.allowed_origins.is_empty());
-        let config = Cli::try_parse_from(["server", "--no-config", "--vault", "work=work"])
-            .unwrap()
-            .load(cwd.path())
-            .unwrap();
+        let config = Cli::try_parse_from([
+            "server",
+            "--no-config",
+            "--vault",
+            "work=work",
+            "--vault-share-key",
+            WORK_KEY,
+        ])
+        .unwrap()
+        .load(cwd.path())
+        .unwrap();
         assert_eq!(config.vaults.len(), 1);
         assert_eq!(config.vaults[0].id, "work");
     }
@@ -507,7 +628,14 @@ read_only = true
                 "notes=state",
             ],
         ] {
-            let mut args = vec!["server", "--no-config", "--vault", "notes=notes"];
+            let mut args = vec![
+                "server",
+                "--no-config",
+                "--vault",
+                "notes=notes",
+                "--vault-share-key",
+                NOTES_KEY,
+            ];
             args.extend(extra);
             assert!(Cli::try_parse_from(args).unwrap().load(cwd.path()).is_err());
         }

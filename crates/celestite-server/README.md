@@ -28,9 +28,9 @@ Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edi
 
 每个 Vault 固定提供 readonly / edit 两条链接，由秘密值与持久化的逻辑 Vault 身份分别派生。`ro-` 属于完整凭证，两个权限使用不同派生域；增删前缀不能转换权限。`read_only = true` 仍限制整个 Vault，因此它的 edit 链接也只有读取能力。
 
-不配置 `share_key` 时，宿主自动产生 32 字节随机秘密值，保存在 `history.redb` 的私有宿主元数据里，不进入正文 CRDT、编辑历史或文件树。已有历史库在正常启动时自动补齐，无需额外初始化。正常重启、显示名称或配置 ID 修改保留链接；临时 Vault 每次启动产生新逻辑身份和新链接。
+使用配置文件且不配置 `share_key` 时，宿主自动产生 32 字节随机秘密值，保存在 `history.redb` 的私有宿主元数据里，不进入正文 CRDT、编辑历史或文件树。已有历史库在正常启动时自动补齐，无需额外初始化。正常重启、显示名称或配置 ID 修改保留链接；临时 Vault 每次启动产生新逻辑身份和新链接。
 
-在 `[[vaults]]` 中配置可选的 `share_key` 可显式控制凭证。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白；显示名 `name` 不参与派生。修改 `share_key` 并重启，会同时使旧 readonly / edit 链接失效，不改变正文或历史身份。配置启动时读取，不支持动态热更新。相同秘密值与同一 Vault 身份派生相同链接：改回旧配置、移除覆盖值恢复默认秘密值或恢复旧状态备份，可能恢复相应旧链接。
+在 `[[vaults]]` 中配置可选的 `share_key` 可显式控制凭证。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白；显示名 `name` 不参与派生。修改 `share_key` 并重启，会同时使旧 readonly / edit 链接失效，不改变正文或历史身份。配置启动时读取，不支持动态热更新。纯 CLI 配置必须显式传入同样要求的秘密值，重启时复用；传入新值并重启同样轮换两种链接。相同秘密值与同一 Vault 身份派生相同链接：改回旧配置、移除覆盖值恢复默认秘密值或恢复旧状态备份，可能恢复相应旧链接。
 
 `[server] public_url` 可设置打印链接使用的公开 HTTP(S) 地址和反向代理前缀，例如 `https://notes.example.com/celestite`；默认使用实际监听地址。该选项只决定链接基址，其 Origin 自动允许，不改变 key 或监听地址。反向代理将该前缀后的请求转发给宿主，并转发 WebSocket upgrade。
 
@@ -40,15 +40,19 @@ Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edi
 
 ## 命令行
 
-使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，可以通过 `--vault` 直接启动。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
+使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，通过 `--vault` 声明 Vault，并为每个 Vault 提供 `--vault-share-key ID=KEY`；缺少任何一个都会报错，包括初始化 / 重置命令。读取默认或显式指定的配置文件时，`share_key` 仍为可选，CLI 可覆盖文件配置。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
 
 ```sh
-# 完全通过命令行启动，目录必须已经存在
+# 完全通过命令行启动，目录必须已经存在；保存秘密值供重启时复用
+notes_key=$(openssl rand -hex 32)
+reference_key=$(openssl rand -hex 32)
 ./target/debug/celestite-server --no-config \
   --listen 127.0.0.1:7437 \
   --allowed-origin http://localhost:1420 \
   --vault notes=./notes --vault-name 'notes=我的笔记' \
+  --vault-share-key "notes=$notes_key" \
   --vault reference=./reference --vault-read-only reference=true \
+  --vault-share-key "reference=$reference_key" \
   --ephemeral-vault notes --ephemeral-vault reference
 
 # 覆盖部分配置；其他 Vault 及设置保留
@@ -75,12 +79,13 @@ Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edi
 | `--reset-vault ID`                 | 可重复；归档指定 Vault 的旧历史，创建新身份，完成后退出         |
 | `--no-web`                         | 禁用配置中的静态 Web 资源目录                                   |
 | `--vault ID=PATH`                  | 可重复；新增 Vault 或仅覆盖已有 Vault 的目录                    |
+| `--vault-share-key ID=KEY`         | 可重复；设置分享秘密值；未加载配置文件时每个 Vault 必须提供     |
 | `--vault-name ID=NAME`             | 可重复；覆盖已声明 Vault 的显示名称                             |
 | `--vault-read-only ID=true\|false` | 可重复；覆盖已声明 Vault 的只读状态                             |
 
 命令行目录路径以**当前工作目录**为基准，配置文件中的路径仍以**配置文件所在目录**为基准。新增 Vault 默认名称为 ID、可写；覆盖已有 Vault 目录保留其名称与只读状态，除非另行覆盖。不支持通过命令行移除配置中的 Vault，完全替换注册列表可使用 `--no-config` 加多个 `--vault`。
 
-`ID=VALUE` 仅按第一个 `=` 分隔，路径和名称可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。
+`ID=VALUE` 仅按第一个 `=` 分隔，路径、名称和秘密值可包含后续 `=`；包含空格的整个参数应加引号。同一种 Vault 参数内重复 ID、未声明 ID 的覆盖、同一 Vault 的初始化 / 重置冲突，以及临时历史与持久化参数冲突都会报错。清除选项与对应设置选项互斥。
 
 `server.web_dir` 可指向 `bun run --cwd web build` 的产物目录；server 同时提供这份 UI。二进制本身不嵌入 Web 资源。静态目录应仅包含可信构建产物，不允许与 Vault 目录重叠。默认监听回环地址；网络访问通过 URL 中的完整随机 key 鉴权，不依赖账号。readonly 的 `ro-` 属于凭证，修改前缀不会转换权限。HTTP 和 WebSocket 共用授权，readonly 允许读取、预览和实时更新，edit 允许正文及目录修改，仍受 Vault 级 `read_only` 限制。每个 Vault 启动时固定提供两条链接，通过配置轮换，无独立分享管理接口。公网使用 HTTPS / WSS，反向代理需转发 WebSocket，并脱敏访问路径中的 key。普通请求日志脱敏 key，授权响应使用 `no-store` / `no-referrer`。CORS 支持 `If-Match`、`Content-Type` 和读取 `ETag`，有 Origin 的请求另行检查来源；CORS 不承担认证。
 
@@ -89,7 +94,7 @@ Vault share links vault_id=notes readonly_url=http://127.0.0.1:7437/ro-<key> edi
 server 使用 `tracing`，二进制通过 `tracing-subscriber` 输出到 stderr，默认级别 `info`。`RUST_LOG` 可覆盖过滤规则；无效规则会使启动失败。
 
 ```sh
-RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist
+RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist "$share_key"
 ```
 
 `info` 记录启动、Vault 初始化、CRDT 导入结果、磁盘保存与关闭；`debug` 增加 HTTP 请求状态码和耗时、线程池操作、更新包大小与因果版本回执。4xx 请求记为 `warn`，5xx 和内部操作失败记为 `error`。每个 HTTP 请求有独立 `request_id`，线程池日志沿用请求上下文。SSE 的响应耗时表示建立响应所需时间。
@@ -202,16 +207,19 @@ host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修
 
 ```sh
 mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
+share_key=$(openssl rand -hex 32)  # 保存该值，后续启动复用
 cargo run -p celestite-server -- --no-config \
   --vault notes=/tmp/celestite-demo/notes \
+  --vault-share-key "notes=$share_key" \
   --vault-state-dir notes=/tmp/celestite-demo/state/notes --init-vault notes
 cargo run -p celestite-server -- --no-config \
   --vault notes=/tmp/celestite-demo/notes \
+  --vault-share-key "notes=$share_key" \
   --vault-state-dir notes=/tmp/celestite-demo/state/notes
 
 # 仓库内 ../notist/docs 的开发入口：
-just init-notist  # 首次执行，已有历史时拒绝覆盖
-just serve-notist
+just init-notist "$share_key"  # 首次执行，已有历史时拒绝覆盖
+just serve-notist "$share_key"
 ```
 
 状态目录必须存在，不能与任何 Vault、其他私有状态目录或静态资源目录重叠；符号链接别名按实际路径校验。一个 profile 同时只允许一个 host 打开。状态库包含稳定 Vault / 文档 / host 实例身份、初始快照、追加更新日志、pending 依赖包、磁盘基线和恢复意图；每次历史事务提交成功后才报告 `durableVersion`。更改名称或 URL 配置 ID，保留相同物理目录与私有状态目录时保留内部身份。更改物理目录则拒绝恢复，需要另行迁移。

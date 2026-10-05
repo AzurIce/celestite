@@ -176,6 +176,36 @@ fn profiles_have_one_owner_and_initialization_cannot_overwrite() {
 }
 
 #[test]
+fn cli_share_keys_fail_before_initializing_history() {
+    let f = Fixture::new();
+    for key in [None, Some("a=short")] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_celestite-server"));
+        command.current_dir(f.dir.path()).args([
+            "--no-config",
+            "--vault",
+            "a=a",
+            "--vault-state-dir",
+            "a=state-a",
+            "--init-vault",
+            "a",
+        ]);
+        if let Some(key) = key {
+            command.args(["--vault-share-key", key]);
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        let expected = if key.is_none() {
+            "--vault-share-key"
+        } else {
+            "at least 32 bytes"
+        };
+        assert!(error.contains(expected), "{error}");
+        assert!(!f.path("state-a/history.redb").exists());
+    }
+}
+
+#[test]
 fn lifecycle_commands_exit_without_listening_and_cannot_repeat_initialization() {
     let f = Fixture::new();
     // An occupied port makes this test fail promptly if setup tries to serve HTTP.
@@ -190,6 +220,8 @@ fn lifecycle_commands_exit_without_listening_and_cannot_repeat_initialization() 
                 &address,
                 "--vault",
                 "a=a",
+                "--vault-share-key",
+                "a=0123456789abcdef0123456789abcdef",
                 "--vault-state-dir",
                 "a=state-a",
                 action,
