@@ -88,6 +88,18 @@ test("display mode is shared across files and Vaults and persists through settin
   await expect(preview).toHaveCount(0);
   await expect(editor).toBeVisible();
   await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const root = await navigator.storage.getDirectory();
+        const directory = await root.getDirectoryHandle("celestite");
+        const file = await directory.getFileHandle("settings.json");
+        return JSON.parse(await (await file.getFile()).text())[
+          "editor.previewMode"
+        ];
+      }),
+    )
+    .toBe("split");
   await page.reload();
   await page.getByRole("treeitem", { name: "range.md", exact: true }).click();
   await expect(

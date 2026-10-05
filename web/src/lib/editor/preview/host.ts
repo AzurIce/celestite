@@ -281,6 +281,7 @@ export class PreviewHost {
         },
       });
     this.stopWorker();
+    this.assetSnapshots.delete(id);
     return this.execute("preview_retry", { id });
   }
   async invalidateProject() {

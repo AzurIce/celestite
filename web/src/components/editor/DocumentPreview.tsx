@@ -257,20 +257,23 @@ export function DocumentPreview(props: {
         <span role="status" aria-label="预览状态">
           {status()}
         </span>
-        <Show when={state()?.status === "failed" || unavailable()}>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => {
-              setError(null);
-              void documents
-                .previews!.retry(documentId)
-                .catch((error) => setError(String(error)));
-            }}
-          >
-            重试预览
-          </Button>
-        </Show>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={
+            state()?.status === "pending" || state()?.status === "computing"
+          }
+          onClick={() => {
+            setError(null);
+            void documents
+              .previews!.retry(documentId)
+              .catch((error) => setError(String(error)));
+          }}
+        >
+          {state()?.status === "failed" || unavailable()
+            ? "重试预览"
+            : "刷新预览"}
+        </Button>
         <Show when={props.authorizeResources}>
           <Button
             size="sm"

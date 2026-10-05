@@ -145,7 +145,6 @@ export class EditorHost {
     });
   }
   protected publishTree() {
-    this.schedule(() => this.executePreview("preview_invalidate_project", {}));
     this.emit({ kind: "tree", sequence: ++this.eventSequence });
   }
   protected async refreshViews(content = true) {

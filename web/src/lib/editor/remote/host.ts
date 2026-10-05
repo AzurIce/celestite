@@ -57,7 +57,12 @@ export class RemoteEditorHost extends EditorHost {
       identity,
       (receipt) => {
         if (receipt.kind === "tree") {
-          if (this.transport === transport && !this.offline) this.publishTree();
+          this.scheduleRemote(async () => {
+            if (this.transport === transport && !this.offline) {
+              await this.executePreview("preview_invalidate_project", {});
+              this.publishTree();
+            }
+          });
           return;
         }
         setTimeout(
@@ -525,6 +530,7 @@ export class RemoteEditorHost extends EditorHost {
     try {
       const documents = await this.connect(token);
       this.publishConnection({ status: "online", error: null });
+      await this.executePreview("preview_invalidate_project", {});
       this.publishTree();
       return documents;
     } catch (error) {

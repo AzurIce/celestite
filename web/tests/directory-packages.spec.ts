@@ -102,6 +102,7 @@ test("a wider read grant loads sibling packages and WASM, preserving the Vault r
       .getByText("本机目录 · Resource Workspace/nested/Notes", { exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(
     page.getByRole("treeitem", { name: "packages", exact: true }),
   ).toHaveCount(0);
@@ -109,10 +110,11 @@ test("a wider read grant loads sibling packages and WASM, preserving the Vault r
     page.getByRole("treeitem", { name: "nested", exact: true }),
   ).toHaveCount(0);
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
-  await editor.focus();
+  await editor.click();
   await page.keyboard.press("Control+End");
   await page.keyboard.insertText("\nSaved in original vault\n");
-  await page.keyboard.press("Control+s");
+  await expect(editor).toContainText("Saved in original vault");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
@@ -197,7 +199,53 @@ test("cancelled and unrelated selections preserve the existing grant and current
   await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
 });
 
-test("external declaration changes refresh preview and lost resource permission leaves editing available", async ({
+test("unchanged directory checks never retry a failed preview; edits and explicit retry still dispatch", async ({
+  page,
+}) => {
+  const preview = await setup(page);
+  const taskId = () =>
+    page.evaluate(() => {
+      const messages = (
+        window as unknown as {
+          editorMessages: {
+            kind: string;
+            event?: { state?: { target: { taskId: string } } };
+          }[];
+        }
+      ).editorMessages;
+      return messages
+        .filter((message) => message.kind === "preview" && message.event?.state)
+        .at(-1)!.event!.state!.target.taskId;
+    });
+  const initial = await taskId();
+  // Cross two actual foreground observation intervals, with focus hints as well.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(6500);
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览失败",
+  );
+  expect(await taskId()).toBe(initial);
+  await preview.getByRole("button", { name: "重试预览", exact: true }).click();
+  await expect.poll(taskId).not.toBe(initial);
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览失败",
+  );
+  const retried = await taskId();
+  const editor = page.getByRole("textbox", { name: "代码编辑器" });
+  await editor.focus();
+  await page.keyboard.press("Control+End");
+  await page.keyboard.insertText("\nChanged source\n");
+  await expect.poll(taskId).not.toBe(retried);
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览失败",
+  );
+  await preview
+    .getByRole("button", { name: "授权依赖目录", exact: true })
+    .click();
+  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+});
+
+test("external declarations refresh on demand and lost resource permission leaves editing available", async ({
   page,
 }) => {
   const preview = await setup(page);
@@ -221,6 +269,7 @@ test("external declaration changes refresh preview and lost resource permission 
     await stream.close();
     window.dispatchEvent(new Event("focus"));
   });
+  await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
   await expect(preview.locator("demo-card strong")).toHaveText(
     "External declaration",
   );
@@ -241,6 +290,7 @@ test("external declaration changes refresh preview and lost resource permission 
     1,
   );
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
   await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
@@ -272,6 +322,24 @@ test("external declaration changes refresh preview and lost resource permission 
     "External declaration",
   );
   await expect(editor).toContainText("Still editable");
+  await page.evaluate(async () => {
+    const workspace = await (
+      await navigator.storage.getDirectory()
+    ).getDirectoryHandle("Resource Workspace");
+    const demo = await (
+      await workspace.getDirectoryHandle("packages")
+    ).getDirectoryHandle("demo");
+    const card = await (
+      await demo.getDirectoryHandle("components")
+    ).getDirectoryHandle("card");
+    const stream = await (
+      await card.getFileHandle("style.js")
+    ).createWritable();
+    await stream.write('export const suffix = "Updated implementation";');
+    await stream.close();
+  });
+  await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
+  await expect(preview.getByRole("alert")).toContainText("请刷新页面");
 });
 
 test("package capabilities validate containment, paths and resource size without exposing write operations", async ({
