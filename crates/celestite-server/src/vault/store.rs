@@ -9,17 +9,22 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("editor_metadata
 const HEADERS: TableDefinition<&str, &[u8]> = TableDefinition::new("editor_documents");
 const JOURNAL: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("editor_journal");
 
+/// Tag storage failures as vault IO errors without a path.
 pub(crate) fn storage_error(error: impl std::fmt::Display) -> VaultError {
     VaultError::new("IO", format!("Editor storage: {error}"), "")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Immutable identity pair of one Vault's durable history; both are UUIDs and
+/// never regenerate while the state file survives.
 pub struct VaultIdentity {
     pub id: String,
     pub history_id: String,
 }
 
+/// Value of the `vault` metadata key; `root` binds the database to exactly one
+/// Vault directory and `schema` gates the on-disk format.
 #[derive(Serialize, Deserialize)]
 struct Metadata {
     schema: u32,
@@ -27,6 +32,8 @@ struct Metadata {
     identity: VaultIdentity,
 }
 
+/// Physical private-history store for one Vault instance. Every method other
+/// than `initialize` and `reset` keeps the store strictly read-only.
 pub(crate) struct Store {
     db: Database,
 }
@@ -56,6 +63,7 @@ impl Store {
         tx.commit().map_err(storage_error)?;
         Ok(seed)
     }
+    /// Read the host instance identity written at initialization; never creates one.
     pub fn instance_id(&self) -> Result<String> {
         let tx = self.db.begin_read().map_err(storage_error)?;
         let meta = tx.open_table(META).map_err(storage_error)?;
@@ -69,6 +77,7 @@ impl Store {
         }
         Ok(id)
     }
+    /// Read the directory-intent WAL; absence means no interrupted operation.
     pub fn directory_intent(&self) -> Result<Option<DirectoryIntent>> {
         let tx = self.db.begin_read().map_err(storage_error)?;
         let meta = tx.open_table(META).map_err(storage_error)?;
@@ -77,6 +86,7 @@ impl Store {
             .map(|value| serde_json::from_slice(value.value()).map_err(storage_error))
             .transpose()
     }
+    /// Persist or clear the directory-intent WAL in a single transaction.
     pub fn set_directory_intent(&self, intent: Option<&DirectoryIntent>) -> Result<()> {
         let tx = self.db.begin_write().map_err(storage_error)?;
         {
@@ -193,6 +203,8 @@ impl Store {
         result
     }
 
+    /// Recover every stored document as (header, full journal). Journal sequences
+    /// must be contiguous from 1 and keys must match their headers.
     pub fn load(&self) -> Result<Vec<(Header, Vec<JournalEntry>)>> {
         let tx = self.db.begin_read().map_err(storage_error)?;
         let headers = tx.open_table(HEADERS).map_err(storage_error)?;
@@ -217,10 +229,14 @@ impl Store {
         Ok(records)
     }
 
+    /// Atomically commit one header and its optional new journal entry.
     pub fn commit(&self, header: &Header, entry: Option<&JournalEntry>) -> Result<()> {
         self.commit_many(&[(header, entry)])
     }
 
+    /// Atomically commit several documents, e.g. a directory operation spanning
+    /// many headers. Per record: the sequence must extend the stored one by
+    /// exactly one new entry, and a byte-identical retry is an idempotent no-op.
     pub fn commit_many(&self, records: &[(&Header, Option<&JournalEntry>)]) -> Result<()> {
         let tx = self.db.begin_write().map_err(storage_error)?;
         {
@@ -273,6 +289,8 @@ impl Store {
     }
 }
 
+/// Best-effort durability of a directory entry after create or rename; a no-op
+/// where the platform cannot sync directories.
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::File::open(path)

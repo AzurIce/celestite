@@ -31,7 +31,6 @@ export type EditorWorkerHost = Pick<
   | "previewResources"
 > & {
   reconnect?: () => Promise<ServiceDocument[]>;
-  observeFiles?: () => Promise<void>;
   setResourceScope?: (
     scope: import("../../vault/file-system-access").LocalDirectoryHandle,
   ) => Promise<void>;
@@ -88,8 +87,6 @@ export async function serveEditorWorker(
             p.scope as import("../../vault/file-system-access").LocalDirectoryHandle,
           );
           return previews.invalidateProject();
-        case "observe_files":
-          return host.observeFiles?.();
         case "reconnect":
           if (!host.reconnect)
             throw new VaultError("Unsupported", "连接不支持重新连接。");

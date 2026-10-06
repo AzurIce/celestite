@@ -5,19 +5,37 @@ import { vaultPath, ROOT_PATH, VaultError } from "../../src/lib/vault";
 import type { VaultBackend, VaultPath } from "../../src/lib/vault";
 import type { SettingsFile } from "../../src/lib/settings/app-file";
 import type { HttpVaultBackend } from "../../src/lib/vault/http";
-import { VaultDocuments } from "../../src/lib/editor/documents";
-import type { openRemoteEditor } from "../../src/lib/editor/client/documents";
-const fakeRemoteEditor: typeof openRemoteEditor = async (_url, backend) => {
-  const documents = new VaultDocuments(backend);
+import {
+  openLocalEditor,
+  openRemoteEditor,
+} from "../../src/lib/editor/client/documents";
+import type { LocalEditorSource } from "../../src/lib/editor/local/worker";
+import { fakeEditorDocuments } from "./fake-documents";
+
+function localEditorResult(backend: VaultBackend, name: string) {
+  const documents = fakeEditorDocuments(backend);
   return {
     identity: {
-      instanceId: "test",
-      vault: { vaultId: "test", historyId: "test" },
+      instanceId: name,
+      vault: { vaultId: name, historyId: name },
     },
-    documents,
     backend: documents.treeBackend,
+    documents,
   };
-};
+}
+/** The default OPFS vault and directory connections share one factory seam. */
+function fakeLocalEditor(
+  backend: VaultBackend,
+  onDirectory?: () => void,
+): typeof openLocalEditor {
+  return async (source: LocalEditorSource) => {
+    if (source.kind === "opfs") return localEditorResult(backend, "local");
+    onDirectory?.();
+    return localEditorResult(backend, "directory");
+  };
+}
+const fakeRemoteEditor: typeof openRemoteEditor = async (_url, backend) =>
+  localEditorResult(backend, "test");
 function files() {
   const contents = new Map<VaultPath, Uint8Array>([
     [vaultPath("a.md"), new TextEncoder().encode("old")],
@@ -80,7 +98,7 @@ function setup(registry = new Registry()) {
   let calls = 0;
   const manager = new VaultManager({
     file: registry,
-    openLocal: async () => local.backend,
+    openLocalEditor: fakeLocalEditor(local.backend),
     openRemoteEditor: fakeRemoteEditor,
     openRemote: async () => {
       calls++;
@@ -199,7 +217,7 @@ test("an obsolete open cannot activate after a more recent selection", async () 
     remote = files();
   const manager = new VaultManager({
     file: registry,
-    openLocal: async () => local.backend,
+    openLocalEditor: fakeLocalEditor(local.backend),
     openRemoteEditor: fakeRemoteEditor,
     openRemote: async () => {
       await pending;
@@ -269,20 +287,12 @@ function localDirectorySetup(registryFailure = false) {
     new VaultManager({
       file: new Registry(),
       directories,
-      openLocal: async () => local.backend,
       pickDirectory: async () => (selected ? handle : null),
       openLocalEditor: async (source) => {
-        assert.equal(source.kind, "directory");
+        if (source.kind === "opfs")
+          return localEditorResult(local.backend, "local");
         opens++;
-        const documents = new VaultDocuments(directory.backend);
-        return {
-          identity: {
-            instanceId: "dir",
-            vault: { vaultId: "dir", historyId: "dir" },
-          },
-          backend: documents.treeBackend,
-          documents,
-        };
+        return localEditorResult(directory.backend, "directory");
       },
     });
   return {
@@ -393,7 +403,7 @@ test("readonly and edit shares of one Vault keep separate instances and non-secr
   const local = files();
   const manager = new VaultManager({
     file: registry,
-    openLocal: async () => local.backend,
+    openLocalEditor: fakeLocalEditor(local.backend),
     openRemoteEditor: fakeRemoteEditor,
     openRemote: async (url) => ({
       backend: files().backend as HttpVaultBackend,

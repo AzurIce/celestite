@@ -17,13 +17,17 @@ export default defineConfig({
       background: "var(--color-background)",
       surface: "var(--color-surface)",
       muted: "var(--color-muted)",
+      selected: "var(--color-selected)",
       foreground: "var(--color-foreground)",
       secondary: "var(--color-secondary)",
       border: "var(--color-border)",
+      "control-border": "var(--color-control-border)",
       accent: "var(--color-accent)",
       "accent-hover": "var(--color-accent-hover)",
       "accent-foreground": "var(--color-accent-foreground)",
       danger: "var(--color-danger)",
+      success: "var(--color-success)",
+      warning: "var(--color-warning)",
       focus: "var(--color-focus)",
       overlay: "var(--color-overlay)",
     },
@@ -55,7 +59,7 @@ export default defineConfig({
       "border border-solid border-border bg-surface text-foreground",
     "ui-floating": "ui-surface shadow-floating",
     "ui-button":
-      "ui-surface inline-flex items-center justify-center gap-[6px] h-control-md px-3 py-0 rounded-control text-ui-sm font-medium whitespace-nowrap [transition-property:background-color,border-color,color] duration-120 ease-[ease] hover:bg-muted",
+      "ui-surface border-control-border inline-flex items-center justify-center gap-[6px] h-control-md px-3 py-0 rounded-control text-ui-sm font-medium whitespace-nowrap [transition-property:background-color,border-color,color] duration-120 ease-[ease] hover:bg-muted",
     "ui-icon-button": "w-control-md",
     "ui-dialog-overlay": "fixed inset-0 z-overlay bg-overlay",
     "ui-dialog":
@@ -73,6 +77,6 @@ export default defineConfig({
     "ui-field-description": "text-ui-sm text-secondary",
     "ui-field-error": "text-ui-sm text-danger",
     "ui-input":
-      "ui-surface w-full h-control-md px-[9px] py-0 rounded-control placeholder:text-secondary disabled:opacity-45 disabled:cursor-not-allowed",
+      "ui-surface border-control-border w-full h-control-md px-[9px] py-0 rounded-control placeholder:text-secondary disabled:opacity-45 disabled:cursor-not-allowed",
   },
 });

@@ -1969,20 +1969,6 @@ impl<B: Backend> EditorCore<B> {
             }
             "read" => to_value(self.read(id)?),
             "resident" => to_value(self.resident()?),
-            "observe_files" => {
-                let ids: Vec<String> = serde_json::from_value(params["ids"].clone())
-                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), ""))?;
-                let mut documents = vec![];
-                for id in ids {
-                    if let Err(error) = self.refresh(&id).await {
-                        if let Some(record) = self.records.get_mut(&id) {
-                            record.error = Some(error.message);
-                        }
-                    }
-                    documents.push(self.read(&id)?);
-                }
-                to_value(documents)
-            }
             "text_changes" => {
                 let before = params["before"]
                     .as_str()

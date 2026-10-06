@@ -99,7 +99,7 @@ function setup(reply: (request: WorkerRequest) => unknown, remote = true) {
     },
     sessionId: "session",
   });
-  const documents = new WorkerDocuments(client, () => {}, undefined, remote);
+  const documents = new WorkerDocuments(client, () => {}, remote);
   return { transport, client, documents };
 }
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));

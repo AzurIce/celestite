@@ -24,15 +24,11 @@
   --uno: "bg-muted";
 }
 .tree-row[data-selected="true"] {
-  background: color-mix(
-    in srgb,
-    var(--color-accent) 11%,
-    var(--color-background)
-  );
+  background: var(--color-selected);
   color: var(--color-foreground);
 }
 .tree-body:focus-within .tree-row[data-focused="true"] {
-  outline: 1px solid var(--color-focus);
+  outline: 2px solid var(--color-focus);
   outline-offset: -1px;
 }
 .tree-row[data-cut="true"] {

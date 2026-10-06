@@ -66,14 +66,13 @@ export interface EditorDocument extends DocumentSnapshot {
   pending?: number;
   restoredSelection?: SelectionContext & { revision: number };
 }
-/** View facade common to local service and the transitional HTTP adapter. */
+/** Connection state for the remote editor session. */
 export interface ConnectionState {
   status: "online" | "offline" | "reconnecting";
   error: string | null;
   unconfirmed?: boolean;
 }
 export interface EditorDocuments {
-  observeFiles?(): Promise<void>;
   retryObservation?(id: string): Promise<boolean>;
   reconnect?(discardUnconfirmed?: boolean): Promise<void>;
   readonly previews?: DocumentPreviews;
@@ -198,7 +197,6 @@ export interface ServiceMethods {
   };
   save: { params: { id: string }; result: ServiceDocument };
   retry_history: { params: { id: string }; result: ServiceDocument };
-  observe_files: { params: Record<string, never>; result: void };
   set_resource_scope: {
     params: { scope: FileSystemDirectoryHandle };
     result: void;

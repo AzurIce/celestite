@@ -74,7 +74,6 @@ export class WorkerDocuments {
   constructor(
     private client: EditorClient,
     private terminate: () => void,
-    watch: VaultBackend["watch"] = async () => () => {},
     private readonly remote = false,
   ) {
     if (remote) this.connection = { status: "online", error: null };
@@ -124,10 +123,8 @@ export class WorkerDocuments {
         this.file("remove", { path, options }) as Promise<void>,
       watch: async (listener) => {
         this.treeListeners.add(listener);
-        const detach = await watch(listener);
         return () => {
           this.treeListeners.delete(listener);
-          detach();
         };
       },
       close: () => this.close(),
@@ -530,10 +527,6 @@ export class WorkerDocuments {
     if (!this.online() || !record || record.readOnlyReason) return false;
     return this.enqueue(() => this.saveRecord(record));
   }
-  async observeFiles(): Promise<void> {
-    if (this.closing) return;
-    await this.enqueue(() => this.client.request("observe_files", {}));
-  }
   async retryObservation(id: string): Promise<boolean> {
     const record = this.records.get(id);
     if (!this.online() || !record) return false;
@@ -773,7 +766,7 @@ export async function openLocalEditor(
   source: import("../local/worker").LocalEditorSource,
 ): Promise<{
   identity: InstanceIdentity;
-  documents: WorkerDocuments;
+  documents: import("../contract").EditorDocuments;
   backend: VaultBackend;
   setResourceScope?: (scope: FileSystemDirectoryHandle) => Promise<void>;
 }> {
@@ -790,12 +783,9 @@ export async function openLocalEditor(
   worker.postMessage({ kind: "initialize", source });
   try {
     const identity = await client.ready;
-    let detach = () => {};
     const documents = new WorkerDocuments(client, () => {
-      detach();
       worker.terminate();
     });
-    if (source.kind === "directory") detach = observeDirectory(documents);
 
     return {
       identity,
@@ -843,7 +833,6 @@ export async function openRemoteEditor(
         worker.terminate();
         void backend.close();
       },
-      undefined,
       true,
     );
     documents.reconnect = async (discardUnconfirmed = false) => {
@@ -860,28 +849,4 @@ export async function openRemoteEditor(
     await backend.close();
     throw error;
   }
-}
-
-/** Coalesce foreground checks and serialize them with accepted local inputs. */
-function observeDirectory(documents: WorkerDocuments) {
-  let pending = false;
-  const observe = () => {
-    if (document.visibilityState === "hidden" || pending) return;
-    pending = true;
-    void documents
-      .observeFiles()
-      .catch(() => {})
-      .finally(() => {
-        pending = false;
-      });
-  };
-  const timer = setInterval(observe, 3000);
-  window.addEventListener("focus", observe);
-  document.addEventListener("visibilitychange", observe);
-  observe();
-  return () => {
-    clearInterval(timer);
-    window.removeEventListener("focus", observe);
-    document.removeEventListener("visibilitychange", observe);
-  };
 }

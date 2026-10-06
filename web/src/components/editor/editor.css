@@ -1,15 +1,5 @@
 .code-editor {
   --uno: "flex min-h-0 min-w-0 flex-1 flex-col bg-surface";
-  --editor-keyword: #786285;
-  --editor-string: #50745c;
-  --editor-number: #956d45;
-  --editor-type: #526f89;
-}
-[data-theme="dark"] .code-editor {
-  --editor-keyword: #bca7c6;
-  --editor-string: #a5bfa6;
-  --editor-number: #ccb294;
-  --editor-type: #a1b6c8;
 }
 .code-editor-host {
   flex: 1;
@@ -27,7 +17,7 @@
 }
 .code-editor .cm-scroller {
   overflow: auto;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-family: var(--font-mono);
   line-height: 1.7;
 }
 .code-editor .cm-content {
@@ -49,19 +39,31 @@
 .code-editor .cm-dropCursor {
   border-left-color: var(--color-foreground);
 }
+.code-editor .cm-editor .cm-fat-cursor {
+  background: var(--color-accent);
+}
+/* Keep the plugin's transparent text for pending commands and replace mode. */
+.code-editor .cm-editor .cm-fat-cursor:not([style*="color: transparent"]) {
+  color: var(--color-accent-foreground) !important;
+}
+.code-editor .cm-editor:not(.cm-focused) .cm-fat-cursor {
+  background: transparent;
+  outline: 1px solid var(--color-accent);
+  color: transparent !important;
+}
 .code-editor .cm-activeLine,
 .code-editor .cm-activeLineGutter {
-  background: color-mix(in srgb, var(--color-accent) 4%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 5%, transparent);
 }
 .code-editor .cm-editor .cm-selectionBackground {
-  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  background: color-mix(in srgb, var(--color-selected) 70%, transparent);
 }
 .code-editor
   .cm-editor.cm-focused
   > .cm-scroller
   > .cm-selectionLayer
   .cm-selectionBackground {
-  background: color-mix(in srgb, var(--color-accent) 32%, transparent);
+  background: var(--color-selected);
 }
 /* CodeMirror draws the selection background separately; keep the text colors. */
 .code-editor .cm-content::selection,
@@ -81,8 +83,8 @@
 .code-editor .cm-search button {
   background: var(--color-surface);
   color: var(--color-foreground);
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border: 1px solid var(--color-control-border);
+  border-radius: var(--radius-control);
 }
 .code-editor .cm-search {
   padding: 10px 16px;
@@ -134,7 +136,7 @@
   border-radius: 3px;
 }
 .code-editor .cm-tooltip-autocomplete > ul > li[aria-selected] {
-  background: var(--color-muted);
+  background: var(--color-selected);
   color: var(--color-foreground);
 }
 .code-editor .cm-token-keyword {

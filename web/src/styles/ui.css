@@ -29,7 +29,7 @@
 }
 
 .ui-button[aria-pressed="true"] {
-  --uno: "bg-muted text-foreground";
+  --uno: "bg-selected text-foreground";
 }
 
 .ui-button:disabled,
@@ -74,7 +74,7 @@
 }
 
 .ui-menu-item[data-highlighted] {
-  --uno: "bg-muted";
+  --uno: "bg-selected";
 }
 
 .ui-menu-item[data-disabled] {
@@ -90,17 +90,13 @@
 }
 
 .ui-input:hover {
-  border-color: color-mix(
-    in srgb,
-    var(--color-secondary) 45%,
-    var(--color-border)
-  );
+  border-color: var(--color-focus);
 }
 
 .ui-input:focus-visible {
   border-color: var(--color-focus);
-  outline: 2px solid color-mix(in srgb, var(--color-focus) 20%, transparent);
-  outline-offset: 0;
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 @media (prefers-reduced-motion: reduce) {

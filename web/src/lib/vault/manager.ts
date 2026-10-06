@@ -1,4 +1,3 @@
-import { VaultDocuments } from "../editor/documents";
 import { FileTreeModel } from "../file-tree/model";
 import type { EditorBuffer } from "../editor/buffer";
 import { openAppDocument, type SettingsFile } from "../settings/app-file";
@@ -48,17 +47,11 @@ export interface VaultManagerSnapshot {
 }
 interface ManagerOptions {
   file?: SettingsFile;
-  openLocal?: () => Promise<VaultBackend>;
   openRemote?: typeof openHttpVault;
   openRemoteEditor?: typeof openRemoteEditor;
   directories?: DirectoryRegistry;
   pickDirectory?: typeof pickLocalDirectory;
-  openLocalEditor?: (source: LocalEditorSource) => Promise<{
-    identity: InstanceIdentity;
-    backend: VaultBackend;
-    documents: EditorDocuments;
-    setResourceScope?: (scope: FileSystemDirectoryHandle) => Promise<void>;
-  }>;
+  openLocalEditor?: typeof openLocalEditor;
 }
 const defaultConnection = (): VaultConnection => ({
   id: DEFAULT_VAULT_ID,
@@ -182,23 +175,6 @@ export class VaultManager {
     this.notify();
     await this.activate(DEFAULT_VAULT_ID);
   }
-  private build(
-    connection: VaultConnection,
-    backend: VaultBackend,
-    readOnly = false,
-  ): VaultInstance {
-    const documents = new VaultDocuments(backend, 800, readOnly);
-    return {
-      id: connection.id,
-      name: connection.name,
-      backend,
-      documents,
-      tree: new FileTreeModel(documents.treeBackend),
-      editorBuffers: new Map(),
-      treeView: { scrollTop: 0 },
-      readOnly,
-    };
-  }
   private open(connection: VaultConnection): Promise<VaultInstance> {
     const existing = this.runtimes.get(connection.id);
     if (existing) return Promise.resolve(existing);
@@ -209,40 +185,36 @@ export class VaultManager {
       let resourceSetter:
         ((scope: FileSystemDirectoryHandle) => Promise<void>) | undefined;
       if (connection.kind !== "remote") {
-        if (connection.kind === "opfs" && this.options.openLocal)
-          vault = this.build(connection, await this.options.openLocal());
-        else {
-          const source: LocalEditorSource =
-            connection.kind === "opfs"
-              ? { kind: "opfs", id: "default" }
-              : {
-                  kind: "directory",
-                  id: connection.id,
-                  handle: this.directoryHandle(connection.id),
-                  resourceScope: this.resourceScopes.get(connection.id),
-                };
-          const { identity, backend, documents, setResourceScope } = await (
-            this.options.openLocalEditor ?? openLocalEditor
-          )(source);
-          resourceSetter = setResourceScope;
-          vault = {
-            id: connection.id,
-            name: connection.name,
-            identity,
-            backend,
-            documents,
-            tree: new FileTreeModel(backend),
-            editorBuffers: new Map(),
-            treeView: { scrollTop: 0 },
-            readOnly: false,
-            ...(setResourceScope
-              ? {
-                  authorizeResources: () =>
-                    this.authorizeResources(connection.id, setResourceScope),
-                }
-              : {}),
-          };
-        }
+        const source: LocalEditorSource =
+          connection.kind === "opfs"
+            ? { kind: "opfs", id: "default" }
+            : {
+                kind: "directory",
+                id: connection.id,
+                handle: this.directoryHandle(connection.id),
+                resourceScope: this.resourceScopes.get(connection.id),
+              };
+        const { identity, backend, documents, setResourceScope } = await (
+          this.options.openLocalEditor ?? openLocalEditor
+        )(source);
+        resourceSetter = setResourceScope;
+        vault = {
+          id: connection.id,
+          name: connection.name,
+          identity,
+          backend,
+          documents,
+          tree: new FileTreeModel(backend),
+          editorBuffers: new Map(),
+          treeView: { scrollTop: 0 },
+          readOnly: false,
+          ...(setResourceScope
+            ? {
+                authorizeResources: () =>
+                  this.authorizeResources(connection.id, setResourceScope),
+              }
+            : {}),
+        };
       } else {
         const { backend, descriptor } = await (
           this.options.openRemote ?? openHttpVault
@@ -299,8 +271,6 @@ export class VaultManager {
         await this.resourceSetters
           .get(id)?.(scope)
           .catch(() => {});
-      if (connection.kind === "directory")
-        await vault.documents.observeFiles?.();
       if (request !== this.selection || this.disposed) return false;
       this.active = vault;
       this.error = null;

@@ -28,10 +28,7 @@ export class DirectoryEditorHost extends EditorHost {
 
   override async composition(id: string, active: boolean) {
     if (active) this.composing.add(id);
-    else {
-      this.composing.delete(id);
-      await this.observeFiles();
-    }
+    else this.composing.delete(id);
   }
   override async save(id: string) {
     if (this.composing.has(id))
@@ -41,25 +38,13 @@ export class DirectoryEditorHost extends EditorHost {
       };
     return super.save(id);
   }
-  async observeFiles() {
-    const resident = await super.execute<CoreDocument[]>("resident");
-    const documents = await this.execute<CoreDocument[]>("observe_files", {
-      ids: resident
-        .filter(
-          (document) => !document.deleted && !this.composing.has(document.id),
-        )
-        .map((document) => document.id),
-    });
-    for (const document of documents) this.publish(document, true);
-    this.publishTree();
-  }
   protected override async execute<T>(
     method: string,
     params: Record<string, unknown> = {},
   ): Promise<T> {
     const result = await super.execute<T>(method, params);
-    // Edits and undo have their own explicit view transaction. Only background
-    // changes need rebasing and an incremental publication.
+    // Edits and undo have their own explicit view transaction. Only save-time
+    // disk merges need rebasing and an incremental publication.
     if (method === "edit" || method === "undo") return result;
     const values = Array.isArray(result) ? result : [result];
     for (const value of values) {

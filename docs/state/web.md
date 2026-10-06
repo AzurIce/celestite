@@ -20,7 +20,7 @@ UI 的正文是 core 已接受正文与待确认输入的投影；CRDT 历史和
 
 ## 两种 Backend 契约
 
-代码中需要区分两种 Backend：
+代码中需要区分两种 Backend（内核注入面详见 [EditorCore API 面](../core.md)）：
 
 - Rust `Backend`：EditorCore 注入的存储与 IO 契约，包含身份、历史恢复与提交、可选普通文件投影。浏览器使用 `BrowserBackend` 或 `MemoryBackend`。
 - TypeScript `VaultBackend`：文件访问契约，提供 `readDir`、`stat`、字节读写、目录操作、变化监听和关闭。OPFS、本机目录与 HTTP 文件适配器实现该接口；UI 通常使用经 Worker RPC 转发的 `treeBackend`。

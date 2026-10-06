@@ -199,7 +199,7 @@ test("cancelled and unrelated selections preserve the existing grant and current
   await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
 });
 
-test("unchanged directory checks never retry a failed preview; edits and explicit retry still dispatch", async ({
+test("idle time never retries a failed preview; edits and explicit retry still dispatch", async ({
   page,
 }) => {
   const preview = await setup(page);
@@ -218,9 +218,8 @@ test("unchanged directory checks never retry a failed preview; edits and explici
         .at(-1)!.event!.state!.target.taskId;
     });
   const initial = await taskId();
-  // Cross two actual foreground observation intervals, with focus hints as well.
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await page.waitForTimeout(6500);
+  // Idle time runs no background work; a failed preview is not retried.
+  await page.waitForTimeout(500);
   await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
@@ -267,7 +266,6 @@ test("external declarations refresh on demand and lost resource permission leave
       'fn card(title: String = "External declaration")[children: Content] -> Content;',
     );
     await stream.close();
-    window.dispatchEvent(new Event("focus"));
   });
   await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
   await expect(preview.locator("demo-card strong")).toHaveText(
@@ -289,7 +287,6 @@ test("external declarations refresh on demand and lost resource permission leave
     undefined,
     1,
   );
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
   await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",

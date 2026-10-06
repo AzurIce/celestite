@@ -41,4 +41,5 @@ CRDT 单 Host 多人协作
 
 - [目标架构](docs/architecture.md)
 - [实施路线图](docs/roadmap.md)
+- [EditorCore API 面](docs/core.md)
 - [Web 当前状态与请求交互](docs/state/web.md)

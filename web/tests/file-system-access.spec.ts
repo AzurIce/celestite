@@ -42,7 +42,6 @@ async function changeDisk(page: Page, text: string) {
     const stream = await (await root.getFileHandle("a.md")).createWritable();
     await stream.write(text);
     await stream.close();
-    window.dispatchEvent(new Event("focus"));
   }, text);
 }
 async function diskText(page: Page) {
@@ -56,71 +55,7 @@ async function diskText(page: Page) {
 const editor = (page: Page) =>
   page.getByRole("textbox", { name: "代码编辑器" });
 
-test("idle directory observations keep highlighting and tree controls stable while disk changes still arrive", async ({
-  page,
-}) => {
-  await installPicker(page, "# Heading\n\n**strong** and #badge[label]\n");
-  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await expect(
-    editor(page).locator('[data-syntax="function.call"]'),
-  ).toHaveText("badge");
-  const stability = await page.evaluate(async () => {
-    const content = document.querySelector(".cm-content")!;
-    const token = content.querySelector('[data-syntax="function.call"]');
-    let mutations = 0;
-    const observer = new MutationObserver((records) => {
-      mutations += records.length;
-    });
-    observer.observe(content, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-    observer.observe(document.querySelector(".tree-toolbar")!, {
-      attributes: true,
-      subtree: true,
-      attributeFilter: ["disabled"],
-    });
-    observer.observe(document.querySelector(".tree-body")!, {
-      attributes: true,
-      attributeFilter: ["aria-busy"],
-    });
-    window.dispatchEvent(new Event("focus"));
-    await new Promise((resolve) => setTimeout(resolve, 6500));
-    observer.disconnect();
-    return {
-      mutations,
-      sameContent: content === document.querySelector(".cm-content"),
-      sameToken:
-        token === content.querySelector('[data-syntax="function.call"]'),
-    };
-  });
-  expect(stability).toEqual({
-    mutations: 0,
-    sameContent: true,
-    sameToken: true,
-  });
-  await changeDisk(page, "# Changed\n\n#newcall[value]\n");
-  await expect(
-    editor(page).locator('[data-syntax="function.call"]'),
-  ).toHaveText("newcall");
-  await page.evaluate(async () => {
-    const root = await (
-      await navigator.storage.getDirectory()
-    ).getDirectoryHandle("Test Project");
-    const stream = await (
-      await root.getFileHandle("external.md", { create: true })
-    ).createWritable();
-    await stream.write("external\n");
-    await stream.close();
-    window.dispatchEvent(new Event("focus"));
-  });
-  await expect(
-    page.getByRole("treeitem", { name: "external.md", exact: true }),
-  ).toBeVisible();
-});
-
-test("composition defers observation and writeback until accepted input has settled", async ({
+test("composition defers writeback; the next save merges the external change", async ({
   page,
 }) => {
   await page.goto("/");
@@ -154,28 +89,29 @@ test("composition defers observation and writeback until accepted input has sett
       after: selection,
       userEvent: "input.type.compose",
     });
-    await documents.observeFiles();
     await backend.writeFile(
       path,
       new TextEncoder().encode("external\nbase\n"),
       { mode: "replace" },
     );
-    await documents.observeFiles();
     const during = documents.snapshot().documents[0].content;
     const savedDuring = await documents.save(id);
     const diskDuring = new TextDecoder().decode(await backend.readFile(path));
     documents.composition(id, false);
-    await documents.observeFiles();
+    const saved = await documents.save(id);
     const after = documents.snapshot().documents[0].content;
+    const diskAfter = new TextDecoder().decode(await backend.readFile(path));
     await documents.close();
     await backend.close();
-    return { during, savedDuring, diskDuring, after };
+    return { during, savedDuring, diskDuring, saved, after, diskAfter };
   });
   expect(result).toEqual({
     during: "base\n本地",
     savedDuring: false,
     diskDuring: "external\nbase\n",
+    saved: true,
     after: "external\nbase\n本地",
+    diskAfter: "external\nbase\n本地",
   });
 });
 
@@ -347,19 +283,21 @@ test("external saves merge with unsaved input, preserve personal undo and redo",
   await page.keyboard.press("Control+End");
   await page.keyboard.insertText("local\n");
   await changeDisk(page, "external\none\ntwo\n");
-  await expect(editor(page)).toContainText("external");
   await expect(editor(page)).toContainText("local");
+  // No background observation: the external change stays invisible until save.
+  await expect(editor(page)).not.toContainText("external");
   expect(await diskText(page)).toBe("external\none\ntwo\n");
   await editor(page).focus();
   await page.keyboard.press("Control+z");
   await expect(editor(page)).not.toContainText("local");
-  await expect(editor(page)).toContainText("external");
   await page.keyboard.press("Control+Shift+Z");
   await expect(editor(page)).toContainText("local");
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
+  await expect(editor(page)).toContainText("external");
+  await expect(editor(page)).toContainText("local");
   expect(await diskText(page)).toBe("external\none\ntwo\nlocal\n");
 });
 
