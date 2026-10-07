@@ -39,7 +39,7 @@ CI 只检出 Celestite，Cargo 按固定提交获取 Notist。Bun 使用 1.4.2�
 
 构建的 `base` 使用 Pages 返回的路径，兼容仓库子路径、用户主页与自定义域名。`/debug/sync/` 有独立静态入口，可以直接访问或刷新；返回编辑器链接使用同一站点路径。本地可用 `bun run build --base /celestite/` 验证子路径构建。
 
-Pages 部署浏览器应用，默认 Vault 存于访问者浏览器的 OPFS。远端 Vault 仍需独立运行 celestite-server；从 Pages 连接时使用 HTTPS，并将 Pages 的来源（如 `https://azurice.github.io`，不含仓库路径）加入服务端 `allowed_origins`。
+Pages 部署浏览器应用，默认 Vault 存于访问者浏览器的 OPFS。远端 Vault 仍需独立运行 celestite-server；从 Pages 连接时使用 HTTPS，若服务端配置了 `allowed_origins`，将 Pages 的来源（如 `https://azurice.github.io`，不含仓库路径）加入其中，未配置时所有来源可用。
 
 ## UI 约定
 

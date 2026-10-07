@@ -112,6 +112,7 @@ struct HostedVault {
 struct ServerState {
     vault: Arc<HostedVault>,
     shares: shares::Registry,
+    // Empty means every origin is allowed; the link key is the only credential.
     origins: Vec<String>,
     shutdown: watch::Sender<bool>,
 }
@@ -197,10 +198,11 @@ async fn access_check(
         Err(error) => return error.into_response(),
     };
     if let Some(origin) = request.headers().get(header::ORIGIN) {
-        if !state
-            .origins
-            .iter()
-            .any(|allowed| origin.as_bytes() == allowed.as_bytes())
+        if !state.origins.is_empty()
+            && !state
+                .origins
+                .iter()
+                .any(|allowed| origin.as_bytes() == allowed.as_bytes())
         {
             return failure("PermissionDenied", "This client origin is not allowed")
                 .into_response();
@@ -268,13 +270,17 @@ pub fn build_server(
     base: &std::path::Path,
 ) -> Result<Server, Box<dyn std::error::Error>> {
     connection_base_url(config.server.public_url.as_deref(), config.server.listen)?;
+    // An empty allowed_origins admits every origin; an explicit list is strict and
+    // additionally admits the server's own listen and public_url origins.
     let mut origins = config.server.allowed_origins.clone();
-    if let Some(public_url) = &config.server.public_url {
-        origins.push(url::Url::parse(public_url)?.origin().ascii_serialization());
-    }
-    origins.push(format!("http://{}", config.server.listen));
-    if config.server.listen.ip().is_loopback() {
-        origins.push(format!("http://localhost:{}", config.server.listen.port()));
+    if !origins.is_empty() {
+        if let Some(public_url) = &config.server.public_url {
+            origins.push(url::Url::parse(public_url)?.origin().ascii_serialization());
+        }
+        origins.push(format!("http://{}", config.server.listen));
+        if config.server.listen.ip().is_loopback() {
+            origins.push(format!("http://localhost:{}", config.server.listen.port()));
+        }
     }
     let origin_headers: Vec<HeaderValue> = origins
         .iter()
@@ -653,6 +659,34 @@ mod tests {
         };
         let router = Host::new(build_server(config, root.path()).unwrap());
         (root, router)
+    }
+    #[tokio::test]
+    async fn unset_allowed_origins_admit_every_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            server: ServerConfig::default(),
+            vault: VaultConfig {
+                name: "Notes".into(),
+                path: root.path().into(),
+                ..Default::default()
+            },
+        };
+        let router = Host::new(build_server(config, root.path()).unwrap());
+        for origin in ["https://untrusted.example", "http://192.0.2.1:1420"] {
+            let response = router
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(router.uri(""))
+                        .header(header::ORIGIN, origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
     async fn call(
         router: &Host,

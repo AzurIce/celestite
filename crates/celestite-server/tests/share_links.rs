@@ -379,6 +379,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
 async fn public_url_origin_is_allowed_for_the_hosted_client() {
     let f = Fixture::new();
     let mut config = f.config();
+    config.server.allowed_origins = vec!["http://127.0.0.1:1432".into()];
     config.server.public_url = Some("https://host.example/deploy".into());
     let server = build_server(config, f.dir.path()).unwrap();
     let key = server.links.key(Permission::Readonly);

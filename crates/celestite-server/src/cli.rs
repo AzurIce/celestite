@@ -21,14 +21,14 @@ pub struct Cli {
     /// Listening address (default: 127.0.0.1:7437)
     #[arg(long, value_name = "IP:PORT")]
     listen: Option<SocketAddr>,
-    /// Allowed client origin; repeat to replace the configured origin list
+    /// Allowed client origin; repeat to restrict the configured origin list. Unset origins allow every client
     #[arg(
         long = "allowed-origin",
         value_name = "ORIGIN",
         conflicts_with = "clear_allowed_origins"
     )]
     allowed_origins: Vec<String>,
-    /// Clear explicitly configured origins (the server's own origin is still allowed)
+    /// Clear configured origins; every client origin is then allowed
     #[arg(long)]
     clear_allowed_origins: bool,
     /// Public HTTP(S) origin/deployment prefix used in startup connection URLs
