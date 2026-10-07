@@ -541,7 +541,7 @@ impl Default for PreviewSessions {
     fn default() -> Self {
         Self {
             // A volatile backend's new_id can restart its counter on reopen.
-            // Use the same random runtime identity source as Document writers.
+            // Use the same random runtime identity source as Buffer writers.
             scope: loro::LoroDoc::new().peer_id().to_string(),
             next_id: 0,
             sequence: 0,

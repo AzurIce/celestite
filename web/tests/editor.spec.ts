@@ -480,7 +480,7 @@ test("committed private history restores a draft after public-file IO fails, wit
   expect(after.id).toBe(before.id);
   expect(after.core.version.identity).toEqual(before.core.version.identity);
   expect(after.core.writerId).not.toBe(before.core.writerId);
-  expect(after.core.undo.can_undo).toBe(false); // Local undo is session-local.
+  expect(after.core.undo.canUndo).toBe(false); // Local undo is session-local.
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",

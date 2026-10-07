@@ -37,7 +37,7 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
             &state.path,
         ));
     }
-    let mut document = Document::from_snapshot(&seed, writer)?;
+    let mut document = Buffer::from_snapshot(&seed, writer)?;
     for packet in packets {
         if packet.kind != PacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
@@ -46,7 +46,10 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
                 &state.path,
             ));
         }
-        if document.import(&packet, "session".into())?.pending {
+        if document
+            .apply(BufferCommand::Import(Import::new(packet, "session")))?
+            .pending
+        {
             return Err(EditorError::new(
                 "InvalidEdit",
                 "Session history has missing dependencies",
@@ -85,15 +88,13 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
         hosted: true,
         read_only: state.read_only,
         header,
-        document,
-        pending_packets: vec![],
+        buffer: document,
         pending_observation: None,
         uncommitted: vec![],
         durable: None,
         conflict: state.conflict,
         error: state.error,
-        last_group: String::new(),
-        last_edit: 0,
+
         first_dirty: None,
     })
 }
@@ -159,7 +160,7 @@ impl<B: Backend> EditorCore<B> {
             if self
                 .records
                 .get(&id)
-                .is_some_and(|old| old.document.identity() != record.document.identity())
+                .is_some_and(|old| old.buffer.identity() != record.buffer.identity())
             {
                 return Err(EditorError::new(
                     "Conflict",
@@ -175,13 +176,13 @@ impl<B: Backend> EditorCore<B> {
             if next.contains_key(id) {
                 continue;
             }
-            let packet = old.document.export_snapshot()?;
+            let packet = old.buffer.export_snapshot()?;
             let missing = record(ReplicaDocument {
                 packets: vec![packet],
                 writer_id: None,
                 state: ReplicaHostState {
                     path: old.header.path.clone(),
-                    version: old.document.version(),
+                    version: old.buffer.version(),
                     saved_content: old.header.saved_text.clone(),
                     backend_revision: old.header.disk_revision.clone(),
                     bom: old.header.bom,
@@ -198,6 +199,7 @@ impl<B: Backend> EditorCore<B> {
         let headers: Vec<_> = next.values().map(|record| record.header.clone()).collect();
         self.backend.replace_volatile_documents(&headers).await?;
         self.records = next;
+        self.mutations.clear();
         self.failure = None;
         self.requires_reopen = false;
         for id in self.records.keys().cloned().collect::<Vec<_>>() {

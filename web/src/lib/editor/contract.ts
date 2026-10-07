@@ -1,6 +1,5 @@
 import type { VaultBackend } from "../vault/types";
 import type { VaultPath } from "../vault/path";
-import type { DocumentSnapshot, DocumentsSnapshot } from "./documents";
 import type {
   PreviewAssets,
   DocumentPreviews,
@@ -9,6 +8,43 @@ import type {
   PreviewState,
   PreviewSubscription,
 } from "./preview/contract";
+
+export interface DocumentSnapshot {
+  deleted?: boolean;
+  conflictResolution?: "local" | "shared";
+  inputFailure?: {
+    outcome: "rejected" | "unknown" | "projection";
+    message: string;
+  };
+  externalChange?: ExternalChangeStatus | null;
+  core?: EditorProjection;
+  pending?: number;
+  restoredSelection?: SelectionContext & { revision: number };
+  id: string;
+  path: VaultPath;
+  content: string;
+  dirty: boolean;
+  saving: boolean;
+  locked: boolean;
+  error: string | null;
+  conflict: boolean;
+  reloadVersion: number;
+  readOnlyReason: string | null;
+  canPreview: boolean;
+  lineEnding: "\n" | "\r\n" | "\r";
+  bom: boolean;
+}
+export interface DocumentsSnapshot {
+  connection?: ConnectionState;
+  documents: readonly DocumentSnapshot[];
+  activeId: string | null;
+  loadingPath: VaultPath | null;
+  openError: string | null;
+  activation: number;
+  conflictPrompt: { id: string; intent: "save" | "close" } | null;
+  conflictResolving: boolean;
+  conflictError: string | null;
+}
 
 export interface Vault {
   vaultId: string;
@@ -36,9 +72,41 @@ export interface SelectionContext {
   mainIndex: number;
 }
 export interface UndoState {
-  can_undo: boolean;
-  can_redo: boolean;
-  group_open: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+}
+export interface UndoContext {
+  metadata?: unknown;
+  positions: number[];
+}
+export type BufferCommand =
+  | {
+      kind: "edit";
+      base: Version;
+      input:
+        { kind: "edits"; edits: TextEdit[] } | { kind: "text"; text: string };
+      origin?: string;
+      group?: string | null;
+      undo: UndoContext;
+    }
+  | { kind: "undo" | "redo"; base: Version; context: UndoContext }
+  | { kind: "import"; packet: SyncPacket; origin?: string; resetUndo?: boolean }
+  | { kind: "clear_undo" };
+export interface BufferUpdate {
+  cause:
+    | { kind: "local" | "import"; origin: string }
+    | { kind: "undo" | "redo" | "history_cleared" };
+  changed: boolean;
+  before: Version;
+  after: Version;
+  beforeLen: number;
+  afterLen: number;
+  revision: number;
+  edits: TextEdit[];
+  undo: UndoState;
+  restored: UndoContext | null;
+  operation: SyncPacket | null;
+  pending: boolean;
 }
 export interface TextSnapshot {
   text: string;
@@ -59,7 +127,7 @@ export interface EditorProjection {
   writerId: string;
   historyError: string | null;
 }
-/** UI consumes this service contract, never a WASM Document or an IO handle. */
+/** UI consumes a view projection, never a raw Buffer or an IO handle. */
 export interface EditorDocument extends DocumentSnapshot {
   remoteChange?: { before: string; edits: TextEdit[] };
   core?: EditorProjection;
@@ -81,14 +149,9 @@ export interface EditorDocuments {
   subscribe(listener: (state: DocumentsSnapshot) => void): () => void;
   open(path: VaultPath): Promise<boolean>;
   activate(id: string): void;
-  update(id: string, content: string): boolean;
-  edit?(id: string, transaction: ViewEdit): boolean;
+  edit(id: string, transaction: ViewEdit): boolean;
   composition?(id: string, active: boolean): void;
-  undo?(
-    id: string,
-    context: SelectionContext,
-    redo?: boolean,
-  ): Promise<boolean>;
+  undo(id: string, context: SelectionContext, redo?: boolean): Promise<boolean>;
   save(id?: string | null): Promise<boolean>;
   saveAll(): Promise<boolean>;
   requestSave(id?: string | null): Promise<boolean>;
@@ -106,7 +169,7 @@ export interface ServiceDocument {
   deleted?: boolean;
   conflictResolution?: "local" | "shared";
   externalChange?: ExternalChangeStatus | null;
-  change?: { before: string; edits: TextEdit[] };
+  change?: { before: Version; edits: TextEdit[] };
   id: string;
   path: VaultPath;
   content?: string;
@@ -115,12 +178,11 @@ export interface ServiceDocument {
   lineEnding: DocumentSnapshot["lineEnding"];
   readOnlyReason: string | null;
   canPreview: boolean;
-  saving: boolean;
   error: string | null;
   conflict: boolean;
   core?: EditorProjection;
 }
-export interface EditResult {
+export interface MutationResult {
   rejection?: RpcError;
   document: ServiceDocument;
   edits: TextEdit[];
@@ -176,24 +238,9 @@ export interface ServiceMethods {
     result: PreviewLink;
   };
   open: { params: { path: VaultPath }; result: ServiceDocument };
-  edit: {
-    params: {
-      id: string;
-      version: Version;
-      edits: TextEdit[];
-      context: SelectionContext;
-      userEvent: string;
-    };
-    result: EditResult;
-  };
-  undo: {
-    params: {
-      id: string;
-      context: SelectionContext;
-      redo: boolean;
-      version?: Version;
-    };
-    result: EditResult;
+  apply: {
+    params: { id: string; command: BufferCommand };
+    result: MutationResult;
   };
   save: { params: { id: string }; result: ServiceDocument };
   retry_history: { params: { id: string }; result: ServiceDocument };

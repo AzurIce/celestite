@@ -1,11 +1,11 @@
 //! Filesystem notifications are hints. A bounded wakeup coalesces bursts, and a
 //! periodic full observation repairs missed events without running IO in notify's callback.
-use crate::{vault::fs::ChangeHint, HostedVault};
+use crate::{HostedVault, vault::fs::ChangeHint};
 use std::{
     sync::{
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc, Weak,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -174,6 +174,7 @@ fn observe_with(
 mod tests {
     use super::*;
     use crate::vault::{documents::Documents, fs::FsVault};
+    use celestite_core::{Edit, TextInput, UndoContext};
     use std::sync::Mutex;
     use tokio::sync::broadcast;
 
@@ -238,35 +239,45 @@ mod tests {
                 .expect("diff must not hold the document lock");
             let states = docs.resident().unwrap();
             let a = states.iter().find(|s| s.path == "a.md").unwrap();
-            docs.transact(
+            docs.apply(
                 &a.id,
-                celestite_core::Transaction {
-                    expected_version: a.snapshot.version.clone(),
+                celestite_core::BufferCommand::Edit(Edit {
+                    base: a.snapshot.version.clone(),
+                    input: TextInput::Edits {
+                        edits: vec![celestite_core::TextEdit {
+                            from: 2,
+                            to: 8,
+                            insert: "MIDDLE".into(),
+                        }],
+                    },
                     origin: "local".into(),
-                    edits: vec![celestite_core::TextEdit {
-                        from: 2,
-                        to: 8,
-                        insert: "MIDDLE".into(),
-                    }],
-                    undo_metadata: None,
-                    undo_positions: vec![],
-                },
+                    group: None,
+                    undo: UndoContext {
+                        metadata: None,
+                        positions: vec![],
+                    },
+                }),
             )
             .unwrap();
             let b = states.iter().find(|s| s.path == "b.md").unwrap();
-            docs.transact(
+            docs.apply(
                 &b.id,
-                celestite_core::Transaction {
-                    expected_version: b.snapshot.version.clone(),
+                celestite_core::BufferCommand::Edit(Edit {
+                    base: b.snapshot.version.clone(),
+                    input: TextInput::Edits {
+                        edits: vec![celestite_core::TextEdit {
+                            from: 5,
+                            to: 5,
+                            insert: " saved".into(),
+                        }],
+                    },
                     origin: "local".into(),
-                    edits: vec![celestite_core::TextEdit {
-                        from: 5,
-                        to: 5,
-                        insert: " saved".into(),
-                    }],
-                    undo_metadata: None,
-                    undo_positions: vec![],
-                },
+                    group: None,
+                    undo: UndoContext {
+                        metadata: None,
+                        positions: vec![],
+                    },
+                }),
             )
             .unwrap();
             let version = docs.state(&files, &b.id).unwrap().snapshot.version;
@@ -370,9 +381,11 @@ mod tests {
                 .rename(&files, "a.md", "renamed.md")
                 .unwrap();
         }
-        assert!(!with_documents(&vault, |docs| docs
-            .complete_file_observation(task.compute()))
-        .unwrap());
+        assert!(
+            !with_documents(&vault, |docs| docs
+                .complete_file_observation(task.compute()))
+            .unwrap()
+        );
         let interim = vault
             .documents
             .lock()

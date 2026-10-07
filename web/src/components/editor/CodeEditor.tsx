@@ -25,12 +25,7 @@ import {
   rectangularSelection,
   highlightActiveLine,
 } from "@codemirror/view";
-import {
-  defaultKeymap,
-  history,
-  historyKeymap,
-  indentWithTab,
-} from "@codemirror/commands";
+import { defaultKeymap, indentWithTab } from "@codemirror/commands";
 import {
   bracketMatching,
   foldGutter,
@@ -64,13 +59,12 @@ interface CodeEditorProps {
   previewSync?: PreviewSync;
   reveal?: { from: number; to: number; requestId: string };
   document: EditorDocument;
-  onTransaction?: (transaction: ViewEdit) => boolean;
+  onTransaction: (transaction: ViewEdit) => boolean;
   onComposition?: (active: boolean) => void;
-  onUndo?: (context: SelectionContext, redo: boolean) => void;
+  onUndo: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
   vim: boolean;
   cached?: EditorBuffer;
-  onChange: (content: string) => boolean;
   onSave: () => void;
   onClose: () => void;
   onVimMode: (mode: VimMode | null) => void;
@@ -152,7 +146,6 @@ export default function CodeEditor(props: CodeEditorProps) {
     props.onCursor(line.number, head - line.from + 1);
   };
   const undo = (redo: boolean) => (editor: EditorView) => {
-    if (!props.onUndo) return false;
     if (!props.document.readOnlyReason && !props.document.core?.historyError)
       props.onUndo(selectionContext(editor.state), redo);
     return true;
@@ -160,12 +153,8 @@ export default function CodeEditor(props: CodeEditorProps) {
   const bindings = () => [
     Prec.highest(
       keymap.of([
-        ...(props.onUndo
-          ? [
-              { key: "Mod-z", run: undo(false), shift: undo(true) },
-              { key: "Mod-y", run: undo(true) },
-            ]
-          : []),
+        { key: "Mod-z", run: undo(false), shift: undo(true) },
+        { key: "Mod-y", run: undo(true) },
         {
           key: "Mod-s",
           run: () => {
@@ -216,22 +205,20 @@ export default function CodeEditor(props: CodeEditorProps) {
         update.changes.iterChanges((from, to, _fromB, _toB, insert) =>
           edits.push({ from, to, insert: insert.toString() }),
         );
-        const accepted = props.onTransaction
-          ? props.onTransaction({
-              edits,
-              content,
-              before: selectionContext(update.startState),
-              after: selectionContext(update.state),
-              userEvent:
-                vimUserEvent(update.view) ??
-                update.transactions
-                  .map((transaction) =>
-                    transaction.annotation(Transaction.userEvent),
-                  )
-                  .find(Boolean) ??
-                "view",
-            })
-          : props.onChange(content);
+        const accepted = props.onTransaction({
+          edits,
+          content,
+          before: selectionContext(update.startState),
+          after: selectionContext(update.state),
+          userEvent:
+            vimUserEvent(update.view) ??
+            update.transactions
+              .map((transaction) =>
+                transaction.annotation(Transaction.userEvent),
+              )
+              .find(Boolean) ??
+            "view",
+        });
         if (!accepted)
           queueMicrotask(() => {
             if (!disposed && view)
@@ -276,11 +263,9 @@ export default function CodeEditor(props: CodeEditorProps) {
               props.document.saving ||
               props.document.core?.historyError
             ),
-          undo: props.onUndo
-            ? (redo) => {
-                if (view) undo(redo)(view);
-              }
-            : undefined,
+          undo: (redo) => {
+            if (view) undo(redo)(view);
+          },
           onMode: (mode) => props.onVimMode(mode),
         })
       : [];
@@ -354,7 +339,6 @@ export default function CodeEditor(props: CodeEditorProps) {
             lineNumbers(),
             highlightActiveLineGutter(),
             highlightSpecialChars(),
-            props.onUndo ? [] : history(),
             drawSelection(),
             dropCursor(),
             rectangularSelection(),
@@ -391,7 +375,6 @@ export default function CodeEditor(props: CodeEditorProps) {
             keymap.of([
               ...closeBracketsKeymap,
               ...defaultKeymap,
-              ...(props.onUndo ? [] : historyKeymap),
               ...searchKeymap,
               ...foldKeymap,
               ...completionKeymap,

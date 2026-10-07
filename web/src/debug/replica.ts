@@ -1,5 +1,10 @@
 import { decodeError } from "../lib/editor/rpc";
-import type { InstanceIdentity } from "../lib/editor/contract";
+import type { BufferCommand, InstanceIdentity } from "../lib/editor/contract";
+import {
+  coreValue,
+  type CoreMutation,
+  type CoreReply,
+} from "../lib/editor/core";
 
 /** One independent Worker and WASM EditorCore per debug instance. */
 export class ReplicaCore {
@@ -66,7 +71,15 @@ export class ReplicaCore {
     params: Record<string, unknown> = {},
   ): Promise<T> {
     await this.ready;
-    return this.request<T>(method, params);
+    return coreValue<T>(await this.request<CoreReply>(method, params));
+  }
+  async apply(id: string, command: BufferCommand): Promise<CoreMutation> {
+    await this.ready;
+    const reply = await this.request<CoreReply>("apply", { id, command });
+    coreValue(reply);
+    const mutation = reply.mutations.find((value) => value.document.id === id);
+    if (!mutation) throw new Error("Missing Buffer mutation receipt");
+    return mutation;
   }
   dispose(error = new Error("Replica closed")) {
     this.closed = true;

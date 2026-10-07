@@ -99,8 +99,12 @@ test("display mode is shared across files and Vaults and persists through settin
             "editor.previewMode"
           ];
         } catch (error) {
-          // The first poll can precede asynchronous settings file creation.
-          if (error instanceof DOMException && error.name === "NotFoundError")
+          // Creation may still be pending, and an overlapping settings write
+          // can invalidate the File snapshot between getFile() and text().
+          if (
+            error instanceof DOMException &&
+            ["NotFoundError", "NotReadableError"].includes(error.name)
+          )
             return null;
           throw error;
         }

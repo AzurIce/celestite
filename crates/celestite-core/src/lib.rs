@@ -1,6 +1,6 @@
 //! Shared, host-independent Celestite editing kernel.
-pub mod document;
-pub use document::*;
+pub mod buffer;
+pub use buffer::*;
 pub mod instance;
 pub use instance::*;
 pub mod backend;

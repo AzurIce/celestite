@@ -9,7 +9,7 @@
     "start": "bun run dev",
     "dev": "bun run core:build && vite",
     "typecheck": "bun run core:build && tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
-    "test:vault": "bun test tests/unit",
+    "test:vault": "bun run core:build && bun test tests/unit",
     "test:ui": "playwright test",
     "build": "bun run core:build && vite build",
     "format": "prettier --write .",

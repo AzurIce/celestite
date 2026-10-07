@@ -6,7 +6,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui";
-import type { DocumentsSnapshot } from "@/lib/editor/documents";
+import type { DocumentsSnapshot } from "@/lib/editor/contract";
 import type { EditorDocuments } from "@/lib/editor/contract";
 
 export function SaveConflict(props: {

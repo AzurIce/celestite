@@ -1,12 +1,13 @@
-use celestite_core::{Document, SyncPacket, TextEdit, Transaction};
-use celestite_server::{build_server, Config, HistoryMode, ServerConfig, VaultConfig};
+use celestite_core::{
+    Buffer, BufferCommand, Edit, Import, SyncPacket, TextEdit, TextInput, UndoContext,
+};
+use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig, build_server};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
-    MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
 };
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -149,11 +150,13 @@ impl Host {
             if frame["kind"] == "document" && frame["document"]["path"] == "a.md" {
                 let packet: SyncPacket = serde_json::from_value(frame["packet"].clone()).unwrap();
                 if let Some(doc) = doc.as_mut() {
-                    Document::import(doc, &packet, "initial".into()).unwrap();
+                    let _ =
+                        Buffer::apply(doc, BufferCommand::Import(Import::new(packet, "initial")))
+                            .unwrap();
                 } else {
                     writer = frame["writerId"].as_str().unwrap().into();
                     doc = Some(
-                        Document::from_snapshot(&packet, Some(writer.parse().unwrap())).unwrap(),
+                        Buffer::from_snapshot(&packet, Some(writer.parse().unwrap())).unwrap(),
                     );
                 }
             }
@@ -195,7 +198,7 @@ async fn next(socket: &mut Socket) -> Value {
 struct Replica {
     socket: Socket,
     session: String,
-    document: Document,
+    document: Buffer,
     writer: String,
     next_request: u64,
     next_operation: u64,
@@ -203,18 +206,24 @@ struct Replica {
 impl Replica {
     fn edit(&mut self, from: usize, to: usize, insert: &str) -> Value {
         let before = self.document.version();
-        self.document
-            .transact(Transaction {
-                expected_version: before.clone(),
-                edits: vec![TextEdit {
-                    from,
-                    to,
-                    insert: insert.into(),
-                }],
+        let _ = self
+            .document
+            .apply(BufferCommand::Edit(Edit {
+                base: before.clone(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from,
+                        to,
+                        insert: insert.into(),
+                    }],
+                },
                 origin: "test".into(),
-                undo_metadata: None,
-                undo_positions: vec![],
-            })
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
             .unwrap();
         self.next_operation += 1;
         json!({"method":"updates","id":self.document.identity().document_id,"packet":self.document.export_updates_since(&before).unwrap(),"version":self.document.version(),"operation":self.next_operation})
@@ -236,8 +245,11 @@ impl Replica {
         if frame["kind"] == "document"
             && frame["document"]["id"] == self.document.identity().document_id
         {
-            let packet = serde_json::from_value(frame["packet"].clone()).unwrap();
-            self.document.import(&packet, "host".into()).unwrap();
+            let packet: SyncPacket = serde_json::from_value(frame["packet"].clone()).unwrap();
+            let _ = self
+                .document
+                .apply(BufferCommand::Import(Import::new((packet).clone(), "host")))
+                .unwrap();
         }
     }
     async fn until_text(&mut self, expected: &str) {

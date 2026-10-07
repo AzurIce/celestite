@@ -2,6 +2,7 @@ import init, {
   MemoryEditorBinding,
 } from "../lib/editor/generated/celestite_core";
 import { decodeError, encodeError } from "../lib/editor/rpc";
+import { callCore } from "../lib/editor/core";
 
 let core: MemoryEditorBinding | undefined;
 let queue: Promise<unknown> = Promise.resolve();
@@ -15,7 +16,7 @@ self.addEventListener("message", (event) => {
       return null;
     }
     if (!core) throw new Error("Replica is not initialized");
-    return JSON.parse(await core.execute(method, JSON.stringify(params)));
+    return callCore(core, method, params);
   });
   queue = task.catch(() => {});
   void task.then(

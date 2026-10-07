@@ -153,9 +153,9 @@ impl Backend for BrowserBackend {
             let packet = SyncPacket {
                 identity,
                 kind: PacketKind::Snapshot,
-                data: seed,
+                data: seed.into(),
             };
-            let mut legacy: Option<Document> = None;
+            let mut legacy: Option<Buffer> = None;
             let mut journal = vec![];
             for sequence in 1..=head.sequence {
                 let data = self
@@ -170,24 +170,33 @@ impl Backend for BrowserBackend {
                 let update = SyncPacket {
                     identity: packet.identity.clone(),
                     kind: meta.as_ref().map_or(PacketKind::Updates, |m| m.kind),
-                    data,
+                    data: data.into(),
                 };
                 let applied = if let Some(meta) = meta {
                     if let Some(doc) = legacy.as_mut() {
-                        doc.import(&update, "legacy-recovery".into())?;
+                        let _ = doc.apply(BufferCommand::Import(Import::new(
+                            update.clone(),
+                            "legacy-recovery",
+                        )))?;
                     }
                     meta.applied
                 } else {
                     if legacy.is_none() {
-                        let mut doc = Document::from_snapshot(&packet, None)?;
+                        let mut doc = Buffer::from_snapshot(&packet, None)?;
                         for prior in &journal {
                             let prior: &JournalEntry = prior;
-                            doc.import(&prior.packet, "legacy-recovery".into())?;
+                            let _ = doc.apply(BufferCommand::Import(Import::new(
+                                prior.packet.clone(),
+                                "legacy-recovery",
+                            )))?;
                         }
                         legacy = Some(doc);
                     }
                     let doc = legacy.as_mut().unwrap();
-                    doc.import(&update, "legacy-recovery".into())?;
+                    let _ = doc.apply(BufferCommand::Import(Import::new(
+                        update.clone(),
+                        "legacy-recovery",
+                    )))?;
                     doc.version()
                 };
                 journal.push(JournalEntry {

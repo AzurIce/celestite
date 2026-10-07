@@ -210,7 +210,15 @@ fn detached_observation_merges_into_newer_live_edits_and_keeps_personal_undo() {
         assert_eq!(state.saved_content, "A1 middle B1");
         assert_eq!(state.writer_id, writer);
         assert!(state.external_change.is_none());
-        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "A1 middle B1");
         let sequence = backend.header(&id).sequence;
         core.refresh(&id).await.unwrap();
@@ -361,19 +369,24 @@ fn changed_input_bypasses_timeout_backoff() {
 }
 
 async fn edit(core: &mut EditorCore<HostBackend>, id: &str, from: usize, to: usize, insert: &str) {
-    core.transact(
+    core.apply(
         id,
-        Transaction {
-            expected_version: core.read(id).unwrap().snapshot.version,
-            edits: vec![TextEdit {
-                from,
-                to,
-                insert: insert.into(),
-            }],
+        BufferCommand::Edit(Edit {
+            base: core.read(id).unwrap().snapshot.version,
+            input: TextInput::Edits {
+                edits: vec![TextEdit {
+                    from,
+                    to,
+                    insert: insert.into(),
+                }],
+            },
             origin: "local".into(),
-            undo_metadata: None,
-            undo_positions: vec![],
-        },
+            group: None,
+            undo: UndoContext {
+                metadata: None,
+                positions: vec![],
+            },
+        }),
     )
     .await
     .unwrap();
@@ -402,7 +415,15 @@ fn fine_diff_and_continuous_disk_branch_preserve_live_writer_and_personal_undo()
             core.refresh(&id).await.unwrap();
             assert_eq!(backend.header(&id).sequence, sequence);
         }
-        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "A12 middle B12");
     });
 }
@@ -468,7 +489,15 @@ fn failed_or_lost_commit_receipts_do_not_publish_and_retry_the_same_operation() 
                 );
             }
             assert_eq!(core.read(&id).unwrap().snapshot.text, "external base local");
-            core.undo(&id, UndoContext::default(), false).await.unwrap();
+            core.apply(
+                &id,
+                BufferCommand::Undo {
+                    base: core.read(&id).unwrap().snapshot.version,
+                    context: UndoContext::default(),
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(core.read(&id).unwrap().snapshot.text, "external base");
         }
     });
@@ -698,10 +727,14 @@ fn short_unicode_observation_sequences_restore_with_consistent_cursors() {
                         let before = core.read(&id).unwrap();
                         assert_eq!(before.saved_content, disk);
                         let mut peer =
-                            Document::from_snapshot(&core.snapshot(&id).unwrap(), None).unwrap();
+                            Buffer::from_snapshot(&core.snapshot(&id).unwrap(), None).unwrap();
                         assert_eq!(peer.snapshot().text, before.snapshot.text);
                         let version = peer.version();
-                        peer.import(&core.updates(&id, &version).unwrap(), "duplicate".into())
+                        let _ = peer
+                            .apply(BufferCommand::Import(Import::new(
+                                (core.updates(&id, &version).unwrap()).clone(),
+                                "duplicate",
+                            )))
                             .unwrap();
                         assert_eq!(peer.version(), version);
                         drop(core);

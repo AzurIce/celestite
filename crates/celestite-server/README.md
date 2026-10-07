@@ -156,23 +156,20 @@ host 返回 `hello`（`sessionId`），然后按文档发送 `document`（元数
 
 下面路径仍相对于 `/<key>/api/v1`。正文与文档业务由 `celestite-core::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
 
-| 方法 | 路径                                  | 请求 / 行为                                                                             |
-| ---- | ------------------------------------- | --------------------------------------------------------------------------------------- |
-| GET  | `/documents`                          | 扫描整个目录，返回可编辑文本状态，包括未在 UI 打开的文件                                |
-| POST | `/documents/open`                     | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态                                  |
-| GET  | `/documents/<document>`               | 正文、因果版本、撤销与保存状态；重新核对磁盘                                            |
-| GET  | `/documents/<document>/snapshot`      | 完整 `SyncPacket`，新副本从这里加入同一历史                                             |
-| POST | `/documents/<document>/updates`       | `Version`，返回该版本之后的更新包                                                       |
-| POST | `/documents/<document>/import`        | `SyncPacket`，验证并合并；返回 `{ result, document }`                                   |
-| POST | `/documents/<document>/transact`      | `Transaction`，UTF-16 范围编辑；返回 `{ result, document }`                             |
-| POST | `/documents/<document>/undo`          | `UndoContext`，可用 `{}`；撤销 server writer 的本地操作                                 |
-| POST | `/documents/<document>/redo`          | 同上，重做                                                                              |
-| POST | `/documents/<document>/save`          | 当前 `Version`，条件写回文件，返回更新的状态                                            |
-| POST | `/documents/<document>/client-commit` | `{ packet, expectedRevision, action }`，客户端副本条件提交，返回 `{ document, packet }` |
+| 方法 | 路径                                  | 请求 / 行为                                                                                     |
+| ---- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| GET  | `/documents`                          | 扫描整个目录，返回可编辑文本状态，包括未在 UI 打开的文件                                        |
+| POST | `/documents/open`                     | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态                                          |
+| GET  | `/documents/<document>`               | 正文、因果版本、撤销与保存状态；重新核对磁盘                                                    |
+| GET  | `/documents/<document>/snapshot`      | 完整 `SyncPacket`，新副本从这里加入同一历史                                                     |
+| POST | `/documents/<document>/updates`       | `Version`，返回该版本之后的更新包                                                               |
+| POST | `/documents/<document>/apply`         | `BufferCommand`，统一编辑、撤销、重做、导入和清除个人撤销；返回 `{ document, update, history }` |
+| POST | `/documents/<document>/save`          | 当前 `Version`，条件写回文件，返回更新的状态                                                    |
+| POST | `/documents/<document>/client-commit` | `{ packet, expectedRevision, action }`，客户端副本条件提交，返回 `{ document, packet }`         |
 
-核心类型字段采用 Rust 的 `snake_case`；外层状态字段采用 `camelCase`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
+命令由 `kind` 区分；命令和回执的多词字段采用 `camelCase`，历史身份保留 `document_id` / `history_id`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
 
-`clientReplicaCommit: true` 保留旧 HTTP 客户端副本提交能力；正常 Web 编辑使用 WebSocket。`client-commit` 的 `action` 为 `save`、`overwrite` 或 `discard`：保存先核对 `expectedRevision`，基线不符时拒绝导入客户端操作；覆盖明确选择客户端正文；丢弃不发送客户端包，重新取得 host 最新文件。返回的完整快照用于补齐客户端历史，文档状态确认实际文件基线。快照限制为 16 MiB，文档请求 JSON 上限为 80 MiB 以容纳字节数组编码；仍使用既有认证、只读约束和 Vault 操作锁。
+`clientReplicaCommit: true` 表示支持独立 HTTP 副本以指定磁盘基线进行条件保存；正常 Web 编辑使用 WebSocket。`client-commit` 的 `action` 为 `save`、`overwrite` 或 `discard`：保存先核对 `expectedRevision`，基线不符时拒绝导入客户端操作；覆盖明确选择客户端正文；丢弃不发送客户端包，重新取得 host 最新文件。返回的完整快照用于补齐客户端历史，文档状态确认实际文件基线。快照限制为 16 MiB，文档请求 JSON 上限为 80 MiB 以容纳字节数组编码；仍使用既有认证、只读约束和 Vault 操作锁。
 
 host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修改；先处理 host 保存，再重试客户端丢弃。
 
@@ -180,20 +177,28 @@ host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修
 
 ```json
 {
-  "expected_version": {
+  "kind": "edit",
+  "base": {
     "identity": { "document_id": "来自状态", "history_id": "来自状态" },
     "clocks": {}
   },
   "origin": "headless-client",
-  "edits": [{ "from": 0, "to": 0, "insert": "hello\n" }],
-  "undo_metadata": null,
-  "undo_positions": []
+  "input": {
+    "kind": "edits",
+    "edits": [{ "from": 0, "to": 0, "insert": "hello\n" }]
+  },
+  "group": null,
+  "undo": { "metadata": null, "positions": [] }
 }
 ```
 
-`expected_version` 必须完整使用刚读取的 `snapshot.version`，示例中的空 clocks 不是现有文件的真实版本。`from/to` 是事务之前正文的 UTF-16 半开区间，不能切开 emoji 等字符的代理对；多项编辑必须有序且互不重叠。内核一次验证所有编辑，然后提交一个撤销步。过期事务 / 保存返回 `409 StaleVersion`，非法坐标和更新包返回 `400 InvalidEdit`。不同文档或历史之间的导入被拒绝。
+`base` 必须完整使用刚读取的 `snapshot.version`，示例中的空 clocks 不是现有文件的真实版本。`from/to` 是事务之前正文的 UTF-16 半开区间，不能切开 emoji 等字符的代理对；多项编辑必须有序且互不重叠。内核一次验证所有编辑，然后提交一个撤销步。过期事务 / 保存返回 `409 StaleVersion`，非法坐标和更新包返回 `400 InvalidEdit`。不同文档或历史之间的导入被拒绝。
 
-协作客户端各自从完整快照建立 `Document`，使用新的 writer，只发送 CRDT 更新。重复和乱序包按 CRDT 语义处理；依赖未齐的包保留，后续补齐。客户端撤销由自己的内核产生更新，不调用 server writer 的 `/undo` 代替个人撤销。两个 HTTP 客户端直接调用 `/transact` 会共享 server writer 的撤销历史，因此这组接口先用于无头开发与测试。
+`input` 也可为 `{ "kind": "text", "text": "完整目标正文" }`，仍进入 Buffer 的同一事务路径。撤销 / 重做命令为 `{ "kind": "undo" | "redo", "base": Version, "context": { "positions": [] } }`，导入为 `{ "kind": "import", "packet": SyncPacket }`，清除个人历史为 `{ "kind": "clear_undo" }`。
+
+`update` 包含版本、显示增量、撤销上下文和原始操作；`history.status` 为 `committed` 或 `failed`。失败的历史提交仍返回已接受的正文，不能当成编辑被拒绝或盲目重发。普通文件写回依然是独立操作；WebSocket 只在历史提交后确认。server 会话的身份与因果检查使用准备好的导入结果，随后直接提交，不重复构造临时副本。
+
+协作客户端各自从完整快照建立 `Buffer`，使用新的 writer，只发送命令结果中的本地 CRDT 操作。重复和乱序包按 CRDT 语义处理；依赖未齐的包保留，后续补齐。个人撤销也由客户端产生操作，不请求 server 代为撤销。直接向此 HTTP API 发出本地编辑 / 撤销命令会使用 server writer，因此该入口用于无头控制与开发测试，而非分配协作者身份。
 
 ### 持久化和磁盘保存
 

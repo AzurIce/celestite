@@ -319,6 +319,12 @@ test("external declarations refresh on demand and lost resource permission leave
     "External declaration",
   );
   await expect(editor).toContainText("Still editable");
+  // The title is also present in the retained, stale preview. Wait for the new
+  // source and its completed render before changing a component implementation.
+  await expect(preview.locator("article")).toContainText("Still editable");
+  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览已更新",
+  );
   await page.evaluate(async () => {
     const workspace = await (
       await navigator.storage.getDirectory()

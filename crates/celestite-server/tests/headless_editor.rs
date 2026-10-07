@@ -1,8 +1,8 @@
 //! Real HTTP clients and a listening server. No browser or editor view involved.
 use celestite_core::*;
-use celestite_server::{build_server, Config, HistoryMode, ServerConfig, VaultConfig};
+use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig, build_server};
 use reqwest::{Client, StatusCode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
 
@@ -128,18 +128,23 @@ impl Server {
 fn snapshot(state: &Value) -> TextSnapshot {
     serde_json::from_value(state["snapshot"].clone()).unwrap()
 }
-fn transaction(doc: &Document, from: usize, to: usize, insert: &str) -> Transaction {
-    Transaction {
-        expected_version: doc.version(),
+fn transaction(doc: &Buffer, from: usize, to: usize, insert: &str) -> BufferCommand {
+    BufferCommand::Edit(Edit {
+        base: doc.version(),
+        input: TextInput::Edits {
+            edits: vec![TextEdit {
+                from,
+                to,
+                insert: insert.into(),
+            }],
+        },
         origin: "headless-client".into(),
-        edits: vec![TextEdit {
-            from,
-            to,
-            insert: insert.into(),
-        }],
-        undo_metadata: None,
-        undo_positions: vec![],
-    }
+        group: None,
+        undo: UndoContext {
+            metadata: None,
+            positions: vec![],
+        },
+    })
 }
 fn route(id: &str, action: &str) -> String {
     format!("/documents/{id}{action}")
@@ -155,8 +160,8 @@ async fn replica_commit_checks_file_revision_before_import_and_returns_saved_his
     let seed: SyncPacket =
         serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
             .unwrap();
-    let mut client = Document::from_snapshot(&seed, None).unwrap();
-    client.transact(transaction(&client, 3, 3, "中文")).unwrap();
+    let mut client = Buffer::from_snapshot(&seed, None).unwrap();
+    let _ = client.apply(transaction(&client, 3, 3, "中文")).unwrap();
     std::fs::write(root.path().join("a.md"), "external").unwrap();
     let body = json!({"packet":client.export_snapshot().unwrap(),"expectedRevision":initial["backendRevision"],"action":"save"});
     assert_eq!(
@@ -170,11 +175,13 @@ async fn replica_commit_checks_file_revision_before_import_and_returns_saved_his
     let retained: SyncPacket =
         serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
             .unwrap();
-    assert!(!Document::from_snapshot(&retained, None)
-        .unwrap()
-        .snapshot()
-        .text
-        .contains("中文"));
+    assert!(
+        !Buffer::from_snapshot(&retained, None)
+            .unwrap()
+            .snapshot()
+            .text
+            .contains("中文")
+    );
     let mut overwrite = body;
     overwrite["action"] = json!("overwrite");
     server.settled(id).await;
@@ -187,7 +194,12 @@ async fn replica_commit_checks_file_revision_before_import_and_returns_saved_his
     );
     assert_eq!(receipt["document"]["savedContent"], "A😀中文B");
     let committed: SyncPacket = serde_json::from_value(receipt["packet"].clone()).unwrap();
-    client.import(&committed, "receipt".into()).unwrap();
+    let _ = client
+        .apply(BufferCommand::Import(Import::new(
+            (committed).clone(),
+            "receipt",
+        )))
+        .unwrap();
     assert_eq!(client.snapshot().text, "A😀中文B");
     std::fs::write(root.path().join("a.md"), "discard target").unwrap();
     let discarded = server
@@ -199,16 +211,12 @@ async fn replica_commit_checks_file_revision_before_import_and_returns_saved_his
         .await;
     assert_eq!(discarded["document"]["savedContent"], "discard target");
     let seed: SyncPacket = serde_json::from_value(discarded["packet"].clone()).unwrap();
-    let mut other_client = Document::from_snapshot(&seed, None).unwrap();
-    other_client
-        .transact(transaction(&other_client, 0, 0, "other draft "))
+    let mut other_client = Buffer::from_snapshot(&seed, None).unwrap();
+    let _ = other_client
+        .apply(transaction(&other_client, 0, 0, "other draft "))
         .unwrap();
     server
-        .ok(
-            "POST",
-            &route(id, "/import"),
-            serde_json::to_value(other_client.export_snapshot().unwrap()).unwrap(),
-        )
+        .ok("POST", &route(id, "/apply"), json!({"kind":"import","packet":serde_json::to_value(other_client.export_snapshot().unwrap()).unwrap()}))
         .await;
     assert_eq!(
         server
@@ -244,7 +252,11 @@ async fn rejected_imports_leave_the_document_and_history_unchanged() {
         .await;
     assert_eq!(
         server
-            .request("POST", &route(id, "/import"), other_seed)
+            .request(
+                "POST",
+                &route(id, "/apply"),
+                json!({"kind":"import","packet":other_seed})
+            )
             .await
             .0,
         StatusCode::CONFLICT
@@ -253,8 +265,8 @@ async fn rejected_imports_leave_the_document_and_history_unchanged() {
     let seed: SyncPacket =
         serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
             .unwrap();
-    let mut peer = Document::from_snapshot(&seed, Some(77)).unwrap();
-    peer.transact(transaction(&peer, 0, 0, "\r")).unwrap();
+    let mut peer = Buffer::from_snapshot(&seed, Some(77)).unwrap();
+    let _ = peer.apply(transaction(&peer, 0, 0, "\r")).unwrap();
     let invalid = peer
         .export_updates_since(&snapshot(&initial).version)
         .unwrap();
@@ -262,21 +274,21 @@ async fn rejected_imports_leave_the_document_and_history_unchanged() {
         server
             .request(
                 "POST",
-                &route(id, "/import"),
-                serde_json::to_value(invalid).unwrap()
+                &route(id, "/apply"),
+                json!({"kind":"import","packet":serde_json::to_value(invalid).unwrap()})
             )
             .await
             .0,
         StatusCode::BAD_REQUEST
     );
     let mut corrupt = seed;
-    corrupt.data = vec![0, 1, 2];
+    corrupt.data = vec![0, 1, 2].into();
     assert_eq!(
         server
             .request(
                 "POST",
-                &route(id, "/import"),
-                serde_json::to_value(corrupt).unwrap()
+                &route(id, "/apply"),
+                json!({"kind":"import","packet":serde_json::to_value(corrupt).unwrap()})
             )
             .await
             .0,
@@ -302,35 +314,32 @@ async fn two_offline_replicas_merge_and_undo_through_real_server() {
     // Discovery includes files that have never had a view or explicit open call.
     let all = server.ok("GET", "/documents", Value::Null).await;
     assert_eq!(all.as_array().unwrap().len(), 2);
-    assert!(all
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|doc| doc["path"] == "closed.md"));
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc["path"] == "closed.md")
+    );
     let opened = server.open("a.md").await;
     let id = opened["id"].as_str().unwrap();
     let seed: SyncPacket =
         serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
             .unwrap();
     let base = snapshot(&opened).version;
-    let mut a = Document::from_snapshot(&seed, Some(101)).unwrap();
-    let mut b = Document::from_snapshot(&seed, Some(202)).unwrap();
-    a.transact(transaction(&a, 0, 0, "甲")).unwrap();
-    b.transact(transaction(&b, 4, 4, "乙")).unwrap();
+    let mut a = Buffer::from_snapshot(&seed, Some(101)).unwrap();
+    let mut b = Buffer::from_snapshot(&seed, Some(202)).unwrap();
+    let _ = a.apply(transaction(&a, 0, 0, "甲")).unwrap();
+    let _ = b.apply(transaction(&b, 4, 4, "乙")).unwrap();
     let a_packet = a.export_updates_since(&base).unwrap();
     server
         .ok(
             "POST",
-            &route(id, "/import"),
-            serde_json::to_value(&a_packet).unwrap(),
+            &route(id, "/apply"),
+            json!({"kind":"import","packet":serde_json::to_value(&a_packet).unwrap()}),
         )
         .await;
     server
-        .ok(
-            "POST",
-            &route(id, "/import"),
-            serde_json::to_value(b.export_updates_since(&base).unwrap()).unwrap(),
-        )
+        .ok("POST", &route(id, "/apply"), json!({"kind":"import","packet":serde_json::to_value(b.export_updates_since(&base).unwrap()).unwrap()}))
         .await;
     for replica in [&mut a, &mut b] {
         let updates: SyncPacket = serde_json::from_value(
@@ -343,26 +352,33 @@ async fn two_offline_replicas_merge_and_undo_through_real_server() {
                 .await,
         )
         .unwrap();
-        replica.import(&updates, "server".into()).unwrap();
+        let _ = replica
+            .apply(BufferCommand::Import(Import::new(
+                (updates).clone(),
+                "server",
+            )))
+            .unwrap();
         assert_eq!(replica.snapshot().text, "甲A😀B乙");
     }
     let duplicate = server
         .ok(
             "POST",
-            &route(id, "/import"),
-            serde_json::to_value(&a_packet).unwrap(),
+            &route(id, "/apply"),
+            json!({"kind":"import","packet":serde_json::to_value(&a_packet).unwrap()}),
         )
         .await;
-    assert!(duplicate["result"]["event"].is_null());
+    assert_eq!(duplicate["update"]["changed"], false);
+    assert!(duplicate["update"]["operation"].is_null());
     assert!(duplicate["document"]["durableVersion"].is_null());
     let merged = a.version();
-    a.undo(None).unwrap();
+    let _ = a
+        .apply(BufferCommand::Undo {
+            base: a.version(),
+            context: UndoContext::default(),
+        })
+        .unwrap();
     server
-        .ok(
-            "POST",
-            &route(id, "/import"),
-            serde_json::to_value(a.export_updates_since(&merged).unwrap()).unwrap(),
-        )
+        .ok("POST", &route(id, "/apply"), json!({"kind":"import","packet":serde_json::to_value(a.export_updates_since(&merged).unwrap()).unwrap()}))
         .await;
     let current = server.ok("GET", &route(id, ""), Value::Null).await;
     assert_eq!(snapshot(&current).text, "A😀B乙");
@@ -397,24 +413,19 @@ async fn transactions_versions_and_server_writer_history_are_validated() {
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     let base = snapshot(&initial).version;
-    let invalid = json!({"expected_version": base, "origin": "test", "edits": [{"from": 2, "to": 3, "insert": "bad"}]});
+    let invalid = json!({"kind":"edit","base":base,"origin":"test","input":{"kind":"edits","edits":[{"from": 2, "to": 3, "insert": "bad"}]},"undo":{"metadata":null,"positions":[]}});
     assert_eq!(
         server
-            .request("POST", &route(id, "/transact"), invalid)
+            .request("POST", &route(id, "/apply"), invalid)
             .await
             .0,
         StatusCode::BAD_REQUEST
     );
-    let edit = json!({"expected_version": base, "origin": "test", "edits": [{"from": 0, "to": 1, "insert": "中"}]});
-    let changed = server
-        .ok("POST", &route(id, "/transact"), edit.clone())
-        .await;
+    let edit = json!({"kind":"edit","base":base,"origin":"test","input":{"kind":"edits","edits":[{"from": 0, "to": 1, "insert": "中"}]},"undo":{"metadata":null,"positions":[]}});
+    let changed = server.ok("POST", &route(id, "/apply"), edit.clone()).await;
     assert_eq!(changed["document"]["snapshot"]["text"], "中😀B");
     assert_eq!(
-        server
-            .request("POST", &route(id, "/transact"), edit)
-            .await
-            .0,
+        server.request("POST", &route(id, "/apply"), edit).await.0,
         StatusCode::CONFLICT
     );
     assert_eq!(
@@ -428,9 +439,21 @@ async fn transactions_versions_and_server_writer_history_are_validated() {
             .0,
         StatusCode::CONFLICT
     );
-    let undone = server.ok("POST", &route(id, "/undo"), json!({})).await;
+    let undone = server
+        .ok(
+            "POST",
+            &route(id, "/apply"),
+            json!({"kind":"undo","base":changed["document"]["snapshot"]["version"]}),
+        )
+        .await;
     assert_eq!(undone["document"]["snapshot"]["text"], "A😀B");
-    let redone = server.ok("POST", &route(id, "/redo"), json!({})).await;
+    let redone = server
+        .ok(
+            "POST",
+            &route(id, "/apply"),
+            json!({"kind":"redo","base":undone["document"]["snapshot"]["version"]}),
+        )
+        .await;
     assert_eq!(redone["document"]["snapshot"]["text"], "中😀B");
     server.stop().await;
 }
@@ -449,21 +472,21 @@ async fn pending_packets_and_unsaved_history_survive_server_restart() {
             .await,
     )
     .unwrap();
-    let mut peer = Document::from_snapshot(&seed, Some(42)).unwrap();
+    let mut peer = Buffer::from_snapshot(&seed, Some(42)).unwrap();
     let base = peer.version();
-    peer.transact(transaction(&peer, 0, 0, "one ")).unwrap();
+    let _ = peer.apply(transaction(&peer, 0, 0, "one ")).unwrap();
     let first = peer.export_updates_since(&base).unwrap();
     let middle = peer.version();
-    peer.transact(transaction(&peer, 8, 8, " two")).unwrap();
+    let _ = peer.apply(transaction(&peer, 8, 8, " two")).unwrap();
     let last = peer.export_updates_since(&middle).unwrap();
     let waiting = server
         .ok(
             "POST",
-            &route(&id, "/import"),
-            serde_json::to_value(last).unwrap(),
+            &route(&id, "/apply"),
+            json!({"kind":"import","packet":serde_json::to_value(last).unwrap()}),
         )
         .await;
-    assert_eq!(waiting["result"]["pending"], true);
+    assert_eq!(waiting["update"]["pending"], true);
     server.stop().await;
     let server = Server::start(root.path(), Some(state.path()), false).await;
     let restored = server.open("a.md").await;
@@ -473,8 +496,8 @@ async fn pending_packets_and_unsaved_history_survive_server_restart() {
     let completed = server
         .ok(
             "POST",
-            &route(&id, "/import"),
-            serde_json::to_value(first).unwrap(),
+            &route(&id, "/apply"),
+            json!({"kind":"import","packet":serde_json::to_value(first).unwrap()}),
         )
         .await;
     assert_eq!(completed["document"]["snapshot"]["text"], "one base two");
@@ -507,8 +530,8 @@ async fn external_changes_merge_with_dirty_history_and_are_preserved_across_rest
     std::fs::write(root.path().join("a.md"), "external").unwrap();
     let clean = server.settled(&id).await;
     assert_eq!(snapshot(&clean).text, "external");
-    assert_eq!(clean["undo"]["can_undo"], false);
-    server.ok("POST", &route(&id, "/transact"), json!({"expected_version": snapshot(&clean).version, "origin": "test", "edits": [{"from": 8, "to": 8, "insert": " local"}]})).await;
+    assert_eq!(clean["undo"]["canUndo"], false);
+    server.ok("POST", &route(&id, "/apply"), json!({"kind":"edit","base":snapshot(&clean).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 8, "to": 8, "insert": " local"}]},"undo":{"metadata":null,"positions":[]}})).await;
     std::fs::write(root.path().join("a.md"), "other editor").unwrap();
     let dirty = server.settled(&id).await;
     assert_eq!(snapshot(&dirty).text, "other editor local");
@@ -574,7 +597,7 @@ async fn move_preserves_identity_and_delete_cannot_be_undone_by_late_save() {
     let server = Server::start(root.path(), Some(state.path()), false).await;
     let initial = server.open("folder/a.md").await;
     let id = initial["id"].as_str().unwrap().to_string();
-    server.ok("POST", &route(&id, "/transact"), json!({"expected_version": snapshot(&initial).version, "origin": "test", "edits": [{"from": 4, "to": 4, "insert": " edit"}]})).await;
+    server.ok("POST", &route(&id, "/apply"), json!({"kind":"edit","base":snapshot(&initial).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 4, "to": 4, "insert": " edit"}]},"undo":{"metadata":null,"positions":[]}})).await;
     let response = server
         .client
         .post(format!("{}/rename", server.url))
@@ -633,7 +656,7 @@ async fn bom_and_crlf_roundtrip_and_read_only_rejects_editor_mutations() {
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     assert_eq!(snapshot(&initial).text, "a\nb\n");
-    let changed = server.ok("POST", &route(id, "/transact"), json!({"expected_version": snapshot(&initial).version, "origin": "test", "edits": [{"from": 0, "to": 1, "insert": "中😀"}]})).await;
+    let changed = server.ok("POST", &route(id, "/apply"), json!({"kind":"edit","base":snapshot(&initial).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 0, "to": 1, "insert": "中😀"}]},"undo":{"metadata":null,"positions":[]}})).await;
     server
         .ok(
             "POST",
@@ -649,19 +672,32 @@ async fn bom_and_crlf_roundtrip_and_read_only_rejects_editor_mutations() {
     let server = Server::start(root.path(), None, true).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
-    for action in ["/transact", "/undo", "/redo", "/save", "/import"] {
-        let body = match action {
-            "/transact" => {
-                json!({"expected_version": snapshot(&initial).version, "origin": "test", "edits": []})
-            }
-            "/save" => initial["snapshot"]["version"].clone(),
-            "/import" => server.ok("GET", &route(id, "/snapshot"), Value::Null).await,
-            _ => json!({}),
-        };
+    let packet = server.ok("GET", &route(id, "/snapshot"), Value::Null).await;
+    for command in [
+        json!({"kind":"edit","base":initial["snapshot"]["version"],"input":{"kind":"edits","edits":[]}}),
+        json!({"kind":"undo","base":initial["snapshot"]["version"]}),
+        json!({"kind":"redo","base":initial["snapshot"]["version"]}),
+        json!({"kind":"import","packet":packet}),
+        json!({"kind":"clear_undo"}),
+    ] {
         assert_eq!(
-            server.request("POST", &route(id, action), body).await.0,
+            server
+                .request("POST", &route(id, "/apply"), command)
+                .await
+                .0,
             StatusCode::FORBIDDEN
         );
     }
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                &route(id, "/save"),
+                initial["snapshot"]["version"].clone()
+            )
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
     server.stop().await;
 }

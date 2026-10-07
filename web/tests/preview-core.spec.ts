@@ -23,7 +23,7 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         vault: { vaultId: "vault", historyId: "vault-history" },
       }),
     );
-    const seed = new wasm.DocumentBinding(
+    const seed = new wasm.BufferBinding(
       JSON.stringify({
         document_id: "doc",
         history_id: "history",
@@ -52,7 +52,12 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
       method: K,
       params: PreviewCoreMethods[K]["params"],
     ): Promise<PreviewCoreMethods[K]["result"]> =>
-      JSON.parse(await core.execute(method, JSON.stringify(params)));
+      (await call(method, params)).value;
+    const call = async (method: string, params: object) => {
+      const reply = JSON.parse(await core.call(method, JSON.stringify(params)));
+      if (reply.status === "error") throw new Error(reply.error.message);
+      return reply;
+    };
     const render = (task: PreviewTask) =>
       new Promise<PreviewCompletion>((resolve, reject) => {
         worker.addEventListener(
@@ -71,13 +76,10 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         worker.postMessage(task);
       });
     try {
-      await core.execute(
-        "join",
-        JSON.stringify({
-          path: "note.not",
-          packet: JSON.parse(seed.export_snapshot()),
-        }),
-      );
+      await call("join", {
+        path: "note.not",
+        packet: JSON.parse(seed.export_snapshot()),
+      });
       await execute("preview_subscribe", {
         id: "doc",
         clientSession: "client",
@@ -88,14 +90,14 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         completion: computed,
       });
       const first = await execute("preview_state", { id: "doc" });
-      await core.execute(
-        "replace_text",
-        JSON.stringify({
-          id: "doc",
-          version: task.ticket.version,
-          text: "= 新标题\n\n未保存正文",
-        }),
-      );
+      await call("apply", {
+        id: "doc",
+        command: {
+          kind: "edit",
+          base: task.ticket.version,
+          input: { kind: "text", text: "= 新标题\n\n未保存正文" },
+        },
+      });
       await execute("preview_retry", { id: "doc" });
       const latest = (await execute("preview_take_task", { id: "doc" }))!;
       const staleAccepted = await execute("preview_complete", {
@@ -106,9 +108,7 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         completion: current,
       });
       const last = await execute("preview_state", { id: "doc" });
-      const document = JSON.parse(
-        await core.execute("read", JSON.stringify({ id: "doc" })),
-      );
+      const document = (await call("read", { id: "doc" })).value;
       return {
         accepted,
         staleAccepted,

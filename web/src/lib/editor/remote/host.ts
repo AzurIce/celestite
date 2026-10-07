@@ -1,30 +1,17 @@
-import { ChangeSet } from "@codemirror/state";
 import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
 import type { HttpVaultBackend, RemoteVaultDescriptor } from "../../vault/http";
-import {
-  EditorHost,
-  type CoreDocument,
-  type CoreEdit,
-  type CorePort,
-} from "../runtime/host";
+import { EditorHost } from "../runtime/host";
+import type { CoreDocument, CoreMutation, CorePort } from "../core";
+import { decodeError } from "../rpc";
 import type {
-  EditResult,
-  SelectionContext,
   ServiceDocument,
   ServiceEvent,
   SyncPacket,
-  TextEdit,
   Version,
 } from "../contract";
 import { RemoteTransport, type RemoteReceipt } from "./transport";
-import { editsOf, sameVersion } from "../view-changes";
 
-interface Patch {
-  before: Version;
-  after: Version;
-  changes: ChangeSet;
-}
 /** Private online replica: core owns history/undo; the transport carries
  * committed updates. Host file saves remain explicit. */
 export class RemoteEditorHost extends EditorHost {
@@ -37,7 +24,6 @@ export class RemoteEditorHost extends EditorHost {
   private operation = 0;
   private composing = new Set<string>();
   private deferred = new Map<string, RemoteReceipt[]>();
-  private patches = new Map<string, Patch[]>();
   private stopping = false;
   private received = new Map<string, number>();
   constructor(
@@ -147,7 +133,7 @@ export class RemoteEditorHost extends EditorHost {
       this.hosts = new Map(states.map((state) => [state.id, state]));
       this.received = received;
       this.operation = 0;
-      this.patches.clear();
+      this.clearPatches();
       this.composing.clear();
       this.deferred.clear();
       this.offline = false;
@@ -242,7 +228,6 @@ export class RemoteEditorHost extends EditorHost {
       return this.document(
         await this.execute<CoreDocument>("read", { id: host.id }),
       );
-    let change: ServiceDocument["change"];
     if (!this.hosts.has(host.id)) {
       await this.execute("replica_join", {
         document: {
@@ -252,37 +237,15 @@ export class RemoteEditorHost extends EditorHost {
         },
       });
     } else {
-      const before = await this.execute<CoreDocument>("read", { id: host.id });
-      const known = Object.entries(host.snapshot.version.clocks).every(
-        ([peer, clock]) => (before.snapshot.version.clocks[peer] ?? 0) >= clock,
-      );
-      if (!known) {
-        const imported = await this.execute<{
-          result: { event: { edits: TextEdit[] } | null; pending: boolean };
-          document: CoreDocument;
-        }>("import", { id: host.id, packet: receipt.packet });
-        if (imported.result.pending)
-          throw new VaultError(
-            "IO",
-            "远端增量缺少历史依赖，协作已暂停。",
-            host.path,
-          );
-        const edits = imported.result.event?.edits ?? [];
-        change = { before: before.snapshot.text, edits };
-        const patches = this.patches.get(host.id) ?? [];
-        patches.push({
-          before: before.snapshot.version,
-          after: imported.document.snapshot.version,
-          changes: ChangeSet.of(edits, before.snapshot.text.length),
-        });
-        if (patches.length > 128) patches.shift();
-        this.patches.set(host.id, patches);
-      }
+      await this.execute("apply", {
+        id: host.id,
+        command: { kind: "import", packet: receipt.packet, origin: "peer" },
+      });
     }
     const raw = await this.hostState(host);
     this.hosts.set(host.id, host);
     this.received.set(host.id, receipt.sequence);
-    this.publish(raw, true, change);
+    this.publish(raw, !prior);
     return this.document(raw);
   }
   private connectionFailure(error: unknown) {
@@ -327,7 +290,7 @@ export class RemoteEditorHost extends EditorHost {
           ? "文件超过 5 MiB，请通过文件树下载后编辑。"
           : "这个文件不是 UTF-8 文本，无法在此编辑。可通过文件树下载。",
         canPreview: false,
-        saving: false,
+
         error: null,
         conflict: false,
       };
@@ -335,105 +298,34 @@ export class RemoteEditorHost extends EditorHost {
       return document;
     }
   }
-  override async edit(
-    id: string,
-    version: Version,
-    edits: TextEdit[],
-    context: SelectionContext,
-    userEvent: string,
-  ): Promise<EditResult> {
+  protected override ensureMutationAllowed() {
     this.requireOnline();
-    let result: CoreEdit;
-    try {
-      const current = await this.execute<CoreDocument>("read", { id });
-      if (!sameVersion(version, current.snapshot.version)) {
-        let pending: ChangeSet | undefined;
-        for (const patch of this.patches.get(id) ?? []) {
-          if (!sameVersion(patch.before, version)) continue;
-          pending ??= ChangeSet.of(edits, patch.changes.length);
-          pending = pending.map(patch.changes, true);
-          context = {
-            ...context,
-            ranges: context.ranges.map((r) => ({
-              anchor: patch.changes.mapPos(r.anchor),
-              head: patch.changes.mapPos(r.head),
-            })),
-          };
-          version = patch.after;
-        }
-        if (!pending || !sameVersion(version, current.snapshot.version))
-          throw new VaultError(
-            "Conflict",
-            "输入的历史版本已过期，输入仍保留。",
-            current.path,
-          );
-        edits = editsOf(pending);
-      }
-      result = await this.execute<CoreEdit>("edit", {
-        id,
-        version,
-        edits,
-        context,
-        userEvent,
-      });
-    } catch (error) {
-      return this.rejectedEdit(id, error);
-    }
-    await this.submit(id, version, result.document.snapshot.version);
-    return { document: this.document(result.document), edits: result.edits };
   }
-  override async undo(
-    id: string,
-    context: SelectionContext,
-    redo: boolean,
-    version?: Version,
-  ): Promise<EditResult> {
-    this.requireOnline();
-    const before = await this.execute<CoreDocument>("read", { id });
-    if (version && !sameVersion(version, before.snapshot.version)) {
-      for (const patch of this.patches.get(id) ?? []) {
-        if (!sameVersion(patch.before, version)) continue;
-        context = {
-          ...context,
-          ranges: context.ranges.map((r) => ({
-            anchor: patch.changes.mapPos(r.anchor),
-            head: patch.changes.mapPos(r.head),
-          })),
-        };
-        version = patch.after;
-      }
-      if (!sameVersion(version, before.snapshot.version))
-        throw new VaultError(
-          "Conflict",
-          "撤销选区的历史版本已过期，正文仍保留。",
-        );
+  protected override async onMutation(mutation: CoreMutation, inReply = false) {
+    await super.onMutation(mutation, inReply);
+    const { update } = mutation;
+    if (update.pending)
+      throw new VaultError(
+        "IO",
+        "远端增量缺少历史依赖，协作已暂停。",
+        mutation.document.path,
+      );
+    if (
+      update.operation &&
+      ["local", "undo", "redo"].includes(update.cause.kind)
+    ) {
+      if (mutation.history.status === "failed")
+        throw decodeError(mutation.history.error);
+      await this.submit(mutation.document.id, update.operation, update.after);
     }
-    const result = await this.execute<CoreEdit>("undo", { id, context, redo });
-    await this.submit(
-      id,
-      before.snapshot.version,
-      result.document.snapshot.version,
-    );
-    return {
-      document: this.document(result.document),
-      edits: result.edits,
-      ...(result.restoredSelection
-        ? { restoredSelection: result.restoredSelection }
-        : {}),
-    };
   }
-  private async submit(id: string, before: Version, after: Version) {
-    if (sameVersion(before, after)) return;
-    const packet = await this.execute<SyncPacket>("export_updates", {
-      id,
-      version: before,
-    });
+  private async submit(id: string, packet: SyncPacket, version: Version) {
     this.unconfirmed = true;
     try {
       await this.transport!.request("updates", {
         id,
         packet,
-        version: after,
+        version,
         operation: ++this.operation,
       });
       this.unconfirmed = false;

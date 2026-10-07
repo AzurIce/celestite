@@ -1,6 +1,6 @@
 //! HTTP compatibility facade over the same EditorCore used by Web.
 use super::{
-    backend::{vault_error, NativeBackend},
+    backend::{NativeBackend, vault_error},
     fs::{FsVault, Result},
     store::VaultIdentity,
 };
@@ -74,6 +74,9 @@ impl Documents {
         block_on(self.core.retry_file_observation(id)).map_err(vault_error)
     }
     pub fn publish_changes(&mut self) -> Result<bool> {
+        // This transport publishes coalesced committed states; drain the owner's
+        // mutation batch so it cannot accumulate behind the state feed.
+        self.core.take_mutations();
         let states = self.resident()?;
         self.feed.publish(states)
     }
@@ -99,19 +102,12 @@ impl Documents {
     pub fn refresh(&mut self, _files: &FsVault, id: &str) -> Result<()> {
         block_on(self.core.refresh(id)).map_err(vault_error)
     }
-    pub fn transact(&mut self, id: &str, transaction: Transaction) -> Result<Option<ChangeEvent>> {
-        block_on(self.core.transact(id, transaction)).map_err(vault_error)
-    }
-    pub fn import(&mut self, id: &str, packet: SyncPacket) -> Result<ImportResult> {
-        block_on(self.core.import(id, packet)).map_err(vault_error)
-    }
-    pub fn undo(
+    pub fn apply(
         &mut self,
         id: &str,
-        context: UndoContext,
-        redo: bool,
-    ) -> Result<Option<ChangeEvent>> {
-        block_on(self.core.undo(id, context, redo)).map_err(vault_error)
+        command: BufferCommand,
+    ) -> Result<std::sync::Arc<EditorMutation>> {
+        block_on(self.core.apply(id, command)).map_err(vault_error)
     }
     fn require_committed(&self, id: &str) -> Result<()> {
         let state = self.core.read(id).map_err(vault_error)?;
@@ -138,7 +134,7 @@ impl Documents {
         let snapshot = self.snapshot(id)?;
         loop {
             let replica =
-                Document::from_snapshot(&snapshot, None).map_err(|e| vault_error(e.into()))?;
+                Buffer::from_snapshot(&snapshot, None).map_err(|e| vault_error(e.into()))?;
             let writer = replica.writer_id();
             if self.writers.insert(writer.clone()) {
                 return Ok(writer);
@@ -162,16 +158,15 @@ impl Documents {
                 id,
             ));
         }
-        let snapshot = self.snapshot(id)?;
-        let mut trial =
-            Document::from_snapshot(&snapshot, None).map_err(|e| vault_error(e.into()))?;
-        let before = trial.version();
-        let result = trial
-            .import(&packet, "session-validation".into())
-            .map_err(|e| vault_error(e.into()))?;
-        let after = trial.version();
-        if result.pending
-            || !super::super::sync::contains(&after, claimed)
+        self.require_committed(id)?;
+        let prepared = self
+            .core
+            .prepare_import(id, Import::new(packet, "peer"))
+            .map_err(vault_error)?;
+        let before = prepared.before();
+        let after = &prepared.preview().version;
+        if prepared.preview().pending
+            || !super::super::sync::contains(after, claimed)
             || after.clocks.iter().any(|(peer, clock)| {
                 peer != writer && *clock > before.clocks.get(peer).copied().unwrap_or(0)
             })
@@ -183,8 +178,8 @@ impl Documents {
                 id,
             ));
         }
-        self.import(id, packet)?;
-        self.require_committed(id)
+        let mutation = block_on(self.core.commit_import(id, prepared)).map_err(vault_error)?;
+        mutation.require_committed().map_err(vault_error)
     }
     pub fn save(&mut self, _files: &FsVault, id: &str, expected: Version) -> Result<()> {
         block_on(self.core.save(id, Some(expected))).map_err(vault_error)

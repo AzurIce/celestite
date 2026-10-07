@@ -1,7 +1,7 @@
 //! Shared editor business: platform adapters implement IO, never save/recovery policy.
 use crate::{backend::*, *};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 mod observation;
 mod replica;
@@ -29,22 +29,19 @@ struct Record {
     hosted: bool,
     read_only: bool,
     header: DocumentHeader,
-    document: Document,
-    pending_packets: Vec<SyncPacket>,
+    buffer: Buffer,
     pending_observation: Option<ObservationCommit>,
     uncommitted: Vec<JournalEntry>,
     durable: Option<Version>,
     conflict: bool,
     error: Option<String>,
-    last_group: String,
-    last_edit: u64,
     first_dirty: Option<u64>,
 }
 
-#[derive(Clone)]
 struct ObservationCommit {
     header: DocumentHeader,
     entry: Option<JournalEntry>,
+    prepared: Option<PreparedImport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,23 +66,31 @@ pub struct EditorDocument {
     pub error: Option<String>,
     pub autosave_delay: Option<u64>,
 }
-#[derive(Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SelectionContext {
-    pub ranges: Vec<SelectionRange>,
-    pub main_index: usize,
+/// Acceptance of text and commitment of history are different facts. A failed
+/// history write never turns an accepted Buffer mutation into a rejected edit.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HistoryCommit {
+    Committed { version: Version, durable: bool },
+    Failed { error: EditorError },
 }
-#[derive(Deserialize, Serialize)]
-pub struct SelectionRange {
-    pub anchor: usize,
-    pub head: usize,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditorEditResult {
+
+#[derive(Debug, Serialize)]
+pub struct EditorMutation {
     pub document: EditorDocument,
-    pub edits: Vec<TextEdit>,
-    pub restored_selection: Option<SelectionContext>,
+    pub update: BufferUpdate,
+    pub history: HistoryCommit,
+}
+
+impl EditorMutation {
+    /// Network acknowledgements and ordinary-file saves require this separately
+    /// from accepting the edit. Local UI still receives the accepted update.
+    pub fn require_committed(&self) -> EditorResult<()> {
+        match &self.history {
+            HistoryCommit::Committed { .. } => Ok(()),
+            HistoryCommit::Failed { error } => Err(error.clone()),
+        }
+    }
 }
 
 /// Host receipt for a private client replica. File baselines remain host-owned;
@@ -117,6 +122,7 @@ pub struct EditorCore<B: Backend> {
     options: EditorOptions,
     previews: preview::PreviewSessions,
     preview_environment: BTreeMap<String, Version>,
+    mutations: Vec<Arc<EditorMutation>>,
 }
 
 pub fn validate_editor_path(path: &str) -> EditorResult<()> {
@@ -225,13 +231,12 @@ impl<B: Backend> EditorCore<B> {
                     &header.path,
                 ));
             }
-            let mut document = Document::from_snapshot(&header.seed, None)?;
-            let mut pending_packets = vec![];
+            let mut document = Buffer::from_snapshot(&header.seed, None)?;
             for entry in journal {
-                let result = document.import(&entry.packet, "recovery".into())?;
-                if result.pending {
-                    pending_packets.push(entry.packet);
-                }
+                let _ = document.apply(BufferCommand::Import(Import::new(
+                    entry.packet.clone(),
+                    "recovery",
+                )))?;
                 if document.version() != entry.applied {
                     return Err(EditorError::new(
                         "IO",
@@ -296,15 +301,13 @@ impl<B: Backend> EditorCore<B> {
                     hosted: false,
                     read_only: false,
                     header,
-                    document,
-                    pending_packets,
+                    buffer: document,
                     pending_observation: None,
                     uncommitted: vec![],
                     durable,
                     conflict: false,
                     error: None,
-                    last_group: String::new(),
-                    last_edit: 0,
+
                     first_dirty: None,
                 },
             );
@@ -318,6 +321,7 @@ impl<B: Backend> EditorCore<B> {
             options,
             previews: preview::PreviewSessions::default(),
             preview_environment: BTreeMap::new(),
+            mutations: vec![],
         };
         core.recover_directory().await?;
         Ok(core)
@@ -345,7 +349,7 @@ impl<B: Backend> EditorCore<B> {
         self.preview_document(id)?;
         self.sync_preview(id);
         let record = self.record(id)?;
-        let snapshot = record.document.snapshot();
+        let snapshot = record.buffer.snapshot();
         let path = record.header.path.clone();
         Ok(self
             .previews
@@ -367,7 +371,7 @@ impl<B: Backend> EditorCore<B> {
         if !self.previews.contains(id) {
             return Ok(None);
         }
-        let snapshot = self.record(id)?.document.snapshot();
+        let snapshot = self.record(id)?.buffer.snapshot();
         let mut task = self.previews.take_task(id, snapshot, self.backend.now_ms());
         if let Some(task) = &mut task {
             task.overlays = self
@@ -376,7 +380,7 @@ impl<B: Backend> EditorCore<B> {
                 .filter(|record| {
                     !record.header.deleted && !preview::supports_preview(&record.header.path)
                 })
-                .map(|record| (record.header.path.clone(), record.document.snapshot().text))
+                .map(|record| (record.header.path.clone(), record.buffer.snapshot().text))
                 .collect();
             if task.overlays.values().map(String::len).sum::<usize>() > 32 * 1024 * 1024 {
                 self.previews.complete(PreviewCompletion {
@@ -419,7 +423,7 @@ impl<B: Backend> EditorCore<B> {
             .filter(|record| {
                 !record.header.deleted && !preview::supports_preview(&record.header.path)
             })
-            .map(|record| (record.header.path.clone(), record.document.version()))
+            .map(|record| (record.header.path.clone(), record.buffer.version()))
             .collect();
         if self.preview_environment != current {
             self.preview_environment = current;
@@ -456,7 +460,7 @@ impl<B: Backend> EditorCore<B> {
         match self.records.get(id) {
             Some(record) if !record.header.deleted => self.previews.reconcile(
                 id,
-                &record.document.version(),
+                &record.buffer.version(),
                 &record.header.path,
                 self.backend.now_ms(),
             ),
@@ -495,14 +499,14 @@ impl<B: Backend> EditorCore<B> {
     pub fn read(&self, id: &str) -> EditorResult<EditorDocument> {
         let record = self.record(id)?;
         let header = &record.header;
-        let snapshot = record.document.snapshot();
+        let snapshot = record.buffer.snapshot();
         let dirty = snapshot.text != header.saved_text;
         Ok(EditorDocument {
             external_change: record.observation.status(),
             id: id.into(),
             path: header.path.clone(),
-            undo: record.document.undo_state(),
-            writer_id: record.document.writer_id(),
+            undo: record.buffer.undo_state(),
+            writer_id: record.buffer.writer_id(),
             saved_content: header.saved_text.clone(),
             bom: header.bom,
             line_ending: header.line_ending.clone(),
@@ -542,10 +546,12 @@ impl<B: Backend> EditorCore<B> {
         let record = self.records.get_mut(id).unwrap();
         record.uncommitted.push(JournalEntry {
             packet,
-            applied: record.document.version(),
+            applied: record.buffer.version(),
         });
-        if record.document.snapshot().text != record.header.saved_text
-            && record.first_dirty.is_none()
+    }
+    fn buffer_changed(&mut self, id: &str) {
+        let record = self.records.get_mut(id).unwrap();
+        if record.buffer.snapshot().text != record.header.saved_text && record.first_dirty.is_none()
         {
             record.first_dirty = Some(self.backend.now_ms());
         }
@@ -624,7 +630,7 @@ impl<B: Backend> EditorCore<B> {
         }
         let id = packet.identity.document_id.clone();
         if let Some(record) = self.records.get(&id) {
-            if record.header.path != path || record.document.identity() != &packet.identity {
+            if record.header.path != path || record.buffer.identity() != &packet.identity {
                 return Err(EditorError::new(
                     "Conflict",
                     "Joined document identity/path mismatch",
@@ -644,7 +650,7 @@ impl<B: Backend> EditorCore<B> {
                 path,
             ));
         }
-        let document = Document::from_snapshot(&packet, writer)?;
+        let document = Buffer::from_snapshot(&packet, writer)?;
         let snapshot = document.snapshot();
         validate_text(&snapshot.text, path)?;
         let header = DocumentHeader {
@@ -669,15 +675,13 @@ impl<B: Backend> EditorCore<B> {
                 hosted: false,
                 read_only: false,
                 header,
-                document,
-                pending_packets: vec![],
+                buffer: document,
                 pending_observation: None,
                 uncommitted: vec![],
                 durable: None,
                 conflict: false,
                 error: None,
-                last_group: String::new(),
-                last_edit: 0,
+
                 first_dirty: None,
             },
         );
@@ -705,7 +709,7 @@ impl<B: Backend> EditorCore<B> {
             document_id: self.backend.new_id()?,
             history_id: self.backend.new_id()?,
         };
-        let document = Document::new(identity.clone(), None, &text)?;
+        let document = Buffer::new(identity.clone(), None, &text)?;
         let header = DocumentHeader {
             id: identity.document_id.clone(),
             path: path.into(),
@@ -734,15 +738,13 @@ impl<B: Backend> EditorCore<B> {
                 hosted: false,
                 read_only: false,
                 header,
-                document,
+                buffer: document,
                 uncommitted: vec![],
-                pending_packets: vec![],
                 pending_observation: None,
                 durable: None,
                 conflict: false,
                 error: None,
-                last_group: String::new(),
-                last_edit: 0,
+
                 first_dirty: None,
             },
         );
@@ -885,7 +887,7 @@ impl<B: Backend> EditorCore<B> {
             record.error = None;
             return Ok(());
         }
-        if record.document.snapshot().text != record.header.saved_text {
+        if record.buffer.snapshot().text != record.header.saved_text {
             let record = self.records.get_mut(id).unwrap();
             record.conflict = true;
             record.error = Some("文件已在外部修改，本地编辑仍保留。".into());
@@ -919,54 +921,61 @@ impl<B: Backend> EditorCore<B> {
         }))
     }
 
-    /// Commit a previously validated candidate before importing into the live Document.
+    /// Commit a previously validated candidate before importing into the live Buffer.
     /// Retrying uses the exact same header and packet even when the receipt was lost.
     async fn finish_observation(&mut self, id: &str) -> EditorResult<()> {
-        let Some(candidate) = self.record(id)?.pending_observation.clone() else {
+        let Some(candidate) = self.record(id)?.pending_observation.as_ref() else {
             return Ok(());
         };
-        if let Err(error) = self
-            .backend
-            .commit(&candidate.header, candidate.entry.as_ref())
-            .await
-        {
+        let header = candidate.header.clone();
+        let entry = candidate.entry.clone();
+        if let Err(error) = self.backend.commit(&header, entry.as_ref()).await {
             self.failure = Some(format!("文件协调尚未持久化：{}", error.message));
             return Err(error);
         }
-        if let Some(entry) = &candidate.entry {
+        let candidate = self
+            .records
+            .get_mut(id)
+            .unwrap()
+            .pending_observation
+            .take()
+            .unwrap();
+        let update = if let Some(prepared) = candidate.prepared {
             let result = self
                 .records
                 .get_mut(id)
                 .unwrap()
-                .document
-                .import(&entry.packet, "filesystem".into());
-            if result.is_err() || self.record(id)?.document.version() != candidate.header.applied {
-                self.requires_reopen = true;
-                self.failure = Some("文件协调已提交，但活动 core 未能应用；必须重新打开。".into());
-                return Err(EditorError::new("IO", self.failure.clone().unwrap(), id));
+                .buffer
+                .commit_import(prepared);
+            match result {
+                Ok(update) if update.after == header.applied => Some(update),
+                _ => {
+                    self.requires_reopen = true;
+                    self.failure =
+                        Some("文件协调已提交，但活动 core 未能应用；必须重新打开。".into());
+                    return Err(EditorError::new("IO", self.failure.clone().unwrap(), id));
+                }
             }
-        }
+        } else {
+            None
+        };
         let record = self.records.get_mut(id).unwrap();
-        record.header = candidate.header;
+        record.header = header;
         record.durable = self
             .backend
             .persistent()
             .then(|| record.header.applied.clone());
-        record.pending_observation = None;
         record.observation.queued = None;
         record.observation.failure = None;
         record.conflict = false;
         record.error = None;
-        if record.document.snapshot().text == record.header.saved_text {
+        if record.buffer.snapshot().text == record.header.saved_text {
             record.first_dirty = None;
         } else if record.first_dirty.is_none() {
             record.first_dirty = Some(self.backend.now_ms());
         }
-        if let Some(entry) = candidate.entry {
-            // Reuse the existing accepted-change notification path (including previews).
-            // This entry has already been committed; do not enqueue a second journal write.
-            self.queue_packet(id, entry.packet);
-            self.records.get_mut(id).unwrap().uncommitted.pop();
+        if let Some(update) = update {
+            self.publish_update(id, update, Ok(()))?;
         }
         Ok(())
     }
@@ -976,6 +985,7 @@ impl<B: Backend> EditorCore<B> {
         id: &str,
         header: DocumentHeader,
         entry: Option<JournalEntry>,
+        prepared: Option<PreparedImport>,
     ) -> EditorResult<()> {
         if !self.record(id)?.uncommitted.is_empty()
             || self.record(id)?.pending_observation.is_some()
@@ -986,8 +996,11 @@ impl<B: Backend> EditorCore<B> {
                 id,
             ));
         }
-        self.records.get_mut(id).unwrap().pending_observation =
-            Some(ObservationCommit { header, entry });
+        self.records.get_mut(id).unwrap().pending_observation = Some(ObservationCommit {
+            header,
+            entry,
+            prepared,
+        });
         self.finish_observation(id).await
     }
 
@@ -1003,7 +1016,7 @@ impl<B: Backend> EditorCore<B> {
             // A durable Prepared record proves that this attempt had not started file IO.
             let mut header = self.record(id)?.header.clone();
             header.pending_write = None;
-            self.stage_observation(id, header, None).await?;
+            self.stage_observation(id, header, None, None).await?;
             return Ok(true);
         }
         if encode(&self.record(id)?.header, &pending.text) == disk.data {
@@ -1015,7 +1028,7 @@ impl<B: Backend> EditorCore<B> {
             if let Some(version) = pending.version {
                 header.disk_cursor = self.cursor(id, version, disk.data.clone())?;
             }
-            self.stage_observation(id, header, None).await?;
+            self.stage_observation(id, header, None, None).await?;
             return Ok(true);
         }
         // Even seeing the old bytes cannot distinguish no write from write + external ABA.
@@ -1033,30 +1046,43 @@ impl<B: Backend> EditorCore<B> {
         clear_undo: bool,
     ) -> EditorResult<()> {
         let (text, bom, ending) = decoded;
-        let revision = disk.revision;
-        let bytes = disk.data;
-        let record = self.record(id)?;
-        let before = record.document.version();
-        let mut external = Document::from_snapshot(&record.document.export_snapshot()?, None)?;
-        external.transact(Transaction {
-            expected_version: external.version(),
-            origin: "filesystem".into(),
-            edits: text_difference(&external.snapshot().text, &text),
-            undo_metadata: None,
-            undo_positions: vec![],
-        })?;
-        let packet = external.export_updates_since(&before)?;
-        let cursor = self.cursor(id, external.version(), bytes)?;
+        let mut external =
+            Buffer::from_snapshot(&self.record(id)?.buffer.export_snapshot()?, None)?;
+        let mut edit = Edit::replace(&external.snapshot(), &text);
+        edit.origin = "filesystem".into();
+        let external_update = external.apply(BufferCommand::Edit(edit))?;
+        let cursor = self.cursor(id, external_update.after, disk.data)?;
+        let update = if let Some(packet) = external_update.operation {
+            let prepared = self.prepare_import(
+                id,
+                Import {
+                    packet,
+                    origin: "filesystem".into(),
+                    reset_undo: clear_undo,
+                },
+            )?;
+            Some(
+                self.records
+                    .get_mut(id)
+                    .unwrap()
+                    .buffer
+                    .commit_import(prepared)?,
+            )
+        } else if clear_undo {
+            Some(
+                self.records
+                    .get_mut(id)
+                    .unwrap()
+                    .buffer
+                    .apply(BufferCommand::ClearUndo)?,
+            )
+        } else {
+            None
+        };
         let record = self.records.get_mut(id).unwrap();
-        record.document.import(&packet, "filesystem".into())?;
-        if clear_undo {
-            record.document.end_undo_group();
-            record.document.clear_undo();
-            record.last_group.clear();
-        }
         record.header.saved_text = text;
-        record.header.saved_version = Some(record.document.version());
-        record.header.disk_revision = revision;
+        record.header.saved_version = Some(record.buffer.version());
+        record.header.disk_revision = disk.revision;
         record.header.bom = bom;
         record.header.line_ending = ending;
         record.header.pending_write = None;
@@ -1064,227 +1090,143 @@ impl<B: Backend> EditorCore<B> {
         record.conflict = false;
         record.error = None;
         record.first_dirty = None;
-        self.queue_packet(id, packet);
-        self.persist(id).await
-    }
-    fn apply_transaction(
-        &mut self,
-        id: &str,
-        transaction: Transaction,
-    ) -> EditorResult<Option<ChangeEvent>> {
-        self.live(id)?;
-        let record = self.record(id)?;
-        let before = record.document.version();
-        if transaction.expected_version != before {
-            return Err(CoreError::StaleVersion.into());
-        }
-        let text = record.document.snapshot().text;
-        let mut size = text.len();
-        for edit in &transaction.edits {
-            validate_text(&edit.insert, id)?;
-            let from = utf16_to_byte(&text, edit.from)?;
-            let to = utf16_to_byte(&text, edit.to)?;
-            size = size
-                .checked_sub(to.saturating_sub(from))
-                .and_then(|n| n.checked_add(edit.insert.len()))
-                .ok_or_else(|| EditorError::new("InvalidEdit", "Invalid edit size", id))?;
-        }
-        if size > MAX_TEXT_BYTES {
-            return Err(EditorError::new("Unsupported", "Text exceeds 5 MiB", id));
-        }
-        let record = self.records.get_mut(id).unwrap();
-        let event = record.document.transact(transaction)?;
-        if record.document.version() != before {
-            let packet = record.document.export_updates_since(&before)?;
-            self.queue_packet(id, packet);
-        }
-        Ok(event)
-    }
-    pub async fn transact(
-        &mut self,
-        id: &str,
-        transaction: Transaction,
-    ) -> EditorResult<Option<ChangeEvent>> {
-        let event = self.apply_transaction(id, transaction)?;
-        if !self.record(id)?.uncommitted.is_empty() {
-            self.persist(id).await?;
-        }
-        Ok(event)
-    }
-    pub async fn edit(
-        &mut self,
-        id: &str,
-        version: Version,
-        edits: Vec<TextEdit>,
-        context: SelectionContext,
-        user_event: String,
-    ) -> EditorResult<EditorEditResult> {
-        self.live(id)?;
-        let now = self.backend.now_ms();
-        let vim_group = user_event.starts_with("input.vim.");
-        let group = if vim_group
-            || user_event.starts_with("input.type")
-            || user_event.starts_with("delete.")
-        {
-            user_event.clone()
+        if let Some(update) = update {
+            self.accept_update(id, update, true)
+                .await?
+                .require_committed()
         } else {
-            String::new()
-        };
-        let record = self.records.get_mut(id).unwrap();
-        if group.is_empty()
-            || group != record.last_group
-            || (!vim_group && now.saturating_sub(record.last_edit) > 500)
-        {
-            record.document.end_undo_group();
-            if !group.is_empty() {
-                record.document.begin_undo_group()?;
+            self.persist(id).await
+        }
+    }
+    /// One mutation contract for UI, headless callers and collaboration. Only
+    /// admission errors are returned as Err; accepted text always has a receipt,
+    /// including when committing its history fails.
+    pub async fn apply(
+        &mut self,
+        id: &str,
+        command: BufferCommand,
+    ) -> EditorResult<Arc<EditorMutation>> {
+        if let BufferCommand::Import(input) = command {
+            let prepared = self.prepare_import(id, input)?;
+            return self.commit_import(id, prepared).await;
+        }
+        self.live(id)?;
+        if let BufferCommand::Edit(edit) = &command {
+            let current = self.record(id)?.buffer.snapshot();
+            if edit.base != current.version {
+                return Err(CoreError::StaleVersion.into());
+            }
+            match &edit.input {
+                TextInput::Text { text } => validate_text(text, id)?,
+                TextInput::Edits { edits } => {
+                    let mut size = current.text.len();
+                    for change in edits {
+                        validate_text(&change.insert, id)?;
+                        let from = utf16_to_byte(&current.text, change.from)?;
+                        let to = utf16_to_byte(&current.text, change.to)?;
+                        size = size
+                            .checked_sub(to.saturating_sub(from))
+                            .and_then(|n| n.checked_add(change.insert.len()))
+                            .ok_or_else(|| {
+                                EditorError::new("InvalidEdit", "Invalid edit size", id)
+                            })?;
+                    }
+                    if size > MAX_TEXT_BYTES {
+                        return Err(EditorError::new("Unsupported", "Text exceeds 5 MiB", id));
+                    }
+                }
             }
         }
-        let event = self.apply_transaction(
-            id,
-            Transaction {
-                expected_version: version,
-                edits,
-                origin: user_event,
-                undo_metadata: Some(serde_json::json!({"mainIndex":context.main_index})),
-                undo_positions: context
-                    .ranges
-                    .iter()
-                    .flat_map(|r| [r.anchor, r.head])
-                    .collect(),
-            },
-        )?;
-        let record = self.records.get_mut(id).unwrap();
-        record.last_group = group;
-        record.last_edit = now;
-        // Return accepted text even if IO failed; the UI must retain the draft.
-        if !record.uncommitted.is_empty() {
-            let _ = self.persist(id).await;
-        }
-        Ok(EditorEditResult {
-            document: self.read(id)?,
-            edits: event.map_or(vec![], |e| e.edits),
-            restored_selection: None,
-        })
+        let update = self.records.get_mut(id).unwrap().buffer.apply(command)?;
+        self.accept_update(id, update, false).await
     }
-    pub async fn import(&mut self, id: &str, packet: SyncPacket) -> EditorResult<ImportResult> {
-        // Hosted replicas must still receive accepted history while their UI
-        // is read-only (including retained tombstones). Local writes remain gated.
-        if self.record(id)?.hosted {
-            self.writable()?;
-        } else {
-            self.live(id)?;
-        }
-        if packet.data.len() > 16 * 1024 * 1024 {
+
+    pub fn prepare_import(&self, id: &str, input: Import) -> EditorResult<PreparedImport> {
+        if input.packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
                 "Unsupported",
                 "CRDT packet exceeds 16 MiB",
                 id,
             ));
         }
-        let record = self.record(id)?;
-        let mut trial = Document::from_snapshot(&record.document.export_snapshot()?, None)?;
-        for waiting in &record.pending_packets {
-            trial.import(waiting, "validation".into())?;
-        }
-        trial.import(&packet, "validation".into())?;
-        validate_text(&trial.snapshot().text, id)?;
-        let record = self.records.get_mut(id).unwrap();
-        let result = record.document.import(&packet, "peer".into())?;
-        if result.pending {
-            record.pending_packets.push(packet.clone());
-        }
-        self.queue_packet(id, packet);
-        self.persist(id).await?;
-        Ok(result)
+        let prepared = self.record(id)?.buffer.prepare_import(input)?;
+        validate_text(&prepared.preview().text, id)?;
+        Ok(prepared)
     }
-    fn apply_undo(
+
+    pub async fn commit_import(
         &mut self,
         id: &str,
-        context: UndoContext,
-        redo: bool,
-    ) -> EditorResult<Option<ChangeEvent>> {
-        self.live(id)?;
-        let record = self.records.get_mut(id).unwrap();
-        record.document.end_undo_group();
-        record.last_group.clear();
-        let before = record.document.version();
-        let event = if redo {
-            record.document.redo_with_context(context)?
+        prepared: PreparedImport,
+    ) -> EditorResult<Arc<EditorMutation>> {
+        // A hosted replica can receive accepted history even while read-only or deleted.
+        if self.record(id)?.hosted {
+            self.writable()?;
         } else {
-            record.document.undo_with_context(context)?
+            self.live(id)?;
+        }
+        let update = self
+            .records
+            .get_mut(id)
+            .unwrap()
+            .buffer
+            .commit_import(prepared)?;
+        self.accept_update(id, update, false).await
+    }
+
+    async fn accept_update(
+        &mut self,
+        id: &str,
+        update: BufferUpdate,
+        header_changed: bool,
+    ) -> EditorResult<Arc<EditorMutation>> {
+        if let Some(packet) = &update.operation {
+            self.queue_packet(id, packet.clone());
+        }
+        let committed = if header_changed || !self.record(id)?.uncommitted.is_empty() {
+            self.persist(id).await
+        } else {
+            Ok(())
         };
-        if record.document.version() != before {
-            let packet = record.document.export_updates_since(&before)?;
-            self.queue_packet(id, packet);
-        }
-        Ok(event)
+        self.publish_update(id, update, committed)
     }
-    pub async fn undo(
+
+    fn publish_update(
         &mut self,
         id: &str,
-        context: UndoContext,
-        redo: bool,
-    ) -> EditorResult<Option<ChangeEvent>> {
-        let event = self.apply_undo(id, context, redo)?;
-        if !self.record(id)?.uncommitted.is_empty() {
-            self.persist(id).await?;
+        update: BufferUpdate,
+        committed: EditorResult<()>,
+    ) -> EditorResult<Arc<EditorMutation>> {
+        if update.changed {
+            self.buffer_changed(id);
         }
-        Ok(event)
-    }
-    pub async fn undo_view(
-        &mut self,
-        id: &str,
-        context: SelectionContext,
-        redo: bool,
-    ) -> EditorResult<EditorEditResult> {
-        let event = self.apply_undo(
-            id,
-            UndoContext {
-                metadata: Some(serde_json::json!({"mainIndex":context.main_index})),
-                positions: context
-                    .ranges
-                    .iter()
-                    .flat_map(|r| [r.anchor, r.head])
-                    .collect(),
+        let history = match committed {
+            Ok(()) => HistoryCommit::Committed {
+                version: update.after.clone(),
+                durable: self.backend.persistent(),
             },
-            redo,
-        )?;
-        if !self.record(id)?.uncommitted.is_empty() {
-            let _ = self.persist(id).await;
-        }
-        let selection = event.as_ref().and_then(|e| {
-            let ranges: Vec<_> = e
-                .restored_positions
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|p| SelectionRange {
-                    anchor: p[0],
-                    head: p[1],
-                })
-                .collect();
-            (!ranges.is_empty()).then(|| SelectionContext {
-                ranges,
-                main_index: e
-                    .restored_metadata
-                    .as_ref()
-                    .and_then(|m| m.get("mainIndex"))
-                    .and_then(|m| m.as_u64())
-                    .unwrap_or(0) as usize,
-            })
-        });
-        Ok(EditorEditResult {
+            Err(error) => HistoryCommit::Failed { error },
+        };
+        let mutation = Arc::new(EditorMutation {
             document: self.read(id)?,
-            edits: event.map_or(vec![], |e| e.edits),
-            restored_selection: selection,
-        })
+            update,
+            history,
+        });
+        self.mutations.push(mutation.clone());
+        Ok(mutation)
     }
+
+    /// The owning runtime drains once after each command, including commands
+    /// that report an IO error after accepting a filesystem update.
+    pub fn take_mutations(&mut self) -> Vec<Arc<EditorMutation>> {
+        std::mem::take(&mut self.mutations)
+    }
+
     pub fn snapshot(&self, id: &str) -> EditorResult<SyncPacket> {
-        Ok(self.record(id)?.document.export_snapshot()?)
+        Ok(self.record(id)?.buffer.export_snapshot()?)
     }
     pub fn updates(&self, id: &str, version: &Version) -> EditorResult<SyncPacket> {
-        Ok(self.record(id)?.document.export_updates_since(version)?)
+        Ok(self.record(id)?.buffer.export_updates_since(version)?)
     }
     pub async fn apply_host_state(
         &mut self,
@@ -1312,7 +1254,7 @@ impl<B: Backend> EditorCore<B> {
                 &state.path,
             ));
         }
-        let version = self.record(id)?.document.version();
+        let version = self.record(id)?.buffer.version();
         if version.identity != state.version.identity
             || state.version.clocks.iter().any(|(writer, count)| {
                 *count < 0 || version.clocks.get(writer).copied().unwrap_or(0) < *count
@@ -1337,7 +1279,7 @@ impl<B: Backend> EditorCore<B> {
         record.observation.remote = state.external_change;
         record.conflict = state.conflict;
         record.error = state.error;
-        if record.document.snapshot().text == record.header.saved_text {
+        if record.buffer.snapshot().text == record.header.saved_text {
             record.first_dirty = None;
         }
         self.persist(id).await?;
@@ -1363,7 +1305,7 @@ impl<B: Backend> EditorCore<B> {
         }
         if action == "discard" {
             let record = self.record(id)?;
-            if record.document.snapshot().text != record.header.saved_text {
+            if record.buffer.snapshot().text != record.header.saved_text {
                 return Err(EditorError::new(
                     "Conflict",
                     "Host has unsaved edits; resolve the host save before discarding the client draft",
@@ -1382,7 +1324,7 @@ impl<B: Backend> EditorCore<B> {
         let packet =
             packet.ok_or_else(|| EditorError::new("InvalidEdit", "Missing client snapshot", id))?;
         if packet.data.len() > 16 * 1024 * 1024
-            || packet.identity != *self.record(id)?.document.identity()
+            || packet.identity != *self.record(id)?.buffer.identity()
         {
             return Err(EditorError::new(
                 "Conflict",
@@ -1390,7 +1332,7 @@ impl<B: Backend> EditorCore<B> {
                 id,
             ));
         }
-        let client = Document::from_snapshot(&packet, None)?;
+        let client = Buffer::from_snapshot(&packet, None)?;
         let client_text = client.snapshot().text;
         validate_text(&client_text, id)?;
         if action == "save" {
@@ -1406,19 +1348,18 @@ impl<B: Backend> EditorCore<B> {
                 ));
             }
         }
-        self.import(id, packet).await?;
+        self.apply(id, BufferCommand::Import(Import::new(packet, "replica")))
+            .await?
+            .require_committed()?;
         if action == "overwrite" {
             // Explicit overwrite chooses exactly the client's text even if the
             // host has already adopted another writer's filesystem changes.
             let state = self.read(id)?.snapshot;
-            self.edit(
-                id,
-                state.version,
-                text_difference(&state.text, &client_text),
-                SelectionContext::default(),
-                "input.overwrite".into(),
-            )
-            .await?;
+            let mut edit = Edit::replace(&state, &client_text);
+            edit.origin = "input.overwrite".into();
+            self.apply(id, BufferCommand::Edit(edit))
+                .await?
+                .require_committed()?;
             self.resolve(id, "overwrite").await
         } else {
             self.save(id, None).await
@@ -1442,7 +1383,7 @@ impl<B: Backend> EditorCore<B> {
         let record = self.record(id)?;
         if expected
             .as_ref()
-            .is_some_and(|version| version != &record.document.version())
+            .is_some_and(|version| version != &record.buffer.version())
         {
             return Err(CoreError::StaleVersion.into());
         }
@@ -1477,11 +1418,11 @@ impl<B: Backend> EditorCore<B> {
         // Reconciliation may have accepted a new version after the client's save request.
         if expected
             .as_ref()
-            .is_some_and(|version| version != &record.document.version())
+            .is_some_and(|version| version != &record.buffer.version())
         {
             return Err(CoreError::StaleVersion.into());
         }
-        let snapshot = record.document.snapshot();
+        let snapshot = record.buffer.snapshot();
         if snapshot.text == record.header.saved_text {
             let record = self.records.get_mut(id).unwrap();
             record.error = None;
@@ -1552,7 +1493,7 @@ impl<B: Backend> EditorCore<B> {
         header.disk_revision = revision;
         header.pending_write = None;
         header.disk_cursor = self.cursor(id, snapshot.version, bytes)?;
-        self.stage_observation(id, header, None).await
+        self.stage_observation(id, header, None, None).await
     }
     pub async fn resolve(&mut self, id: &str, action: &str) -> EditorResult<()> {
         if self.failure.is_some() {
@@ -1580,21 +1521,15 @@ impl<B: Backend> EditorCore<B> {
             }
             "overwrite" => {
                 if matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
-                    let desired = self.record(id)?.document.snapshot().text;
+                    let desired = self.record(id)?.buffer.snapshot().text;
                     self.merge_disk(id, disk).await?;
                     self.require_observed(id)?;
-                    let snapshot = self.record(id)?.document.snapshot();
-                    self.transact(
-                        id,
-                        Transaction {
-                            expected_version: snapshot.version,
-                            edits: text_difference(&snapshot.text, &desired),
-                            origin: "filesystem-overwrite".into(),
-                            undo_metadata: None,
-                            undo_positions: vec![],
-                        },
-                    )
-                    .await?;
+                    let snapshot = self.record(id)?.buffer.snapshot();
+                    let mut edit = Edit::replace(&snapshot, &desired);
+                    edit.origin = "filesystem-overwrite".into();
+                    self.apply(id, BufferCommand::Edit(edit))
+                        .await?
+                        .require_committed()?;
                 } else {
                     self.records.get_mut(id).unwrap().header.disk_revision = disk.revision;
                 }
@@ -1612,7 +1547,7 @@ impl<B: Backend> EditorCore<B> {
         if self.records.values().any(|r| {
             !r.header.deleted
                 && r.header.path == path
-                && r.document.snapshot().text != r.header.saved_text
+                && r.buffer.snapshot().text != r.header.saved_text
         }) {
             return Err(EditorError::new(
                 "Conflict",
@@ -1936,29 +1871,13 @@ impl<B: Backend> EditorCore<B> {
                     .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
                 to_value(self.updates(id, &version)?)
             }
-            "import" => {
-                let packet = serde_json::from_value(params["packet"].clone())
+            "apply" => {
+                let command = serde_json::from_value(params["command"].clone())
                     .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
-                let result = self.import(id, packet).await?;
-                to_value(serde_json::json!({"result":result,"document":self.read(id)?}))
-            }
-            "replace_text" => {
-                let text = params["text"]
-                    .as_str()
-                    .ok_or_else(|| EditorError::new("InvalidEdit", "Missing text", id))?;
-                let version = serde_json::from_value(params["version"].clone())
-                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
-                let edits = text_difference(&self.read(id)?.snapshot.text, text);
-                to_value(
-                    self.edit(
-                        id,
-                        version,
-                        edits,
-                        SelectionContext::default(),
-                        "input.replace".into(),
-                    )
-                    .await?,
-                )
+                self.apply(id, command).await?;
+                // The mutation itself is delivered exactly once in the runtime's
+                // mutation batch. The reply only identifies the target document.
+                to_value(id)
             }
             "open" => {
                 let path = params["path"]
@@ -1969,39 +1888,19 @@ impl<B: Backend> EditorCore<B> {
             }
             "read" => to_value(self.read(id)?),
             "resident" => to_value(self.resident()?),
-            "text_changes" => {
-                let before = params["before"]
-                    .as_str()
-                    .ok_or_else(|| EditorError::new("InvalidEdit", "Missing previous text", ""))?;
-                let after = params["after"]
-                    .as_str()
-                    .ok_or_else(|| EditorError::new("InvalidEdit", "Missing current text", ""))?;
-                to_value(text_difference(before, after))
-            }
-            "edit" => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct Edit {
-                    id: String,
-                    version: Version,
-                    edits: Vec<TextEdit>,
-                    context: SelectionContext,
-                    user_event: String,
-                }
-                let p: Edit = serde_json::from_value(params)
+            "observe_files" => {
+                let ids: Vec<String> = serde_json::from_value(params["ids"].clone())
                     .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), ""))?;
-                to_value(
-                    self.edit(&p.id, p.version, p.edits, p.context, p.user_event)
-                        .await?,
-                )
-            }
-            "undo" => {
-                let context = serde_json::from_value(params["context"].clone())
-                    .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), id))?;
-                to_value(
-                    self.undo_view(id, context, params["redo"].as_bool().unwrap_or(false))
-                        .await?,
-                )
+                let mut documents = vec![];
+                for id in ids {
+                    if let Err(error) = self.refresh(&id).await {
+                        if let Some(record) = self.records.get_mut(&id) {
+                            record.error = Some(error.message);
+                        }
+                    }
+                    documents.push(self.read(&id)?);
+                }
+                to_value(documents)
             }
             "save" => {
                 let _ = self.save(id, None).await;

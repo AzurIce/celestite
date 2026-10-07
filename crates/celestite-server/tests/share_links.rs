@@ -1,11 +1,11 @@
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
-use celestite_server::{build_server, Config, HistoryMode, Permission, Server, VaultConfig};
+use celestite_server::{Config, HistoryMode, Permission, Server, VaultConfig, build_server};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{fs, time::Duration};
 use tower::ServiceExt;
 
@@ -115,15 +115,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     )
     .await;
     assert_eq!(updates.status(), StatusCode::OK);
-    for tail in [
-        "transact",
-        "import",
-        "undo",
-        "redo",
-        "save",
-        "client-commit",
-        "retry-observation",
-    ] {
+    for tail in ["apply", "save", "client-commit", "retry-observation"] {
         assert_eq!(
             response(
                 &server.router,
@@ -151,9 +143,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
             StatusCode::FORBIDDEN
         );
     }
-    let edited = read(response(&server.router, &editor, "POST", &format!("/documents/{id}/transact"), json!({
-        "expected_version": version, "origin":"test", "edits":[{"from":0,"to":0,"insert":"edited "}], "undo_metadata":null,"undo_positions":[]
-    })).await).await;
+    let edited = read(response(&server.router, &editor, "POST", &format!("/documents/{id}/apply"), json!({"kind":"edit","base":version,"origin":"test","input":{"kind":"edits","edits":[{"from":0,"to":0,"insert":"edited "}]},"undo":{"metadata":null,"positions":[]}})).await).await;
     assert_eq!(edited["document"]["snapshot"]["text"], "edited original");
     let visible = read(
         response(
@@ -248,10 +238,12 @@ async fn shutdown_ends_both_event_feeds() {
     }
     server.shutdown.send_replace(true);
     for mut body in feeds {
-        assert!(tokio::time::timeout(Duration::from_secs(1), body.frame())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), body.frame())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -274,10 +266,12 @@ fn existing_history_automatically_acquires_a_private_seed_without_share_initiali
     assert_ne!(server.links.readonly, server.links.edit);
     assert!(!f.dir.path().join("state/shares.redb").exists());
     drop(server);
-    assert!(!fs::read(&path)
-        .unwrap()
-        .windows(key.len())
-        .any(|part| part == key.as_bytes()));
+    assert!(
+        !fs::read(&path)
+            .unwrap()
+            .windows(key.len())
+            .any(|part| part == key.as_bytes())
+    );
     let server = f.start(HistoryMode::Recover);
     assert_eq!(server.links.key(Permission::Edit), key.as_str());
     drop(server);

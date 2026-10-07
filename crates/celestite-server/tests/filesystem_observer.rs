@@ -1,8 +1,8 @@
 //! Observe through the change feed before reading a document: a GET must not be
 //! what causes these filesystem edits to enter host history.
-use celestite_server::{build_server, Config, HistoryMode, ServerConfig, VaultConfig};
+use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig, build_server};
 use reqwest::{Client, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio::{
     sync::{oneshot, watch},
@@ -161,9 +161,7 @@ async fn append(host: &Host, id: &str, state: &Value, text: &str) -> Value {
         .unwrap()
         .encode_utf16()
         .count();
-    host.request("POST", &format!("/documents/{id}/transact"), json!({
-        "expected_version": state["snapshot"]["version"], "origin": "test", "edits": [{"from":offset,"to":offset,"insert":text}],
-    })).await["document"].clone()
+    host.request("POST", &format!("/documents/{id}/apply"), json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":offset,"to":offset,"insert":text}]},"undo":{"metadata":null,"positions":[]}})).await["document"].clone()
 }
 
 #[tokio::test]
@@ -232,11 +230,8 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
     let state = host
         .request(
             "POST",
-            &format!("/documents/{id}/transact"),
-            json!({
-                "expected_version":state["snapshot"]["version"], "origin":"local",
-                "edits":[{"from":2,"to":8,"insert":"MIDDLE"}]
-            }),
+            &format!("/documents/{id}/apply"),
+            json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"local","input":{"kind":"edits","edits":[{"from":2,"to":8,"insert":"MIDDLE"}]},"undo":{"metadata":null,"positions":[]}}),
         )
         .await["document"]
         .clone();
@@ -265,7 +260,11 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
     tokio::time::sleep(Duration::from_millis(160)).await;
     assert_eq!(host.state(&id).await["snapshot"]["version"], prior);
     let undone = host
-        .request("POST", &format!("/documents/{id}/undo"), json!({}))
+        .request(
+            "POST",
+            &format!("/documents/{id}/apply"),
+            json!({"kind":"undo","base":prior}),
+        )
         .await;
     assert_eq!(undone["document"]["snapshot"]["text"], "A middle B");
     drop(feed);
@@ -339,7 +338,9 @@ async fn a_read_only_vault_still_observes_its_hosts_external_files() {
 
 #[tokio::test]
 async fn independent_replicas_follow_committed_changes_and_keep_their_personal_undo() {
-    use celestite_core::{Document, SyncPacket, TextEdit, Transaction};
+    use celestite_core::{
+        Buffer, BufferCommand, Edit, Import, SyncPacket, TextEdit, TextInput, UndoContext,
+    };
     let root = tempfile::tempdir().unwrap();
     let history = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "left middle right").unwrap();
@@ -354,27 +355,33 @@ async fn independent_replicas_follow_committed_changes_and_keep_their_personal_u
             .await,
     )
     .unwrap();
-    let mut a = Document::from_snapshot(&seed, None).unwrap();
-    let mut b = Document::from_snapshot(&seed, None).unwrap();
+    let mut a = Buffer::from_snapshot(&seed, None).unwrap();
+    let mut b = Buffer::from_snapshot(&seed, None).unwrap();
     let common = a.version();
     for (doc, from, to, text) in [(&mut a, 5, 11, "MIDDLE"), (&mut b, 12, 17, "RIGHT")] {
-        doc.transact(Transaction {
-            expected_version: doc.version(),
-            origin: "local".into(),
-            edits: vec![TextEdit {
-                from,
-                to,
-                insert: text.into(),
-            }],
-            undo_metadata: None,
-            undo_positions: vec![],
-        })
-        .unwrap();
+        let _ = doc
+            .apply(BufferCommand::Edit(Edit {
+                base: doc.version(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from,
+                        to,
+                        insert: text.into(),
+                    }],
+                },
+                origin: "local".into(),
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
+            .unwrap();
         let packet = doc.export_updates_since(&common).unwrap();
         host.request(
             "POST",
-            &format!("/documents/{id}/import"),
-            serde_json::to_value(packet).unwrap(),
+            &format!("/documents/{id}/apply"),
+            json!({"kind":"import","packet":serde_json::to_value(packet).unwrap()}),
         )
         .await;
     }
@@ -395,19 +402,22 @@ async fn independent_replicas_follow_committed_changes_and_keep_their_personal_u
             .await,
         )
         .unwrap();
-        doc.import(&packet, "host".into()).unwrap();
+        let _ = doc
+            .apply(BufferCommand::Import(Import::new((packet).clone(), "host")))
+            .unwrap();
         assert_eq!(doc.snapshot().text, "LEFT MIDDLE RIGHT");
     }
     assert_eq!(a.version(), b.version());
     let before = a.version();
-    a.undo(None).unwrap();
+    let _ = a
+        .apply(BufferCommand::Undo {
+            base: a.version(),
+            context: UndoContext::default(),
+        })
+        .unwrap();
     assert_eq!(a.snapshot().text, "LEFT middle RIGHT");
     let accepted = host
-        .request(
-            "POST",
-            &format!("/documents/{id}/import"),
-            serde_json::to_value(a.export_updates_since(&before).unwrap()).unwrap(),
-        )
+        .request("POST", &format!("/documents/{id}/apply"), json!({"kind":"import","packet":serde_json::to_value(a.export_updates_since(&before).unwrap()).unwrap()}))
         .await;
     second
         .until(&id, |notice| {
@@ -423,9 +433,16 @@ async fn independent_replicas_follow_committed_changes_and_keep_their_personal_u
         .await,
     )
     .unwrap();
-    b.import(&packet, "host".into()).unwrap();
+    let _ = b
+        .apply(BufferCommand::Import(Import::new((packet).clone(), "host")))
+        .unwrap();
     assert_eq!(a.snapshot().text, b.snapshot().text);
-    b.undo(None).unwrap();
+    let _ = b
+        .apply(BufferCommand::Undo {
+            base: b.version(),
+            context: UndoContext::default(),
+        })
+        .unwrap();
     assert_eq!(b.snapshot().text, "LEFT middle right");
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),

@@ -1,9 +1,9 @@
 //! Profile lifecycle and isolation through the public server configuration/API.
-use axum::{body::Body, http::Request, Router};
+use axum::{Router, body::Body, http::Request};
 use celestite_core::SyncPacket;
-use celestite_server::{build_server, Config, HistoryMode, VaultConfig};
+use celestite_server::{Config, HistoryMode, VaultConfig, build_server};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -239,7 +239,7 @@ async fn independent_servers_preserve_isolated_history_across_restart_and_rename
     );
     let before = ok(&router, "GET", &router.url(""), Value::Null).await;
     let route = format!(
-        "{}/documents/{}/transact",
+        "{}/documents/{}/apply",
         router.url(""),
         a["id"].as_str().unwrap()
     );
@@ -247,11 +247,7 @@ async fn independent_servers_preserve_isolated_history_across_restart_and_rename
         &router,
         "POST",
         &route,
-        json!({
-            "expected_version": a["snapshot"]["version"], "origin":"test",
-            "edits":[{"from":0,"to":0,"insert":"unsaved "}],
-            "undo_metadata":null, "undo_positions":[]
-        }),
+        json!({"kind":"edit","base":a["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":0,"to":0,"insert":"unsaved "}]},"undo":{"metadata":null,"positions":[]}}),
     )
     .await;
     let saved = &committed["document"];
@@ -287,12 +283,8 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
     ok(
         &router,
         "POST",
-        &router.url(&format!("/documents/{id}/transact")),
-        json!({
-            "expected_version":initial["snapshot"]["version"], "origin":"test",
-            "edits":[{"from":0,"to":0,"insert":"old draft "}],
-            "undo_metadata":null, "undo_positions":[]
-        }),
+        &router.url(&format!("/documents/{id}/apply")),
+        json!({"kind":"edit","base":initial["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":0,"to":0,"insert":"old draft "}]},"undo":{"metadata":null,"positions":[]}}),
     )
     .await;
     let packet = ok(
@@ -315,11 +307,11 @@ async fn explicit_reset_archives_unsaved_history_and_rejects_old_packets() {
         &router,
         "POST",
         &format!(
-            "{}/documents/{}/import",
+            "{}/documents/{}/apply",
             router.url(""),
             new["id"].as_str().unwrap()
         ),
-        packet.clone(),
+        json!({"kind":"import","packet":packet}),
     )
     .await;
     assert_eq!(status, 409);

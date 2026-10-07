@@ -310,7 +310,7 @@ export default function SyncDebug() {
                         disabled={
                           working() ||
                           state().readOnly ||
-                          !replica().document.undo.can_undo
+                          !replica().document.undo.canUndo
                         }
                         onClick={() => void session.undo(replica().name)}
                       >
@@ -321,7 +321,7 @@ export default function SyncDebug() {
                         disabled={
                           working() ||
                           state().readOnly ||
-                          !replica().document.undo.can_redo
+                          !replica().document.undo.canRedo
                         }
                         onClick={() => void session.undo(replica().name, true)}
                       >

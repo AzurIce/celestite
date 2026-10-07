@@ -5,37 +5,10 @@ import { vaultPath, ROOT_PATH, VaultError } from "../../src/lib/vault";
 import type { VaultBackend, VaultPath } from "../../src/lib/vault";
 import type { SettingsFile } from "../../src/lib/settings/app-file";
 import type { HttpVaultBackend } from "../../src/lib/vault/http";
-import {
-  openLocalEditor,
-  openRemoteEditor,
-} from "../../src/lib/editor/client/documents";
-import type { LocalEditorSource } from "../../src/lib/editor/local/worker";
-import { fakeEditorDocuments } from "./fake-documents";
-
-function localEditorResult(backend: VaultBackend, name: string) {
-  const documents = fakeEditorDocuments(backend);
-  return {
-    identity: {
-      instanceId: name,
-      vault: { vaultId: name, historyId: name },
-    },
-    backend: documents.treeBackend,
-    documents,
-  };
-}
-/** The default OPFS vault and directory connections share one factory seam. */
-function fakeLocalEditor(
-  backend: VaultBackend,
-  onDirectory?: () => void,
-): typeof openLocalEditor {
-  return async (source: LocalEditorSource) => {
-    if (source.kind === "opfs") return localEditorResult(backend, "local");
-    onDirectory?.();
-    return localEditorResult(backend, "directory");
-  };
-}
+import { createTestEditor, replaceText } from "./core-runtime";
+import type { openRemoteEditor } from "../../src/lib/editor/client/documents";
 const fakeRemoteEditor: typeof openRemoteEditor = async (_url, backend) =>
-  localEditorResult(backend, "test");
+  createTestEditor(backend);
 function files() {
   const contents = new Map<VaultPath, Uint8Array>([
     [vaultPath("a.md"), new TextEncoder().encode("old")],
@@ -56,9 +29,14 @@ function files() {
     async readFile(path) {
       return contents.get(path)!.slice();
     },
+    async readFileSnapshot(path) {
+      const data = contents.get(path)!.slice();
+      return { data, revision: Array.from(data).join(",") };
+    },
     async writeFile(path, data) {
       if (failure) throw new VaultError("IO", "save failed");
       contents.set(path, data.slice());
+      return Array.from(data).join(",");
     },
     async mkdir() {},
     async rename() {},
@@ -98,7 +76,7 @@ function setup(registry = new Registry()) {
   let calls = 0;
   const manager = new VaultManager({
     file: registry,
-    openLocalEditor: fakeLocalEditor(local.backend),
+    openLocalEditor: async () => createTestEditor(local.backend),
     openRemoteEditor: fakeRemoteEditor,
     openRemote: async () => {
       calls++;
@@ -139,7 +117,7 @@ test("the default Vault cannot be removed and opening identities isolate buffers
   });
   await local.documents.open(vaultPath("a.md"));
   const localId = local.documents.snapshot().activeId!;
-  local.documents.update(localId, "local edit");
+  replaceText(local.documents, localId, "local edit");
   await local.tree.refresh();
   local.tree.select(vaultPath("a.md"));
   await manager.connect(url);
@@ -188,7 +166,7 @@ test("failed saves keep the connection, backend and dirty buffer alive", async (
   await manager.connect(url);
   const vault = manager.snapshot().active!;
   await vault.documents.open(vaultPath("a.md"));
-  vault.documents.update(vault.documents.snapshot().activeId!, "unsaved");
+  replaceText(vault.documents, vault.documents.snapshot().activeId!, "unsaved");
   remote.setFailure();
   await assert.rejects(manager.removeConnection(vault.id));
   assert.equal(manager.snapshot().active, vault);
@@ -217,7 +195,7 @@ test("an obsolete open cannot activate after a more recent selection", async () 
     remote = files();
   const manager = new VaultManager({
     file: registry,
-    openLocalEditor: fakeLocalEditor(local.backend),
+    openLocalEditor: async () => createTestEditor(local.backend),
     openRemoteEditor: fakeRemoteEditor,
     openRemote: async () => {
       await pending;
@@ -289,10 +267,18 @@ function localDirectorySetup(registryFailure = false) {
       directories,
       pickDirectory: async () => (selected ? handle : null),
       openLocalEditor: async (source) => {
-        if (source.kind === "opfs")
-          return localEditorResult(local.backend, "local");
+        if (source.kind === "opfs") return createTestEditor(local.backend);
+        assert.equal(source.kind, "directory");
         opens++;
-        return localEditorResult(directory.backend, "directory");
+        const documents = (await createTestEditor(directory.backend)).documents;
+        return {
+          identity: {
+            instanceId: "dir",
+            vault: { vaultId: "dir", historyId: "dir" },
+          },
+          backend: documents.treeBackend,
+          documents,
+        };
       },
     });
   return {
@@ -346,7 +332,11 @@ test("denied directory permission retains the runtime and dirty edits until a ne
   await manager.openDirectory();
   const runtime = manager.snapshot().active!;
   await runtime.documents.open(vaultPath("a.md"));
-  runtime.documents.update(runtime.documents.snapshot().activeId!, "unsaved");
+  replaceText(
+    runtime.documents,
+    runtime.documents.snapshot().activeId!,
+    "unsaved",
+  );
   state.deny();
   assert.equal(await manager.activate(runtime.id), false);
   assert.match(manager.snapshot().error!, /读写权限/);
@@ -377,7 +367,7 @@ test("removing a directory forgets its handle only after saving; save failure re
   await second.openDirectory();
   const dirty = second.snapshot().active!;
   await dirty.documents.open(vaultPath("a.md"));
-  dirty.documents.update(dirty.documents.snapshot().activeId!, "unsaved");
+  replaceText(dirty.documents, dirty.documents.snapshot().activeId!, "unsaved");
   failure.directory.setFailure();
   await assert.rejects(second.removeConnection(dirty.id));
   assert.equal(failure.records.size, 1);
@@ -403,7 +393,7 @@ test("readonly and edit shares of one Vault keep separate instances and non-secr
   const local = files();
   const manager = new VaultManager({
     file: registry,
-    openLocalEditor: fakeLocalEditor(local.backend),
+    openLocalEditor: async () => createTestEditor(local.backend),
     openRemoteEditor: fakeRemoteEditor,
     openRemote: async (url) => ({
       backend: files().backend as HttpVaultBackend,

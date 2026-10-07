@@ -48,13 +48,33 @@ pub fn difference(before: &str, after: &str) -> Vec<TextEdit> {
 pub(crate) fn validate_edits(text: &str, edits: &[TextEdit]) -> Result<Vec<TextEdit>, CoreError> {
     let mut previous: Option<&TextEdit> = None;
     let mut useful = Vec::new();
+    // Ranges are ordered. Resolve all endpoints in one pass, including the
+    // large scripts produced by filesystem diffs, instead of rescanning text
+    // from the beginning for every endpoint.
+    let mut units = 0;
+    let mut byte = 0;
+    let mut advance = |offset| {
+        while units < offset {
+            let ch = text[byte..]
+                .chars()
+                .next()
+                .ok_or(CoreError::InvalidPosition { offset })?;
+            units += ch.len_utf16();
+            byte += ch.len_utf8();
+        }
+        if units == offset {
+            Ok(byte)
+        } else {
+            Err(CoreError::InvalidPosition { offset })
+        }
+    };
     for edit in edits {
         if edit.from > edit.to || previous.is_some_and(|p| p.to > edit.from || p.from == edit.from)
         {
             return Err(CoreError::InvalidEdits);
         }
-        let from = utf16_to_byte(text, edit.from)?;
-        let to = utf16_to_byte(text, edit.to)?;
+        let from = advance(edit.from)?;
+        let to = advance(edit.to)?;
         if text[from..to] != edit.insert {
             useful.push(edit.clone());
         }

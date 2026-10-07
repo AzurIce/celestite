@@ -41,7 +41,7 @@ impl From<crate::CoreError> for EditorError {
     fn from(error: crate::CoreError) -> Self {
         let code = match error {
             crate::CoreError::FilesystemDiffTimeout => "FilesystemDiffTimeout",
-            crate::CoreError::StaleVersion => "StaleVersion",
+            crate::CoreError::StaleVersion | crate::CoreError::StalePreparation => "StaleVersion",
             crate::CoreError::IdentityMismatch
             | crate::CoreError::WriterCollision
             | crate::CoreError::WriterAlreadyUsed { .. } => "Conflict",

@@ -5,9 +5,7 @@ import { PreviewHost } from "../preview/host";
 import type { EditorHost } from "./host";
 import type {
   InstanceIdentity,
-  SelectionContext,
-  TextEdit,
-  Version,
+  BufferCommand,
   WorkerMessage,
   WorkerRequest,
   ServiceEvent,
@@ -19,8 +17,7 @@ export type EditorWorkerHost = Pick<
   | "executePreview"
   | "open"
   | "read"
-  | "edit"
-  | "undo"
+  | "apply"
   | "retryHistory"
   | "retryObservation"
   | "save"
@@ -35,7 +32,16 @@ export type EditorWorkerHost = Pick<
     scope: import("../../vault/file-system-access").LocalDirectoryHandle,
   ) => Promise<void>;
 };
-export async function serveEditorWorker(
+export interface EditorServicePort {
+  postMessage(message: WorkerMessage): void;
+  addEventListener(
+    type: "message",
+    listener: (event: MessageEvent<WorkerRequest>) => void,
+  ): void;
+}
+/** The same serialized service can be carried by a Worker, IPC or an in-process port. */
+export async function serveEditor(
+  port: EditorServicePort,
   create: (
     emit: (event: ServiceEvent) => void,
     schedule: (task: () => Promise<unknown>) => void,
@@ -45,13 +51,6 @@ export async function serveEditorWorker(
     dispose: () => void;
   }>,
 ) {
-  const port = self as unknown as {
-    postMessage(message: WorkerMessage): void;
-    addEventListener(
-      type: "message",
-      listener: (event: MessageEvent<WorkerRequest>) => void,
-    ): void;
-  };
   const sessionId = crypto.randomUUID();
   let host: EditorWorkerHost;
   let previews: PreviewHost;
@@ -117,21 +116,8 @@ export async function serveEditorWorker(
           return host.open(vaultPath(String(p.path)));
         case "read":
           return host.read(String(p.id));
-        case "edit":
-          return host.edit(
-            String(p.id),
-            p.version as Version,
-            p.edits as TextEdit[],
-            p.context as SelectionContext,
-            String(p.userEvent),
-          );
-        case "undo":
-          return host.undo(
-            String(p.id),
-            p.context as SelectionContext,
-            Boolean(p.redo),
-            p.version as Version | undefined,
-          );
+        case "apply":
+          return host.apply(String(p.id), p.command as BufferCommand);
         case "retry_history":
           return host.retryHistory(String(p.id));
         case "retry_observation":

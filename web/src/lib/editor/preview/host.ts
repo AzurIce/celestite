@@ -32,6 +32,11 @@ export class PreviewHost {
     private emit: (event: PreviewEvent) => void,
     private schedule: (task: () => Promise<unknown>) => void,
     private resources: PreviewResources,
+    private createExecutor: () => Worker = () =>
+      new Worker(new URL("./worker.ts", import.meta.url), {
+        type: "module",
+        name: "celestite-preview",
+      }),
   ) {}
   private async drain() {
     for (const event of await this.execute("preview_events", {})) {
@@ -98,10 +103,7 @@ export class PreviewHost {
     }
   }
   private createWorker() {
-    const worker = new Worker(new URL("./worker.ts", import.meta.url), {
-      type: "module",
-      name: "celestite-preview",
-    });
+    const worker = this.createExecutor();
     worker.addEventListener(
       "message",
       (event: MessageEvent<PreviewWorkerMessage>) => {
@@ -270,22 +272,29 @@ export class PreviewHost {
         });
     });
   }
+  private async interrupt() {
+    // Terminating the executor must also release its core task, including a
+    // stale task still occupying the single-flight slot after text/environment
+    // changes. Otherwise no executor remains to deliver that task's completion.
+    try {
+      if (this.running)
+        await this.execute("preview_complete", {
+          completion: {
+            taskId: this.running.ticket.taskId,
+            outcome: { kind: "failure", message: "预览执行器已重启，请重试。" },
+          },
+        });
+    } finally {
+      this.stopWorker();
+    }
+  }
   async retry(id: string) {
-    // A shared executor may be processing another subscribed document. Report
-    // its interruption before revoking this executor, so it cannot remain busy.
-    if (this.running)
-      await this.execute("preview_complete", {
-        completion: {
-          taskId: this.running.ticket.taskId,
-          outcome: { kind: "failure", message: "预览执行器已重启，请重试。" },
-        },
-      });
-    this.stopWorker();
+    await this.interrupt();
     this.assetSnapshots.delete(id);
     return this.execute("preview_retry", { id });
   }
   async invalidateProject() {
-    this.stopWorker();
+    await this.interrupt();
     this.assetSnapshots.clear();
     await this.execute("preview_invalidate_project", {});
   }

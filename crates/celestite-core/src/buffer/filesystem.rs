@@ -8,13 +8,13 @@ use web_time::Instant;
 pub(crate) const DIFF_BUDGET: Duration = Duration::from_secs(5);
 
 pub(crate) struct FilesystemChange {
-    branch: LoroDoc,
+    branch: Buffer,
     base: Version,
     expected: String,
 }
 
 impl FilesystemChange {
-    pub(crate) fn new(branch: LoroDoc, base: Version, expected: String) -> Self {
+    pub(crate) fn new(branch: Buffer, base: Version, expected: String) -> Self {
         Self {
             branch,
             base,
@@ -23,47 +23,20 @@ impl FilesystemChange {
     }
 
     pub(crate) fn compute(
-        self,
+        mut self,
         new_text: &str,
         budget: Duration,
-    ) -> Result<(SyncPacket, Version), CoreError> {
+    ) -> Result<(Option<SyncPacket>, Version), CoreError> {
         let deadline = Instant::now() + budget;
         let edits = difference(&self.expected, new_text, deadline)?;
-        let text = self.branch.get_text("source");
-        for edit in edits.iter().rev() {
-            check_deadline(deadline)?;
-            if edit.to > edit.from {
-                text.delete_utf16(edit.from, edit.to - edit.from)
-                    .map_err(crdt_error)?;
-            }
-            if !edit.insert.is_empty() {
-                text.insert_utf16(edit.from, &edit.insert)
-                    .map_err(crdt_error)?;
-            }
-        }
         check_deadline(deadline)?;
-        self.branch.set_next_commit_origin("filesystem");
-        self.branch.commit();
-        let version = Version {
-            identity: self.base.identity.clone(),
-            clocks: self
-                .branch
-                .state_vv()
-                .iter()
-                .filter(|(_, count)| **count > 0)
-                .map(|(peer, count)| (peer.to_string(), *count))
-                .collect(),
-        };
-        let packet = SyncPacket {
-            identity: self.base.identity.clone(),
-            kind: PacketKind::Updates,
-            data: self
-                .branch
-                .export(ExportMode::updates(&version_vector(&self.base)?))
-                .map_err(crdt_error)?,
-        };
+        // This is a detached Buffer, not another implementation of CRDT editing.
+        // A timeout discards the whole branch; the live Buffer is never touched.
+        let mut edit = Edit::new(self.base.clone(), edits);
+        edit.origin = "filesystem".into();
+        let update = self.branch.apply(BufferCommand::Edit(edit))?;
         check_deadline(deadline)?;
-        Ok((packet, version))
+        Ok((update.operation, update.after))
     }
 }
 

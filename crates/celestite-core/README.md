@@ -2,41 +2,56 @@
 
 Celestite 的统一 Rust 编辑器内核。`EditorCore<Backend>` 注入平台 IO，管理文档身份、CRDT、个人撤销、私有历史、文件保存、外部冲突与目录操作恢复。不依赖 HTTP、Solid 或 CodeMirror。
 
-下层 `Document` 使用 `LoroText("source")`，固定 `loro = 1.16.2`，提供：
+[`Buffer`](src/buffer/mod.rs) 是一份已加载文本历史的本地副本，可以直接使用，不需要先创建 EditorCore、Backend 或协作连接。它使用 `LoroText("source")`，固定 `loro = 1.16.2`，提供：
 
 - 先完整验证、再提交的 UTF-16 编辑事务与因果版本检查。
 - 完整快照和增量交换、乱序 / 重复更新、文档和历史身份校验。
 - 插入亲和性的锚点，以及保留远端修改的本地撤销 / 重做。
-- 显式撤销组、全部撤销位置转换、不参与 CRDT 的宿主元数据。
-- 操作结束后排队交付的变更事件，不在 CRDT 提交中回调宿主。
+- 调用方显式指定的撤销组、全部撤销位置转换、不参与 CRDT 的宿主元数据。
+- 同步返回一次命令的完整结果，不持有事件队列，也不在提交中回调调用方。
 
 ```rust
-use celestite_core::{Document, DocumentIdentity, TextEdit, Transaction};
+use celestite_core::{Buffer, BufferCommand, DocumentIdentity, Edit, TextEdit};
 
-let mut document = Document::new(
+let mut buffer = Buffer::new(
     DocumentIdentity { document_id: "file-1".into(), history_id: "history-1".into() },
     None,
     "hello",
 )?;
-document.transact(Transaction {
-    expected_version: document.version(),
-    origin: "headless".into(),
-    edits: vec![TextEdit { from: 5, to: 5, insert: " world".into() }],
-    undo_metadata: None,
-    undo_positions: vec![],
-})?;
-assert_eq!(document.snapshot().text, "hello world");
+let update = buffer.apply(BufferCommand::Edit(Edit::new(
+    buffer.version(),
+    vec![TextEdit { from: 5, to: 5, insert: " world".into() }],
+)))?;
+assert_eq!(buffer.snapshot().text, "hello world");
+assert!(update.changed);
+assert!(update.local_operation().is_some());
 # Ok::<(), celestite_core::CoreError>(())
 ```
 
-一个逻辑文档只创建一次历史，其他副本通过 `Document::from_snapshot` 加入，使用新的 writer。独立地用相同初始字符串创建两个文档不会建立共同历史。writer ID 是当前内核实例的身份；恢复时使用新 writer，撤销栈不随 CRDT 历史持久化。`revision` 仅在当前实例内递增，跨实例比较使用 `Version`。
+### 命令与结果
+
+[`BufferCommand`](src/buffer/types.rs) 只有 `Edit`、`Undo`、`Redo`、`Import`、`ClearUndo`。编辑输入可以是 UTF-16 区间，也可以是整份目标正文；后者由 Buffer 转换成同一条编辑路径。带坐标的命令显式携带 `base` 版本。`Edit.group` 为 `None` 时独立成步，相邻且相同的组 ID 合并成步；真实导入、撤销和重做终止当前组。无效输入和真正的 no-op 不改变分组。
+
+每次 `apply` 返回一份 `BufferUpdate`：前后版本、UTF-16 长度、显示增量、个人撤销状态、恢复上下文，以及精确的原始操作包。no-op 的 `changed` 为 false 且没有操作包；依赖未齐的导入仍返回待持久化的原包。`operation` 用于历史提交，`local_operation()` 只返回本地编辑 / 撤销 / 重做产生的操作，不把导入当作本地修改重新发出。操作字节以不可变 `Arc<[u8]>` 共享，不随各消费者复制。
+
+BufferUpdate 不携带整份正文；调用方按需获取 `snapshot()`。快照导出用于加入 / 恢复，按版本导出用于反熵补齐，不能代替一次命令已经返回的操作包。
+
+### 导入准入
+
+[`prepare_import`](src/buffer/history.rs) 只试算一次，包含所有待补齐依赖，返回不可复制、不可序列化的 `PreparedImport`。调用方读取预期正文、版本和 pending 状态，完成配额、会话权限或提交前检查，再把该值交给 `commit_import`。后者核对实例和 revision，并在原 Buffer 上应用原始操作，不重新 fork，也不替换活动 LoroDoc。另一个 Buffer、正文更新、撤销状态变化或新待补齐包都会使准备结果过期；丢弃准备结果不会改动 Buffer。
+
+文件系统差异在隔离的历史 Buffer 上执行同一 `apply`，直接使用返回的操作包。协调器提交准备好的历史后再应用同一个准备结果；失败保留正文和重试意图。
+
+一个逻辑文档只创建一次历史，其他副本通过 `Buffer::from_snapshot` 加入，使用新的 writer。导出共享快照不替换原 Buffer，也不清空其个人撤销。独立地用相同初始字符串创建两个 Buffer 不会建立共同历史。writer 是这份 Buffer 的写入身份；恢复时使用新 writer，撤销栈不随 CRDT 历史持久化。`revision` 仅在当前实例内递增，跨实例比较使用 `Version`。`DocumentIdentity` 仍表示逻辑文档 / 历史身份，存储与网络中的 document ID 不因内存对象名而改变。
 
 ```sh
 cargo test -p celestite-core
 cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 ```
 
-默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `DocumentBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<BrowserBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录并可配置 redb 历史存储。64 位 writer ID 在 JSON 中保持字符串。
+默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `BufferBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<BrowserBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录并可配置 redb 历史存储。64 位 writer ID 在 JSON 中保持字符串。
+
+`BufferBinding` 直接拥有 Buffer，`apply(commandJson)` 同步返回 `BufferUpdate`，其余接口仅用于读取、锚点和历史导出。没有第二套编辑方法或通知队列。EditorBinding / MemoryEditorBinding 的 `call(method, paramsJson)` 异步返回 `{ status, value | error, mutations }`；即便文件 IO 最终失败，先前已接受的修改仍会随同返回。Worker 先消费 mutations，再处理命令结果。
 
 ## Backend 与服务接口
 
@@ -50,7 +65,11 @@ cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 
 [`MemoryBackend`](src/memory.rs) 是公开的 `Backend` 实现，以 `BTreeMap<String, StoredDocument>` 保存文档头、初始 CRDT 快照与增量 journal。`commit()` 校验序号与重发内容后更新记录，`load()` 返回内存记录，`replace_volatile_documents()` 原子替换整批记录并清空增量。它的 `persistent()` 和 `has_projection()` 均为 `false`，文件与目录 IO 返回 `Unsupported`；编辑与撤销由 `EditorCore` 中的活动文档执行。后端随 core 释放，不跨 Worker 或进程重启保留数据。
 
-core 提供类型化的 `open_file`、`read`、`edit` / `transact`、`undo`、`import`、`save`、`resolve`、`rename`、`remove` 等 Rust 方法，`execute_service(method, params)` 提供 Worker / IPC 可序列化入口。Web 包装只管理请求队列、事件序号、视图投影和定时器；自动保存延迟由 core 返回。
+EditorCore 的文本入口统一为 `apply(id, BufferCommand)`，返回 `EditorMutation { document, update, history }`。只有准入失败返回错误；已接受修改的历史提交结果单独表达为 `HistoryCommit::Committed` 或 `Failed`。网络确认和文件保存通过 `require_committed()` 检查提交状态，不能把提交失败误判成文本未修改。
+
+所有活动 Buffer 的结果经同一个流程登记历史、更新派生状态并发布。运行时在每次命令后调用 `take_mutations()` 取走批次；WASM 的 `call` 自动执行该步骤。Rust 返回值和批次共享同一回执，重试历史 IO 不产生第二次文本修改。`open_file`、`read`、`save`、`resolve`、`rename`、`remove` 等负责文档集合与文件业务，不另建编辑历史。
+
+Web 使用同一处理层消费 Buffer 结果、维护版本化视图映射并交付命令回复 / 外部变化。远端只发送结果中的本地操作包，不在编辑或撤销后另行导出；本机目录不从前后字符串重新猜测差异。视图端按输入时间和显式 Vim 会话选择组 ID，core 不解释 UI 命令名称。
 
 映射普通目录的实例可用 `ExternalChangePolicy::Merge` 协调外部修改。设置 `EditorOptions.defer_filesystem_diff = true` 后，`refresh` 只安排任务；平台通过 `take_file_observation()` 取得隔离历史分支，在锁外运行 `FileObservationTask::compute()`，再调用 `complete_file_observation()`。core 重读磁盘并校验文档身份、路径、基线与观察序号，允许协作历史在计算期间推进。未采用后台执行的独占 core 使用相同算法内联计算。
 

@@ -4,18 +4,18 @@ use crate::vault::{
     documents::{DocumentState, Documents},
     fs::{ChangeHint, FsVault, Result, VaultError},
 };
-use crate::{failure, ApiError, HostedVault, RemoteAccess, ServerState};
+use crate::{ApiError, HostedVault, RemoteAccess, ServerState, failure};
 use axum::{
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, State},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Extension, Json, Router,
 };
-use celestite_core::{ChangeEvent, ImportResult, SyncPacket, Transaction, UndoContext, Version};
-use serde::{Deserialize, Serialize};
+use celestite_core::{BufferCommand, EditorMutation, SyncPacket, Version};
+use serde::Deserialize;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
 
@@ -27,10 +27,7 @@ pub(crate) fn routes() -> Router<Arc<ServerState>> {
         .route("/{id}/api/v1/documents/{document}", get(state))
         .route("/{id}/api/v1/documents/{document}/snapshot", get(snapshot))
         .route("/{id}/api/v1/documents/{document}/updates", post(updates))
-        .route("/{id}/api/v1/documents/{document}/import", post(import))
-        .route("/{id}/api/v1/documents/{document}/transact", post(transact))
-        .route("/{id}/api/v1/documents/{document}/undo", post(undo))
-        .route("/{id}/api/v1/documents/{document}/redo", post(redo))
+        .route("/{id}/api/v1/documents/{document}/apply", post(apply))
         .route("/{id}/api/v1/documents/{document}/save", post(save))
         .route(
             "/{id}/api/v1/documents/{document}/retry-observation",
@@ -85,12 +82,6 @@ pub(crate) async fn run_documents_with_tree<T: Send + 'static>(
     .await
     .map_err(|_| failure("IO", "Document operation failed"))?
     .map_err(Into::into)
-}
-
-#[derive(Serialize)]
-struct Reply<T: Serialize> {
-    result: T,
-    document: DocumentState,
 }
 
 async fn list(
@@ -176,75 +167,15 @@ async fn updates(
     ))
 }
 
-async fn transact(
+async fn apply(
     Extension(access): Extension<RemoteAccess>,
     Path((_key, document)): Path<(String, String)>,
-    Json(transaction): Json<Transaction>,
-) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
+    Json(command): Json<BufferCommand>,
+) -> std::result::Result<Json<Arc<EditorMutation>>, ApiError> {
     Ok(Json(
         run_documents(access.grant.vault.clone(), true, move |files, docs| {
             docs.refresh(files, &document)?;
-            let result = docs.transact(&document, transaction)?;
-            Ok(Reply {
-                result,
-                document: docs.state(files, &document)?,
-            })
-        })
-        .await?,
-    ))
-}
-
-async fn import(
-    Extension(access): Extension<RemoteAccess>,
-    Path((_key, document)): Path<(String, String)>,
-    Json(packet): Json<SyncPacket>,
-) -> std::result::Result<Json<Reply<ImportResult>>, ApiError> {
-    Ok(Json(
-        run_documents(access.grant.vault.clone(), true, move |files, docs| {
-            docs.refresh(files, &document)?;
-            let bytes = packet.data.len();
-            let kind = packet.kind;
-            let result = docs.import(&document, packet)?;
-            let state = docs.state(files, &document)?;
-            tracing::info!(document_id = %document, ?kind, bytes, pending = result.pending, changed = result.event.is_some(), persistent_history = docs.persistent(), durable = state.durable_version.as_ref() == Some(&state.snapshot.version), "CRDT packet imported");
-            tracing::debug!(document_id = %document, version = ?state.snapshot.version, durable_version = ?state.durable_version, "CRDT import receipt");
-            Ok(Reply {
-                result,
-                document: state,
-            })
-        })
-        .await?,
-    ))
-}
-
-async fn undo(
-    Extension(access): Extension<RemoteAccess>,
-    Path((_key, document)): Path<(String, String)>,
-    Json(context): Json<UndoContext>,
-) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
-    history(access, document, context, false).await
-}
-async fn redo(
-    Extension(access): Extension<RemoteAccess>,
-    Path((_key, document)): Path<(String, String)>,
-    Json(context): Json<UndoContext>,
-) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
-    history(access, document, context, true).await
-}
-async fn history(
-    access: RemoteAccess,
-    document: String,
-    context: UndoContext,
-    redo: bool,
-) -> std::result::Result<Json<Reply<Option<ChangeEvent>>>, ApiError> {
-    Ok(Json(
-        run_documents(access.grant.vault.clone(), true, move |files, docs| {
-            docs.refresh(files, &document)?;
-            let result = docs.undo(&document, context, redo)?;
-            Ok(Reply {
-                result,
-                document: docs.state(files, &document)?,
-            })
+            docs.apply(&document, command)
         })
         .await?,
     ))
@@ -345,7 +276,7 @@ mod tests {
     use crate::testing::Host;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tower::ServiceExt;
 
     async fn request(router: &Host, method: &str, path: &str, body: Value) -> Value {
@@ -428,14 +359,11 @@ mod tests {
         // requested any snapshot or polled the next frame.
         for _ in 0..140 {
             let end = state["snapshot"]["text"].as_str().unwrap().len();
-            let transaction = json!({
-                "expected_version":state["snapshot"]["version"],"origin":"test",
-                "edits":[{"from":end,"to":end,"insert":"x"}]
-            });
+            let transaction = json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":end,"to":end,"insert":"x"}]},"undo":{"metadata":null,"positions":[]}});
             state = request(
                 &router,
                 "POST",
-                &format!("/documents/{id}/transact"),
+                &format!("/documents/{id}/apply"),
                 transaction,
             )
             .await["document"]
@@ -455,11 +383,8 @@ mod tests {
         state = request(
             &router,
             "POST",
-            &format!("/documents/{id}/transact"),
-            json!({
-                "expected_version":state["snapshot"]["version"],"origin":"test",
-                "edits":[{"from":end,"to":end,"insert":"y"}]
-            }),
+            &format!("/documents/{id}/apply"),
+            json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":end,"to":end,"insert":"y"}]},"undo":{"metadata":null,"positions":[]}}),
         )
         .await["document"]
             .clone();
@@ -474,9 +399,11 @@ mod tests {
             state["snapshot"]["version"]
         );
         stopping.send_replace(true);
-        assert!(tokio::time::timeout(Duration::from_secs(5), body.frame())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

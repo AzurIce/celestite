@@ -6,9 +6,10 @@ import type {
   VaultBackend,
   WriteFileOptions,
 } from "../../vault/types";
-import type { DocumentsSnapshot } from "../documents";
+import type { DocumentsSnapshot } from "../contract";
 import { EditorClient } from "../rpc";
-import { rebaseInputs } from "../view-changes";
+import { rebaseInputs, sameVersion } from "../view-changes";
+import { EditGroups, undoContext } from "../commands";
 import type { DocumentPreviews, PreviewState } from "../preview/contract";
 import type {
   ConnectionState,
@@ -17,12 +18,17 @@ import type {
   SelectionContext,
   ServiceDocument,
   ViewEdit,
+  Version,
 } from "../contract";
 
+interface PendingInput extends ViewEdit {
+  group: string | null;
+}
 interface ViewRecord extends EditorDocument {
   savedContent: string;
   acceptedContent: string;
-  inputs: ViewEdit[];
+  acceptedVersion?: Version;
+  inputs: PendingInput[];
   blocked: boolean;
 }
 function within(path: VaultPath, parent: VaultPath) {
@@ -54,6 +60,7 @@ export class WorkerDocuments {
   private connection?: ConnectionState;
   private replacingSession = false;
   private records = new Map<string, ViewRecord>();
+  private groups = new EditGroups();
   private treeListeners = new Set<Parameters<VaultBackend["watch"]>[0]>();
   private listeners = new Set<(state: DocumentsSnapshot) => void>();
   private queue: Promise<unknown> = Promise.resolve();
@@ -155,8 +162,14 @@ export class WorkerDocuments {
       conflictResolving: this.conflictResolving,
       conflictError: this.conflictError,
       documents: [...this.records.values()].map((record) => {
-        const { inputs, savedContent, acceptedContent, blocked, ...document } =
-          record;
+        const {
+          inputs,
+          savedContent,
+          acceptedContent,
+          acceptedVersion,
+          blocked,
+          ...document
+        } = record;
         return {
           ...document,
           locked: document.locked || blocked,
@@ -219,15 +232,23 @@ export class WorkerDocuments {
     if (!record) return;
     const { content, savedContent, change, ...metadata } = document;
     if (change && content !== undefined) {
-      if (record.acceptedContent !== change.before) {
+      if (
+        !record.acceptedVersion ||
+        !sameVersion(record.acceptedVersion, change.before)
+      ) {
         record.blocked = true;
         record.error = "远端投影版本不连续，输入仍保留。请复制正文后重新连接。";
         record.inputFailure = { outcome: "projection", message: record.error };
         return;
       }
       const beforeProjection = record.content;
-      const rebased = rebaseInputs(change.before, change.edits, record.inputs);
+      const rebased = rebaseInputs(
+        record.acceptedContent,
+        change.edits,
+        record.inputs,
+      );
       record.acceptedContent = content;
+      record.acceptedVersion = document.core?.version;
       record.content = rebased.content;
       record.remoteChange = { before: beforeProjection, edits: rebased.edits };
     } else if (
@@ -236,6 +257,7 @@ export class WorkerDocuments {
     ) {
       record.content = content;
       record.acceptedContent = content;
+      record.acceptedVersion = document.core?.version;
     }
     Object.assign(record, metadata);
     if (savedContent !== undefined) record.savedContent = savedContent;
@@ -343,8 +365,10 @@ export class WorkerDocuments {
           ...document,
           content: document.content ?? "",
           acceptedContent: document.content ?? "",
+          acceptedVersion: document.core?.version,
           savedContent: document.savedContent ?? "",
           dirty: false,
+          saving: false,
           locked: false,
           reloadVersion: 0,
           inputs: [],
@@ -372,10 +396,6 @@ export class WorkerDocuments {
     // inputs, so held remote updates cannot split a composition.
     void (active ? send() : this.enqueue(send)).catch(() => {});
   }
-  /** Full-text writes are deliberately unavailable on the worker edit path. */
-  update(_id: string, _content: string) {
-    return false;
-  }
   edit(id: string, input: ViewEdit): boolean {
     const record = this.records.get(id);
     if (
@@ -388,20 +408,23 @@ export class WorkerDocuments {
       (this.connection && this.connection.status !== "online")
     )
       return false;
+    const pending = { ...input, group: this.groups.next(id, input.userEvent) };
     record.content = input.content;
-    record.inputs.push(input);
+    record.inputs.push(pending);
     this.notify();
-    void this.enqueue(() => this.performEdit(record, input)).catch((error) => {
-      record.blocked = true;
-      record.error = `编辑尚未确认，输入已保留。${error instanceof Error ? error.message : String(error)}`;
-      record.inputFailure = { outcome: "unknown", message: record.error };
-      this.notify();
-    });
+    void this.enqueue(() => this.performEdit(record, pending)).catch(
+      (error) => {
+        record.blocked = true;
+        record.error = `编辑尚未确认，输入已保留。${error instanceof Error ? error.message : String(error)}`;
+        record.inputFailure = { outcome: "unknown", message: record.error };
+        this.notify();
+      },
+    );
     return true;
   }
   private async performEdit(
     record: ViewRecord,
-    input: ViewEdit,
+    input: PendingInput,
   ): Promise<boolean> {
     if (!record.inputs.includes(input)) return true;
     if (
@@ -412,12 +435,16 @@ export class WorkerDocuments {
       return false;
     if (record.inputs[0] !== input)
       throw new VaultError("IO", "待确认输入顺序不连续。");
-    const result = await this.client.request("edit", {
+    const result = await this.client.request("apply", {
       id: record.id,
-      version: record.core!.version,
-      edits: input.edits,
-      context: input.before,
-      userEvent: input.userEvent,
+      command: {
+        kind: "edit",
+        base: record.acceptedVersion!,
+        input: { kind: "edits", edits: input.edits },
+        undo: undoContext(input.before),
+        origin: input.userEvent,
+        group: input.group,
+      },
     });
     if (result.rejection) {
       record.blocked = true;
@@ -431,6 +458,7 @@ export class WorkerDocuments {
     }
     record.inputs.shift();
     record.acceptedContent = result.document.content ?? input.content;
+    record.acceptedVersion = result.document.core?.version;
     this.merge(result.document);
     this.notify();
     return !record.core?.historyError;
@@ -493,15 +521,23 @@ export class WorkerDocuments {
     try {
       return await this.enqueue(async () => {
         if (!(await this.flushInputs(record))) return false;
-        const result = await this.client.request("undo", {
+        this.groups.break(id);
+        const result = await this.client.request("apply", {
           id,
-          context:
-            queued && record.restoredSelection
-              ? record.restoredSelection
-              : context,
-          redo,
-          version: record.core!.version,
+          command: {
+            kind: redo ? "redo" : "undo",
+            base: record.acceptedVersion!,
+            context: undoContext(
+              queued && record.restoredSelection
+                ? record.restoredSelection
+                : context,
+            ),
+          },
         });
+        if (result.rejection) {
+          record.error = result.rejection.message;
+          return false;
+        }
         record.content = applyEdits(record.content, result.edits);
         this.merge(result.document);
         if (result.restoredSelection)
@@ -544,6 +580,8 @@ export class WorkerDocuments {
   }
   private async saveRecord(record: ViewRecord) {
     if (!this.online()) return false;
+    record.saving = true;
+    this.notify();
     try {
       if (!(await this.flushInputs(record))) return false;
       const result = await this.client.request("save", {
@@ -556,6 +594,9 @@ export class WorkerDocuments {
       record.error = String(error);
       this.notify();
       return false;
+    } finally {
+      record.saving = false;
+      this.notify();
     }
   }
   async saveAll() {
@@ -675,6 +716,7 @@ export class WorkerDocuments {
   }
   private forget(id: string) {
     this.records.delete(id);
+    this.groups.break(id);
     if (this.activeId === id)
       this.activeId = [...this.records.keys()][this.records.size - 1] ?? null;
     if (this.conflictPrompt?.id === id) this.conflictPrompt = null;

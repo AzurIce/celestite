@@ -19,7 +19,7 @@ fn real_distributed_rewrites_complete_and_preserve_the_exact_disk_branch() {
             include_str!("../../tests/fixtures/filesystem/content-functions.after.txt"),
         ),
     ] {
-        let mut doc = Document::new(
+        let mut doc = Buffer::new(
             DocumentIdentity {
                 document_id: name.into(),
                 history_id: "history".into(),
@@ -37,15 +37,20 @@ fn real_distributed_rewrites_complete_and_preserve_the_exact_disk_branch() {
             .unwrap();
         eprintln!("{name}: {:.2} ms", started.elapsed().as_secs_f64() * 1000.);
         assert_eq!(doc.snapshot(), live);
-        doc.import(&packet, "filesystem".into()).unwrap();
+        let _ = doc
+            .apply(BufferCommand::Import(Import::new(
+                packet.unwrap(),
+                "filesystem",
+            )))
+            .unwrap();
         assert_eq!(doc.snapshot().text, after);
         assert_eq!(doc.historical_text(&version).unwrap(), after);
     }
 }
 
 #[test]
-fn historical_diff_does_not_mutate_live_undo_anchors_or_subscribers() {
-    let mut doc = Document::new(
+fn historical_diff_does_not_mutate_the_live_buffer_or_personal_history() {
+    let mut doc = Buffer::new(
         DocumentIdentity {
             document_id: "doc".into(),
             history_id: "history".into(),
@@ -56,20 +61,24 @@ fn historical_diff_does_not_mutate_live_undo_anchors_or_subscribers() {
     .unwrap();
     let disk = doc.version();
     let writer = doc.writer_id();
-    let subscription = doc.subscribe();
-    doc.transact(Transaction {
-        expected_version: disk.clone(),
-        origin: "local".into(),
-        edits: vec![TextEdit {
-            from: 2,
-            to: 8,
-            insert: "MIDDLE".into(),
-        }],
-        undo_metadata: None,
-        undo_positions: vec![],
-    })
-    .unwrap();
-    subscription.recv().unwrap();
+    let _ = doc
+        .apply(BufferCommand::Edit(Edit {
+            base: disk.clone(),
+            input: TextInput::Edits {
+                edits: vec![TextEdit {
+                    from: 2,
+                    to: 8,
+                    insert: "MIDDLE".into(),
+                }],
+            },
+            origin: "local".into(),
+            group: None,
+            undo: UndoContext {
+                metadata: None,
+                positions: vec![],
+            },
+        }))
+        .unwrap();
     let anchor = doc.anchor_at(5, Affinity::After).unwrap();
     let before = doc.snapshot();
     let undo = doc.undo_state();
@@ -80,23 +89,30 @@ fn historical_diff_does_not_mutate_live_undo_anchors_or_subscribers() {
         .unwrap();
     assert_eq!(doc.snapshot(), before);
     assert_eq!(doc.undo_state(), undo);
-    assert!(matches!(
-        subscription.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    doc.import(&packet, "filesystem".into()).unwrap();
-    let event = subscription.recv().unwrap();
-    assert_eq!(event.after.text, "A1 MIDDLE B1");
+    let update = doc
+        .apply(BufferCommand::Import(Import::new(
+            packet.unwrap(),
+            "filesystem",
+        )))
+        .unwrap();
+    assert_eq!(update.after, doc.version());
+    assert!(update.local_operation().is_none());
+    assert_eq!(doc.snapshot().text, "A1 MIDDLE B1");
     assert_eq!(doc.historical_text(&external).unwrap(), "A1 middle B1");
     assert_eq!(doc.writer_id(), writer);
     assert_eq!(doc.resolve_anchor(&anchor).unwrap().offset, 6);
-    doc.undo(None).unwrap();
-    assert_eq!(subscription.recv().unwrap().after.text, "A1 middle B1");
+    let _ = doc
+        .apply(BufferCommand::Undo {
+            base: doc.version(),
+            context: UndoContext::default(),
+        })
+        .unwrap();
+    assert_eq!(doc.snapshot().text, "A1 middle B1");
 }
 
 #[test]
 fn unknown_or_inconsistent_disk_versions_are_rejected() {
-    let doc = Document::new(
+    let doc = Buffer::new(
         DocumentIdentity {
             document_id: "doc".into(),
             history_id: "history".into(),

@@ -11,7 +11,7 @@ import { createBrowserIo } from "./io";
 import { EditorHost } from "../runtime/host";
 import { DirectoryEditorHost } from "./host";
 import { encodeError } from "../rpc";
-import { serveEditorWorker } from "../runtime/service";
+import { serveEditor, type EditorServicePort } from "../runtime/service";
 import { DirectoryPackageResources } from "./package-resources";
 
 export type LocalEditorSource =
@@ -38,61 +38,64 @@ async function start(source: LocalEditorSource) {
           "Busy",
           "此 Vault 已在另一标签页中打开，请先关闭该标签页。",
         );
-      await serveEditorWorker(async (emit, schedule) => {
-        await init();
-        const backend =
-          source.kind === "opfs"
-            ? await openOpfsVault(source.id)
-            : await openDirectoryVault(source.handle, source.id);
-        try {
-          const store = await OpfsInstanceStore.open(storeId);
-          const binding = await EditorBinding.open(
-            JSON.stringify(store.identity),
-            createBrowserIo(store, backend),
-            source.kind === "directory",
-          );
-          // A stale optional resource capability must not prevent opening the Vault.
-          const packages =
-            source.kind === "directory" && source.resourceScope
-              ? await DirectoryPackageResources.open(
-                  source.resourceScope,
-                  source.handle,
-                ).catch(() => undefined)
-              : undefined;
-          const host =
-            source.kind === "directory"
-              ? new DirectoryEditorHost(
-                  binding,
-                  backend,
-                  emit,
-                  schedule,
-                  packages,
-                )
-              : new EditorHost(binding, backend, emit, schedule);
-          return {
-            identity: store.identity,
-            host: Object.assign(
-              host,
+      await serveEditor(
+        self as unknown as EditorServicePort,
+        async (emit, schedule) => {
+          await init();
+          const backend =
+            source.kind === "opfs"
+              ? await openOpfsVault(source.id)
+              : await openDirectoryVault(source.handle, source.id);
+          try {
+            const store = await OpfsInstanceStore.open(storeId);
+            const binding = await EditorBinding.open(
+              JSON.stringify(store.identity),
+              createBrowserIo(store, backend),
+              source.kind === "directory",
+            );
+            // A stale optional resource capability must not prevent opening the Vault.
+            const packages =
+              source.kind === "directory" && source.resourceScope
+                ? await DirectoryPackageResources.open(
+                    source.resourceScope,
+                    source.handle,
+                  ).catch(() => undefined)
+                : undefined;
+            const host =
               source.kind === "directory"
-                ? {
-                    setResourceScope: async (scope: LocalDirectoryHandle) => {
-                      host.previewResources.setPackages(
-                        await DirectoryPackageResources.open(
-                          scope,
-                          source.handle,
-                        ),
-                      );
-                    },
-                  }
-                : {},
-            ),
-            dispose: () => binding.free(),
-          };
-        } catch (error) {
-          await backend.close();
-          throw error;
-        }
-      });
+                ? new DirectoryEditorHost(
+                    binding,
+                    backend,
+                    emit,
+                    schedule,
+                    packages,
+                  )
+                : new EditorHost(binding, backend, emit, schedule);
+            return {
+              identity: store.identity,
+              host: Object.assign(
+                host,
+                source.kind === "directory"
+                  ? {
+                      setResourceScope: async (scope: LocalDirectoryHandle) => {
+                        host.previewResources.setPackages(
+                          await DirectoryPackageResources.open(
+                            scope,
+                            source.handle,
+                          ),
+                        );
+                      },
+                    }
+                  : {},
+              ),
+              dispose: () => binding.free(),
+            };
+          } catch (error) {
+            await backend.close();
+            throw error;
+          }
+        },
+      );
     },
   );
 }

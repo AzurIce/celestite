@@ -592,29 +592,15 @@ export function VaultEditor(props: VaultEditorProps) {
                                 wrap={wrap()}
                                 vim={settings().values["editor.vimMode"]}
                                 onVimMode={setVimMode}
-                                onChange={(content) =>
-                                  props.documents.update(id, content)
-                                }
                                 onComposition={(active) =>
                                   props.documents.composition?.(id, active)
                                 }
-                                onTransaction={
-                                  props.documents.edit
-                                    ? (transaction) =>
-                                        props.documents.edit!(id, transaction)
-                                    : undefined
+                                onTransaction={(transaction) =>
+                                  props.documents.edit(id, transaction)
                                 }
-                                onUndo={
-                                  props.documents.undo
-                                    ? (context, redo) => {
-                                        void props.documents.undo!(
-                                          id,
-                                          context,
-                                          redo,
-                                        );
-                                      }
-                                    : undefined
-                                }
+                                onUndo={(context, redo) => {
+                                  void props.documents.undo(id, context, redo);
+                                }}
                                 onSave={() => {
                                   void props.documents.requestSave(id);
                                 }}

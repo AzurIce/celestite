@@ -1,12 +1,12 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath } from "../../vault/path";
 import type { VaultBackend } from "../../vault/types";
-import { OpfsInstanceStore } from "./store";
+import type { OpfsInstanceStore } from "./store";
 import { encodeError } from "../rpc";
 
 /** Browser primitives for the Rust Backend. No editing or recovery policy here. */
 export function createBrowserIo(
-  store: OpfsInstanceStore,
+  store: Pick<OpfsInstanceStore, "json" | "putJson" | "bytes" | "put">,
   backend: VaultBackend,
 ) {
   return (request: string): string | Promise<string> => {

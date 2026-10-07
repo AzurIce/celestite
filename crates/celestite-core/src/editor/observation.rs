@@ -1,7 +1,7 @@
 //! Filesystem observation coordination. The platform executes detached work;
 //! this module alone validates its baseline and commits it into current history.
 use super::*;
-use crate::document::filesystem::{DIFF_BUDGET, FilesystemChange};
+use crate::buffer::filesystem::{DIFF_BUDGET, FilesystemChange};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +34,7 @@ impl ObservationToken {
     fn applies_to(&self, record: &Record) -> bool {
         !record.header.deleted
             && record.header.pending_write.is_none()
-            && self.identity == *record.document.identity()
+            && self.identity == *record.buffer.identity()
             && self.path == record.header.path
             && self.baseline_revision == record.header.disk_revision
             && Some(&self.baseline_version) == baseline(record)
@@ -73,7 +73,8 @@ impl ObservationCoordinator {
     }
 }
 
-/// Contains no live editor, backend or undo session. Safe to execute on a worker.
+/// Owns an isolated Buffer branch, never the live editor, backend or undo session.
+/// Safe to execute on a worker.
 pub struct FileObservationTask {
     token: ObservationToken,
     disk: FileSnapshot,
@@ -84,7 +85,7 @@ pub struct FileObservationResult {
     token: ObservationToken,
     disk: FileSnapshot,
     decoded: (String, bool, String),
-    result: EditorResult<(SyncPacket, Version)>,
+    result: EditorResult<(Option<SyncPacket>, Version)>,
 }
 impl FileObservationTask {
     pub fn path(&self) -> &str {
@@ -177,7 +178,7 @@ impl<B: Backend> EditorCore<B> {
         let token = ObservationToken {
             task_id: self.backend.new_id()?,
             id: id.into(),
-            identity: record.document.identity().clone(),
+            identity: record.buffer.identity().clone(),
             path: record.header.path.clone(),
             baseline_revision: record.header.disk_revision.clone(),
             baseline_version: base.clone(),
@@ -185,7 +186,7 @@ impl<B: Backend> EditorCore<B> {
             revision: disk.revision.clone(),
         };
         let change = match record
-            .document
+            .buffer
             .prepare_filesystem_change(base, &record.header.saved_text)
         {
             Ok(change) => change,
@@ -257,7 +258,7 @@ impl<B: Backend> EditorCore<B> {
             }
         };
         if let Err(mut error) = self
-            .commit_disk_change(id, result.disk, result.decoded, Some(packet), version)
+            .commit_disk_change(id, result.disk, result.decoded, packet, version)
             .await
         {
             if error.path.is_empty() {
@@ -374,7 +375,7 @@ impl<B: Backend> EditorCore<B> {
             )
         })?;
         if decoded.0 == record.header.saved_text {
-            if record.document.historical_text(base)? != decoded.0 {
+            if record.buffer.historical_text(base)? != decoded.0 {
                 return Err(EditorError::new(
                     "IO",
                     "Historical disk baseline text mismatch",
@@ -415,20 +416,17 @@ impl<B: Backend> EditorCore<B> {
     ) -> EditorResult<()> {
         let record = self.record(id)?;
         let mut header = record.header.clone();
-        let entry = if let Some(packet) = packet {
-            let mut trial = Document::from_snapshot(&record.document.export_snapshot()?, None)?;
-            for waiting in &record.pending_packets {
-                trial.import(waiting, "validation".into())?;
-            }
-            trial.import(&packet, "filesystem-validation".into())?;
-            validate_text(&trial.snapshot().text, &header.path)?;
+        let prepared = packet
+            .map(|packet| self.prepare_import(id, Import::new(packet, "filesystem")))
+            .transpose()?;
+        let entry = if let Some(prepared) = prepared.as_ref().filter(|p| p.accepts_operations()) {
             header.sequence = header
                 .sequence
                 .checked_add(1)
                 .ok_or_else(|| EditorError::new("IO", "Journal counter exhausted", &header.path))?;
-            header.applied = trial.version();
+            header.applied = prepared.preview().version.clone();
             Some(JournalEntry {
-                packet,
+                packet: prepared.packet().clone(),
                 applied: header.applied.clone(),
             })
         } else {
@@ -440,6 +438,6 @@ impl<B: Backend> EditorCore<B> {
         header.saved_version = Some(disk_version.clone());
         header.disk_revision = disk.revision;
         header.disk_cursor = self.cursor(id, disk_version, disk.data)?;
-        self.stage_observation(id, header, entry).await
+        self.stage_observation(id, header, entry, prepared).await
     }
 }

@@ -25,7 +25,7 @@ async fn core(path: &str, source: &str) -> EditorCore<MemoryBackend> {
     ))
     .await
     .unwrap();
-    let document = Document::new(
+    let document = Buffer::new(
         DocumentIdentity {
             document_id: "doc".into(),
             history_id: "history".into(),
@@ -43,8 +43,8 @@ async fn core(path: &str, source: &str) -> EditorCore<MemoryBackend> {
 async fn replace(core: &mut EditorCore<MemoryBackend>, text: &str) {
     let version = core.read("doc").unwrap().snapshot.version;
     core.execute_service(
-        "replace_text",
-        json!({"id":"doc", "version":version, "text":text}),
+        "apply",
+        json!({"id":"doc","command":{"kind":"edit","base":version,"input":{"kind":"text","text":text}}}),
     )
     .await
     .unwrap();
@@ -107,7 +107,7 @@ fn cache_capacity_is_released_with_the_last_subscription() {
                 "doc".into()
             } else {
                 let id = format!("cache-{index}");
-                let document = Document::new(
+                let document = Buffer::new(
                     DocumentIdentity {
                         document_id: id.clone(),
                         history_id: format!("history-{index}"),
@@ -218,18 +218,30 @@ fn returning_to_same_text_by_undo_still_revokes_old_causal_version() {
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
         replace(&mut core, "changed").await;
-        core.undo("doc", UndoContext::default(), false)
-            .await
-            .unwrap();
+        core.apply(
+            "doc",
+            BufferCommand::Undo {
+                base: core.read("doc").unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         let snapshot = core.read("doc").unwrap().snapshot;
         assert_eq!(snapshot.text, old.source);
         assert_ne!(snapshot.version, old.ticket.version);
         assert!(!core.complete_preview(output(&old, "obsolete")));
         time(2000);
         let task = core.take_preview_task("doc").unwrap().unwrap();
-        core.undo("doc", UndoContext::default(), true)
-            .await
-            .unwrap();
+        core.apply(
+            "doc",
+            BufferCommand::Redo {
+                base: core.read("doc").unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(!core.complete_preview(output(&task, "obsolete after redo")));
         assert_eq!(core.read("doc").unwrap().snapshot.text, "changed");
     });
@@ -241,25 +253,38 @@ fn imported_history_invalidates_preview_and_duplicate_import_does_not() {
         let mut core = core("a.md", "local").await;
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
-        let mut peer = Document::from_snapshot(&core.snapshot("doc").unwrap(), Some(200)).unwrap();
-        peer.transact(Transaction {
-            expected_version: peer.version(),
-            origin: "peer".into(),
-            edits: vec![TextEdit {
-                from: 5,
-                to: 5,
-                insert: " remote".into(),
-            }],
-            undo_metadata: None,
-            undo_positions: vec![],
-        })
-        .unwrap();
+        let mut peer = Buffer::from_snapshot(&core.snapshot("doc").unwrap(), Some(200)).unwrap();
+        let _ = peer
+            .apply(BufferCommand::Edit(Edit {
+                base: peer.version(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from: 5,
+                        to: 5,
+                        insert: " remote".into(),
+                    }],
+                },
+                origin: "peer".into(),
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
+            .unwrap();
         let packet = peer.export_updates_since(&old.ticket.version).unwrap();
-        core.import("doc", packet.clone()).await.unwrap();
+        core.apply(
+            "doc",
+            BufferCommand::Import(Import::new(packet.clone(), "peer")),
+        )
+        .await
+        .unwrap();
         assert!(!core.complete_preview(output(&old, "old")));
         time(2000);
         let task = core.take_preview_task("doc").unwrap().unwrap();
-        core.import("doc", packet).await.unwrap();
+        core.apply("doc", BufferCommand::Import(Import::new(packet, "peer")))
+            .await
+            .unwrap();
         assert!(core.complete_preview(output(&task, "current")));
     });
 }
@@ -647,7 +672,7 @@ fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits
         let mut core = core("a.not", "= same body").await;
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
-        let declaration = Document::new(
+        let declaration = Buffer::new(
             DocumentIdentity {
                 document_id: "defs".into(),
                 history_id: "defs-history".into(),

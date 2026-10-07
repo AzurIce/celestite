@@ -57,6 +57,91 @@ fn preview_result(task: &PreviewTask) -> PreviewCompletion {
 }
 
 #[test]
+fn import_admission_uses_the_buffers_pending_history_even_after_recovery() {
+    block_on(async {
+        let backend = MemoryBackend::new(b"base");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        let mut peer = Buffer::from_snapshot(&core.snapshot(&id).unwrap(), Some(42)).unwrap();
+        let start = peer.version();
+        let _ = peer
+            .apply(BufferCommand::Edit(Edit {
+                base: start.clone(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from: 4,
+                        to: 4,
+                        insert: " next".into(),
+                    }],
+                },
+                origin: "peer".into(),
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
+            .unwrap();
+        let first = peer.export_updates_since(&start).unwrap();
+        let middle = peer.version();
+        let _ = peer
+            .apply(BufferCommand::Edit(Edit {
+                base: middle.clone(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from: 9,
+                        to: 9,
+                        insert: "\r".into(),
+                    }],
+                },
+                origin: "peer".into(),
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
+            .unwrap();
+        let last = peer.export_updates_since(&middle).unwrap();
+        assert!(
+            core.apply(&id, BufferCommand::Import(Import::new(last, "peer")))
+                .await
+                .unwrap()
+                .update
+                .pending
+        );
+
+        for recover in [false, true] {
+            if recover {
+                core = EditorCore::open(backend.clone()).await.unwrap();
+            }
+            let before = core.read(&id).unwrap();
+            assert_eq!(
+                core.prepare_import(&id, Import::new(first.clone(), "peer"))
+                    .unwrap_err()
+                    .code,
+                "InvalidEdit"
+            );
+            assert_eq!(
+                core.apply(
+                    &id,
+                    BufferCommand::Import(Import::new(first.clone(), "peer"))
+                )
+                .await
+                .unwrap_err()
+                .code,
+                "InvalidEdit"
+            );
+            let after = core.read(&id).unwrap();
+            assert_eq!(after.snapshot, before.snapshot);
+            assert_eq!(after.writer_id, before.writer_id);
+            assert_eq!(after.undo, before.undo);
+            assert_eq!(backend.storage.borrow().documents[&id].0.sequence, 1);
+        }
+    });
+}
+
+#[test]
 fn preview_rename_and_deletion_revoke_tasks_even_without_a_text_change() {
     block_on(async {
         let backend = MemoryBackend::new(b"body");
@@ -129,19 +214,32 @@ fn accepted_draft_remains_previewable_when_history_commit_fails() {
         let id = core.open_file("a.md").await.unwrap();
         let version = core.read(&id).unwrap().snapshot.version;
         backend.storage.borrow_mut().fail_commit = true;
-        core.edit(
-            &id,
-            version,
-            vec![TextEdit {
-                from: 0,
-                to: 5,
-                insert: "accepted draft".into(),
-            }],
-            SelectionContext::default(),
-            "input.replace".into(),
-        )
-        .await
-        .unwrap();
+        let receipt = core
+            .apply(
+                &id,
+                BufferCommand::Edit(Edit {
+                    base: version,
+                    input: TextInput::Edits {
+                        edits: vec![TextEdit {
+                            from: 0,
+                            to: 5,
+                            insert: "accepted draft".into(),
+                        }],
+                    },
+                    origin: "input.replace".into(),
+                    group: None,
+                    undo: UndoContext::default(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(receipt.history, HistoryCommit::Failed { .. }));
+        assert!(receipt.require_committed().is_err());
+        assert!(receipt.update.changed);
+        assert_eq!(receipt.update.after, receipt.document.snapshot.version);
+        let delivery = core.take_mutations();
+        assert_eq!(delivery.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&delivery[0], &receipt));
         assert!(core.read(&id).unwrap().persistence_error.is_some());
         core.subscribe_preview(&id, "client").unwrap();
         let task = core.take_preview_task(&id).unwrap().unwrap();
@@ -149,6 +247,19 @@ fn accepted_draft_remains_previewable_when_history_commit_fails() {
         assert!(core.complete_preview(preview_result(&task)));
         assert_eq!(backend.storage.borrow().files["a.md"], b"saved");
         assert!(core.read(&id).unwrap().dirty);
+        backend.storage.borrow_mut().fail_commit = false;
+        core.retry_history().await.unwrap();
+        assert!(
+            core.take_mutations().is_empty(),
+            "retrying IO must not create another text edit"
+        );
+        let storage = backend.storage.borrow();
+        let journal = &storage.documents[&id].1;
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            journal[0].packet.data,
+            receipt.update.operation.as_ref().unwrap().data
+        );
     });
 }
 fn revision(data: &[u8]) -> String {
@@ -279,16 +390,21 @@ impl Backend for MemoryBackend {
 }
 async fn replace(core: &mut EditorCore<MemoryBackend>, id: &str, text: &str) {
     let current = core.read(id).unwrap();
-    core.edit(
+    core.apply(
         id,
-        current.snapshot.version,
-        vec![TextEdit {
-            from: 0,
-            to: current.snapshot.text.encode_utf16().count(),
-            insert: text.into(),
-        }],
-        SelectionContext::default(),
-        "input.paste".into(),
+        BufferCommand::Edit(Edit {
+            base: current.snapshot.version,
+            input: TextInput::Edits {
+                edits: vec![TextEdit {
+                    from: 0,
+                    to: current.snapshot.text.encode_utf16().count(),
+                    insert: text.into(),
+                }],
+            },
+            origin: "input.paste".into(),
+            group: None,
+            undo: UndoContext::default(),
+        }),
     )
     .await
     .unwrap();
@@ -312,7 +428,17 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
                 .unwrap()
                 .contains("编辑历史尚未持久化")
         );
-        assert!(core.undo(&id, UndoContext::default(), false).await.is_err());
+        assert!(
+            core.apply(
+                &id,
+                BufferCommand::Undo {
+                    base: core.read(&id).unwrap().snapshot.version,
+                    context: UndoContext::default()
+                }
+            )
+            .await
+            .is_err()
+        );
         assert_eq!(backend.storage.borrow().files["a.md"], b"old");
         backend.storage.borrow_mut().fail_commit = false;
         core.retry_history().await.unwrap();
@@ -320,9 +446,25 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
             core.read(&id).unwrap().durable_version,
             Some(core.read(&id).unwrap().snapshot.version)
         );
-        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "old");
-        core.undo(&id, UndoContext::default(), true).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Redo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         core.save(&id, None).await.unwrap();
         drop(core);
         let restored = EditorCore::open(backend).await.unwrap();
@@ -448,40 +590,77 @@ fn private_history_does_not_require_an_ordinary_directory() {
 }
 
 #[test]
-fn vim_undo_groups_follow_commands_and_insert_sessions_instead_of_timeouts() {
+fn undo_groups_follow_caller_gesture_ids_not_backend_time() {
     block_on(async {
         let backend = MemoryBackend::new(b"");
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
         for (text, group, elapsed) in [
-            ("a", "input.vim.insert-1", 0),
-            ("b", "input.vim.insert-1", 2000),
-            ("c", "input.vim.insert-2", 2001),
+            ("a", "gesture-1", 0),
+            ("b", "gesture-1", 2000),
+            ("c", "gesture-2", 2001),
         ] {
             backend.storage.borrow_mut().now = elapsed;
             let state = core.read(&id).unwrap().snapshot;
             let end = state.text.encode_utf16().count();
-            core.edit(
+            core.apply(
                 &id,
-                state.version,
-                vec![TextEdit {
-                    from: end,
-                    to: end,
-                    insert: text.into(),
-                }],
-                SelectionContext::default(),
-                group.into(),
+                BufferCommand::Edit(Edit {
+                    base: state.version,
+                    input: TextInput::Edits {
+                        edits: vec![TextEdit {
+                            from: end,
+                            to: end,
+                            insert: text.into(),
+                        }],
+                    },
+                    origin: "test".into(),
+                    group: Some(group.into()),
+                    undo: UndoContext::default(),
+                }),
             )
             .await
             .unwrap();
         }
-        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "ab");
-        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "");
-        core.undo(&id, UndoContext::default(), true).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Redo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "ab");
-        core.undo(&id, UndoContext::default(), true).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Redo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "abc");
     });
 }
@@ -505,12 +684,19 @@ fn serialized_service_isolates_documents_and_rejects_stale_edits() {
             .execute_service("open", json!({"path":"b.md"}))
             .await
             .unwrap();
-        let command = json!({"id":first["id"],"version":first["snapshot"]["version"],
-            "edits":[{"from":3,"to":3,"insert":"!"}],"context":{"ranges":[{"anchor":3,"head":3}],"mainIndex":0},"userEvent":"input.type"});
-        let result = core.execute_service("edit", command.clone()).await.unwrap();
-        assert_eq!(result["document"]["snapshot"]["text"], "A😀!");
+        let command = json!({"id":first["id"],"command":{"kind":"edit","base":first["snapshot"]["version"],
+            "input":{"kind":"edits","edits":[{"from":3,"to":3,"insert":"!"}]},"undo":{"positions":[3,3],"metadata":{"mainIndex":0}},"group":"gesture"}});
+        let result = core
+            .execute_service("apply", command.clone())
+            .await
+            .unwrap();
+        assert_eq!(result, first["id"]);
+        let mutations = core.take_mutations();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].document.snapshot.text, "A😀!");
+        assert!(mutations[0].update.local_operation().is_some());
         assert_eq!(
-            core.execute_service("edit", command)
+            core.execute_service("apply", command)
                 .await
                 .unwrap_err()
                 .code,
@@ -545,7 +731,15 @@ fn restart_allocates_fresh_writer_and_external_changes_are_not_personal_undo() {
         core.refresh(&id).await.unwrap();
         assert!(!core.read(&id).unwrap().undo.can_undo);
         replace(&mut core, &id, "external 😀!").await;
-        core.undo(&id, UndoContext::default(), false).await.unwrap();
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text, "external 😀");
         let version = core.read(&id).unwrap().snapshot.version;
         drop(core);

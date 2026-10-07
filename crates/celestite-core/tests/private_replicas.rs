@@ -3,7 +3,7 @@ use futures_lite::future::block_on;
 use serde_json::json;
 
 fn seed(id: &str, text: &str) -> SyncPacket {
-    Document::new(
+    Buffer::new(
         DocumentIdentity {
             document_id: id.into(),
             history_id: format!("history-{id}"),
@@ -16,7 +16,7 @@ fn seed(id: &str, text: &str) -> SyncPacket {
     .unwrap()
 }
 fn hosted(packet: SyncPacket, path: &str, deleted: bool) -> ReplicaDocument {
-    let snapshot = Document::from_snapshot(&packet, None).unwrap().snapshot();
+    let snapshot = Buffer::from_snapshot(&packet, None).unwrap().snapshot();
     ReplicaDocument {
         packets: vec![packet],
         writer_id: None,
@@ -73,8 +73,8 @@ fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
         core.join("b.md", b.clone()).await.unwrap();
         let version = core.read("A").unwrap().snapshot.version;
         core.execute_service(
-            "replace_text",
-            json!({"id":"A","version":version,"text":"retained draft"}),
+            "apply",
+            json!({"id":"A","command":{"kind":"edit","base":version,"input":{"kind":"text","text":"retained draft"}}}),
         )
         .await
         .unwrap();
@@ -110,20 +110,25 @@ fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
 fn session_imports_catch_up_packets_and_close_does_not_require_write_permission() {
     block_on(async {
         let initial = seed("file", "seed");
-        let mut source = Document::from_snapshot(&initial, None).unwrap();
+        let mut source = Buffer::from_snapshot(&initial, None).unwrap();
         let before = source.version();
-        source
-            .transact(Transaction {
-                expected_version: before.clone(),
-                edits: vec![TextEdit {
-                    from: 0,
-                    to: 0,
-                    insert: "remote ".into(),
-                }],
+        let _ = source
+            .apply(BufferCommand::Edit(Edit {
+                base: before.clone(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from: 0,
+                        to: 0,
+                        insert: "remote ".into(),
+                    }],
+                },
                 origin: "test".into(),
-                undo_metadata: None,
-                undo_positions: vec![],
-            })
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
             .unwrap();
         let mut input = hosted(source.export_snapshot().unwrap(), "a.md", false);
         input.packets = vec![
@@ -135,24 +140,35 @@ fn session_imports_catch_up_packets_and_close_does_not_require_write_permission(
         core.replace_replica_session(vec![input]).await.unwrap();
         assert_eq!(core.read("file").unwrap().snapshot.text, "remote seed");
         let before = source.version();
-        source
-            .transact(Transaction {
-                expected_version: before.clone(),
-                edits: vec![TextEdit {
-                    from: 0,
-                    to: 0,
-                    insert: "next ".into(),
-                }],
+        let _ = source
+            .apply(BufferCommand::Edit(Edit {
+                base: before.clone(),
+                input: TextInput::Edits {
+                    edits: vec![TextEdit {
+                        from: 0,
+                        to: 0,
+                        insert: "next ".into(),
+                    }],
+                },
                 origin: "test".into(),
-                undo_metadata: None,
-                undo_positions: vec![],
-            })
+                group: None,
+                undo: UndoContext {
+                    metadata: None,
+                    positions: vec![],
+                },
+            }))
             .unwrap();
-        core.import("file", source.export_updates_since(&before).unwrap())
-            .await
-            .unwrap();
+        core.apply(
+            "file",
+            BufferCommand::Import(Import::new(
+                source.export_updates_since(&before).unwrap(),
+                "peer",
+            )),
+        )
+        .await
+        .unwrap();
         assert_eq!(core.read("file").unwrap().snapshot.text, "next remote seed");
-        assert_eq!(core.execute_service("replace_text", json!({"id":"file","version":core.read("file").unwrap().snapshot.version,"text":"blocked"})).await.unwrap_err().code, "PermissionDenied");
+        assert_eq!(core.execute_service("apply", json!({"id":"file","command":{"kind":"edit","base":core.read("file").unwrap().snapshot.version,"input":{"kind":"text","text":"blocked"}}})).await.unwrap_err().code, "PermissionDenied");
         core.execute_service("close", json!({})).await.unwrap();
     });
 }
@@ -176,7 +192,7 @@ async fn replica(name: &str, packet: SyncPacket) -> EditorCore<MemoryBackend> {
 #[test]
 fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
     block_on(async {
-        let seed = Document::new(
+        let seed = Buffer::new(
             DocumentIdentity {
                 document_id: "file".into(),
                 history_id: "history".into(),
@@ -197,27 +213,61 @@ fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
         );
         for (core, text) in [(&mut a, "A😀aB"), (&mut b, "A😀bB")] {
             core.execute_service(
-                "replace_text",
-                json!({"id":"file","version":base,"text":text}),
+                "apply",
+                json!({"id":"file","command":{"kind":"edit","base":base,"input":{"kind":"text","text":text}}}),
             )
             .await
             .unwrap();
         }
         let a_packet = a.updates("file", &base).unwrap();
         let b_packet = b.updates("file", &base).unwrap();
-        a.import("file", b_packet.clone()).await.unwrap();
-        b.import("file", a_packet.clone()).await.unwrap();
-        c.import("file", b_packet.clone()).await.unwrap();
-        c.import("file", a_packet).await.unwrap();
-        c.import("file", b_packet).await.unwrap();
+        a.apply(
+            "file",
+            BufferCommand::Import(Import::new(b_packet.clone(), "peer")),
+        )
+        .await
+        .unwrap();
+        b.apply(
+            "file",
+            BufferCommand::Import(Import::new(a_packet.clone(), "peer")),
+        )
+        .await
+        .unwrap();
+        c.apply(
+            "file",
+            BufferCommand::Import(Import::new(b_packet.clone(), "peer")),
+        )
+        .await
+        .unwrap();
+        c.apply("file", BufferCommand::Import(Import::new(a_packet, "peer")))
+            .await
+            .unwrap();
+        c.apply("file", BufferCommand::Import(Import::new(b_packet, "peer")))
+            .await
+            .unwrap();
         let merged = a.read("file").unwrap().snapshot;
         assert_eq!(merged.text, b.read("file").unwrap().snapshot.text);
         assert_eq!(merged.version, c.read("file").unwrap().snapshot.version);
         assert!(merged.text.contains('a') && merged.text.contains('b'));
-        a.undo("file", UndoContext::default(), false).await.unwrap();
+        a.apply(
+            "file",
+            BufferCommand::Undo {
+                base: a.read("file").unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
         let undo = a.updates("file", &merged.version).unwrap();
-        b.import("file", undo.clone()).await.unwrap();
-        c.import("file", undo).await.unwrap();
+        b.apply(
+            "file",
+            BufferCommand::Import(Import::new(undo.clone(), "peer")),
+        )
+        .await
+        .unwrap();
+        c.apply("file", BufferCommand::Import(Import::new(undo, "peer")))
+            .await
+            .unwrap();
         for core in [&a, &b, &c] {
             let state = core.read("file").unwrap();
             assert_eq!(state.snapshot.text, "A😀bB");
@@ -231,7 +281,7 @@ fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
 #[test]
 fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
     block_on(async {
-        let packet = Document::new(
+        let packet = Buffer::new(
             DocumentIdentity {
                 document_id: "file".into(),
                 history_id: "history".into(),
@@ -245,8 +295,8 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
         let mut core = replica("client", packet.clone()).await;
         let before = core.read("file").unwrap().snapshot.version;
         core.execute_service(
-            "replace_text",
-            json!({"id":"file","version":before,"text":"draft"}),
+            "apply",
+            json!({"id":"file","command":{"kind":"edit","base":before,"input":{"kind":"text","text":"draft"}}}),
         )
         .await
         .unwrap();
@@ -259,8 +309,8 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
         assert_eq!(core.join("a.md", other).await.unwrap_err().code, "Conflict");
         assert!(
             core.execute_service(
-                "replace_text",
-                json!({"id":"file","version":before,"text":"stale"})
+                "apply",
+                json!({"id":"file","command":{"kind":"edit","base":before,"input":{"kind":"text","text":"stale"}}})
             )
             .await
             .is_err()
@@ -272,7 +322,7 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
 #[test]
 fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() {
     block_on(async {
-        let packet = Document::new(
+        let packet = Buffer::new(
             DocumentIdentity {
                 document_id: "file".into(),
                 history_id: "history".into(),
@@ -284,7 +334,7 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
         .export_snapshot()
         .unwrap();
         let mut core = replica("client", packet.clone()).await;
-        let other = Document::new(
+        let other = Buffer::new(
             DocumentIdentity {
                 document_id: "other".into(),
                 history_id: "other-history".into(),
@@ -299,8 +349,8 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
         for (id, text) in [("file", "draft"), ("other", "keep other edit")] {
             let version = core.read(id).unwrap().snapshot.version;
             core.execute_service(
-                "replace_text",
-                json!({"id":id,"version":version,"text":text}),
+                "apply",
+                json!({"id":id,"command":{"kind":"edit","base":version,"input":{"kind":"text","text":text}}}),
             )
             .await
             .unwrap();
@@ -352,7 +402,7 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
         read_only.version = core.read("file").unwrap().snapshot.version;
         read_only.read_only = true;
         core.apply_host_state("file", read_only).await.unwrap();
-        assert_eq!(core.execute_service("replace_text", json!({"id":"file","version":core.read("file").unwrap().snapshot.version,"text":"blocked"})).await.unwrap_err().code,
+        assert_eq!(core.execute_service("apply", json!({"id":"file","command":{"kind":"edit","base":core.read("file").unwrap().snapshot.version,"input":{"kind":"text","text":"blocked"}}})).await.unwrap_err().code,
             "PermissionDenied");
         core.subscribe_preview("file", "readonly-view").unwrap();
         assert!(core.take_preview_task("file").unwrap().is_some());

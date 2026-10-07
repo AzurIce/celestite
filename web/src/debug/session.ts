@@ -1,5 +1,6 @@
 import { normalizeVaultUrl } from "../lib/vault/http";
 import { ReplicaCore } from "./replica";
+import type { CoreMutation } from "../lib/editor/core";
 import type {
   InstanceIdentity,
   SyncPacket,
@@ -280,10 +281,13 @@ export class DebugSession {
     this.notify();
     void this.enqueue(async () => {
       const current = replica.document.snapshot.version;
-      const result = await replica.core.call<{ document: DebugDocument }>(
-        "replace_text",
-        { id: replica.document.id, version: current, text },
-      );
+      const result = await replica.core.apply(replica.document.id, {
+        kind: "edit",
+        base: current,
+        input: { kind: "text", text },
+        origin: "input.replace",
+        undo: { positions: [] },
+      });
       replica.document = result.document;
       replica.lastError = null;
     })
@@ -323,16 +327,17 @@ export class DebugSession {
       id: replica.document.id,
       version: this.host!.snapshot.version,
     });
-    const reply = await this.http<{
-      document: DebugDocument;
-      result: { pending: boolean };
-    }>(this.route() + "/import", packet);
+    const reply = await this.http<CoreMutation>(this.route() + "/apply", {
+      kind: "import",
+      packet,
+      origin: "debug-peer",
+    });
     this.host = reply.document;
     replica.acknowledged = reply.document.durableVersion;
     this.record(
       replica.name,
       "推送 → host",
-      `${packet.data.length} B · ${reply.result.pending ? "等待因果依赖" : "已合并"} · ${reply.document.durableVersion ? "历史已提交" : "host 历史仅驻留内存"}`,
+      `${packet.data.length} B · ${reply.update.pending ? "等待因果依赖" : "已合并"} · ${reply.document.durableVersion ? "历史已提交" : "host 历史仅驻留内存"}`,
     );
   }
   private async pullReplica(replica: Replica) {
@@ -351,16 +356,17 @@ export class DebugSession {
       this.route() + "/updates",
       replica.document.snapshot.version,
     );
-    const reply = await replica.core.call<{
-      document: DebugDocument;
-      result: { pending: boolean };
-    }>("import", { id: replica.document.id, packet });
+    const reply = await replica.core.apply(replica.document.id, {
+      kind: "import",
+      packet,
+      origin: "debug-peer",
+    });
     replica.document = reply.document;
     replica.text = reply.document.snapshot.text;
     this.record(
       replica.name,
       "host → 拉取",
-      `${packet.data.length} B · ${reply.result.pending ? "等待因果依赖" : "已合并"}`,
+      `${packet.data.length} B · ${reply.update.pending ? "等待因果依赖" : "已合并"}`,
     );
     await this.refreshHost();
   }
@@ -388,14 +394,11 @@ export class DebugSession {
     return this.operation(name, redo ? "重做" : "撤销", async () => {
       this.ensureWritable();
       const replica = this.replica(name);
-      const result = await replica.core.call<{ document: DebugDocument }>(
-        "undo",
-        {
-          id: replica.document.id,
-          context: { ranges: [], mainIndex: 0 },
-          redo,
-        },
-      );
+      const result = await replica.core.apply(replica.document.id, {
+        kind: redo ? "redo" : "undo",
+        base: replica.document.snapshot.version,
+        context: { positions: [] },
+      });
       replica.document = result.document;
       replica.text = result.document.snapshot.text;
       replica.lastError = null;

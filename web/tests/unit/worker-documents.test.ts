@@ -72,7 +72,7 @@ function document(): ServiceDocument {
     lineEnding: "\n",
     readOnlyReason: null,
     canPreview: true,
-    saving: false,
+
     error: null,
     conflict: false,
     conflictResolution: "shared",
@@ -83,7 +83,7 @@ function document(): ServiceDocument {
       },
       durableVersion: null,
       writerId: "2",
-      undo: { can_undo: false, can_redo: false, group_open: false },
+      undo: { canUndo: false, canRedo: false },
       historyError: null,
     },
   };
@@ -107,7 +107,7 @@ const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 test("rejected input retains its projection and withdraws dependent inputs using current accepted text", async () => {
   let accepted = document();
   const { transport, client, documents } = setup((request) => {
-    if (request.method === "edit")
+    if (request.method === "apply")
       return {
         document: accepted,
         edits: [],
@@ -124,7 +124,7 @@ test("rejected input retains its projection and withdraws dependent inputs using
   assert.equal(snapshot.documents[0].content, "baseXY");
   assert.equal(snapshot.documents[0].inputFailure?.outcome, "rejected");
   assert.equal(
-    transport.sent.filter((request) => request.method === "edit").length,
+    transport.sent.filter((request) => request.method === "apply").length,
     1,
   );
   accepted = {
@@ -137,7 +137,10 @@ test("rejected input retains its projection and withdraws dependent inputs using
   };
   transport.document({
     ...accepted,
-    change: { before: "base", edits: [{ from: 0, to: 0, insert: "R" }] },
+    change: {
+      before: document().core!.version,
+      edits: [{ from: 0, to: 0, insert: "R" }],
+    },
   });
   assert.equal(documents.snapshot().documents[0].content, "RbaseXY");
   assert.equal(await documents.discardRejectedInput("file"), true);
@@ -156,7 +159,7 @@ test("unknown failures cannot be withdrawn as rejected edits", async () => {
   await documents.open(vaultPath("a.md"));
   const original = transport.postMessage.bind(transport);
   transport.postMessage = (request) =>
-    request.method === "edit"
+    request.method === "apply"
       ? queueMicrotask(() =>
           transport.emit({
             kind: "reply",
@@ -218,7 +221,7 @@ test("closing shared views and connections does not request file saves", async (
 
 test("closing a connection refuses retained input without submitting a save", async () => {
   const { transport, client, documents } = setup((request) =>
-    request.method === "edit"
+    request.method === "apply"
       ? {
           document: document(),
           edits: [],
