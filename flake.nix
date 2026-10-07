@@ -1,5 +1,5 @@
 {
-  description = "";
+  description = "Celestite devshell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -35,25 +35,33 @@
             ];
           }
         );
+
+        inherit (pkgs.stdenv.hostPlatform) isDarwin isLinux;
       in
       {
-
         devShells.default = craneLib.devShell {
-          buildInputs = with pkgs; [
-            dbus
-            librsvg
-            webkitgtk_4_1
-          ];
+          # Tauri renders with WebKitGTK on Linux but with the system WKWebView on
+          # macOS, so all the GTK/WebKit/GStreamer deps below are Linux-only
+          # (webkitgtk is also marked broken on darwin in nixpkgs).
+          buildInputs =
+            with pkgs;
+            pkgs.lib.optionals isLinux [
+              dbus
+              librsvg
+              webkitgtk_4_1
+              gst_all_1.gst-plugins-base # Optional, if you get `GStreamer element appsink not found. Please install it.`
+            ];
 
-          packages = with pkgs; [
-            bun
-            cargo-tauri
-            pkg-config
-            wrapGAppsHook4
-            gst_all_1.gst-plugins-base # Optional, if you get `GStreamer element appsink not found. Please install it.`
-          ];
+          packages =
+            with pkgs;
+            [
+              bun
+              cargo-tauri
+              pkg-config
+            ]
+            ++ pkgs.lib.optionals isLinux [ wrapGAppsHook4 ];
 
-          shellHook = ''
+          shellHook = pkgs.lib.optionalString isLinux ''
             export XDG_DATA_DIRS="$GSETTINGS_SCHEMAS_PATH" # Needed on Wayland to report the correct display scale
 
             # Work around an NVIDIA EGL + Wayland explicit-sync bug.
