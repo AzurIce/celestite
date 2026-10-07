@@ -1,16 +1,13 @@
 import { VaultError } from "../../vault/errors";
 import { decodeError } from "../rpc";
 import type { RpcError } from "../contract";
-import type { CoreDocument } from "../core";
+import type { HostDocument, CollaborationSnapshot } from "../contract";
 import type { SyncPacket } from "../contract";
 
 export interface RemoteReceipt {
   kind: "document";
   sequence: number;
-  document: Omit<CoreDocument, "savedContent" | "snapshot"> & {
-    savedContent?: string;
-    snapshot: Omit<CoreDocument["snapshot"], "text">;
-  };
+  document: Omit<HostDocument, "savedContent"> & { savedContent?: string };
   packet: SyncPacket;
   writerId: string;
 }
@@ -25,9 +22,12 @@ export class RemoteTransport {
     {
       resolve: (value: unknown) => void;
       reject: (error: unknown) => void;
-      timer: ReturnType<typeof setTimeout>;
+      payload: string;
+      timer?: ReturnType<typeof setTimeout>;
     }
   >();
+  private active = new Set<number>();
+  private queuedCharacters = 0;
   private closed = false;
   private initialized = false;
   private readyResolve!: () => void;
@@ -41,7 +41,12 @@ export class RemoteTransport {
   constructor(
     url: string,
     identity: { id: string; historyId: string },
-    private receive: (receipt: RemoteReceipt | { kind: "tree" }) => void,
+    private receive: (
+      receipt:
+        | RemoteReceipt
+        | { kind: "tree" }
+        | { kind: "members"; state: CollaborationSnapshot },
+    ) => void,
     private disconnected: (error: unknown) => void,
   ) {
     const address = new URL(url + "/api/v1/sync");
@@ -49,7 +54,7 @@ export class RemoteTransport {
     this.socket = new WebSocket(address);
     this.socket.onopen = () =>
       this.socket.send(
-        JSON.stringify({ protocolVersion: 2, vaultIdentity: identity }),
+        JSON.stringify({ protocolVersion: 3, vaultIdentity: identity }),
       );
     this.socket.onmessage = (event) => {
       if (this.closed) return;
@@ -61,7 +66,12 @@ export class RemoteTransport {
           if (!this.initialized)
             throw new Error("Buffer received before session readiness");
           this.receive(frame);
-        } else if (frame.kind === "tree") this.receive(frame);
+        } else if (frame.kind === "members")
+          this.receive({
+            kind: "members",
+            state: { ...frame.state, sessionId: this.sessionId },
+          });
+        else if (frame.kind === "tree") this.receive(frame);
         else if (frame.kind === "ready") {
           if (!this.sessionId || frame.sessionId !== this.sessionId)
             throw new Error("Invalid session barrier");
@@ -72,6 +82,9 @@ export class RemoteTransport {
           if (!pending) return;
           clearTimeout(pending.timer);
           this.pending.delete(frame.requestId);
+          this.queuedCharacters -= pending.payload.length;
+          this.active.delete(frame.requestId);
+          this.pump();
           if (frame.error) pending.reject(decodeError(frame.error as RpcError));
           else pending.resolve(frame.result);
         } else if (frame.kind === "fatal") this.fail(decodeError(frame));
@@ -98,25 +111,47 @@ export class RemoteTransport {
     )
       return Promise.reject(new VaultError("Closed", "协作会话未连接。"));
     const requestId = ++this.nextRequest;
+    const payload = JSON.stringify({
+      ...params,
+      method,
+      requestId,
+      sessionId: this.sessionId,
+    });
+    if (
+      this.pending.size >= 64 ||
+      this.queuedCharacters + payload.length > 80 * 1024 * 1024
+    ) {
+      const error = new VaultError("IO", "协作请求队列已满，正文仍保留。");
+      this.fail(error);
+      return Promise.reject(error);
+    }
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(
-        () => this.fail(new VaultError("IO", "协作操作确认超时；正文仍保留。")),
-        20000,
-      );
       this.pending.set(requestId, {
         resolve: resolve as (value: unknown) => void,
         reject,
-        timer,
+        payload,
       });
-      this.socket.send(
-        JSON.stringify({
-          ...params,
-          method,
-          requestId,
-          sessionId: this.sessionId,
-        }),
-      );
+      this.queuedCharacters += payload.length;
+      this.pump();
     });
+  }
+  private pump() {
+    if (this.closed) return;
+    for (const [requestId, pending] of this.pending) {
+      if (this.active.size >= 2) break;
+      if (pending.timer !== undefined) continue;
+      this.active.add(requestId);
+      pending.timer = setTimeout(
+        () => this.fail(new VaultError("IO", "协作操作确认超时；正文仍保留。")),
+        20000,
+      );
+      try {
+        this.socket.send(pending.payload);
+      } catch (error) {
+        this.fail(error);
+        break;
+      }
+    }
   }
   private fail(error: unknown) {
     if (this.closed) return;

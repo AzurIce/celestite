@@ -484,9 +484,7 @@ mod tests {
             .unwrap()
             .contains(&package));
         let mut documents = crate::vault::documents::Documents::open(&root, &[0; 32]).unwrap();
-        documents
-            .open_file(&crate::vault::fs::FsVault::open(&root).unwrap(), "a.not")
-            .unwrap();
+        documents.open_file("a.not").unwrap();
         assert!(documents
             .resident()
             .unwrap()

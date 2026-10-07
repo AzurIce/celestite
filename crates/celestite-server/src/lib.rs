@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-mod editor_api;
+mod collaboration;
+mod documents_api;
 mod package_resources;
 mod profile;
 mod reconcile;
@@ -101,9 +102,10 @@ struct HostedVault {
     id: String,
     name: String,
     read_only: bool,
-    files: Mutex<FsVault>,
+    files: Mutex<Arc<FsVault>>,
     packages: package_resources::PackageResources,
     documents: Mutex<Documents>,
+    collaboration: collaboration::CollaborationState,
     events: broadcast::Sender<ChangeHint>,
     _watcher: Mutex<notify::RecommendedWatcher>,
     reconcile_trigger: reconcile::Trigger,
@@ -299,9 +301,9 @@ pub fn build_server(
         },
         web_dir,
     ) = profile::prepare(config.vault, config.server.web_dir.as_deref(), base)?;
-    let files = FsVault::open(&root)?;
     let seed = shares::seed(vault.share_key.as_deref())?;
     let documents = Documents::open(&root, &seed)?;
+    let files = documents.files.clone();
     let identity = documents.identity.id.clone();
     let (trigger, observations) = reconcile::channel();
     let reconcile_signal = trigger.clone();
@@ -328,6 +330,7 @@ pub fn build_server(
         packages: package_resources::PackageResources::new(root.clone(), file_events.clone())?,
         files: Mutex::new(files),
         documents: Mutex::new(documents),
+        collaboration: collaboration::CollaborationState::new(),
         events: file_events,
         _watcher: Mutex::new(watcher),
         reconcile_trigger: trigger.clone(),
@@ -345,7 +348,7 @@ pub fn build_server(
     });
     let api = Router::new()
         .merge(package_resources::routes())
-        .merge(editor_api::routes())
+        .merge(documents_api::routes())
         .merge(sync::routes())
         .route("/{id}/api/v1", get(describe))
         .route("/{id}/api/v1/stat", get(stat))
@@ -419,34 +422,6 @@ pub fn build_server(
     })
 }
 
-async fn run<T: Send + 'static>(
-    vault: Arc<HostedVault>,
-    mutation: bool,
-    action: impl FnOnce(&FsVault) -> vault::fs::Result<T> + Send + 'static,
-) -> Result<T, ApiError> {
-    if mutation && vault.read_only {
-        return Err(failure("PermissionDenied", "Vault is read-only"));
-    }
-    let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        let _entered = span.enter();
-        tracing::debug!(vault_identity = %vault.id, mutation, "Running file operation");
-        let files = vault
-            .files
-            .lock()
-            .map_err(|_| VaultError::new("IO", "Vault operation lock failed", ""))?;
-        let result = action(&files);
-        // Failed recursive operations can partially complete, so invalidate on failure too.
-        if mutation {
-            vault.reconcile_trigger.request();
-            let _ = vault.events.send(ChangeHint::all());
-        }
-        result
-    })
-    .await
-    .map_err(|_| failure("IO", "Vault operation failed"))?
-    .map_err(Into::into)
-}
 #[derive(Deserialize)]
 struct FileQuery {
     #[serde(default)]
@@ -465,7 +440,7 @@ async fn describe(
         .lock()
         .map_err(|_| failure("IO", "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.root, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "clientReplicaCommit": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.root, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
     ))
 }
 async fn stat(
@@ -473,7 +448,7 @@ async fn stat(
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Option<vault::fs::Entry>>, ApiError> {
     Ok(Json(
-        run(access.grant.vault.clone(), false, move |v| {
+        vault::runtime::execute_files(access.grant.vault.clone(), false, move |v| {
             v.stat(&query.path)
         })
         .await?,
@@ -484,7 +459,7 @@ async fn read_dir(
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Vec<vault::fs::Entry>>, ApiError> {
     Ok(Json(
-        run(access.grant.vault.clone(), false, move |v| {
+        vault::runtime::execute_files(access.grant.vault.clone(), false, move |v| {
             v.read_dir(&query.path)
         })
         .await?,
@@ -494,7 +469,7 @@ async fn read_file(
     Extension(access): Extension<RemoteAccess>,
     Query(query): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
-    let bytes = run(access.grant.vault.clone(), false, move |v| {
+    let bytes = vault::runtime::execute_files(access.grant.vault.clone(), false, move |v| {
         if v.stat(&query.path)?
             .and_then(|e| e.size)
             .is_some_and(|s| s > 64 * 1024 * 1024)
@@ -534,26 +509,25 @@ async fn write_file(
             "Replace requires the version returned by reading the file",
         ));
     }
-    let version =
-        editor_api::run_documents(access.grant.vault.clone(), true, move |v, documents| {
-            documents.before_replace(&query.path)?;
-            let version = v.write_file(
-                &query.path,
-                &bytes,
-                query.mode.as_deref().unwrap_or(""),
-                expected.as_deref(),
-            )?;
-            documents.refresh_path(v, &query.path)?;
-            Ok(version)
-        })
-        .await?;
+    let version = vault::runtime::execute(access.grant.vault.clone(), true, move |v, documents| {
+        documents.before_replace(&query.path)?;
+        let version = v.write_file(
+            &query.path,
+            &bytes,
+            query.mode.as_deref().unwrap_or(""),
+            expected.as_deref(),
+        )?;
+        documents.refresh_path(&query.path)?;
+        Ok(version)
+    })
+    .await?;
     Ok((StatusCode::NO_CONTENT, [(header::ETAG, version)]).into_response())
 }
 async fn mkdir(
     Extension(access): Extension<RemoteAccess>,
     Query(query): Query<FileQuery>,
 ) -> Result<StatusCode, ApiError> {
-    run(access.grant.vault.clone(), true, move |v| {
+    vault::runtime::execute_files(access.grant.vault.clone(), true, move |v| {
         v.mkdir(&query.path, query.recursive)
     })
     .await?;
@@ -563,8 +537,8 @@ async fn remove(
     Extension(access): Extension<RemoteAccess>,
     Query(query): Query<FileQuery>,
 ) -> Result<StatusCode, ApiError> {
-    editor_api::run_documents(access.grant.vault.clone(), true, move |v, documents| {
-        documents.remove(v, &query.path, query.recursive)
+    vault::runtime::execute(access.grant.vault.clone(), true, move |_, documents| {
+        documents.remove(&query.path, query.recursive)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -578,8 +552,8 @@ async fn rename(
     Extension(access): Extension<RemoteAccess>,
     Json(args): Json<Rename>,
 ) -> Result<StatusCode, ApiError> {
-    editor_api::run_documents(access.grant.vault.clone(), true, move |v, documents| {
-        documents.rename(v, &args.from, &args.to)
+    vault::runtime::execute(access.grant.vault.clone(), true, move |_, documents| {
+        documents.rename(&args.from, &args.to)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)

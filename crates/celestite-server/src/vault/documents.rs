@@ -8,9 +8,9 @@ use celestite_core::*;
 use futures_lite::future::block_on;
 use std::path::Path;
 
-pub type DocumentState = EditorDocument;
 pub(crate) struct Documents {
     pub identity: VaultIdentity,
+    pub files: std::sync::Arc<FsVault>,
     core: EditorCore<NativeBackend>,
     feed: super::changes::DocumentFeed,
     writers: std::collections::HashSet<String>,
@@ -18,6 +18,7 @@ pub(crate) struct Documents {
 impl Documents {
     pub fn open(root: &Path, seed: &[u8; 32]) -> Result<Self> {
         let backend = NativeBackend::open(root, VaultIdentity::new(root, seed))?;
+        let files = backend.files.clone();
         let core = block_on(EditorCore::open_with_options(
             backend,
             EditorOptions {
@@ -34,6 +35,7 @@ impl Documents {
         let feed = super::changes::DocumentFeed::new(identity.clone(), core.persistent());
         Ok(Self {
             identity,
+            files,
             core,
             feed,
             writers: Default::default(),
@@ -46,7 +48,7 @@ impl Documents {
         // History failures stay frozen; a filesystem hint is not permission to retry.
         if let Some(error) = self
             .core
-            .resident()
+            .resident_status()
             .map_err(vault_error)?
             .iter()
             .find_map(|state| state.persistence_error.as_ref())
@@ -55,7 +57,7 @@ impl Documents {
         }
         Ok(())
     }
-    pub fn resident(&self) -> Result<Vec<DocumentState>> {
+    pub fn resident(&self) -> Result<Vec<EditorDocument>> {
         self.core.resident().map_err(vault_error)
     }
     pub fn has_file_observations(&self) -> bool {
@@ -74,7 +76,7 @@ impl Documents {
         // This transport publishes coalesced committed states; drain the owner's
         // mutation batch so it cannot accumulate behind the state feed.
         self.core.take_mutations();
-        let states = self.resident()?;
+        let states = self.core.resident_status().map_err(vault_error)?;
         self.feed.publish(states)
     }
     pub fn subscribe(&mut self) -> Result<super::changes::Subscription> {
@@ -84,21 +86,32 @@ impl Documents {
     pub fn persistent(&self) -> bool {
         self.core.persistent()
     }
-    pub fn open_file(&mut self, _files: &FsVault, path: &str) -> Result<String> {
+    pub fn open_file(&mut self, path: &str) -> Result<String> {
         block_on(self.core.open_file(path)).map_err(vault_error)
     }
-    pub fn list(&mut self, _files: &FsVault) -> Result<Vec<DocumentState>> {
+    pub fn list(&mut self) -> Result<Vec<EditorDocument>> {
         block_on(self.core.list()).map_err(vault_error)
     }
-    pub fn state(&self, _files: &FsVault, id: &str) -> Result<DocumentState> {
+    pub fn state(&self, id: &str) -> Result<EditorDocument> {
         self.core.read(id).map_err(vault_error)
     }
-    pub fn refresh_path(&mut self, _files: &FsVault, path: &str) -> Result<()> {
+    pub fn host_document(&self, id: &str, known_revision: Option<&str>) -> Result<HostDocument> {
+        let status = self.core.status(id).map_err(vault_error)?;
+        self.core
+            .host_document(id, known_revision != Some(status.backend_revision.as_str()))
+            .map_err(vault_error)
+    }
+    pub fn committed_version(&self, id: &str) -> Result<Version> {
+        self.require_committed(id)?;
+        Ok(self.core.status(id).map_err(vault_error)?.version)
+    }
+    pub fn refresh_path(&mut self, path: &str) -> Result<()> {
         block_on(self.core.refresh_path(path)).map_err(vault_error)
     }
-    pub fn refresh(&mut self, _files: &FsVault, id: &str) -> Result<()> {
+    pub fn refresh(&mut self, id: &str) -> Result<()> {
         block_on(self.core.refresh(id)).map_err(vault_error)
     }
+    #[cfg(test)]
     pub fn apply(
         &mut self,
         id: &str,
@@ -107,7 +120,7 @@ impl Documents {
         block_on(self.core.apply(id, command)).map_err(vault_error)
     }
     fn require_committed(&self, id: &str) -> Result<()> {
-        let state = self.core.read(id).map_err(vault_error)?;
+        let state = self.core.status(id).map_err(vault_error)?;
         if !super::changes::exportable(&state, self.persistent()) {
             return Err(super::fs::VaultError::new(
                 "IO",
@@ -128,16 +141,23 @@ impl Documents {
     /// Writers are reserved for the lifetime of this host, even before their
     /// first operation. A reconnect always receives a new writer.
     pub fn allocate_writer(&mut self, id: &str) -> Result<String> {
-        let snapshot = self.snapshot(id)?;
+        self.require_committed(id)?;
+        let version = self.core.status(id).map_err(vault_error)?.version;
+        let host_writer = self.core.writer_id(id).map_err(vault_error)?;
         loop {
-            let replica =
-                Buffer::from_snapshot(&snapshot, None).map_err(|e| vault_error(e.into()))?;
-            let writer = replica.writer_id();
-            if self.writers.insert(writer.clone()) {
+            let mut bytes = [0_u8; 8];
+            getrandom::fill(&mut bytes)
+                .map_err(|e| super::fs::VaultError::new("IO", e.to_string(), id))?;
+            let writer = u64::from_le_bytes(bytes).to_string();
+            if writer != host_writer
+                && !version.clocks.contains_key(&writer)
+                && self.writers.insert(writer.clone())
+            {
                 return Ok(writer);
             }
         }
     }
+
     /// Validate on an isolated history before touching live state or undo.
     /// Clients may only advance their assigned writer, with complete causal
     /// dependencies; an old session's unsent writer cannot be smuggled in.
@@ -163,7 +183,7 @@ impl Documents {
         let before = prepared.before();
         let after = &prepared.preview().version;
         if prepared.preview().pending
-            || !super::super::sync::contains(after, claimed)
+            || !after.contains(claimed)
             || after.clocks.iter().any(|(peer, clock)| {
                 peer != writer && *clock > before.clocks.get(peer).copied().unwrap_or(0)
             })
@@ -178,25 +198,16 @@ impl Documents {
         let mutation = block_on(self.core.commit_import(id, prepared)).map_err(vault_error)?;
         mutation.require_committed().map_err(vault_error)
     }
-    pub fn save(&mut self, _files: &FsVault, id: &str, expected: Version) -> Result<()> {
+    pub fn save(&mut self, id: &str, expected: Version) -> Result<()> {
         block_on(self.core.save(id, Some(expected))).map_err(vault_error)
-    }
-    pub fn commit_replica(
-        &mut self,
-        id: &str,
-        packet: Option<SyncPacket>,
-        expected: &str,
-        action: &str,
-    ) -> Result<()> {
-        block_on(self.core.commit_replica(id, packet, expected, action)).map_err(vault_error)
     }
     pub fn before_replace(&self, path: &str) -> Result<()> {
         self.core.before_replace(path).map_err(vault_error)
     }
-    pub fn rename(&mut self, _files: &FsVault, from: &str, to: &str) -> Result<()> {
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         block_on(self.core.rename(from, to)).map_err(vault_error)
     }
-    pub fn remove(&mut self, _files: &FsVault, path: &str, recursive: bool) -> Result<()> {
+    pub fn remove(&mut self, path: &str, recursive: bool) -> Result<()> {
         block_on(self.core.remove(path, recursive)).map_err(vault_error)
     }
 }

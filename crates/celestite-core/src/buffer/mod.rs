@@ -118,6 +118,25 @@ impl Buffer {
         }
     }
 
+    /// Compare a file baseline without allocating a second copy of the text.
+    pub fn content_matches(&self, value: &str) -> bool {
+        if self.text.len_utf8() != value.len() {
+            return false;
+        }
+        let mut remaining = value;
+        let mut matches = true;
+        self.text.iter(|chunk| {
+            if let Some(rest) = remaining.strip_prefix(chunk) {
+                remaining = rest;
+                true
+            } else {
+                matches = false;
+                false
+            }
+        });
+        matches && remaining.is_empty()
+    }
+
     /// Rejected input never changes text, undo grouping, revision or pending
     /// history. Successful no-ops have `changed == false` and no operation.
     pub fn apply(&mut self, command: BufferCommand) -> Result<BufferUpdate, CoreError> {

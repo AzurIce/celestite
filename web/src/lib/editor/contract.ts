@@ -36,6 +36,7 @@ export interface DocumentSnapshot {
 }
 export interface DocumentsSnapshot {
   connection?: ConnectionState;
+  collaboration?: CollaborationSnapshot;
   documents: readonly DocumentSnapshot[];
   activeId: string | null;
   loadingPath: VaultPath | null;
@@ -61,6 +62,46 @@ export interface DocumentIdentity {
 export interface Version {
   identity: DocumentIdentity;
   clocks: Record<string, number>;
+}
+/** Serialized CRDT positions are opaque outside core. */
+export type Anchor = { readonly __anchor: unique symbol };
+export type Affinity = "before" | "after";
+export interface ResolvedAnchor {
+  offset: number;
+  refreshed: Anchor;
+}
+export interface MemberView {
+  viewId: string;
+  documentId: string;
+  focused: boolean;
+}
+export interface CollaborationMember {
+  sessionId: string;
+  readOnly: boolean;
+  documents: string[];
+  views: MemberView[];
+}
+export interface CollaborationSnapshot {
+  sessionId: string;
+  sequence: number;
+  members: CollaborationMember[];
+}
+export interface HostDocument {
+  id: string;
+  path: string;
+  version: Version;
+  savedVersion: Version | null;
+  durableVersion: Version | null;
+  backendRevision: string;
+  dirty: boolean;
+  deleted: boolean;
+  conflict: boolean;
+  error: string | null;
+  externalChange?: ExternalChangeStatus | null;
+  persistenceError: string | null;
+  savedContent: string;
+  bom: boolean;
+  lineEnding: "\n" | "\r\n" | "\r";
 }
 export interface TextEdit {
   from: number;
@@ -144,6 +185,21 @@ export interface EditorDocuments {
   retryObservation?(id: string): Promise<boolean>;
   reconnect?(discardUnconfirmed?: boolean): Promise<void>;
   readonly previews?: DocumentPreviews;
+  anchorsAt?(
+    id: string,
+    version: Version,
+    positions: [number, Affinity][],
+  ): Promise<Anchor[]>;
+  resolveAnchors?(
+    id: string,
+    checkpoint: Version,
+    anchors: Anchor[],
+  ): Promise<[Version, ResolvedAnchor[]]>;
+  setView?(
+    viewId: string,
+    documentId: string | null,
+    focused: boolean,
+  ): Promise<void>;
   readonly treeBackend: VaultBackend;
   snapshot(): DocumentsSnapshot;
   subscribe(listener: (state: DocumentsSnapshot) => void): () => void;
@@ -189,6 +245,7 @@ export interface MutationResult {
   restoredSelection?: SelectionContext;
 }
 export type ServiceEvent =
+  | { kind: "members"; sequence: number; state: CollaborationSnapshot | null }
   | { kind: "document"; sequence: number; document: ServiceDocument }
   | { kind: "tree"; sequence: number }
   | { kind: "connection"; sequence: number; connection: ConnectionState };
@@ -223,6 +280,23 @@ export interface WorkerRequest {
 
 /** Async host operations: identical envelope over Worker messages or native IPC. */
 export interface ServiceMethods {
+  release_document: { params: { id: string }; result: void };
+  collaboration: {
+    params: Record<string, never>;
+    result: CollaborationSnapshot | null;
+  };
+  set_view: {
+    params: { viewId: string; documentId: string | null; focused: boolean };
+    result: void;
+  };
+  anchors_at: {
+    params: { id: string; version: Version; positions: [number, Affinity][] };
+    result: Anchor[];
+  };
+  resolve_anchors: {
+    params: { id: string; checkpoint: Version; anchors: Anchor[] };
+    result: [Version, ResolvedAnchor[]];
+  };
   read: { params: { id: string }; result: ServiceDocument };
   preview_assets: {
     params: { id: string; taskId: string };

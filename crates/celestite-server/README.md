@@ -121,7 +121,7 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 ```json
 {
-  "protocolVersion": 2,
+  "protocolVersion": 3,
   "vaultIdentity": {
     "id": "描述接口的 id",
     "historyId": "描述接口的 historyId"
@@ -129,69 +129,44 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 }
 ```
 
-host 返回 `hello`（`sessionId`）和 `ready`，握手不加载文件或发送文档。客户端 `open` 时，host 创建或复用对应 Buffer，分配该会话的十进制 `writerId` 并返回完整快照，同时订阅后续变化。快照与订阅在同一串行边界建立；只有本会话打开过的 Buffer 才会推送 `document`（元数据、`packet`、writer 和递增 `sequence`）。文本来自 CRDT 包；元数据不重复发送正文，`savedContent` 仅在初次打开或磁盘基线改变时发送。慢消费者只补齐其已订阅 Buffer；无法导出历史时结束会话，客户端冻结并保留正文。
+host 返回 `hello`（`sessionId`）和 `ready`，握手不加载文件或发送文档。客户端 `open` 时，host 创建或复用对应 Buffer，分配该会话的十进制 `writerId` 并返回完整快照，同时订阅后续变化。快照与订阅在同一串行边界建立；只有本会话当前订阅的 Buffer 才会推送 `document`（host 元数据、`packet`、writer 和递增 `sequence`）。文本来自 CRDT 包；元数据不重复发送正文，`savedContent` 仅在初次打开或磁盘基线改变时发送。慢消费者只补齐其已订阅 Buffer；无法导出历史时结束会话，客户端冻结并保留正文。
+
+host 同时发送 `members {state}` 全量成员快照，包含成员会话 ID、有效只读权限、正文订阅和视图焦点；允许合并中间状态。成员 ID 与文档 writer 分开。退订清除对应视图，断线或关闭会话清除在线成员。
 
 请求均为 `{ sessionId, requestId, method, ...参数 }`，响应为 `{ kind: "reply", requestId, result }` 或 `error`：
 
-| method  | 参数                           | 行为                                                                               |
-| ------- | ------------------------------ | ---------------------------------------------------------------------------------- |
-| open    | path 或 id，二选一             | 按路径创建 / 复用 Buffer，或重连时按 ID 加入；返回快照与元数据                     |
-| updates | id, packet, version, operation | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后在内存接受并确认 |
-| save    | id, version                    | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                       |
-| probe   | id, version                    | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                               |
-| ping    | —                              | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                               |
+| method            | 参数                           | 行为                                                                               |
+| ----------------- | ------------------------------ | ---------------------------------------------------------------------------------- |
+| open              | path 或 id，二选一             | 按路径创建 / 复用 Buffer，或重连时按 ID 加入；返回快照与元数据                     |
+| updates           | id, packet, version, operation | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后在内存接受并确认 |
+| save              | id, version                    | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                       |
+| probe             | id, version                    | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                               |
+| unsubscribe       | id                             | 停止文本订阅，清除对应视图；同会话重新打开沿用 writer                              |
+| set_view          | viewId, documentId, focused    | 登记视图与焦点；documentId 为 null 时移除视图                                      |
+| retry_observation | id                             | 重新排队磁盘观察，不写文件                                                         |
+| ping              | —                              | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                               |
 
-`document`、`tree` 和 `heartbeat` 为主动通知；`tree` 使文件树失效，实际目录仍通过 HTTP 查询。除 `open` 和 `ping` 外，命令要求目标 Buffer 已在本会话打开。会话缓存最近 256 条操作回执，同序号同包重发返回原回执，变更载荷或跳号被拒绝；回执过期用因果检查点核对。重连分配新会话与 writer，按 ID 重新打开此前订阅的 Buffer，拒绝旧 writer 的未提交操作，不自动重放。回执只表示内存接受，server 重启后旧历史失效。
+`document`、`members`、`tree` 和 `heartbeat` 为主动通知；`tree` 使文件树失效，实际目录仍通过 HTTP 查询。文本操作要求目标 Buffer 已在本会话订阅；非空视图目标也必须已订阅。会话缓存最近 256 条操作回执，同序号同包重发返回原回执，变更载荷或跳号被拒绝；回执过期用因果检查点核对。重连分配新会话与 writer，按 ID 重新打开此前订阅的 Buffer，拒绝旧 writer 的未提交操作，不自动重放。回执只表示内存接受，server 重启后旧历史失效。
 
 客户端的个人撤销也生成自己的 CRDT 增量。输入同步不隐式保存普通文件；保存可能写回已经合入的其他 writer 修改。外部文件变化按磁盘历史分支合并，客户端不能用“丢弃”清除所有人的共享未保存历史。客户端导入保留当前 writer / 撤销，UI 映射待确认输入和选区，IME 期间暂缓导入；断线时整个 Vault 工作区（文件树与编辑区）显示遮罩并禁止交互，重新认证核对历史身份并从 host 重建会话；未确认输入可导出正文或明确丢弃，不自动重放。`probe` 保留为调试与因果检查接口，首期 Web 重连流程不使用它恢复旧输入。
 
-## 无头编辑器 API
+## 文档检查 API
 
 下面路径仍相对于 `/<key>/api/v1`。正文与文档业务由 `celestite-core::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
 
-| 方法 | 路径                                  | 请求 / 行为                                                                                     |
-| ---- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| GET  | `/documents`                          | 核对并返回已加载的 Buffer，不扫描或加载未打开文件                                               |
-| POST | `/documents/open`                     | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态                                          |
-| GET  | `/documents/<document>`               | 正文、因果版本、撤销与保存状态；重新核对磁盘                                                    |
-| GET  | `/documents/<document>/snapshot`      | 完整 `SyncPacket`，新副本从这里加入同一历史                                                     |
-| POST | `/documents/<document>/updates`       | `Version`，返回该版本之后的更新包                                                               |
-| POST | `/documents/<document>/apply`         | `BufferCommand`，统一编辑、撤销、重做、导入和清除个人撤销；返回 `{ document, update, history }` |
-| POST | `/documents/<document>/save`          | 当前 `Version`，条件写回文件，返回更新的状态                                                    |
-| POST | `/documents/<document>/client-commit` | `{ packet, expectedRevision, action }`，客户端副本条件提交，返回 `{ document, packet }`         |
+| 方法 | 路径                             | 请求 / 行为                                            |
+| ---- | -------------------------------- | ------------------------------------------------------ |
+| GET  | `/documents`                     | 核对并返回已加载的 Buffer，不扫描或加载未打开文件      |
+| POST | `/documents/open`                | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态 |
+| GET  | `/documents/<document>`          | 正文、因果版本、撤销与保存状态；重新核对磁盘           |
+| GET  | `/documents/<document>/snapshot` | 完整 `SyncPacket`，用于只读历史检查                    |
+| POST | `/documents/<document>/updates`  | `Version`，返回该版本之后的更新包                      |
 
-命令由 `kind` 区分；命令和回执的多词字段采用 `camelCase`，历史身份保留 `document_id` / `history_id`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
+回执的多词字段采用 `camelCase`，历史身份保留 `document_id` / `history_id`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 writer ID": counter } }`。writer ID 用字符串，避免 JS 64 位整数精度丢失。`SyncPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
 
-`clientReplicaCommit: true` 表示支持独立 HTTP 副本以指定磁盘基线进行条件保存；正常 Web 编辑使用 WebSocket。`client-commit` 的 `action` 为 `save`、`overwrite` 或 `discard`：保存先核对 `expectedRevision`，基线不符时拒绝导入客户端操作；覆盖明确选择客户端正文；丢弃不发送客户端包，重新取得 host 最新文件。返回的完整快照用于补齐客户端历史，文档状态确认实际文件基线。快照限制为 16 MiB，文档请求 JSON 上限为 80 MiB 以容纳字节数组编码；仍使用既有认证、只读约束和 Vault 操作锁。
+HTTP 文档接口用于只读检查；编辑、撤销、增量准入、保存与观察重试均经过 WebSocket 会话。宿主 `vault/runtime.rs` 统一串行执行与通知发布，后台观察复用同一边界。只读普通文件传输不持有投影修改锁。
 
-host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修改；先处理 host 保存，再重试客户端丢弃。
-
-事务示例：
-
-```json
-{
-  "kind": "edit",
-  "base": {
-    "identity": { "document_id": "来自状态", "history_id": "来自状态" },
-    "clocks": {}
-  },
-  "origin": "headless-client",
-  "input": {
-    "kind": "edits",
-    "edits": [{ "from": 0, "to": 0, "insert": "hello\n" }]
-  },
-  "group": null,
-  "undo": { "metadata": null, "positions": [] }
-}
-```
-
-`base` 必须完整使用刚读取的 `snapshot.version`，示例中的空 clocks 不是现有文件的真实版本。`from/to` 是事务之前正文的 UTF-16 半开区间，不能切开 emoji 等字符的代理对；多项编辑必须有序且互不重叠。内核一次验证所有编辑，然后提交一个撤销步。过期事务 / 保存返回 `409 StaleVersion`，非法坐标和更新包返回 `400 InvalidEdit`。不同文档或历史之间的导入被拒绝。
-
-`input` 也可为 `{ "kind": "text", "text": "完整目标正文" }`，仍进入 Buffer 的同一事务路径。撤销 / 重做命令为 `{ "kind": "undo" | "redo", "base": Version, "context": { "positions": [] } }`，导入为 `{ "kind": "import", "packet": SyncPacket }`，清除个人历史为 `{ "kind": "clear_undo" }`。
-
-`update` 包含版本、显示增量、撤销上下文和原始操作；`history.status` 为 `committed` 或 `failed`。失败的历史提交仍返回已接受的正文，不能当成编辑被拒绝或盲目重发。普通文件写回依然是独立操作；WebSocket 只在历史提交后确认。server 会话的身份与因果检查使用准备好的导入结果，随后直接提交，不重复构造临时副本。
-
-协作客户端各自从完整快照建立 `Buffer`，使用新的 writer，只发送命令结果中的本地 CRDT 操作。重复和乱序包按 CRDT 语义处理；依赖未齐的包保留，后续补齐。个人撤销也由客户端产生操作，不请求 server 代为撤销。直接向此 HTTP API 发出本地编辑 / 撤销命令会使用 server writer，因此该入口用于无头控制与开发测试，而非分配协作者身份。
+无头客户端同样建立自己的 `EditorCore`，使用会话分配的 writer，发送本地编辑和个人撤销产生的 CRDT 增量。server 只接受依赖完整且通过会话验证的包。Buffer 命令及 UTF-16 坐标约束见 [core API](../celestite-core/README.md)。
 
 ### 内存历史与磁盘保存
 
@@ -208,7 +183,7 @@ cargo run -p celestite-server -- --no-config \
 just serve-notist "$share_key"
 ```
 
-描述接口始终报告 `persistentHistory: false`，文档的 `durableVersion` 为 null。`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）。内存历史确认不等于写回 `.md`，`/save` 是独立动作。没有可见文本变化的导入也可能推进因果版本；等待依赖的包不会被虚报为已应用版本。
+描述接口始终报告 `persistentHistory: false`，文档的 `durableVersion` 为 null。`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）。内存历史确认不等于写回 `.md`，WebSocket `save` 是独立动作。没有可见文本变化的导入也可能推进因果版本；等待依赖的包不会被虚报为已应用版本。
 
 server 重启丢弃未写回正文和历史，并生成新的 `historyId` 与实例身份；打开文件时从当前磁盘字节建立新文档 ID 和历史。旧客户端保留内存正文并拒绝重连到新历史，需要保留正文后重新打开连接。同一进程内重连可以恢复 host 已接受的编辑，包括回执丢失的操作。
 
@@ -220,7 +195,7 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 外部 diff 在后台释放 Vault 文件锁与文档锁后计算，提交时重新核对磁盘与基线。读取和增量导出始终返回当前已提交历史；计算未完成时不等待新磁盘内容，文档元数据中的 `externalChange` 显示 `pending` 或 `failed`（`code`、`message`、`retryAt`）。状态变化也通过 SSE / WebSocket 推送，不要求先有正文版本变化。
 
-待协调时保存返回 `409 FilesystemReconciliationPending`，计算超时返回 `409 FilesystemDiffTimeout`，两者都携带文件路径并保留历史和磁盘内容。相同失败输入从 30 秒退避至最多 5 分钟；新内容绕过退避。`POST /documents/<document>/retry-observation` 或 WebSocket `retry_observation`（参数 `id`）立即重新排队，返回当前文档状态；重试只协调，不写回物理文件，也允许只读 Vault 使用。
+待协调时保存返回 `409 FilesystemReconciliationPending`，计算超时返回 `409 FilesystemDiffTimeout`，两者都携带文件路径并保留历史和磁盘内容。相同失败输入从 30 秒退避至最多 5 分钟；新内容绕过退避。WebSocket `retry_observation`（参数 `id`）立即重新排队，返回当前文档状态；重试只协调，不写回物理文件，也允许只读 Vault 使用。
 
 `GET /<key>/api/v1/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全部已加载 Buffer 元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已接受 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文，也不加载其他文件。
 
@@ -230,15 +205,15 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 ### 当前范围
 
-已实现独立文本 CRDT 与单个 server 的文件协调。打开文本时才建立 Buffer，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。当前关闭标签不取消订阅，已加载的 host Buffer 保留到进程结束，以保留已接受但未保存的编辑。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、历史压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
+已实现独立文本 CRDT 与单个 server 的文件协调。打开文本时才建立 Buffer，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。关闭标签取消文本订阅并清除视图，已加载的 host Buffer 保留到进程结束，以保留已接受但未保存的编辑。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、历史压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
 
-移动 / 删除的物理结果保留在文件系统中，内存元数据与目录操作不构成跨资源原子事务。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入保留为无头 / 调试传输，SSE 保留为变化提示；远端 Web 使用自己的 Rust WASM core 和实时 WebSocket 会话。
+移动 / 删除的物理结果保留在文件系统中，内存元数据与目录操作不构成跨资源原子事务。外部程序 rename 的稳定身份识别暂未实现。HTTP 文档接口用于只读检查，SSE 保留为变化提示；远端 Web 使用自己的 Rust WASM core 和实时 WebSocket 会话。
 
 ## 多实例与可视化调试
 
-多个独立客户端可从同一快照加入，通过 `/updates` 与 `/apply` 的 import 命令交换各自 writer 的历史。生产连接使用 WebSocket 会话、心跳和主动广播；调试页通过目录元数据列出文件，选择文档后才打开，保留 HTTP 主动拉取，不提供在线成员 / presence 列表。客户端个人撤销在自己的 core 上执行，不能用服务端 writer 的 undo 命令替代。
+多个独立客户端通过生产 WebSocket 会话交换各自 writer 的历史，并接收在线成员、订阅和视图状态。客户端个人撤销在自己的 core 上执行。光标与选区的 presence 传输和渲染尚待实现。
 
-Web 提供 `/debug/sync` 调试页，显示 host 与最多 6 个独立 WASM core，支持手动 / 每秒同步、暂停传输、个人撤销、显式保存、版本与提交回执检查。开发时使用 `http://localhost:1420/debug/sync`；构建后配置 `--web-dir web/dist`，也可从 server 的同一路径打开。详见 [Web 调试说明](../../web/README.md#同步调试页)。调试页用现有文档 API，沿用令牌、来源和只读检查。
+Web 提供 `/debug/sync` 调试页，运行最多 6 个独立的生产远端编辑 Worker，支持实时同步、个人撤销、显式保存、版本与确认状态检查。开发时使用 `http://localhost:1420/debug/sync`；构建后配置 `--web-dir web/dist`。详见 [Web 调试说明](../../web/README.md#同步调试页)。调试页复用编辑器的 WebSocket 会话、成员与订阅协议。
 
 ## 验证
 

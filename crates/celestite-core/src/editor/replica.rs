@@ -86,7 +86,9 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
     Ok(Record {
         observation,
         hosted: true,
+        attached: true,
         read_only: state.read_only,
+        dirty: !document.content_matches(&header.saved_text),
         header,
         buffer: document,
         pending_observation: None,
@@ -100,6 +102,20 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
 }
 
 impl<B: Backend> EditorCore<B> {
+    /// Stop a remote subscription while keeping the Buffer and its personal undo.
+    /// A closed cache releases its path reservation; it is not a deleted file.
+    pub fn release_replica_document(&mut self, id: &str) -> EditorResult<()> {
+        if self.backend.has_projection() || self.backend.persistent() || !self.record(id)?.hosted {
+            return Err(EditorError::new(
+                "Unsupported",
+                "Only volatile hosted replicas can release a subscription",
+                id,
+            ));
+        }
+        self.records.get_mut(id).unwrap().attached = false;
+        self.previews.close(id);
+        Ok(())
+    }
     /// A new document's deletion flag participates in path validation immediately.
     pub async fn join_replica_document(&mut self, input: ReplicaDocument) -> EditorResult<String> {
         self.writable()?;
@@ -114,10 +130,9 @@ impl<B: Backend> EditorCore<B> {
         let id = next.header.id.clone();
         if self.records.contains_key(&id)
             || (!next.header.deleted
-                && self
-                    .records
-                    .values()
-                    .any(|old| !old.header.deleted && old.header.path == next.header.path))
+                && self.records.values().any(|old| {
+                    old.attached && !old.header.deleted && old.header.path == next.header.path
+                }))
         {
             return Err(EditorError::new(
                 "Conflict",
@@ -170,34 +185,13 @@ impl<B: Backend> EditorCore<B> {
             }
             next.insert(id, record);
         }
-        // An open document omitted by the host remains readable as a tombstone.
-        // Its old writer and undo stack do not survive the new session.
-        for (id, old) in &self.records {
-            if next.contains_key(id) {
-                continue;
-            }
-            let packet = old.buffer.export_snapshot()?;
-            let missing = record(ReplicaDocument {
-                packets: vec![packet],
-                writer_id: None,
-                state: ReplicaHostState {
-                    path: old.header.path.clone(),
-                    version: old.buffer.version(),
-                    saved_content: old.header.saved_text.clone(),
-                    backend_revision: old.header.disk_revision.clone(),
-                    bom: old.header.bom,
-                    line_ending: old.header.line_ending.clone(),
-                    deleted: true,
-                    read_only: true,
-                    conflict: false,
-                    error: None,
-                    external_change: None,
-                },
-            })?;
-            next.insert(id.clone(), missing);
-        }
+        // The caller supplies the complete active session catalogue. Closed,
+        // unsubscribed caches must not be resurrected as phantom tombstones.
         let headers: Vec<_> = next.values().map(|record| record.header.clone()).collect();
         self.backend.replace_volatile_documents(&headers).await?;
+        for id in self.records.keys().filter(|id| !next.contains_key(*id)) {
+            self.previews.close(id);
+        }
         self.records = next;
         self.mutations.clear();
         self.failure = None;

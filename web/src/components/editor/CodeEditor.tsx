@@ -54,13 +54,17 @@ import "./editor.css";
 
 import type { EditorBuffer } from "@/lib/editor/buffer";
 import type { PreviewSync } from "./preview-sync";
-export type { EditorBuffer } from "@/lib/editor/buffer";
 interface CodeEditorProps {
   previewSync?: PreviewSync;
   reveal?: { from: number; to: number; requestId: string };
   document: EditorDocument;
   onTransaction: (transaction: ViewEdit) => boolean;
   onComposition?: (active: boolean) => void;
+  onView?: (
+    viewId: string,
+    documentId: string | null,
+    focused: boolean,
+  ) => void;
   onUndo: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
   vim: boolean;
@@ -71,32 +75,7 @@ interface CodeEditorProps {
   onCursor: (line: number, column: number) => void;
   onCache: (buffer: EditorBuffer) => void;
 }
-function minimalChange(before: string, after: string) {
-  const oldChars = Array.from(before),
-    newChars = Array.from(after);
-  let prefix = 0,
-    suffix = 0;
-  while (
-    prefix < oldChars.length &&
-    prefix < newChars.length &&
-    oldChars[prefix] === newChars[prefix]
-  )
-    prefix++;
-  while (
-    suffix < oldChars.length - prefix &&
-    suffix < newChars.length - prefix &&
-    oldChars[oldChars.length - suffix - 1] ===
-      newChars[newChars.length - suffix - 1]
-  )
-    suffix++;
-  const from = oldChars.slice(0, prefix).join("").length;
-  return {
-    from,
-    to:
-      before.length - oldChars.slice(oldChars.length - suffix).join("").length,
-    insert: newChars.slice(prefix, newChars.length - suffix).join(""),
-  };
-}
+import { minimalChange } from "@/lib/editor/view-changes";
 const serviceUpdate = Annotation.define<boolean>();
 const selectionContext = (state: EditorState): SelectionContext => ({
   ranges: state.selection.ranges.map(({ anchor, head }) => ({ anchor, head })),
@@ -125,6 +104,7 @@ const highlight = HighlightStyle.define([
 export default function CodeEditor(props: CodeEditorProps) {
   const previewSync = untrack(() => props.previewSync);
   const documentId = untrack(() => props.document.id);
+  const viewId = crypto.randomUUID();
   let detachPreviewSync: (() => void) | undefined;
   let host!: HTMLDivElement;
   let view: EditorView | undefined;
@@ -191,6 +171,8 @@ export default function CodeEditor(props: CodeEditorProps) {
       autocorrect: "off",
     }),
     EditorView.updateListener.of((update) => {
+      if (update.focusChanged)
+        props.onView?.(viewId, documentId, update.view.hasFocus);
       if (update.docChanged) previewSync?.invalidateEditor(update.view);
       if (update.geometryChanged || update.viewportChanged)
         previewSync?.editorLayoutChanged(update.view);
@@ -387,6 +369,7 @@ export default function CodeEditor(props: CodeEditorProps) {
             buffer.wrap.of(wrap),
           ],
         });
+    props.onView?.(viewId, documentId, false);
     view = new EditorView({ parent: host, state });
     view.scrollDOM.scrollTop = buffer.scrollTop;
     view.scrollDOM.scrollLeft = buffer.scrollLeft;
@@ -508,6 +491,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     },
   );
   onCleanup(() => {
+    props.onView?.(viewId, null, false);
     detachPreviewSync?.();
     disposed = true;
     observer?.disconnect();

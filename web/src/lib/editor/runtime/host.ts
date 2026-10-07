@@ -2,7 +2,7 @@ import { ChangeSet } from "@codemirror/state";
 import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
 import type { VaultBackend } from "../../vault/types";
-import { decodeError, encodeError } from "../rpc";
+import { encodeError } from "../rpc";
 import {
   callCore,
   coreValue,
@@ -26,6 +26,10 @@ import type {
   ServiceEvent,
   Version,
   UndoContext,
+  CollaborationSnapshot,
+  Affinity,
+  Anchor,
+  ResolvedAnchor,
 } from "../contract";
 
 interface Patch {
@@ -50,16 +54,28 @@ export class EditorHost {
   ) {
     this.previewResources = new PreviewResources(backend, packages);
   }
-  private async invoke(
+  private coreQueue: Promise<unknown> = Promise.resolve();
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.coreQueue.then(task);
+    this.coreQueue = result.catch(() => {});
+    return result;
+  }
+  private async call(
     method: string,
     params: Record<string, unknown> = {},
     replyFor?: string,
   ): Promise<CoreReply> {
     const reply = await callCore(this.core, method, params);
-    // Effects are delivered even when a save/refresh ends in an IO error.
     for (const mutation of reply.mutations)
       await this.onMutation(mutation, mutation.document.id === replyFor);
     return reply;
+  }
+  private invoke(
+    method: string,
+    params: Record<string, unknown> = {},
+    replyFor?: string,
+  ): Promise<CoreReply> {
+    return this.serialize(() => this.call(method, params, replyFor));
   }
   protected async execute<T>(
     method: string,
@@ -141,29 +157,44 @@ export class EditorHost {
         }
       : { ...command, base: version, context };
   }
-  async apply(id: string, command: BufferCommand): Promise<MutationResult> {
-    this.ensureMutationAllowed();
-    try {
-      command = this.rebase(
-        command,
-        await this.execute<CoreDocument>("read", { id }),
+  apply(id: string, command: BufferCommand): Promise<MutationResult> {
+    return this.serialize(async () => {
+      this.ensureMutationAllowed();
+      const current = coreValue<CoreDocument>(await this.call("read", { id }));
+      try {
+        command = this.rebase(command, current);
+      } catch (error) {
+        return {
+          document: this.document(current),
+          edits: [],
+          rejection: encodeError(error),
+        };
+      }
+      // Reading/rebasing and acceptance share one core lease. Detached network
+      // completions cannot advance history between these two steps.
+      const reply = await this.call("apply", { id, command }, id);
+      if (reply.status === "error") {
+        const document = coreValue<CoreDocument>(
+          await this.call("read", { id }),
+        );
+        return {
+          document: this.document(document),
+          edits: [],
+          rejection: reply.error,
+        };
+      }
+      const mutation = reply.mutations.find(
+        (value) => value.document.id === id,
       );
-    } catch (error) {
-      return this.rejectedMutation(id, error);
-    }
-    // Publishing/transmitting an accepted update may fail. Such failures are
-    // never reclassified as rejected input just because their error code matches.
-    const reply = await this.invoke("apply", { id, command }, id);
-    if (reply.status === "error")
-      return this.rejectedMutation(id, decodeError(reply.error));
-    const mutation = reply.mutations.find((value) => value.document.id === id);
-    if (!mutation) throw new VaultError("IO", "编辑命令缺少 Buffer 回执。", id);
-    const selection = restoredSelection(mutation.update.restored);
-    return {
-      document: this.document(mutation.document),
-      edits: mutation.update.edits,
-      ...(selection ? { restoredSelection: selection } : {}),
-    };
+      if (!mutation)
+        throw new VaultError("IO", "编辑命令缺少 Buffer 回执。", id);
+      const selection = restoredSelection(mutation.update.restored);
+      return {
+        document: this.document(mutation.document),
+        edits: mutation.update.edits,
+        ...(selection ? { restoredSelection: selection } : {}),
+      };
+    });
   }
   executePreview<K extends keyof PreviewCoreMethods>(
     method: K,
@@ -236,6 +267,36 @@ export class EditorHost {
     for (const raw of await this.execute<CoreDocument[]>("resident"))
       this.publish(raw, content);
   }
+  collaboration(): CollaborationSnapshot | null {
+    return null;
+  }
+  async setView(
+    _viewId: string,
+    _documentId: string | null,
+    _focused: boolean,
+  ) {}
+  protected publishMembers(state: CollaborationSnapshot | null) {
+    this.emit({ kind: "members", sequence: ++this.eventSequence, state });
+  }
+  anchorsAt(
+    id: string,
+    version: Version,
+    positions: [number, Affinity][],
+  ): Promise<Anchor[]> {
+    return this.execute("anchors_at", { id, version, positions });
+  }
+  resolveAnchors(
+    id: string,
+    checkpoint: Version,
+    anchors: Anchor[],
+  ): Promise<[Version, ResolvedAnchor[]]> {
+    return this.execute("resolve_anchors", { id, checkpoint, anchors });
+  }
+  async releaseDocument(id: string) {
+    clearTimeout(this.timers.get(id));
+    this.timers.delete(id);
+    this.previews.delete(id);
+  }
   async composition(_id: string, _active: boolean) {}
   async open(path: VaultPath): Promise<ServiceDocument> {
     try {
@@ -266,18 +327,6 @@ export class EditorHost {
   }
   async read(id: string): Promise<ServiceDocument> {
     return this.document(await this.execute<CoreDocument>("read", { id }));
-  }
-  protected async rejectedMutation(
-    id: string,
-    error: unknown,
-  ): Promise<MutationResult> {
-    // Called only before apply or for its explicit error reply. Acceptance is
-    // determined by the core contract, not an adapter-maintained error-code list.
-    return {
-      document: await this.read(id),
-      edits: [],
-      rejection: encodeError(error),
-    };
   }
   async retryHistory(id: string) {
     const raw = await this.execute<CoreDocument>("retry_history", { id });

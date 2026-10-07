@@ -123,6 +123,7 @@ export class EditorClient {
       this.previewSequence = message.event.sequence;
       for (const listener of this.previewListeners) listener(message.event);
     } else if (
+      message.kind === "members" ||
       message.kind === "document" ||
       message.kind === "tree" ||
       message.kind === "connection"

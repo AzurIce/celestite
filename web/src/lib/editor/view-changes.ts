@@ -55,3 +55,30 @@ import { Text } from "@codemirror/state";
 function importText(text: string) {
   return Text.of(text.split("\n"));
 }
+
+export function minimalChange(before: string, after: string) {
+  const oldChars = Array.from(before),
+    newChars = Array.from(after);
+  let prefix = 0,
+    suffix = 0;
+  while (
+    prefix < oldChars.length &&
+    prefix < newChars.length &&
+    oldChars[prefix] === newChars[prefix]
+  )
+    prefix++;
+  while (
+    suffix < oldChars.length - prefix &&
+    suffix < newChars.length - prefix &&
+    oldChars[oldChars.length - suffix - 1] ===
+      newChars[newChars.length - suffix - 1]
+  )
+    suffix++;
+  const from = oldChars.slice(0, prefix).join("").length;
+  return {
+    from,
+    to:
+      before.length - oldChars.slice(oldChars.length - suffix).join("").length,
+    insert: newChars.slice(prefix, newChars.length - suffix).join(""),
+  };
+}

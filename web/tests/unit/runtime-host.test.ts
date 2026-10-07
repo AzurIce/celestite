@@ -1,5 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { RemoteEditorHost } from "../../src/lib/editor/remote/host";
+import type { RemoteTransport } from "../../src/lib/editor/remote/transport";
+import type {
+  HttpVaultBackend,
+  RemoteVaultDescriptor,
+} from "../../src/lib/vault/http";
+import { vaultPath } from "../../src/lib/vault/path";
 import { EditorHost } from "../../src/lib/editor/runtime/host";
 import type {
   CoreDocument,
@@ -168,4 +175,97 @@ test("gesture grouping uses input time and explicit Vim sessions, independently 
   assert.equal(groups.next("doc", "input.paste", 100002), null);
   groups.break("doc");
   assert.notEqual(groups.next("doc", "input.type", 100003), first);
+});
+
+test("an import cannot interleave between reading a base and accepting a rebased edit", async () => {
+  const calls: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const core: CorePort = {
+    async call(method) {
+      calls.push(method);
+      if (method === "read") {
+        await gate;
+        return JSON.stringify({ status: "ok", value: before, mutations: [] });
+      }
+      return JSON.stringify(
+        method === "apply"
+          ? { status: "ok", value: "doc", mutations: [mutation] }
+          : { status: "ok", value: null, mutations: [] },
+      );
+    },
+  };
+  const instance = new TestHost(
+    core,
+    {} as VaultBackend,
+    () => {},
+    () => {},
+  );
+  const edit = instance.apply("doc", command);
+  const imported = instance.run("observe_files");
+  await Promise.resolve();
+  assert.deepEqual(calls, ["read"]);
+  release();
+  await edit;
+  await imported;
+  assert.deepEqual(calls, ["read", "apply", "observe_files"]);
+});
+
+test("concurrent open replies join a replica once and accept metadata in receipt order", async () => {
+  const calls: string[] = [];
+  const core: CorePort = {
+    async call(method, params) {
+      calls.push(method);
+      // Each call yields, so both network replies reach the host before join ends.
+      await Promise.resolve();
+      const state = JSON.parse(params).state;
+      return JSON.stringify({
+        status: "ok",
+        value: state
+          ? {
+              ...before,
+              snapshot: { ...before.snapshot, version: state.version },
+            }
+          : null,
+        mutations: [],
+      });
+    },
+  };
+  let sequence = 0;
+  const transport = {
+    async request() {
+      const current = ++sequence;
+      return {
+        kind: "document",
+        sequence: current,
+        writerId: "2",
+        document: {
+          ...before,
+          version: version(current + 4),
+          savedContent: "base",
+        },
+        packet: { identity: version(4).identity, kind: "snapshot", data: [] },
+      };
+    },
+  } as unknown as RemoteTransport;
+  const instance = new RemoteEditorHost(
+    core,
+    { packageResources: () => undefined } as unknown as HttpVaultBackend,
+    { readOnly: false } as RemoteVaultDescriptor,
+    () => {},
+    () => {},
+  );
+  Object.assign(instance, { transport, offline: false });
+  const documents = await Promise.all([
+    instance.open(vaultPath("a.md")),
+    instance.open(vaultPath("a.md")),
+  ]);
+  assert.equal(calls.filter((method) => method === "replica_join").length, 1);
+  assert.equal(calls.filter((method) => method === "apply").length, 1);
+  assert.deepEqual(
+    documents.map((document) => document.core?.version),
+    [version(5), version(6)],
+  );
 });

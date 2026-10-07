@@ -754,3 +754,61 @@ fn restart_allocates_fresh_writer_and_external_changes_are_not_personal_undo() {
         assert!(!after.undo.can_undo);
     });
 }
+
+#[test]
+fn lightweight_status_tracks_baselines_without_exposing_personal_state_or_text() {
+    block_on(async {
+        let backend = MemoryBackend::new(b"old");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        let check = |core: &EditorCore<MemoryBackend>, expected: bool| {
+            let status = core.status(&id).unwrap();
+            let document = core.read(&id).unwrap();
+            assert_eq!(status.dirty, expected);
+            assert_eq!(
+                status.dirty,
+                document.snapshot.text != document.saved_content
+            );
+            assert_eq!(status.version, document.snapshot.version);
+            let host = serde_json::to_value(core.host_document(&id, true).unwrap()).unwrap();
+            for field in ["snapshot", "undo", "writerId", "autosaveDelay"] {
+                assert!(host.get(field).is_none(), "host must not expose {field}");
+            }
+        };
+        check(&core, false);
+        replace(&mut core, &id, "draft").await;
+        check(&core, true);
+        core.save(&id, None).await.unwrap();
+        check(&core, false);
+        core.apply(
+            &id,
+            BufferCommand::Undo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
+        check(&core, true);
+        core.apply(
+            &id,
+            BufferCommand::Redo {
+                base: core.read(&id).unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
+        check(&core, false);
+        backend
+            .storage
+            .borrow_mut()
+            .files
+            .insert("a.md".into(), b"external".to_vec());
+        core.refresh(&id).await.unwrap();
+        check(&core, false);
+        backend.storage.borrow_mut().fail_commit = true;
+        replace(&mut core, &id, "uncommitted").await;
+        check(&core, true);
+    });
+}

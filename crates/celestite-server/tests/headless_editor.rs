@@ -1,678 +1,312 @@
-//! Real HTTP clients and a listening server. No browser or editor view involved.
+//! Independent production cores communicating through real WebSocket sessions.
+mod support;
 use celestite_core::*;
-use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
-use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
-use tokio::{sync::oneshot, task::JoinHandle};
+use std::time::Duration;
+use support::{Host, Peer};
 
-struct Server {
-    client: Client,
-    url: String,
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<()>,
-}
-
-impl Server {
-    async fn start(root: &Path, read_only: bool) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = build_server(
-            Config {
-                server: ServerConfig {
-                    listen: address,
-                    ..Default::default()
-                },
-                vault: VaultConfig {
-                    name: "Notes".into(),
-                    path: root.into(),
-                    read_only,
-                    ..Default::default()
-                },
-            },
-            root,
-        )
-        .unwrap();
-        let key = server
-            .links
-            .key(celestite_server::Permission::Edit)
-            .to_owned();
-        let (shutdown, stopping) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, server.router)
-                .with_graceful_shutdown(async {
-                    let _ = stopping.await;
-                })
-                .await
-                .unwrap();
-        });
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            url: format!("http://{address}/{key}/api/v1"),
-            shutdown,
-            task,
-        }
-    }
-
-    async fn request(&self, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
-        let response = self
-            .client
-            .request(method.parse().unwrap(), format!("{}{path}", self.url))
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        let status = response.status();
-        assert_eq!(
-            response
-                .headers()
-                .get("cache-control")
-                .map(|s| s.to_str().unwrap()),
-            Some("no-store")
-        );
-        let bytes = response.bytes().await.unwrap();
-        let value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        (status, value)
-    }
-
-    async fn ok(&self, method: &str, path: &str, body: Value) -> Value {
-        let (status, value) = self.request(method, path, body).await;
-        assert!(status.is_success(), "{status}: {value}");
-        value
-    }
-
-    async fn open(&self, path: &str) -> Value {
-        self.ok("POST", "/documents/open", json!({"path": path}))
-            .await
-    }
-
-    async fn settled(&self, id: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let state = self.ok("GET", &route(id, ""), Value::Null).await;
-                if state["externalChange"].is_null() {
-                    return state;
-                }
-                assert_eq!(state["externalChange"]["phase"], "pending", "{state}");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+async fn state(host: &Host, id: &str) -> Value {
+    host.json("GET", &format!("/documents/{id}"), Value::Null)
         .await
-        .expect("background observation committed")
-    }
-
-    async fn stop(self) {
-        drop(self.client);
-        let _ = self.shutdown.send(());
-        tokio::time::timeout(Duration::from_secs(5), self.task)
-            .await
-            .unwrap()
-            .unwrap();
-    }
 }
-
-fn snapshot(state: &Value) -> TextSnapshot {
-    serde_json::from_value(state["snapshot"].clone()).unwrap()
-}
-fn transaction(doc: &Buffer, from: usize, to: usize, insert: &str) -> BufferCommand {
-    BufferCommand::Edit(Edit {
-        base: doc.version(),
-        input: TextInput::Edits {
-            edits: vec![TextEdit {
-                from,
-                to,
-                insert: insert.into(),
-            }],
-        },
-        origin: "headless-client".into(),
-        group: None,
-        undo: UndoContext {
-            metadata: None,
-            positions: vec![],
-        },
+async fn settled(host: &Host, id: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = state(host, id).await;
+            if state["externalChange"].is_null() {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
+    .await
+    .unwrap()
 }
-fn route(id: &str, action: &str) -> String {
-    format!("/documents/{id}{action}")
-}
-
 #[tokio::test]
-async fn replica_commit_checks_file_revision_before_import_and_returns_saved_history() {
+async fn independent_cores_merge_and_undo_only_their_own_operations() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap();
-    let seed: SyncPacket =
-        serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
-            .unwrap();
-    let mut client = Buffer::from_snapshot(&seed, None).unwrap();
-    let _ = client.apply(transaction(&client, 3, 3, "中文")).unwrap();
-    std::fs::write(root.path().join("a.md"), "external").unwrap();
-    let body = json!({"packet":client.export_snapshot().unwrap(),"expectedRevision":initial["backendRevision"],"action":"save"});
-    assert_eq!(
-        server
-            .request("POST", &route(id, "/client-commit"), body.clone())
-            .await
-            .0,
-        StatusCode::CONFLICT
+    let host = Host::start(root.path(), false).await;
+    let mut a = host.peer().await;
+    let mut b = host.peer().await;
+    let id = a.open("a.md").await;
+    assert_eq!(b.open("a.md").await, id);
+    assert_ne!(
+        a.core.read(&id).unwrap().writer_id,
+        b.core.read(&id).unwrap().writer_id
     );
-    // Rejected local changes never entered the host history.
-    let retained: SyncPacket =
-        serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
-            .unwrap();
-    assert!(!Buffer::from_snapshot(&retained, None)
-        .unwrap()
-        .snapshot()
-        .text
-        .contains("中文"));
-    let mut overwrite = body;
-    overwrite["action"] = json!("overwrite");
-    server.settled(id).await;
-    let receipt = server
-        .ok("POST", &route(id, "/client-commit"), overwrite)
-        .await;
+    a.edit(&id, 3, 3, "甲").await;
+    b.edit(&id, 3, 3, "乙").await;
+    a.sync(&id).await;
+    b.sync(&id).await;
+    let merged = a.core.read(&id).unwrap().snapshot;
     assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "A😀中文B"
+        merged,
+        TextSnapshot {
+            revision: merged.revision,
+            ..b.core.read(&id).unwrap().snapshot
+        }
     );
-    assert_eq!(receipt["document"]["savedContent"], "A😀中文B");
-    let committed: SyncPacket = serde_json::from_value(receipt["packet"].clone()).unwrap();
-    let _ = client
-        .apply(BufferCommand::Import(Import::new(
-            (committed).clone(),
-            "receipt",
-        )))
-        .unwrap();
-    assert_eq!(client.snapshot().text, "A😀中文B");
-    std::fs::write(root.path().join("a.md"), "discard target").unwrap();
-    let discarded = server
-        .ok(
-            "POST",
-            &route(id, "/client-commit"),
-            json!({"packet":null,"expectedRevision":"ignored","action":"discard"}),
-        )
-        .await;
-    assert_eq!(discarded["document"]["savedContent"], "discard target");
-    let seed: SyncPacket = serde_json::from_value(discarded["packet"].clone()).unwrap();
-    let mut other_client = Buffer::from_snapshot(&seed, None).unwrap();
-    let _ = other_client
-        .apply(transaction(&other_client, 0, 0, "other draft "))
-        .unwrap();
-    server
-        .ok("POST", &route(id, "/apply"), json!({"kind":"import","packet":serde_json::to_value(other_client.export_snapshot().unwrap()).unwrap()}))
-        .await;
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(id, "/client-commit"),
-                json!({"packet":null,"expectedRevision":"ignored","action":"discard"}),
-            )
-            .await
-            .0,
-        StatusCode::CONFLICT
-    );
-    let retained = server.ok("GET", &route(id, ""), Value::Null).await;
-    assert_eq!(retained["snapshot"]["text"], "other draft discard target");
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn rejected_imports_leave_the_document_and_history_unchanged() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a.md"), "base").unwrap();
-    std::fs::write(root.path().join("b.md"), "other history").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap();
-    let other = server.open("b.md").await;
-    let other_seed = server
-        .ok(
-            "GET",
-            &route(other["id"].as_str().unwrap(), "/snapshot"),
-            Value::Null,
-        )
-        .await;
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(id, "/apply"),
-                json!({"kind":"import","packet":other_seed})
-            )
-            .await
-            .0,
-        StatusCode::CONFLICT
-    );
-
-    let seed: SyncPacket =
-        serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
-            .unwrap();
-    let mut peer = Buffer::from_snapshot(&seed, Some(77)).unwrap();
-    let _ = peer.apply(transaction(&peer, 0, 0, "\r")).unwrap();
-    let invalid = peer
-        .export_updates_since(&snapshot(&initial).version)
-        .unwrap();
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(id, "/apply"),
-                json!({"kind":"import","packet":serde_json::to_value(invalid).unwrap()})
-            )
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
-    let mut corrupt = seed;
-    corrupt.data = vec![0, 1, 2].into();
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(id, "/apply"),
-                json!({"kind":"import","packet":serde_json::to_value(corrupt).unwrap()})
-            )
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
-    let unchanged = server.ok("GET", &route(id, ""), Value::Null).await;
-    assert_eq!(snapshot(&unchanged), snapshot(&initial));
-    assert_eq!(unchanged["dirty"], false);
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "base"
-    );
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn two_independent_replicas_merge_and_undo_through_real_server() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
-    std::fs::write(root.path().join("closed.md"), "not opened in a view").unwrap();
-    std::fs::write(root.path().join("image.bin"), [0, 255]).unwrap();
-    let server = Server::start(root.path(), false).await;
-    let all = server.ok("GET", "/documents", Value::Null).await;
-    assert!(all.as_array().unwrap().is_empty());
-    let opened = server.open("a.md").await;
-    let id = opened["id"].as_str().unwrap();
-    let seed: SyncPacket =
-        serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
-            .unwrap();
-    let base = snapshot(&opened).version;
-    let mut a = Buffer::from_snapshot(&seed, Some(101)).unwrap();
-    let mut b = Buffer::from_snapshot(&seed, Some(202)).unwrap();
-    let _ = a.apply(transaction(&a, 0, 0, "甲")).unwrap();
-    let _ = b.apply(transaction(&b, 4, 4, "乙")).unwrap();
-    let a_packet = a.export_updates_since(&base).unwrap();
-    server
-        .ok(
-            "POST",
-            &route(id, "/apply"),
-            json!({"kind":"import","packet":serde_json::to_value(&a_packet).unwrap()}),
-        )
-        .await;
-    server
-        .ok("POST", &route(id, "/apply"), json!({"kind":"import","packet":serde_json::to_value(b.export_updates_since(&base).unwrap()).unwrap()}))
-        .await;
-    for replica in [&mut a, &mut b] {
-        let updates: SyncPacket = serde_json::from_value(
-            server
-                .ok(
-                    "POST",
-                    &route(id, "/updates"),
-                    serde_json::to_value(replica.version()).unwrap(),
-                )
-                .await,
-        )
-        .unwrap();
-        let _ = replica
-            .apply(BufferCommand::Import(Import::new(
-                (updates).clone(),
-                "server",
-            )))
-            .unwrap();
-        assert_eq!(replica.snapshot().text, "甲A😀B乙");
-    }
-    let duplicate = server
-        .ok(
-            "POST",
-            &route(id, "/apply"),
-            json!({"kind":"import","packet":serde_json::to_value(&a_packet).unwrap()}),
-        )
-        .await;
-    assert_eq!(duplicate["update"]["changed"], false);
-    assert!(duplicate["update"]["operation"].is_null());
-    assert!(duplicate["document"]["durableVersion"].is_null());
-    let merged = a.version();
-    let _ = a
-        .apply(BufferCommand::Undo {
-            base: a.version(),
-            context: UndoContext::default(),
-        })
-        .unwrap();
-    server
-        .ok("POST", &route(id, "/apply"), json!({"kind":"import","packet":serde_json::to_value(a.export_updates_since(&merged).unwrap()).unwrap()}))
-        .await;
-    let current = server.ok("GET", &route(id, ""), Value::Null).await;
-    assert_eq!(snapshot(&current).text, "A😀B乙");
+    assert!(merged.text.contains('甲') && merged.text.contains('乙'));
+    a.undo(&id, false).await;
+    b.sync(&id).await;
+    assert_eq!(b.core.read(&id).unwrap().snapshot.text, "A😀乙B");
+    b.undo(&id, false).await;
+    a.sync(&id).await;
+    assert_eq!(a.core.read(&id).unwrap().snapshot.text, "A😀B");
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),
         "A😀B"
     );
-    let saved = server
-        .ok(
-            "POST",
-            &route(id, "/save"),
-            serde_json::to_value(snapshot(&current).version).unwrap(),
-        )
-        .await;
-    assert_eq!(saved["dirty"], false);
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "A😀B乙"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("closed.md")).unwrap(),
-        "not opened in a view"
-    );
-    server.stop().await;
+    a.close().await;
+    b.close().await;
+    host.stop().await;
 }
-
 #[tokio::test]
-async fn transactions_versions_and_server_writer_history_are_validated() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap();
-    let base = snapshot(&initial).version;
-    let invalid = json!({"kind":"edit","base":base,"origin":"test","input":{"kind":"edits","edits":[{"from": 2, "to": 3, "insert": "bad"}]},"undo":{"metadata":null,"positions":[]}});
-    assert_eq!(
-        server
-            .request("POST", &route(id, "/apply"), invalid)
-            .await
-            .0,
-        StatusCode::BAD_REQUEST
-    );
-    let edit = json!({"kind":"edit","base":base,"origin":"test","input":{"kind":"edits","edits":[{"from": 0, "to": 1, "insert": "中"}]},"undo":{"metadata":null,"positions":[]}});
-    let changed = server.ok("POST", &route(id, "/apply"), edit.clone()).await;
-    assert_eq!(changed["document"]["snapshot"]["text"], "中😀B");
-    assert_eq!(
-        server.request("POST", &route(id, "/apply"), edit).await.0,
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(id, "/save"),
-                serde_json::to_value(&base).unwrap()
-            )
-            .await
-            .0,
-        StatusCode::CONFLICT
-    );
-    let undone = server
-        .ok(
-            "POST",
-            &route(id, "/apply"),
-            json!({"kind":"undo","base":changed["document"]["snapshot"]["version"]}),
-        )
-        .await;
-    assert_eq!(undone["document"]["snapshot"]["text"], "A😀B");
-    let redone = server
-        .ok(
-            "POST",
-            &route(id, "/apply"),
-            json!({"kind":"redo","base":undone["document"]["snapshot"]["version"]}),
-        )
-        .await;
-    assert_eq!(redone["document"]["snapshot"]["text"], "中😀B");
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn pending_packets_complete_in_memory_and_unsaved_history_expires_on_restart() {
+async fn session_admission_rejects_foreign_writers_histories_and_missing_dependencies() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "base").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap().to_string();
-    let seed: SyncPacket = serde_json::from_value(
-        server
-            .ok("GET", &route(&id, "/snapshot"), Value::Null)
-            .await,
+    let host = Host::start(root.path(), false).await;
+    let mut peer = host.peer().await;
+    let id = peer.open("a.md").await;
+    let before = state(&host, &id).await;
+    let seed = peer.core.snapshot(&id).unwrap();
+    let mut foreign = Buffer::from_snapshot(&seed, None).unwrap();
+    let _ = foreign
+        .apply(BufferCommand::Edit(Edit::replace(
+            &foreign.snapshot(),
+            "foreign",
+        )))
+        .unwrap();
+    let rejected = peer.request("updates", json!({"id":id,"packet":foreign.export_updates_since(&peer.core.read(&id).unwrap().snapshot.version).unwrap(),"version":foreign.version(),"operation":1})).await;
+    assert_eq!(rejected["error"]["code"], "InvalidEdit");
+    let mut wrong = seed.clone();
+    wrong.identity.history_id = "other history".into();
+    let rejected = peer
+        .request(
+            "updates",
+            json!({"id":id,"packet":wrong,"version":foreign.version(),"operation":1}),
+        )
+        .await;
+    assert!(!rejected["error"].is_null());
+    let assigned = peer.core.read(&id).unwrap().writer_id.parse().unwrap();
+    let mut disconnected = Buffer::from_snapshot(&seed, Some(assigned)).unwrap();
+    let _ = disconnected
+        .apply(BufferCommand::Edit(Edit::replace(
+            &disconnected.snapshot(),
+            "first",
+        )))
+        .unwrap();
+    let missing = disconnected.version();
+    let _ = disconnected
+        .apply(BufferCommand::Edit(Edit::replace(
+            &disconnected.snapshot(),
+            "second",
+        )))
+        .unwrap();
+    let rejected = peer.request("updates", json!({"id":id,"packet":disconnected.export_updates_since(&missing).unwrap(),"version":disconnected.version(),"operation":1})).await;
+    assert_eq!(rejected["error"]["code"], "InvalidEdit");
+    assert_eq!(state(&host, &id).await["snapshot"], before["snapshot"]);
+    peer.edit(&id, 4, 4, " valid").await;
+    peer.close().await;
+    host.stop().await;
+}
+#[tokio::test]
+async fn file_save_uses_a_causal_checkpoint_and_preserves_encoding() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.md"), "\u{feff}A😀B\r\nline\r\n").unwrap();
+    let host = Host::start(root.path(), false).await;
+    let mut peer = host.peer().await;
+    let id = peer.open("a.md").await;
+    let initial = peer.core.read(&id).unwrap();
+    peer.edit(&id, 3, 3, "中文").await;
+    let stale = peer
+        .request("save", json!({"id":id,"version":initial.snapshot.version}))
+        .await;
+    assert_eq!(stale["error"]["code"], "StaleVersion");
+    let version = peer.core.read(&id).unwrap().snapshot.version;
+    let saved = peer.ok("save", json!({"id":id,"version":version})).await;
+    peer.accept(saved).await;
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
+        "\u{feff}A😀中文B\r\nline\r\n"
+    );
+    peer.close().await;
+    host.stop().await;
+}
+#[tokio::test]
+async fn external_changes_merge_without_becoming_personal_undo() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.md"), "A middle B").unwrap();
+    let host = Host::start(root.path(), false).await;
+    let mut peer = host.peer().await;
+    let id = peer.open("a.md").await;
+    let writer = peer.core.read(&id).unwrap().writer_id;
+    peer.edit(&id, 2, 8, "MIDDLE").await;
+    std::fs::write(root.path().join("a.md"), "LEFT middle RIGHT").unwrap();
+    settled(&host, &id).await;
+    peer.sync(&id).await;
+    assert_eq!(
+        peer.core.read(&id).unwrap().snapshot.text,
+        "LEFT MIDDLE RIGHT"
+    );
+    assert_eq!(peer.core.read(&id).unwrap().writer_id, writer);
+    assert_eq!(
+        peer.undo(&id, false).await.snapshot.text,
+        "LEFT middle RIGHT"
+    );
+    peer.close().await;
+    host.stop().await;
+}
+#[tokio::test]
+async fn moves_preserve_identity_and_deleted_documents_reject_late_updates_and_saves() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.md"), "base").unwrap();
+    let host = Host::start(root.path(), false).await;
+    let mut peer = host.peer().await;
+    let id = peer.open("a.md").await;
+    host.json("POST", "/rename", json!({"from":"a.md","to":"b.md"}))
+        .await;
+    peer.sync(&id).await;
+    assert_eq!(peer.core.read(&id).unwrap().path, "b.md");
+    host.json("DELETE", "/entry?path=b.md", Value::Null).await;
+    peer.sync(&id).await;
+    assert!(peer.core.read(&id).unwrap().deleted);
+    let version = peer.core.read(&id).unwrap().snapshot.version;
+    let save = peer
+        .request("save", json!({"id":id,"version":version}))
+        .await;
+    assert_eq!(save["error"]["code"], "NotFound");
+    assert!(!root.path().join("b.md").exists());
+    peer.close().await;
+    host.stop().await;
+}
+#[tokio::test]
+async fn readonly_sessions_receive_updates_but_cannot_submit_operations() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.md"), "base").unwrap();
+    let host = Host::start(root.path(), false).await;
+    let mut writer = host.peer().await;
+    let mut reader = Peer::connect(&host.readonly_url).await;
+    let id = writer.open("a.md").await;
+    reader.open("a.md").await;
+    writer.edit(&id, 4, 4, " changed").await;
+    reader.sync(&id).await;
+    assert_eq!(reader.core.read(&id).unwrap().snapshot.text, "base changed");
+    let denied = reader.request("updates", json!({"id":id,"packet":reader.core.snapshot(&id).unwrap(),"version":reader.core.read(&id).unwrap().snapshot.version,"operation":1})).await;
+    assert_eq!(denied["error"]["code"], "PermissionDenied");
+    let denied = reader
+        .request(
+            "save",
+            json!({"id":id,"version":reader.core.read(&id).unwrap().snapshot.version}),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], "PermissionDenied");
+    reader.ok("unsubscribe", json!({"id":id})).await;
+    writer.close().await;
+    reader.close().await;
+    host.stop().await;
+}
+#[tokio::test]
+async fn membership_tracks_subscriptions_views_and_disconnects_without_text_changes() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.md"), "base").unwrap();
+    let host = Host::start(root.path(), false).await;
+    let mut observer = host.peer().await;
+    let mut peer = host.peer().await;
+    let id = peer.open("a.md").await;
+    let writer = peer.core.read(&id).unwrap().writer_id;
+    peer.edit(&id, 4, 4, " draft").await;
+    let member_id = peer.session.clone();
+    peer.ok(
+        "set_view",
+        json!({"viewId":"editor","documentId":id,"focused":true}),
     )
-    .unwrap();
-    let mut peer = Buffer::from_snapshot(&seed, Some(42)).unwrap();
-    let base = peer.version();
-    let _ = peer.apply(transaction(&peer, 0, 0, "one ")).unwrap();
-    let first = peer.export_updates_since(&base).unwrap();
-    let middle = peer.version();
-    let _ = peer.apply(transaction(&peer, 8, 8, " two")).unwrap();
-    let last = peer.export_updates_since(&middle).unwrap();
-    let waiting = server
-        .ok(
-            "POST",
-            &route(&id, "/apply"),
-            json!({"kind":"import","packet":serde_json::to_value(last).unwrap()}),
-        )
+    .await;
+    let members = observer
+        .next_members(|state| {
+            state["members"].as_array().is_some_and(|members| {
+                members.iter().any(|m| {
+                    m["sessionId"] == member_id
+                        && m["views"].as_array().is_some_and(|v| !v.is_empty())
+                })
+            })
+        })
         .await;
-    assert_eq!(waiting["update"]["pending"], true);
-    let completed = server
-        .ok(
-            "POST",
-            &route(&id, "/apply"),
-            json!({"kind":"import","packet":serde_json::to_value(first).unwrap()}),
-        )
+    assert_eq!(members["members"].as_array().unwrap().len(), 2);
+    let before = state(&host, &id).await["snapshot"].clone();
+    peer.ok("unsubscribe", json!({"id":id})).await;
+    observer
+        .next_members(|state| {
+            state["members"].as_array().is_some_and(|members| {
+                members.iter().any(|m| {
+                    m["sessionId"] == member_id
+                        && m["documents"] == json!([])
+                        && m["views"] == json!([])
+                })
+            })
+        })
         .await;
-    assert_eq!(completed["document"]["snapshot"]["text"], "one base two");
-    assert_eq!(completed["document"]["dirty"], true);
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "base"
-    );
-    assert!(completed["document"]["durableVersion"].is_null());
-    server.stop().await;
-    let server = Server::start(root.path(), false).await;
-    let restored = server.open("a.md").await;
-    assert_eq!(snapshot(&restored).text, "base");
-    assert_ne!(restored["id"], id);
-    assert!(restored["durableVersion"].is_null());
-    server.stop().await;
+    peer.sync(&id).await;
+    assert_eq!(peer.core.read(&id).unwrap().writer_id, writer);
+    assert!(peer.core.read(&id).unwrap().undo.can_undo);
+    assert_eq!(state(&host, &id).await["snapshot"], before);
+    peer.close().await;
+    observer
+        .next_members(|state| {
+            state["members"]
+                .as_array()
+                .is_some_and(|members| members.iter().all(|m| m["sessionId"] != member_id))
+        })
+        .await;
+    observer.close().await;
+    host.stop().await;
 }
-
 #[tokio::test]
-async fn external_changes_merge_with_dirty_buffers_and_saved_bytes_survive_restart() {
+async fn production_anchor_rpc_checks_versions_and_unicode_boundaries() {
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a.md"), "old").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap().to_string();
-    std::fs::write(root.path().join("a.md"), "external").unwrap();
-    let clean = server.settled(&id).await;
-    assert_eq!(snapshot(&clean).text, "external");
-    assert_eq!(clean["undo"]["canUndo"], false);
-    server.ok("POST", &route(&id, "/apply"), json!({"kind":"edit","base":snapshot(&clean).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 8, "to": 8, "insert": " local"}]},"undo":{"metadata":null,"positions":[]}})).await;
-    std::fs::write(root.path().join("a.md"), "other editor").unwrap();
-    let dirty = server.settled(&id).await;
-    assert_eq!(snapshot(&dirty).text, "other editor local");
-    assert_eq!(dirty["conflict"], false);
+    std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
+    let host = Host::start(root.path(), false).await;
+    let mut peer = host.peer().await;
+    let id = peer.open("a.md").await;
+    let version = peer.core.read(&id).unwrap().snapshot.version;
+    let anchors = peer
+        .core
+        .execute_service(
+            "anchors_at",
+            json!({"id":id,"version":version,"positions":[[3,"before"]]}),
+        )
+        .await
+        .unwrap();
+    assert!(peer
+        .core
+        .execute_service(
+            "anchors_at",
+            json!({"id":id,"version":version,"positions":[[2,"before"]]})
+        )
+        .await
+        .is_err());
+    peer.edit(&id, 0, 0, "前").await;
     assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(&id, "/save"),
-                serde_json::to_value(snapshot(&clean).version).unwrap()
+        peer.core
+            .execute_service(
+                "anchors_at",
+                json!({"id":id,"version":version,"positions":[[3,"before"]]})
             )
             .await
-            .0,
-        StatusCode::CONFLICT
+            .unwrap_err()
+            .code,
+        "StaleVersion"
     );
-    let read = server
-        .client
-        .get(format!("{}/file?path=a.md", server.url))
-        .send()
-        .await
-        .unwrap();
-    let revision = read.headers()["etag"].to_str().unwrap().to_string();
-    drop(read);
-    let legacy = server
-        .client
-        .put(format!("{}/file?path=a.md&mode=replace", server.url))
-        .header("if-match", revision)
-        .body("bypass")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(legacy.status(), StatusCode::CONFLICT);
-    drop(legacy);
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "other editor"
-    );
-    server
-        .ok(
-            "POST",
-            &route(&id, "/save"),
-            serde_json::to_value(snapshot(&dirty).version).unwrap(),
+    let resolved = peer
+        .core
+        .execute_service(
+            "resolve_anchors",
+            json!({"id":id,"checkpoint":version,"anchors":anchors}),
         )
-        .await;
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "other editor local"
-    );
-    server.stop().await;
-    let server = Server::start(root.path(), false).await;
-    let reopened = server.open("a.md").await;
-    assert_eq!(snapshot(&reopened).text, "other editor local");
-    assert_ne!(reopened["id"], id);
-    assert_eq!(reopened["dirty"], false);
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn move_preserves_identity_and_delete_cannot_be_undone_by_late_save() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join("folder")).unwrap();
-    std::fs::write(root.path().join("folder/a.md"), "base").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("folder/a.md").await;
-    let id = initial["id"].as_str().unwrap().to_string();
-    server.ok("POST", &route(&id, "/apply"), json!({"kind":"edit","base":snapshot(&initial).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 4, "to": 4, "insert": " edit"}]},"undo":{"metadata":null,"positions":[]}})).await;
-    let response = server
-        .client
-        .post(format!("{}/rename", server.url))
-        .json(&json!({"from": "folder", "to": "renamed"}))
-        .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    drop(response);
-    let moved = server.open("renamed/a.md").await;
-    assert_eq!(moved["id"], id);
-    assert_eq!(snapshot(&moved).text, "base edit");
-    server
-        .ok(
-            "POST",
-            &route(&id, "/save"),
-            serde_json::to_value(snapshot(&moved).version).unwrap(),
-        )
-        .await;
-    assert!(!root.path().join("folder").exists());
-    let response = server
-        .client
-        .delete(format!("{}/entry?path=renamed&recursive=true", server.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    drop(response);
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(&id, "/save"),
-                serde_json::to_value(snapshot(&moved).version).unwrap()
-            )
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    let removed = server.ok("GET", &route(&id, ""), Value::Null).await;
-    assert_eq!(removed["deleted"], true);
-    assert_eq!(snapshot(&removed).text, "base edit");
-    server.stop().await;
-    let server = Server::start(root.path(), false).await;
-    assert_eq!(
-        server.request("GET", &route(&id, ""), Value::Null).await.0,
-        StatusCode::NOT_FOUND
-    );
-    assert!(!root.path().join("renamed").exists());
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn bom_and_crlf_roundtrip_and_read_only_rejects_editor_mutations() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a.md"), "\u{feff}a\r\nb\r\n").unwrap();
-    let server = Server::start(root.path(), false).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap();
-    assert_eq!(snapshot(&initial).text, "a\nb\n");
-    let changed = server.ok("POST", &route(id, "/apply"), json!({"kind":"edit","base":snapshot(&initial).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 0, "to": 1, "insert": "中😀"}]},"undo":{"metadata":null,"positions":[]}})).await;
-    server
-        .ok(
-            "POST",
-            &route(id, "/save"),
-            changed["document"]["snapshot"]["version"].clone(),
-        )
-        .await;
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "\u{feff}中😀\r\nb\r\n"
-    );
-    server.stop().await;
-    let server = Server::start(root.path(), true).await;
-    let initial = server.open("a.md").await;
-    let id = initial["id"].as_str().unwrap();
-    let packet = server.ok("GET", &route(id, "/snapshot"), Value::Null).await;
-    for command in [
-        json!({"kind":"edit","base":initial["snapshot"]["version"],"input":{"kind":"edits","edits":[]}}),
-        json!({"kind":"undo","base":initial["snapshot"]["version"]}),
-        json!({"kind":"redo","base":initial["snapshot"]["version"]}),
-        json!({"kind":"import","packet":packet}),
-        json!({"kind":"clear_undo"}),
-    ] {
-        assert_eq!(
-            server
-                .request("POST", &route(id, "/apply"), command)
-                .await
-                .0,
-            StatusCode::FORBIDDEN
-        );
-    }
-    assert_eq!(
-        server
-            .request(
-                "POST",
-                &route(id, "/save"),
-                initial["snapshot"]["version"].clone()
-            )
-            .await
-            .0,
-        StatusCode::FORBIDDEN
-    );
-    server.stop().await;
+    assert_eq!(resolved[1][0]["offset"], 4);
+    peer.close().await;
+    host.stop().await;
 }

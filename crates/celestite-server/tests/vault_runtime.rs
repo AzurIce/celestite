@@ -1,3 +1,4 @@
+mod support;
 use axum::{body::Body, http::Request, Router};
 use celestite_server::{build_server, Config, Permission, VaultConfig};
 use http_body_util::BodyExt;
@@ -8,6 +9,9 @@ use tower::ServiceExt;
 struct Host {
     router: Router,
     key: String,
+    peer: tokio::sync::Mutex<support::Peer>,
+    stopping: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl Host {
     async fn request(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
@@ -38,16 +42,18 @@ impl Host {
             .await
     }
     async fn edit(&self, document: &Value, text: &str) -> Value {
-        self.ok(
-            "POST",
-            &format!("/documents/{}/apply", document["id"].as_str().unwrap()),
-            json!({
-                "kind":"edit", "base":document["snapshot"]["version"], "origin":"test",
-                "input":{"kind":"text","text":text}, "undo":{"metadata":null,"positions":[]}
-            }),
-        )
-        .await["document"]
-            .clone()
+        let mut peer = self.peer.lock().await;
+        let id = peer.open(document["path"].as_str().unwrap()).await;
+        peer.replace(&id, text).await;
+        self.ok("GET", &format!("/documents/{id}"), Value::Null)
+            .await
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.stopping.send_replace(true);
+        self.task.abort();
     }
 }
 
@@ -74,11 +80,29 @@ impl Fixture {
             },
         }
     }
-    fn start(&self, root: &str) -> Host {
+    async fn start(&self, root: &str) -> Host {
         let server = build_server(self.config(root), self.0.path()).unwrap();
+        let key = server.links.key(Permission::Edit).to_owned();
+        let stopping = server.shutdown;
+        let router = server.router.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut signal = stopping.subscribe();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, server.router)
+                .with_graceful_shutdown(async move {
+                    signal.changed().await.ok();
+                })
+                .await
+                .unwrap();
+        });
+        let peer = support::Peer::connect(&format!("http://{address}/{key}/api/v1")).await;
         Host {
-            key: server.links.key(Permission::Edit).into(),
-            router: server.router,
+            router,
+            key,
+            peer: tokio::sync::Mutex::new(peer),
+            stopping,
+            task,
         }
     }
 }
@@ -86,7 +110,7 @@ impl Fixture {
 #[tokio::test]
 async fn listing_and_observation_do_not_open_buffers_or_create_state_files() {
     let f = Fixture::new();
-    let host = f.start("a");
+    let host = f.start("a").await;
     assert_eq!(host.ok("GET", "/documents", Value::Null).await, json!([]));
     let directory = host.ok("GET", "/directory?path=", Value::Null).await;
     assert_eq!(directory.as_array().unwrap().len(), 2);
@@ -120,7 +144,7 @@ async fn listing_and_observation_do_not_open_buffers_or_create_state_files() {
 #[tokio::test]
 async fn restart_uses_saved_bytes_and_rejects_previous_history() {
     let f = Fixture::new();
-    let host = f.start("a");
+    let host = f.start("a").await;
     let before = host.ok("GET", "", Value::Null).await;
     let document = host.open("note.md").await;
     let document = host.edit(&document, "unsaved draft").await;
@@ -133,7 +157,7 @@ async fn restart_uses_saved_bytes_and_rejects_previous_history() {
         "disk"
     );
     drop(host);
-    let host = f.start("a");
+    let host = f.start("a").await;
     let after = host.ok("GET", "", Value::Null).await;
     assert_eq!(before["vaultIdentity"]["id"], after["vaultIdentity"]["id"]);
     assert_ne!(
@@ -151,24 +175,24 @@ async fn restart_uses_saved_bytes_and_rejects_previous_history() {
     let next = host.open("note.md").await;
     assert_ne!(next["id"], document["id"]);
     assert_eq!(next["snapshot"]["text"], "disk");
-    let (status, _) = host
-        .request(
-            "POST",
-            &format!("/documents/{}/apply", next["id"].as_str().unwrap()),
-            json!({"kind":"import","packet":packet}),
+    let rejected = {
+        let mut peer = host.peer.lock().await;
+        let id = peer.open("note.md").await;
+        peer.request("updates", json!({"id":id,"packet":packet,"version":document["snapshot"]["version"],"operation":1})).await
+    };
+    assert!(!rejected["error"].is_null());
+    let saved = host.edit(&next, "saved text").await;
+    host.peer
+        .lock()
+        .await
+        .ok(
+            "save",
+            json!({"id":saved["id"],"version":saved["snapshot"]["version"]}),
         )
         .await;
-    assert!(status >= 400);
-    let saved = host.edit(&next, "saved text").await;
-    host.ok(
-        "POST",
-        &format!("/documents/{}/save", saved["id"].as_str().unwrap()),
-        saved["snapshot"]["version"].clone(),
-    )
-    .await;
     drop(host);
     assert_eq!(
-        f.start("a").open("note.md").await["snapshot"]["text"],
+        f.start("a").await.open("note.md").await["snapshot"]["text"],
         "saved text"
     );
 }
@@ -176,8 +200,8 @@ async fn restart_uses_saved_bytes_and_rejects_previous_history() {
 #[tokio::test]
 async fn directories_with_the_same_share_secret_have_distinct_identities() {
     let f = Fixture::new();
-    let a = f.start("a");
-    let b = f.start("b");
+    let a = f.start("a").await;
+    let b = f.start("b").await;
     assert_ne!(a.key, b.key);
     let first = a.ok("GET", "", Value::Null).await;
     let second = b.ok("GET", "", Value::Null).await;
@@ -231,8 +255,8 @@ fn obsolete_history_configuration_and_cli_flags_are_rejected() {
 async fn canonical_directory_aliases_preserve_configured_share_identity() {
     let f = Fixture::new();
     std::os::unix::fs::symlink("a", f.0.path().join("alias")).unwrap();
-    let first = f.start("a");
+    let first = f.start("a").await;
     let key = first.key.clone();
     drop(first);
-    assert_eq!(f.start("alias").key, key);
+    assert_eq!(f.start("alias").await.key, key);
 }

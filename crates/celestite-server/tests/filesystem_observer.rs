@@ -1,5 +1,6 @@
 //! Observe through the change feed before reading a document: a GET must not be
 //! what causes these filesystem edits to enter host history.
+mod support;
 use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
 use reqwest::{Client, Response};
 use serde_json::{json, Value};
@@ -11,6 +12,7 @@ use tokio::{
 
 struct Host {
     client: Client,
+    peer: tokio::sync::Mutex<Option<support::Peer>>,
     url: String,
     shutdown: oneshot::Sender<()>,
     stopping: watch::Sender<bool>,
@@ -52,6 +54,7 @@ impl Host {
         });
         Self {
             client: Client::new(),
+            peer: tokio::sync::Mutex::new(None),
             url: format!("http://{address}/{key}/api/v1"),
             shutdown,
             stopping: stop_events,
@@ -70,6 +73,29 @@ impl Host {
         let body = response.text().await.unwrap();
         assert!(status.is_success(), "{status}: {body}");
         serde_json::from_str(&body).unwrap()
+    }
+    async fn edit(&self, id: &str, command: Value) -> Value {
+        let mut slot = self.peer.lock().await;
+        if slot.is_none() {
+            *slot = Some(support::Peer::connect(&self.url).await);
+        }
+        let peer = slot.as_mut().unwrap();
+        if peer.core.read(id).is_err() {
+            let state = self.state(id).await;
+            assert_eq!(peer.open(state["path"].as_str().unwrap()).await, id);
+        } else {
+            peer.sync(id).await;
+        }
+        let command = serde_json::from_value(command).unwrap();
+        peer.apply(id, command).await;
+        self.state(id).await
+    }
+    async fn save(&self, id: &str, version: Value) -> Value {
+        let mut slot = self.peer.lock().await;
+        let peer = slot.as_mut().unwrap();
+        let receipt = peer.ok("save", json!({"id":id,"version":version})).await;
+        peer.accept(receipt).await;
+        self.state(id).await
     }
     async fn feed(&self) -> Feed {
         let response = self
@@ -94,6 +120,9 @@ impl Host {
             .await
     }
     async fn stop(self) {
+        if let Some(peer) = self.peer.into_inner() {
+            peer.close().await;
+        }
         self.stopping.send_replace(true);
         let _ = self.shutdown.send(());
         tokio::time::timeout(Duration::from_secs(5), self.task)
@@ -159,7 +188,7 @@ async fn append(host: &Host, id: &str, state: &Value, text: &str) -> Value {
         .unwrap()
         .encode_utf16()
         .count();
-    host.request("POST", &format!("/documents/{id}/apply"), json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":offset,"to":offset,"insert":text}]},"undo":{"metadata":null,"positions":[]}})).await["document"].clone()
+    host.edit(id, json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":offset,"to":offset,"insert":text}]},"undo":{"metadata":null,"positions":[]}} )).await
 }
 
 #[tokio::test]
@@ -224,18 +253,16 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
     let id = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
     let state = host.state(&id).await;
     let state = host
-        .request(
-            "POST",
-            &format!("/documents/{id}/apply"),
+        .edit(
+            &id,
             json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"local","input":{"kind":"edits","edits":[{"from":2,"to":8,"insert":"MIDDLE"}]},"undo":{"metadata":null,"positions":[]}}),
         )
-        .await["document"]
-        .clone();
+        .await;
     feed.until(&id, |notice| {
         notice["version"] == state["snapshot"]["version"]
     })
     .await;
-    let writer = state["writerId"].clone();
+    let writer = host.state(&id).await["writerId"].clone();
     let mut prior = state["snapshot"]["version"].clone();
     for text in ["A1 middle B1", "A2 middle B2", "A middle B"] {
         std::fs::write(root.path().join("a.md"), text).unwrap();
@@ -246,23 +273,15 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
         assert_eq!(state["writerId"], writer);
         assert_eq!(state["conflict"], false);
     }
-    let saved = host
-        .request("POST", &format!("/documents/{id}/save"), prior.clone())
-        .await;
+    let saved = host.save(&id, prior.clone()).await;
     feed.until(&id, |notice| notice["dirty"] == false).await;
     assert_eq!(saved["snapshot"]["version"], prior);
     // Rewriting the exact bytes generates OS events but no further CRDT operation.
     std::fs::write(root.path().join("a.md"), "A MIDDLE B").unwrap();
     tokio::time::sleep(Duration::from_millis(160)).await;
     assert_eq!(host.state(&id).await["snapshot"]["version"], prior);
-    let undone = host
-        .request(
-            "POST",
-            &format!("/documents/{id}/apply"),
-            json!({"kind":"undo","base":prior}),
-        )
-        .await;
-    assert_eq!(undone["document"]["snapshot"]["text"], "A middle B");
+    let undone = host.edit(&id, json!({"kind":"undo","base":prior})).await;
+    assert_eq!(undone["snapshot"]["text"], "A middle B");
     drop(feed);
     host.stop().await;
 }
@@ -335,53 +354,19 @@ async fn a_read_only_vault_still_observes_its_hosts_external_files() {
 
 #[tokio::test]
 async fn independent_replicas_follow_committed_changes_and_keep_their_personal_undo() {
-    use celestite_core::{
-        Buffer, BufferCommand, Edit, Import, SyncPacket, TextEdit, TextInput, UndoContext,
-    };
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "left middle right").unwrap();
     let host = Host::start(root.path(), false).await;
-    host.open("a.md").await;
+    let mut a = support::Peer::connect(&host.url).await;
+    let mut b = support::Peer::connect(&host.url).await;
+    let id = a.open("a.md").await;
+    b.open("a.md").await;
     let mut first = host.feed().await;
     let mut second = host.feed().await;
     let initial = first.next().await;
     second.next().await;
-    let id = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
-    let seed: SyncPacket = serde_json::from_value(
-        host.request("GET", &format!("/documents/{id}/snapshot"), Value::Null)
-            .await,
-    )
-    .unwrap();
-    let mut a = Buffer::from_snapshot(&seed, None).unwrap();
-    let mut b = Buffer::from_snapshot(&seed, None).unwrap();
-    let common = a.version();
-    for (doc, from, to, text) in [(&mut a, 5, 11, "MIDDLE"), (&mut b, 12, 17, "RIGHT")] {
-        let _ = doc
-            .apply(BufferCommand::Edit(Edit {
-                base: doc.version(),
-                input: TextInput::Edits {
-                    edits: vec![TextEdit {
-                        from,
-                        to,
-                        insert: text.into(),
-                    }],
-                },
-                origin: "local".into(),
-                group: None,
-                undo: UndoContext {
-                    metadata: None,
-                    positions: vec![],
-                },
-            }))
-            .unwrap();
-        let packet = doc.export_updates_since(&common).unwrap();
-        host.request(
-            "POST",
-            &format!("/documents/{id}/apply"),
-            json!({"kind":"import","packet":serde_json::to_value(packet).unwrap()}),
-        )
-        .await;
-    }
+    a.edit(&id, 5, 11, "MIDDLE").await;
+    b.edit(&id, 12, 17, "RIGHT").await;
     std::fs::write(root.path().join("a.md"), "LEFT middle right").unwrap();
     for feed in [&mut first, &mut second] {
         feed.until(&id, |notice| {
@@ -389,62 +374,36 @@ async fn independent_replicas_follow_committed_changes_and_keep_their_personal_u
         })
         .await;
     }
-    for doc in [&mut a, &mut b] {
-        let packet: SyncPacket = serde_json::from_value(
-            host.request(
-                "POST",
-                &format!("/documents/{id}/updates"),
-                serde_json::to_value(doc.version()).unwrap(),
-            )
-            .await,
-        )
-        .unwrap();
-        let _ = doc
-            .apply(BufferCommand::Import(Import::new((packet).clone(), "host")))
-            .unwrap();
-        assert_eq!(doc.snapshot().text, "LEFT MIDDLE RIGHT");
+    for peer in [&mut a, &mut b] {
+        peer.sync(&id).await;
+        assert_eq!(
+            peer.core.read(&id).unwrap().snapshot.text,
+            "LEFT MIDDLE RIGHT"
+        );
     }
-    assert_eq!(a.version(), b.version());
-    let before = a.version();
-    let _ = a
-        .apply(BufferCommand::Undo {
-            base: a.version(),
-            context: UndoContext::default(),
-        })
-        .unwrap();
-    assert_eq!(a.snapshot().text, "LEFT middle RIGHT");
-    let accepted = host
-        .request("POST", &format!("/documents/{id}/apply"), json!({"kind":"import","packet":serde_json::to_value(a.export_updates_since(&before).unwrap()).unwrap()}))
-        .await;
+    assert_eq!(
+        a.core.read(&id).unwrap().snapshot.version,
+        b.core.read(&id).unwrap().snapshot.version
+    );
+    let accepted = a.undo(&id, false).await;
+    assert_eq!(accepted.snapshot.text, "LEFT middle RIGHT");
     second
         .until(&id, |notice| {
-            notice["version"] == accepted["document"]["snapshot"]["version"]
+            notice["version"] == serde_json::to_value(&accepted.snapshot.version).unwrap()
         })
         .await;
-    let packet: SyncPacket = serde_json::from_value(
-        host.request(
-            "POST",
-            &format!("/documents/{id}/updates"),
-            serde_json::to_value(b.version()).unwrap(),
-        )
-        .await,
-    )
-    .unwrap();
-    let _ = b
-        .apply(BufferCommand::Import(Import::new((packet).clone(), "host")))
-        .unwrap();
-    assert_eq!(a.snapshot().text, b.snapshot().text);
-    let _ = b
-        .apply(BufferCommand::Undo {
-            base: b.version(),
-            context: UndoContext::default(),
-        })
-        .unwrap();
-    assert_eq!(b.snapshot().text, "LEFT middle right");
+    b.sync(&id).await;
+    assert_eq!(
+        a.core.read(&id).unwrap().snapshot.text,
+        b.core.read(&id).unwrap().snapshot.text
+    );
+    assert_eq!(b.undo(&id, false).await.snapshot.text, "LEFT middle right");
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),
         "LEFT middle right"
     );
+    a.close().await;
+    b.close().await;
     drop(first);
     drop(second);
     host.stop().await;

@@ -29,6 +29,10 @@ export async function installWorkerHarness(page: Page, remote = false) {
           setTimeout(() => handler.call(this, event), 500);
           return;
         }
+        if (self.holdUpdateReplies && frame.kind === "reply" && frame.result?.operation) {
+          (self.heldUpdateReplies ??= []).push(() => handler.call(this, event));
+          return;
+        }
         if (self.delayReplies && frame.kind === "reply" && frame.result?.operation) setTimeout(() => handler.call(this, event), 80);
         else handler.call(this, event);
       }; }

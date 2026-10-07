@@ -307,7 +307,7 @@ Tree-sitter runtime 与编译 CLI 固定为 `0.26.11`。语法 WASM、queries �
 
 所有正文命令走 `apply(id, BufferCommand)`。`EditorBinding.call` 返回命令结果及 mutations 批次，`runtime/host.ts` 统一消费 Buffer 的版本化显示增量；本机目录不再根据字符串补算差异，远端直接发送结果里的本地操作包。CodeMirror 只承载视图与待确认投影，不安装独立撤销历史，也没有绕开 core 的纯 JS 编辑退路。撤销组在输入发生时由 `commands.ts` 确定，慢 IO 不会把一次输入手势拆成多个撤销步。
 
-`MemoryBackend` 是 core 的内存历史存储后端，通过 `MemoryEditorBinding` 接入远端 Worker；它保存文档快照与增量，不提供内存文件系统，也不写入 OPFS。远端文件和目录由 HTTP 适配器访问 host。关闭标签释放 UI buffer，Worker 历史继续保留和同步；刷新后从 host 重建会话，未确认输入没有本机持久化副本。后端实现见 [core README](../crates/celestite-core/README.md#backend-与服务接口)，加载范围与请求流程见 [Web 当前状态与请求交互](../docs/state/web.md)。
+`MemoryBackend` 是 core 的内存历史存储后端，通过 `MemoryEditorBinding` 接入远端 Worker；它保存文档快照与增量，不提供内存文件系统，也不写入 OPFS。远端文件和目录由 HTTP 适配器访问 host。关闭标签释放 UI buffer 并退订正文，Worker 保留历史与个人撤销缓存；刷新后从 host 重建会话，未确认输入没有本机持久化副本。后端实现见 [core README](../crates/celestite-core/README.md#backend-与服务接口)，加载范围与请求流程见 [Web 当前状态与请求交互](../docs/state/web.md)。
 
 文件树接收该运行时的 `treeBackend`。移动、重命名、删除以及复制/下载读取会先保存相关缓冲区，相关文档在操作期间短暂禁止编辑；保存失败则拒绝后续文件操作。文件树原有的目录树与 OPFS 后端仍保持独立，OPFS watch 不产生事件。
 
@@ -327,7 +327,7 @@ Tree-sitter runtime 与编译 CLI 固定为 `0.26.11`。语法 WASM、queries �
 
 切换保留各自的文档、未保存正文、撤销历史、文件树展开/选择和剪贴板；同路径文件属于不同 Vault。本地后台文档仍可自动保存，协作 Vault 仅显式保存，离开页面时检查所有已打开 Vault。项目设置随当前 Vault 重新读取，过时的异步结果不能覆盖新 Vault 的设置。移除远端连接先确认没有未处理输入，再释放运行时、删除本地连接记录，不隐式保存共享文件；失败保留连接和缓冲区，不调用远端删除操作。
 
-远端协作使用每 VaultInstance 一条 WebSocket：握手核对历史与权限并建立会话，打开文本时才创建或复用 host Buffer、分配 writer 并取得快照。输入和个人撤销发送 CRDT 增量，host 在内存接受后确认，并向打开过该 Buffer 的会话推送；客户端 core 导入后增量更新 UI，保留个人撤销、光标与待确认输入，IME 期间延迟导入。文件树失效、保存回执和心跳复用同一条连接，目录查询与附件传输仍使用 HTTP。关闭标签后该文档仍保持订阅，尚未实现 Buffer 卸载。
+远端协作使用每 VaultInstance 一条 WebSocket：握手核对历史与权限并建立会话，打开文本时才创建或复用 host Buffer、分配 writer 并取得快照。输入和个人撤销发送 CRDT 增量，host 在内存接受后确认，并向当前订阅该 Buffer 的会话推送；客户端 core 导入后增量更新 UI，保留个人撤销、光标与待确认输入，IME 期间延迟导入。文件树失效、保存回执和心跳复用同一条连接，目录查询与附件传输仍使用 HTTP。关闭标签先确认该文档已接受的输入，再退订正文并清除成员视图；Worker 保留 Buffer 与撤销缓存，同会话重开不会清空历史。重连只重建活动订阅，host Buffer 尚未卸载。
 
 协作保存是独立操作，历史确认不代表物理文件已写回。host 的文件系统 bridge 将外部修改合入共享历史并推送；保存时若因果版本过期，客户端先补齐再尝试，不覆盖未见更新。共享历史不能通过客户端“丢弃编辑”整体清除。本地 OPFS 的条件保存冲突仍提供覆盖、丢弃和取消。
 
@@ -385,8 +385,8 @@ HTML 在 ShadowRoot 中继承应用主题。展开底部诊断可跳转源码；
 
 运行 `bun run dev`，打开 `http://localhost:1420/debug/sync`。server 可由仓库根目录的 `just serve-notist "$share_key"` 启动。`share_key` 是需保存并复用的秘密值，任意非空字符串均可，推荐用 `openssl rand -hex 32` 生成以保持链接不可猜测。在页面连接宿主启动日志中的完整 URL，选择文本并点击“打开并重建实例”。使用其他 Vault 时填写该 Vault 的启动链接。
 
-默认创建 A / B 两个独立 Worker 与 WASM `EditorCore<MemoryBackend>`，可增加至 6 个。分别修改正文，再点击“同步全部”；也可逐个推送、拉取、暂停传输，以及切换每秒同步。个人撤销由各自 core 产生 CRDT 更新。“保存到文件”只写 host 当前正文，未推送的客户端修改不会被保存。
+默认创建 A / B 两个独立的生产远端编辑 Worker，可增加至 6 个。每个实例通过 WebSocket 加入 host，输入和个人撤销自动实时同步；保存按钮等待该实例的目标正文版本获 host 确认后写回文件。
 
-界面显示 host、实例 / writer 身份、正文版本、历史提交与文件写回版本，以及最近 100 条传输日志。实例只保留在页面内存中，结束会话或重建实例会释放它们。暂停传输允许继续编辑以构造并发测试；这是调试控制，不代表生产客户端离线编辑策略已经实现。
+界面显示实例 / writer 身份、已接受正文版本、本机历史提交、网络确认与文件保存状态。实例只保留在页面内存中，结束会话或重建实例会释放它们。断线保留正文并停止编辑，重新连接采用 host 历史；未确认输入阻止关闭或直接重连。
 
-host 历史仅驻留内存，重启丢弃未写回的编辑。调试页通过目录元数据列出文件，选择并打开时才建立 Buffer。server 配置 `--web-dir web/dist` 后，也可直接打开其 `/debug/sync`。调试页复用已有认证和文档 API，不新增服务端成员注册或调试权限旁路。
+host 历史仅驻留内存，重启丢弃未写回的编辑。调试页通过目录元数据列出文件，选择并打开时才建立 Buffer。server 配置 `--web-dir web/dist` 后，也可直接打开其 `/debug/sync`。调试页与编辑器共用 `openRemoteEditor`、RPC、成员与订阅生命周期，没有独立的 HTTP 编辑协议。

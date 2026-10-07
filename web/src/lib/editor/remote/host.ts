@@ -6,26 +6,36 @@ import type { CoreDocument, CoreMutation, CorePort } from "../core";
 import { decodeError } from "../rpc";
 import type {
   ServiceDocument,
+  HostDocument,
+  CollaborationSnapshot,
+  MemberView,
   ServiceEvent,
   SyncPacket,
-  Version,
 } from "../contract";
 import { RemoteTransport, type RemoteReceipt } from "./transport";
+import { SyncSession } from "./session";
 
 /** Private online replica: core owns history/undo; the transport carries
  * committed updates. Host file saves remain explicit. */
 export class RemoteEditorHost extends EditorHost {
-  private hosts = new Map<string, CoreDocument>();
+  private hosts = new Map<string, HostDocument>();
+  private subscriptions = new Set<string>();
+  private members: CollaborationSnapshot | null = null;
+  private views = new Map<string, MemberView>();
+  private sync?: SyncSession;
   private unsupported = new Map<string, ServiceDocument>();
   private offline = true;
   private resetting = false;
-  private unconfirmed = false;
+  private get unconfirmed() {
+    return this.sync?.unconfirmed ?? false;
+  }
   private transport?: RemoteTransport;
-  private operation = 0;
   private composing = new Set<string>();
   private deferred = new Map<string, RemoteReceipt[]>();
   private stopping = false;
   private received = new Map<string, number>();
+  private imports = new Map<string, Promise<ServiceDocument>>();
+  private inbox = { count: 0, bytes: 0 };
   constructor(
     core: CorePort,
     private http: HttpVaultBackend,
@@ -37,10 +47,17 @@ export class RemoteEditorHost extends EditorHost {
   }
   async connect() {
     const identity = this.descriptor.vaultIdentity!;
+    const inbox = (this.inbox = { count: 0, bytes: 0 });
     const transport = new RemoteTransport(
       this.http.url,
       identity,
       (receipt) => {
+        if (this.transport !== transport) return;
+        if (receipt.kind === "members") {
+          this.members = receipt.state;
+          this.publishMembers(receipt.state);
+          return;
+        }
         if (receipt.kind === "tree") {
           this.scheduleRemote(async () => {
             if (this.transport === transport && !this.offline) {
@@ -50,53 +67,63 @@ export class RemoteEditorHost extends EditorHost {
           });
           return;
         }
-        setTimeout(
-          () =>
-            this.scheduleRemote(async () => {
-              if (this.transport !== transport || this.offline) return;
-              if (this.composing.has(receipt.document.id)) {
-                const pending = this.deferred.get(receipt.document.id) ?? [];
-                pending.push(receipt);
-                this.deferred.set(receipt.document.id, pending);
-                if (pending.length <= 256) return;
-                transport.close();
-                await this.pause(
-                  new VaultError(
-                    "IO",
-                    "组合输入期间的远端更新过多；正文仍保留。",
-                  ),
-                );
-                return;
-              }
-              try {
-                await this.receive(receipt);
-              } catch (error) {
-                transport.close();
-                await this.pause(error);
-              }
-            }),
-          0,
-        );
-      },
-      (error) => {
-        if (!this.stopping)
-          setTimeout(
-            () =>
-              this.scheduleRemote(async () => {
-                if (this.transport === transport && !this.offline)
-                  await this.pause(error);
-              }),
-            0,
+        inbox.count++;
+        inbox.bytes += receipt.packet.data.length;
+        if (inbox.count > 256 || inbox.bytes > 32 * 1024 * 1024) {
+          this.networkFailure(
+            transport,
+            new VaultError("IO", "协作接收队列已满，正文仍保留。"),
           );
+          return;
+        }
+        this.scheduleRemote(async () => {
+          let held = false;
+          try {
+            if (
+              this.transport !== transport ||
+              this.offline ||
+              !this.subscriptions.has(receipt.document.id)
+            )
+              return;
+            if (this.composing.has(receipt.document.id)) {
+              const pending = this.deferred.get(receipt.document.id) ?? [];
+              pending.push(receipt);
+              this.deferred.set(receipt.document.id, pending);
+              held = true;
+              return;
+            }
+            await this.receive(receipt);
+          } catch (error) {
+            this.networkFailure(transport, error);
+          } finally {
+            if (!held) {
+              inbox.count--;
+              inbox.bytes -= receipt.packet.data.length;
+            }
+          }
+        });
       },
+      (error) => this.networkFailure(transport, error),
     );
     this.transport = transport;
+    this.sync = new SyncSession(
+      (update) => transport.request("updates", { ...update }),
+      (unconfirmed) => {
+        if (this.transport === transport && !this.offline)
+          this.publishConnection({
+            status: "online",
+            error: null,
+            unconfirmed,
+          });
+      },
+      (error) => this.networkFailure(transport, error),
+    );
     try {
       await transport.ready;
       const receipts: RemoteReceipt[] = [];
-      for (const id of this.hosts.keys())
+      for (const id of this.subscriptions)
         receipts.push(await transport.request<RemoteReceipt>("open", { id }));
-      const hosts = new Map<string, CoreDocument>();
+      const hosts = new Map<string, HostDocument>();
       const documents = new Map<
         string,
         { packets: SyncPacket[]; writerId: string }
@@ -121,7 +148,6 @@ export class RemoteEditorHost extends EditorHost {
         hosts.set(id, {
           ...receipt.document,
           savedContent: receipt.document.savedContent ?? prior!.savedContent,
-          snapshot: { ...receipt.document.snapshot, text: "" },
         });
         received.set(id, receipt.sequence);
       }
@@ -133,14 +159,17 @@ export class RemoteEditorHost extends EditorHost {
       });
       // Publish the new session only after every history and the final catalogue
       // have been accepted. A failed handshake leaves old buffers and undo intact.
-      this.hosts = new Map(states.map((state) => [state.id, state]));
+      this.hosts = hosts;
+      for (const host of hosts.values())
+        this.sync.acknowledge(host.id, host.version);
       this.received = received;
-      this.operation = 0;
       this.clearPatches();
       this.composing.clear();
       this.deferred.clear();
+      for (const view of this.views.values())
+        if (this.subscriptions.has(view.documentId))
+          await transport.request("set_view", { ...view });
       this.offline = false;
-      this.unconfirmed = false;
       return states.map((state) => this.document(state));
     } catch (error) {
       transport.close();
@@ -155,7 +184,14 @@ export class RemoteEditorHost extends EditorHost {
       const deferred = this.deferred.get(id) ?? [];
       this.deferred.delete(id);
       if (!this.offline)
-        for (const receipt of deferred) await this.receive(receipt);
+        for (const receipt of deferred) {
+          try {
+            await this.receive(receipt);
+          } finally {
+            this.inbox.count--;
+            this.inbox.bytes -= receipt.packet.data.length;
+          }
+        }
     }
   }
   private requireOnline() {
@@ -187,13 +223,13 @@ export class RemoteEditorHost extends EditorHost {
     };
   }
   private replicaState(
-    host: CoreDocument,
+    host: HostDocument,
     error = host.error,
     conflict = host.conflict,
   ) {
     return {
       path: host.path,
-      version: host.snapshot.version,
+      version: host.version,
       savedContent: host.savedContent,
       backendRevision: host.backendRevision,
       bom: host.bom,
@@ -206,7 +242,7 @@ export class RemoteEditorHost extends EditorHost {
     };
   }
   private async hostState(
-    host: CoreDocument,
+    host: HostDocument,
     error = host.error,
     conflict = host.conflict,
   ) {
@@ -218,14 +254,36 @@ export class RemoteEditorHost extends EditorHost {
       },
     });
   }
-  private async receive(receipt: RemoteReceipt) {
+  private receive(receipt: RemoteReceipt): Promise<ServiceDocument> {
+    const id = receipt.document.id;
+    const transport = this.transport!;
+    const previous = this.imports.get(id) ?? Promise.resolve();
+    // Open/save replies and pushed updates may arrive together. Their join,
+    // import and metadata acceptance form one ordered document operation.
+    const result = previous
+      .catch(() => {})
+      .then(() => {
+        this.requireTransport(transport);
+        return this.importReceipt(receipt, transport);
+      });
+    this.imports.set(id, result);
+    void result
+      .finally(() => {
+        if (this.imports.get(id) === result) this.imports.delete(id);
+      })
+      .catch(() => {});
+    return result;
+  }
+  private async importReceipt(
+    receipt: RemoteReceipt,
+    transport: RemoteTransport,
+  ) {
     const prior = this.hosts.get(receipt.document.id);
     if (receipt.document.savedContent === undefined && !prior)
       throw new VaultError("IO", "远端缺少初始磁盘元数据。");
-    const host: CoreDocument = {
+    const host: HostDocument = {
       ...receipt.document,
       savedContent: receipt.document.savedContent ?? prior!.savedContent,
-      snapshot: { ...receipt.document.snapshot, text: "" },
     };
     if (receipt.sequence <= (this.received.get(host.id) ?? -1))
       return this.document(
@@ -245,11 +303,72 @@ export class RemoteEditorHost extends EditorHost {
         command: { kind: "import", packet: receipt.packet, origin: "peer" },
       });
     }
+    this.requireTransport(transport);
+    if (!this.subscriptions.has(host.id))
+      return this.document(
+        await this.execute<CoreDocument>("read", { id: host.id }),
+      );
     const raw = await this.hostState(host);
+    this.requireTransport(transport);
     this.hosts.set(host.id, host);
+    this.sync?.acknowledge(host.id, host.version);
     this.received.set(host.id, receipt.sequence);
     this.publish(raw, !prior);
     return this.document(raw);
+  }
+  private networkFailure(transport: RemoteTransport, error: unknown) {
+    if (this.transport !== transport || this.stopping) return;
+    const online = !this.offline;
+    this.offline = true;
+    this.sync?.stop(error, false);
+    transport.close();
+    if (online)
+      this.scheduleRemote(async () => {
+        if (this.transport === transport && !this.stopping)
+          await this.pause(error);
+      });
+  }
+  override collaboration() {
+    return this.members;
+  }
+  override async setView(
+    viewId: string,
+    documentId: string | null,
+    focused: boolean,
+  ) {
+    if (documentId === null) this.views.delete(viewId);
+    else this.views.set(viewId, { viewId, documentId, focused });
+    if (!this.offline)
+      await this.transport!.request("set_view", {
+        viewId,
+        documentId,
+        focused,
+      });
+  }
+  override async releaseDocument(id: string) {
+    if (this.subscriptions.has(id)) {
+      this.requireOnline();
+      const transport = this.transport!;
+      const sync = this.sync!;
+      const current = await this.execute<CoreDocument>("read", { id });
+      await sync.wait(id, current.snapshot.version);
+      this.requireTransport(transport);
+      await transport.request("unsubscribe", { id });
+      this.requireTransport(transport);
+      await this.execute("replica_release", { id });
+      this.subscriptions.delete(id);
+      for (const [viewId, view] of this.views)
+        if (view.documentId === id) this.views.delete(viewId);
+      this.composing.delete(id);
+      this.deferred.delete(id);
+    }
+    this.unsupported.delete(id);
+    await super.releaseDocument(id);
+  }
+  private requireTransport(transport: RemoteTransport) {
+    if (this.transport !== transport)
+      throw new VaultError("Closed", "协作会话已替换。");
+    this.requireOnline();
   }
   private connectionFailure(error: unknown) {
     return (
@@ -258,27 +377,38 @@ export class RemoteEditorHost extends EditorHost {
     );
   }
   private async pause(error: unknown) {
+    const transport = this.transport;
     this.offline = true;
+    this.members = null;
+    this.publishMembers(null);
     this.publishConnection({
       status: "offline",
       error: error instanceof Error ? error.message : String(error),
       unconfirmed: this.unconfirmed,
     });
     for (const host of this.hosts.values()) {
+      if (this.transport !== transport) return;
+      if (!this.subscriptions.has(host.id)) continue;
       const raw = await this.hostState(
         host,
         error instanceof Error ? error.message : String(error),
       );
+      if (this.transport !== transport) return;
       this.publish(raw, true);
     }
   }
   override async open(path: VaultPath): Promise<ServiceDocument> {
     this.requireOnline();
+    const transport = this.transport!;
     try {
-      return await this.receive(
-        await this.transport!.request<RemoteReceipt>("open", { path }),
-      );
+      const receipt = await transport.request<RemoteReceipt>("open", {
+        path,
+      });
+      this.requireTransport(transport);
+      this.subscriptions.add(receipt.document.id);
+      return await this.receive(receipt);
     } catch (error) {
+      if (this.transport !== transport) throw error;
       if (this.connectionFailure(error)) await this.pause(error);
       if (!(error instanceof VaultError) || error.code !== "Unsupported")
         throw error;
@@ -319,48 +449,37 @@ export class RemoteEditorHost extends EditorHost {
     ) {
       if (mutation.history.status === "failed")
         throw decodeError(mutation.history.error);
-      await this.submit(mutation.document.id, update.operation, update.after);
-    }
-  }
-  private async submit(id: string, packet: SyncPacket, version: Version) {
-    this.unconfirmed = true;
-    try {
-      await this.transport!.request("updates", {
-        id,
-        packet,
-        version,
-        operation: ++this.operation,
-      });
-      this.unconfirmed = false;
-    } catch (error) {
-      this.transport?.close();
-      await this.pause(error);
-      throw error;
+      this.sync!.enqueue(mutation.document.id, update.operation, update.after);
     }
   }
   override async save(id: string): Promise<ServiceDocument> {
     const unsupported = this.unsupported.get(id);
     if (unsupported) return unsupported;
     this.requireOnline();
+    const transport = this.transport!;
+    const sync = this.sync!;
     // A filesystem observation or another editor can advance the host between
     // the user's save command and its execution. Import before retrying; never
     // overwrite a version the client has not seen.
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await this.execute<CoreDocument>("read", { id });
+      await sync.wait(id, current.snapshot.version);
+      this.requireTransport(transport);
       try {
-        return await this.receive(
-          await this.transport!.request<RemoteReceipt>("save", {
-            id,
-            version: current.snapshot.version,
-          }),
-        );
+        const receipt = await transport.request<RemoteReceipt>("save", {
+          id,
+          version: current.snapshot.version,
+        });
+        this.requireTransport(transport);
+        return await this.receive(receipt);
       } catch (error) {
+        if (this.transport !== transport) throw error;
         if ((error as { code?: string }).code === "StaleVersion") {
-          await this.receive(
-            await this.transport!.request<RemoteReceipt>("open", {
-              path: current.path,
-            }),
-          );
+          const receipt = await transport.request<RemoteReceipt>("open", {
+            id,
+          });
+          this.requireTransport(transport);
+          await this.receive(receipt);
           continue;
         }
         if (this.connectionFailure(error)) await this.pause(error);
@@ -377,10 +496,12 @@ export class RemoteEditorHost extends EditorHost {
   }
   override async retryObservation(id: string): Promise<ServiceDocument> {
     this.requireOnline();
-    const receipt = await this.transport!.request<RemoteReceipt>(
+    const transport = this.transport!;
+    const receipt = await transport.request<RemoteReceipt>(
       "retry_observation",
       { id },
     );
+    this.requireTransport(transport);
     return this.receive(receipt);
   }
   override async resolve(
@@ -417,7 +538,9 @@ export class RemoteEditorHost extends EditorHost {
       throw error;
     }
     this.offline = true;
+    this.sync?.stop(new VaultError("Closed", "协作会话已替换。"), false);
     this.transport?.close();
+    this.members = null;
     this.descriptor = descriptor;
     this.resetting = true;
     try {
@@ -435,11 +558,14 @@ export class RemoteEditorHost extends EditorHost {
     }
   }
   override async flush() {
-    if (this.unconfirmed)
+    try {
+      await this.sync?.drain();
+    } catch (error) {
       throw new VaultError(
         "Conflict",
-        "存在尚未确认的协作编辑，请导出正文并重新连接。",
+        `未确认的协作编辑仍保留，连接仍保留。请导出正文后恢复连接。${error instanceof Error ? error.message : String(error)}`,
       );
+    }
     // A volatile replica has no file projection. Flush history, never host files.
     await this.execute("flush_history");
   }
@@ -447,33 +573,46 @@ export class RemoteEditorHost extends EditorHost {
     method: string,
     p: Record<string, unknown>,
   ): Promise<unknown> {
+    this.requireOnline();
+    const transport = this.transport!;
     try {
-      return await this.performFileOperation(method, p);
+      const result = await this.performFileOperation(method, p, transport);
+      this.requireTransport(transport);
+      return result;
     } catch (error) {
-      if (this.connectionFailure(error)) await this.pause(error);
+      if (this.transport === transport && this.connectionFailure(error))
+        await this.pause(error);
       throw error;
     } finally {
-      if (["writeFile", "mkdir", "rename", "remove"].includes(method))
+      if (
+        this.transport === transport &&
+        ["writeFile", "mkdir", "rename", "remove"].includes(method)
+      )
         await this.executePreview("preview_invalidate_project", {});
     }
   }
   private async performFileOperation(
     method: string,
     p: Record<string, unknown>,
+    transport: RemoteTransport,
   ): Promise<unknown> {
     this.requireOnline();
     const path = vaultPath(String(p.path ?? p.from ?? ""));
     const affected = [...this.hosts.values()].filter(
-      (host) => host.path === path || host.path.startsWith(path + "/"),
+      (host) =>
+        this.subscriptions.has(host.id) &&
+        (host.path === path || host.path.startsWith(path + "/")),
     );
     if (["writeFile", "rename", "remove"].includes(method))
       for (const host of affected) {
         const raw = await this.execute<CoreDocument>("read", { id: host.id });
+        this.requireTransport(transport);
         if (
           !this.descriptor.readOnly &&
           raw.snapshot.text !== raw.savedContent
         ) {
           const saved = await this.save(host.id);
+          this.requireTransport(transport);
           if (saved.error)
             throw new VaultError(
               saved.conflict ? "Conflict" : "IO",
@@ -512,20 +651,24 @@ export class RemoteEditorHost extends EditorHost {
       default:
         throw new VaultError("Unsupported", "未知文件操作。", path);
     }
+    this.requireTransport(transport);
     if (method === "remove") return;
     for (const host of affected) {
-      const receipt = await this.transport!.request<RemoteReceipt>("open", {
+      if (!this.subscriptions.has(host.id)) continue;
+      const receipt = await transport.request<RemoteReceipt>("open", {
         path:
           method === "rename"
             ? host.path.replace(path, String(p.to))
             : host.path,
       });
+      this.requireTransport(transport);
       await this.receive(receipt);
     }
   }
   override async close() {
     await this.flush();
     this.stopping = true;
+    this.sync?.stop(new VaultError("Closed", "协作会话已关闭。"), false);
     this.transport?.close();
     await super.close();
   }

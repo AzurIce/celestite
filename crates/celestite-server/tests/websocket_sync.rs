@@ -140,7 +140,7 @@ impl Host {
         let mut socket = self.socket().await;
         send(
             &mut socket,
-            json!({"protocolVersion":2,"vaultIdentity":self.identity}),
+            json!({"protocolVersion":3,"vaultIdentity":self.identity}),
         )
         .await;
         let hello = next(&mut socket).await;
@@ -474,7 +474,7 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
     let mut wrong = host.socket().await;
     send(
         &mut wrong,
-        json!({"protocolVersion":2,"vaultIdentity":{"id":"wrong","historyId":"wrong"}}),
+        json!({"protocolVersion":3,"vaultIdentity":{"id":"wrong","historyId":"wrong"}}),
     )
     .await;
     assert_eq!(next(&mut wrong).await["code"], "Conflict");

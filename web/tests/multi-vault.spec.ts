@@ -329,6 +329,7 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   page,
   api,
 }, testInfo) => {
+  await installWorkerHarness(page, true);
   const name = "remote-preview.md";
   const source =
     "# Remote initial\n\n[go to Notist](remote-note.not#dest)\n\n" +
@@ -351,16 +352,14 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   await page.getByRole("button", { name: "分栏", exact: true }).click();
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h1")).toHaveText("Remote initial");
-  let release!: () => void;
-  const blocked = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  await page
-    .context()
-    .route(api.url + "/api/v1/documents/*/client-commit", async (route) => {
-      await blocked;
-      await route.continue();
-    });
+  await workerEvaluate(
+    page,
+    () => {
+      (self as any).holdUpdateReplies = true;
+    },
+    undefined,
+    -1,
+  );
   try {
     await editor(page).focus();
     await page.keyboard.press("Control+Home");
@@ -368,6 +367,19 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
     await page.keyboard.press("Shift+End");
     await page.keyboard.insertText("# Remote draft");
     await expect(preview.locator("h1")).toHaveText("Remote draft");
+    await expect
+      .poll(() =>
+        workerEvaluate(
+          page,
+          () => (self as any).heldUpdateReplies?.length ?? 0,
+          undefined,
+          -1,
+        ),
+      )
+      .toBeGreaterThan(0);
+    await page.keyboard.insertText(" accepted");
+    await expect(preview.locator("h1")).toHaveText("Remote draft accepted");
+
     expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(source);
     await preview.locator("h2").first().click();
     await expect(editor(page)).toBeFocused();
@@ -411,7 +423,16 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
       path: testInfo.outputPath("remote-split-preview.png"),
     });
   } finally {
-    release();
+    await workerEvaluate(
+      page,
+      () => {
+        (self as any).holdUpdateReplies = false;
+        for (const reply of (self as any).heldUpdateReplies ?? []) reply();
+        (self as any).heldUpdateReplies = [];
+      },
+      undefined,
+      -1,
+    );
   }
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
@@ -423,7 +444,20 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览已更新",
   );
-  await preview.getByRole("link", { name: "go to Notist" }).click();
+  // Saving invalidates project resources; a displayed ticket can expire while
+  // its replacement is compiling. Retry navigation once the new result arrives.
+  await expect(async () => {
+    if (
+      await page
+        .getByRole("tab", { name: "remote-note.not", exact: true })
+        .count()
+    )
+      return;
+    await preview.getByRole("link", { name: "go to Notist" }).click();
+    await expect(
+      page.getByRole("tab", { name: "remote-note.not", exact: true }),
+    ).toBeVisible({ timeout: 500 });
+  }).toPass();
   await expect(preview.locator("h1")).toHaveText("远端 Notist");
   await expect(preview.locator(".notist-custom")).toContainText("ok");
   await preview.locator(".notist-custom").click();
@@ -1447,7 +1481,7 @@ async function openSyncDebug(page: Page, api: Api, path: string) {
       .getByRole("textbox"),
   ).toHaveValue("A😀B");
   await expect(
-    page.getByRole("button", { name: "同步全部", exact: true }),
+    page.getByRole("button", { name: "添加实例", exact: true }),
   ).toBeEnabled();
 }
 
@@ -1464,14 +1498,14 @@ test("sync debug runs three independent WASM cores, merges through host, and pre
   const c = page.getByRole("region", { name: "实例 C", exact: true });
   await expect(c.getByRole("textbox")).toHaveValue("A😀B");
   await expect(
-    page.getByRole("button", { name: "同步全部", exact: true }),
+    page.getByRole("button", { name: "添加实例", exact: true }),
   ).toBeEnabled();
   await a.getByRole("textbox").fill("A😀aB");
-  await b.getByRole("textbox").fill("A😀bB");
+  await expect(b.getByRole("textbox")).toHaveValue("A😀aB");
+  await b.getByRole("textbox").fill("A😀abB");
   await expect(
-    page.getByRole("button", { name: "同步全部", exact: true }),
+    page.getByRole("button", { name: "添加实例", exact: true }),
   ).toBeEnabled();
-  await page.getByRole("button", { name: "同步全部", exact: true }).click();
   await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
     "因果版本已收敛",
   );
@@ -1483,56 +1517,48 @@ test("sync debug runs three independent WASM cores, merges through host, and pre
   expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀B");
   await a.getByRole("button", { name: "撤销", exact: true }).click();
   await expect(a.getByRole("textbox")).toHaveValue("A😀bB");
-  await page.getByRole("button", { name: "同步全部", exact: true }).click();
   await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
     "因果版本已收敛",
   );
   for (const region of [a, b, c])
     await expect(region.getByRole("textbox")).toHaveValue("A😀bB");
-  await page.getByRole("button", { name: "保存到文件", exact: true }).click();
-  await expect(page.getByRole("status", { name: "Host 保存状态" })).toHaveText(
+  await a.getByRole("button", { name: "保存到文件", exact: true }).click();
+  await expect(a.getByRole("status", { name: "实例 A 保存状态" })).toHaveText(
     "文件与正文一致",
   );
   expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀bB");
-  await expect(page.getByRole("region", { name: "同步日志" })).toContainText(
-    "host 历史仅驻留内存",
-  );
 });
 
-test("sync debug keeps paused and failed transfers in memory and resumes explicit synchronization", async ({
+test("sync debug retains a disconnected production replica and rejoins the host history", async ({
   page,
   api,
 }) => {
+  await installWorkerHarness(page, true);
   const path = `debug-fault-${crypto.randomUUID()}.md`;
   await writeFile(join(api.root, "notes", path), "A😀B");
   await openSyncDebug(page, api, path);
   const a = page.getByRole("region", { name: "实例 A", exact: true });
   const b = page.getByRole("region", { name: "实例 B", exact: true });
-  await b.getByRole("button", { name: "暂停传输", exact: true }).click();
-  await a.getByRole("textbox").fill("A😀oneB");
-  await page.getByRole("button", { name: "同步全部", exact: true }).click();
+  await workerEvaluate(
+    page,
+    () => {
+      (self as any).testSockets.forEach((socket: WebSocket) => socket.close());
+    },
+    undefined,
+    1,
+  );
   await expect(
-    page
-      .getByRole("region", { name: "Host", exact: true })
-      .getByRole("textbox"),
-  ).toHaveValue("A😀oneB");
+    b.getByRole("button", { name: "重新连接", exact: true }),
+  ).toBeEnabled();
+  await a.getByRole("textbox").fill("A😀oneB");
   await expect(b.getByRole("textbox")).toHaveValue("A😀B");
-  await b.getByRole("textbox").fill("A😀twoB");
-  await b.getByRole("button", { name: "恢复传输", exact: true }).click();
-  const pattern = `${api.url}/api/v1/documents/**`;
-  await page.route(pattern, (route) => route.abort());
-  await b.getByRole("button", { name: "推送", exact: true }).click();
-  await expect(page.getByRole("alert")).toBeVisible();
-  await expect(b.getByRole("textbox")).toHaveValue("A😀twoB");
-  await page.unroute(pattern);
-  await page.getByRole("button", { name: "同步全部", exact: true }).click();
+  await expect(b.getByRole("textbox")).not.toBeEditable();
+  await b.getByRole("button", { name: "重新连接", exact: true }).click();
+  await expect(b.getByRole("textbox")).toHaveValue("A😀oneB");
   await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
     "因果版本已收敛",
   );
-  const merged = await a.getByRole("textbox").inputValue();
-  expect(merged).toContain("one");
-  expect(merged).toContain("two");
-  await expect(b.getByRole("textbox")).toHaveValue(merged);
+  expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀B");
 });
 
 test("sync debug honors share credentials and read-only vaults", async ({
@@ -1546,7 +1572,7 @@ test("sync debug honors share credentials and read-only vaults", async ({
     .getByLabel("Vault URL", { exact: true })
     .fill(api.urls.readonly.replace("/ro-", "/"));
   await page.getByRole("button", { name: "连接 server", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("NotFound");
+  await expect(page.getByRole("alert")).toContainText("Link not found");
   await page.getByLabel("Vault URL", { exact: true }).fill(api.urls.readonly);
   await page.getByRole("button", { name: "连接 server", exact: true }).click();
   await page.getByLabel("调试文档", { exact: true }).selectOption(path);
@@ -1557,14 +1583,11 @@ test("sync debug honors share credentials and read-only vaults", async ({
   await expect(a.getByRole("textbox")).toHaveValue("A😀B");
   await expect(a.getByRole("textbox")).not.toBeEditable();
   await expect(
-    a.getByRole("button", { name: "推送", exact: true }),
+    a.getByRole("button", { name: "撤销", exact: true }),
   ).toBeDisabled();
   await expect(
-    page.getByRole("button", { name: "保存到文件", exact: true }),
+    a.getByRole("button", { name: "保存到文件", exact: true }),
   ).toBeDisabled();
-  await expect(
-    a.getByRole("button", { name: "拉取", exact: true }),
-  ).toBeEnabled();
 });
 
 test("sync debug retains textarea focus during rapid input and automatically converges without saving files", async ({
@@ -1585,16 +1608,10 @@ test("sync debug retains textarea focus during rapid input and automatically con
   await a.pressSequentially("+stream", { delay: 20 });
   await expect(a).toBeFocused();
   await expect(a).toHaveValue("A😀B+stream");
-  const automatic = page.getByRole("checkbox", {
-    name: "每秒同步",
-    exact: true,
-  });
-  await automatic.check();
-  await expect(b).toHaveValue("A😀B+stream", { timeout: 10000 });
+  await expect(b).toHaveValue("A😀B+stream");
   await expect(page.getByRole("status", { name: "收敛状态" })).toHaveText(
     "因果版本已收敛",
   );
-  await automatic.uncheck();
   expect(await readFile(join(api.root, "notes", path), "utf8")).toBe("A😀B");
 });
 
@@ -2134,3 +2151,74 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
     }
   });
 }
+
+test("document leases release presence, keep undo on reopen, and permit path reuse and reconnect", async ({
+  page,
+  api,
+}) => {
+  await installWorkerHarness(page, true);
+  const a = `lease-a-${crypto.randomUUID()}.md`;
+  const b = `lease-b-${crypto.randomUUID()}.md`;
+  await writeFile(join(api.root, "notes", a), "seed");
+  await writeFile(join(api.root, "notes", b), "other");
+  await page.goto("/");
+  await connect(page, api.url);
+  const mine = () =>
+    page.evaluate(() => {
+      const events = (window as any).editorMessages as any[];
+      const state = events
+        .filter((event) => event.kind === "members" && event.state)
+        .at(-1)?.state;
+      return state?.members.find(
+        (member: any) => member.sessionId === state.sessionId,
+      );
+    });
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await editor(page).focus();
+  await page.keyboard.press("Control+End");
+  await page.keyboard.insertText(" local");
+  await expect(editor(page)).toHaveText("seed local");
+  await expect
+    .poll(
+      async () =>
+        (await mine())?.views.filter((view: any) => view.focused).length ?? 0,
+    )
+    .toBe(1);
+  await page.getByRole("button", { name: `关闭 ${a}`, exact: true }).click();
+  await expect.poll(async () => (await mine())?.documents.length).toBe(0);
+  await expect.poll(async () => (await mine())?.views.length).toBe(0);
+  expect(await readFile(join(api.root, "notes", a), "utf8")).toBe("seed");
+  await writeFile(join(api.root, "notes", a), "prefix seed");
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("prefix seed local");
+  await editor(page).focus();
+  await page.keyboard.press("Control+z");
+  await expect(editor(page)).toHaveText("prefix seed");
+  await page.getByRole("button", { name: `关闭 ${a}`, exact: true }).click();
+  await expect.poll(async () => (await mine())?.documents.length).toBe(0);
+  const removed = await fetch(
+    `${api.url}/api/v1/entry?path=${encodeURIComponent(a)}`,
+    { method: "DELETE" },
+  );
+  expect(removed.ok).toBe(true);
+  await writeFile(join(api.root, "notes", a), "recreated");
+  await page.getByRole("button", { name: "刷新文件树", exact: true }).click();
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("recreated");
+  await page.getByRole("button", { name: `关闭 ${a}`, exact: true }).click();
+  await page.getByRole("treeitem", { name: b, exact: true }).click();
+  await expect(editor(page)).toHaveText("other");
+  await workerEvaluate(
+    page,
+    () => {
+      (self as any).testSockets.forEach((socket: WebSocket) => socket.close());
+    },
+    undefined,
+    -1,
+  );
+  await page.getByRole("button", { name: "尝试重新连接", exact: true }).click();
+  await expect(editor(page)).toHaveText("other");
+  await page.getByRole("treeitem", { name: a, exact: true }).click();
+  await expect(editor(page)).toHaveText("recreated");
+  await expect.poll(async () => (await mine())?.documents.length).toBe(2);
+});

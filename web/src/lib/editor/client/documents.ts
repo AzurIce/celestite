@@ -13,6 +13,9 @@ import { EditGroups, undoContext } from "../commands";
 import type { DocumentPreviews, PreviewState } from "../preview/contract";
 import type {
   ConnectionState,
+  CollaborationSnapshot,
+  Affinity,
+  Anchor,
   EditorDocument,
   InstanceIdentity,
   SelectionContext,
@@ -58,12 +61,15 @@ export class WorkerDocuments {
   };
   reconnect?: (discardUnconfirmed?: boolean) => Promise<void>;
   private connection?: ConnectionState;
+  private members?: CollaborationSnapshot;
   private replacingSession = false;
+  private generation = 0;
   private records = new Map<string, ViewRecord>();
   private groups = new EditGroups();
   private treeListeners = new Set<Parameters<VaultBackend["watch"]>[0]>();
   private listeners = new Set<(state: DocumentsSnapshot) => void>();
   private queue: Promise<unknown> = Promise.resolve();
+  private saves = new Map<string, Promise<boolean>>();
   private activeId: string | null = null;
   private activation = 0;
   private loadingPath: VaultPath | null = null;
@@ -83,8 +89,27 @@ export class WorkerDocuments {
     private terminate: () => void,
     private readonly remote = false,
   ) {
-    if (remote) this.connection = { status: "online", error: null };
+    if (remote) {
+      this.connection = { status: "online", error: null };
+      void client
+        .request("collaboration", {})
+        .then((state) => {
+          if (
+            state &&
+            (!this.members || state.sequence >= this.members.sequence)
+          ) {
+            this.members = state;
+            this.notify();
+          }
+        })
+        .catch(() => {});
+    }
     this.unsubscribe = client.subscribe((event) => {
+      if (event.kind === "members") {
+        this.members = event.state ?? undefined;
+        this.notify();
+        return;
+      }
       if (event.kind === "connection") {
         if (!this.replacingSession || event.connection.status !== "online")
           this.connection = event.connection;
@@ -137,13 +162,30 @@ export class WorkerDocuments {
       close: () => this.close(),
     };
   }
+  anchorsAt(id: string, version: Version, positions: [number, Affinity][]) {
+    return this.client.request("anchors_at", { id, version, positions });
+  }
+  resolveAnchors(id: string, checkpoint: Version, anchors: Anchor[]) {
+    return this.client.request("resolve_anchors", { id, checkpoint, anchors });
+  }
+  setView(viewId: string, documentId: string | null, focused: boolean) {
+    return this.client.request("set_view", { viewId, documentId, focused });
+  }
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
     const result = this.queue.then(task);
     this.queue = result.catch(() => {});
     return result;
   }
+  private start<T>(task: () => Promise<T>): Promise<T> {
+    return this.enqueue(async () => {
+      const pending = task();
+      void pending.catch(() => {});
+      return { pending };
+    }).then(({ pending }) => pending);
+  }
   snapshot(): DocumentsSnapshot {
     return {
+      collaboration: this.members,
       connection: this.connection
         ? {
             ...this.connection,
@@ -266,6 +308,8 @@ export class WorkerDocuments {
   async reconnectSession(discardUnconfirmed = false) {
     if (this.replacingSession) throw new VaultError("Busy", "正在重新连接。");
     this.replacingSession = true;
+    this.generation++;
+    this.openRequest++;
     this.connection = {
       ...this.connection,
       status: "reconnecting",
@@ -308,6 +352,7 @@ export class WorkerDocuments {
       throw error;
     } finally {
       this.replacingSession = false;
+      for (const record of this.records.values()) record.saving = false;
       this.notify();
     }
   }
@@ -354,13 +399,17 @@ export class WorkerDocuments {
     this.openError = null;
     this.activation++;
     this.notify();
-    return this.enqueue(async () => {
+    return this.start(async () => {
       try {
         if (request !== this.openRequest || this.closing) return false;
         const document = await this.client.request("open", {
           path,
         });
-        if (request !== this.openRequest || this.closing) return false;
+        if (request !== this.openRequest || this.closing) {
+          if (!this.records.has(document.id))
+            await this.client.request("release_document", { id: document.id });
+          return false;
+        }
         this.records.set(document.id, {
           ...document,
           content: document.content ?? "",
@@ -561,8 +610,27 @@ export class WorkerDocuments {
   async save(id = this.activeId): Promise<boolean> {
     const record = id ? this.records.get(id) : undefined;
     if (!this.online() || !record || record.readOnlyReason) return false;
-    return this.enqueue(() => this.saveRecord(record));
+    const previous = this.saves.get(record.id) ?? Promise.resolve(true);
+    const saved = previous
+      .catch(() => false)
+      .then(() =>
+        this.enqueue(async () => {
+          if (!(await this.flushInputs(record)))
+            return { pending: Promise.resolve(false) };
+          const pending = this.saveRecord(record, false);
+          void pending.catch(() => {});
+          return { pending };
+        }).then(({ pending }) => pending),
+      );
+    this.saves.set(record.id, saved);
+    void saved
+      .finally(() => {
+        if (this.saves.get(record.id) === saved) this.saves.delete(record.id);
+      })
+      .catch(() => {});
+    return saved;
   }
+
   async retryObservation(id: string): Promise<boolean> {
     const record = this.records.get(id);
     if (!this.online() || !record) return false;
@@ -578,25 +646,30 @@ export class WorkerDocuments {
       }
     });
   }
-  private async saveRecord(record: ViewRecord) {
+  private async saveRecord(record: ViewRecord, flush = true) {
     if (!this.online()) return false;
+    const generation = this.generation;
     record.saving = true;
     this.notify();
     try {
-      if (!(await this.flushInputs(record))) return false;
+      if (flush && !(await this.flushInputs(record))) return false;
       const result = await this.client.request("save", {
         id: record.id,
       });
+      if (generation !== this.generation) return false;
       this.merge(result);
       this.notify();
       return !result.error && !result.core?.historyError;
     } catch (error) {
+      if (generation !== this.generation) return false;
       record.error = String(error);
       this.notify();
       return false;
     } finally {
-      record.saving = false;
-      this.notify();
+      if (generation === this.generation) {
+        record.saving = false;
+        this.notify();
+      }
     }
   }
   async saveAll() {
@@ -640,16 +713,19 @@ export class WorkerDocuments {
       record.content !== record.savedContent
     )
       return false;
+    const generation = this.generation;
     record.locked = true;
     this.notify();
     try {
-      return await this.enqueue(async () => {
+      return await this.start(async () => {
         if (
           this.remote
             ? !(await this.flushInputs(record))
             : !record.readOnlyReason && !(await this.saveRecord(record))
         )
           return false;
+        await this.client.request("release_document", { id });
+        if (generation !== this.generation) return false;
         this.forget(id);
         return true;
       });
@@ -702,7 +778,10 @@ export class WorkerDocuments {
         }
         if (action === "discard") record.reloadVersion++;
         this.conflictPrompt = null;
-        if (prompt.intent === "close") this.forget(record.id);
+        if (prompt.intent === "close") {
+          await this.client.request("release_document", { id: record.id });
+          this.forget(record.id);
+        }
         return true;
       });
     } catch (error) {
@@ -737,6 +816,12 @@ export class WorkerDocuments {
   ) {
     if (this.closing) throw new VaultError("Closed", "Vault is closing");
     this.requireOnline();
+    if (
+      ["stat", "readDir", "readFileSnapshot"].includes(method) ||
+      (this.remote && method === "readFile")
+    )
+      return this.client.request("file", { method, ...params });
+    const generation = this.generation;
     const path = params.path ?? params.from ?? vaultPath("");
     const changes = ["rename", "remove", "writeFile", "readFile"].includes(
       method,
@@ -747,14 +832,19 @@ export class WorkerDocuments {
     for (const record of affected) record.locked = true;
     if (affected.length) this.notify();
     try {
-      return await this.enqueue(async () => {
+      return await this.start(async () => {
         this.requireOnline();
         for (const record of affected)
           if (!record.readOnlyReason && !(await this.flushInputs(record)))
             throw new VaultError("IO", "编辑历史尚未提交。", path);
         const result = await this.client.request("file", { method, ...params });
+        if (generation !== this.generation)
+          throw new VaultError("Closed", "编辑服务会话已替换。");
         if (method === "remove")
-          for (const record of affected) this.forget(record.id);
+          for (const record of affected) {
+            await this.client.request("release_document", { id: record.id });
+            this.forget(record.id);
+          }
         // Worker notifications carry stable IDs and renamed paths; don't derive
         // new identities from paths or recreate buffers here.
         return result;

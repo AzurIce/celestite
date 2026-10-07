@@ -1,3 +1,4 @@
+mod support;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -123,7 +124,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
             )
             .await
             .status(),
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "{tail}"
         );
     }
@@ -140,8 +141,18 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
             StatusCode::FORBIDDEN
         );
     }
-    let edited = read(response(&server.router, &editor, "POST", &format!("/documents/{id}/apply"), json!({"kind":"edit","base":version,"origin":"test","input":{"kind":"edits","edits":[{"from":0,"to":0,"insert":"edited "}]},"undo":{"metadata":null,"positions":[]}})).await).await;
-    assert_eq!(edited["document"]["snapshot"]["text"], "edited original");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = server.router.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut peer = support::Peer::connect(&format!("http://{address}/{editor}/api/v1")).await;
+    assert_eq!(peer.open("a.md").await, id);
+    let edited = peer.edit(id, 0, 0, "edited ").await;
+    assert_eq!(edited.snapshot.text, "edited original");
+    peer.close().await;
+    task.abort();
     let visible = read(
         response(
             &server.router,
@@ -325,7 +336,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
         .unwrap();
     socket
         .send(Message::Text(
-            json!({"protocolVersion":2,"vaultIdentity":description["vaultIdentity"]})
+            json!({"protocolVersion":3,"vaultIdentity":description["vaultIdentity"]})
                 .to_string()
                 .into(),
         ))

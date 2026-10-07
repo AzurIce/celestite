@@ -1,6 +1,6 @@
 //! Filesystem notifications are hints. A bounded wakeup coalesces bursts, and a
 //! periodic observation of loaded buffers repairs missed events outside notify's callback.
-use crate::{vault::fs::ChangeHint, HostedVault};
+use crate::HostedVault;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -99,28 +99,6 @@ impl Drop for Reconciler {
     }
 }
 
-fn with_documents<T>(
-    vault: &HostedVault,
-    action: impl FnOnce(&mut crate::vault::documents::Documents) -> crate::vault::fs::Result<T>,
-) -> crate::vault::fs::Result<T> {
-    // Match every HTTP document/file operation's lock order.
-    let _files = vault
-        .files
-        .lock()
-        .map_err(|_| crate::vault::fs::VaultError::new("IO", "Vault lock failed", ""))?;
-    let mut documents = vault
-        .documents
-        .lock()
-        .map_err(|_| crate::vault::fs::VaultError::new("IO", "Document lock failed", ""))?;
-    let result = action(&mut documents);
-    // Also publish failures: a previously usable document can now require recovery.
-    if documents.publish_changes()? {
-        let _ = vault.events.send(ChangeHint::all());
-        tracing::debug!(vault_identity = %vault.id, "Background document states changed");
-    }
-    result
-}
-
 fn observe(vault: &HostedVault, stopping: &AtomicBool) -> crate::vault::fs::Result<()> {
     observe_with(vault, stopping, |task| task.compute())
 }
@@ -132,13 +110,17 @@ fn observe_with(
         celestite_core::FileObservationTask,
     ) -> celestite_core::FileObservationResult,
 ) -> crate::vault::fs::Result<()> {
-    with_documents(vault, |docs| docs.reconcile())?;
-    let count = with_documents(vault, |docs| docs.resident().map(|states| states.len()))?;
+    crate::vault::runtime::execute_locked(vault, false, true, |_, docs| docs.reconcile())?;
+    let count = crate::vault::runtime::execute_locked(vault, false, true, |_, docs| {
+        docs.resident().map(|states| states.len())
+    })?;
     for _ in 0..count {
         if stopping.load(Ordering::Acquire) {
             break;
         }
-        let task = match with_documents(vault, |docs| docs.take_file_observation()) {
+        let task = match crate::vault::runtime::execute_locked(vault, false, true, |_, docs| {
+            docs.take_file_observation()
+        }) {
             Ok(Some(task)) => task,
             Ok(None) => break,
             Err(error) => {
@@ -151,7 +133,9 @@ fn observe_with(
         // Both Vault locks were dropped. HTTP and collaboration edits can advance
         // live history throughout this isolated, bounded calculation.
         let result = execute(task);
-        let accepted = with_documents(vault, |docs| docs.complete_file_observation(result));
+        let accepted = crate::vault::runtime::execute_locked(vault, false, true, |_, docs| {
+            docs.complete_file_observation(result)
+        });
         match accepted {
             Ok(accepted) => {
                 tracing::debug!(vault_identity = %vault.id, %path, accepted, elapsed_ms = started.elapsed().as_millis(), "Filesystem diff completed")
@@ -161,7 +145,7 @@ fn observe_with(
             }
         }
     }
-    with_documents(vault, |docs| {
+    crate::vault::runtime::execute_locked(vault, false, true, |_, docs| {
         if docs.has_file_observations() {
             vault.reconcile_trigger.request();
         }
@@ -173,7 +157,7 @@ fn observe_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{documents::Documents, fs::FsVault};
+    use crate::vault::documents::Documents;
     use celestite_core::{Edit, TextInput, UndoContext};
     use std::sync::Mutex;
     use tokio::sync::broadcast;
@@ -183,9 +167,8 @@ mod tests {
         std::fs::write(root.path().join("a.md"), "A middle B").unwrap();
         std::fs::write(root.path().join("b.md"), "other").unwrap();
         let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
-        let files = FsVault::open(root.path()).unwrap();
-        documents.open_file(&files, "a.md").unwrap();
-        documents.open_file(&files, "b.md").unwrap();
+        documents.open_file("a.md").unwrap();
+        documents.open_file("b.md").unwrap();
         let (trigger, _) = channel();
         let (events, _) = broadcast::channel(128);
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
@@ -193,8 +176,9 @@ mod tests {
             id: documents.identity.id.clone(),
             name: "Notes".into(),
             read_only: false,
-            files: Mutex::new(FsVault::open(root.path()).unwrap()),
+            files: Mutex::new(documents.files.clone()),
             documents: Mutex::new(documents),
+            collaboration: crate::collaboration::CollaborationState::new(),
             packages: crate::package_resources::PackageResources::new(
                 root.path().into(),
                 events.clone(),
@@ -225,7 +209,7 @@ mod tests {
         });
         prepared.recv_timeout(Duration::from_secs(5)).unwrap();
         {
-            let files = vault
+            let _files = vault
                 .files
                 .try_lock()
                 .expect("diff must not hold the file lock");
@@ -276,8 +260,8 @@ mod tests {
                 }),
             )
             .unwrap();
-            let version = docs.state(&files, &b.id).unwrap().snapshot.version;
-            docs.save(&files, &b.id, version).unwrap();
+            let version = docs.state(&b.id).unwrap().snapshot.version;
+            docs.save(&b.id, version).unwrap();
         }
         resume.send(()).unwrap();
         worker.join().unwrap();
@@ -353,7 +337,7 @@ mod tests {
     fn rename_during_diff_discards_the_old_path_result_then_reconciles_the_new_path() {
         let (root, vault) = fixture();
         std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
-        let task = with_documents(&vault, |docs| {
+        let task = crate::vault::runtime::execute_locked(&vault, false, true, |_, docs| {
             docs.reconcile()?;
             docs.take_file_observation()
         })
@@ -369,17 +353,19 @@ mod tests {
             .find(|s| s.path == "a.md")
             .unwrap();
         {
-            let files = vault.files.lock().unwrap();
+            let _files = vault.files.lock().unwrap();
             vault
                 .documents
                 .lock()
                 .unwrap()
-                .rename(&files, "a.md", "renamed.md")
+                .rename("a.md", "renamed.md")
                 .unwrap();
         }
-        assert!(!with_documents(&vault, |docs| docs
-            .complete_file_observation(task.compute()))
-        .unwrap());
+        assert!(
+            !crate::vault::runtime::execute_locked(&vault, false, true, |_, docs| docs
+                .complete_file_observation(task.compute()))
+            .unwrap()
+        );
         let interim = vault
             .documents
             .lock()
@@ -409,9 +395,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.md"), "base").unwrap();
         let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
-        documents
-            .open_file(&FsVault::open(root.path()).unwrap(), "a.md")
-            .unwrap();
+        documents.open_file("a.md").unwrap();
         let mut subscription = documents.subscribe().unwrap();
         let (trigger, receiver) = channel();
         // Intentionally never register this watcher: no notification can wake the worker.
@@ -426,8 +410,9 @@ mod tests {
                 events.clone(),
             )
             .unwrap(),
-            files: Mutex::new(FsVault::open(root.path()).unwrap()),
+            files: Mutex::new(documents.files.clone()),
             documents: Mutex::new(documents),
+            collaboration: crate::collaboration::CollaborationState::new(),
             events,
             _watcher: Mutex::new(watcher),
             reconcile_trigger: trigger.clone(),
@@ -466,9 +451,7 @@ mod tests {
         drop(vault);
         let mut reopened = Documents::open(root.path(), &[0; 32]).unwrap();
         assert!(reopened.resident().unwrap().is_empty());
-        reopened
-            .open_file(&FsVault::open(root.path()).unwrap(), "a.md")
-            .unwrap();
+        reopened.open_file("a.md").unwrap();
         let next = reopened.resident().unwrap().pop().unwrap().snapshot;
         assert_eq!(next.text, state.snapshot.text);
         assert_ne!(next.version.identity, state.snapshot.version.identity);

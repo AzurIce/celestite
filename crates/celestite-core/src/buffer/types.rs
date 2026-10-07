@@ -18,6 +18,16 @@ pub struct Version {
     pub clocks: BTreeMap<String, i32>,
 }
 
+impl Version {
+    /// Causal containment is only defined within the same document history.
+    pub fn contains(&self, checkpoint: &Self) -> bool {
+        self.identity == checkpoint.identity
+            && checkpoint.clocks.iter().all(|(writer, clock)| {
+                *clock >= 0 && self.clocks.get(writer).copied().unwrap_or(0) >= *clock
+            })
+    }
+}
+
 /// An owned, immutable point-in-time read. `revision` is local to this instance;
 /// use `version`, not revision, for cross-instance comparisons and preconditions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

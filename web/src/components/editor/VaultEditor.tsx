@@ -31,7 +31,7 @@ import type {
 } from "@/lib/editor/contract";
 import { setSetting, settings } from "@/lib/settings";
 import type { PreviewModeSetting } from "@/lib/settings/schema";
-import type { EditorBuffer } from "./CodeEditor";
+import type { EditorBuffer } from "@/lib/editor/buffer";
 import { languageName } from "./languages";
 
 import type { VimMode } from "./vim";
@@ -592,6 +592,11 @@ export function VaultEditor(props: VaultEditorProps) {
                                 wrap={wrap()}
                                 vim={settings().values["editor.vimMode"]}
                                 onVimMode={setVimMode}
+                                onView={(viewId, documentId, focused) => {
+                                  void props.documents
+                                    .setView?.(viewId, documentId, focused)
+                                    .catch(() => {});
+                                }}
                                 onComposition={(active) =>
                                   props.documents.composition?.(id, active)
                                 }

@@ -24,7 +24,6 @@ export interface RemoteVaultDescriptor {
     watch: boolean;
     conditionalWrite: boolean;
     documentEditing?: boolean;
-    clientReplicaCommit?: boolean;
     websocketSync?: boolean;
   };
 }

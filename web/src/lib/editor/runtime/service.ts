@@ -13,6 +13,11 @@ import type {
 } from "../contract";
 export type EditorWorkerHost = Pick<
   EditorHost,
+  | "collaboration"
+  | "setView"
+  | "anchorsAt"
+  | "resolveAnchors"
+  | "releaseDocument"
   | "composition"
   | "executePreview"
   | "open"
@@ -57,7 +62,7 @@ export async function serveEditor(
   let queue: Promise<unknown> = Promise.resolve();
   let closing = false;
   let release!: () => void;
-  function enqueue(task: () => Promise<unknown>) {
+  function enqueue<T>(task: () => Promise<T>) {
     const result = queue.then(async () => {
       try {
         return await task();
@@ -71,11 +76,33 @@ export async function serveEditor(
   port.addEventListener("message", (event) => {
     const request = event.data;
     if (!request || request.kind !== "request") return;
-    void enqueue(async () => {
+    const dispatch = async () => {
       if (!host || closing || request.sessionId !== sessionId)
         throw new VaultError("Closed", "编辑服务会话无效或正在关闭。");
       const p = request.params;
       switch (request.method) {
+        case "collaboration":
+          return host.collaboration();
+        case "release_document":
+          return host.releaseDocument(String(p.id));
+        case "set_view":
+          return host.setView(
+            String(p.viewId),
+            p.documentId === null ? null : String(p.documentId),
+            Boolean(p.focused),
+          );
+        case "anchors_at":
+          return host.anchorsAt(
+            String(p.id),
+            p.version as import("../contract").Version,
+            p.positions as [number, import("../contract").Affinity][],
+          );
+        case "resolve_anchors":
+          return host.resolveAnchors(
+            String(p.id),
+            p.checkpoint as import("../contract").Version,
+            p.anchors as import("../contract").Anchor[],
+          );
         case "set_resource_scope":
           if (!host.setResourceScope)
             throw new VaultError(
@@ -147,7 +174,32 @@ export async function serveEditor(
         default:
           throw new VaultError("Unsupported", "未知编辑服务命令。");
       }
-    }).then(
+    };
+    // Network waits yield the host queue; all actual core calls are serialized
+    // by EditorHost. Slow IO cannot hold incoming imports or accepted editing.
+    const detached = [
+      "save",
+      "release_document",
+      "set_view",
+      "open",
+      "reconnect",
+      "close",
+      "file",
+      "retry_observation",
+    ].includes(request.method);
+    const result = detached
+      ? enqueue(async () => {
+          const pending = dispatch();
+          void pending.catch(() => {});
+          return { pending };
+        })
+          .then(({ pending }) => pending)
+          .finally(() => {
+            if (previews && !closing)
+              void enqueue(() => previews.refresh()).catch(() => {});
+          })
+      : enqueue(dispatch);
+    void result.then(
       (result) =>
         port.postMessage({
           kind: "reply",

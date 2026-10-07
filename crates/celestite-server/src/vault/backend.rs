@@ -6,6 +6,7 @@ use super::{
 use celestite_core::*;
 use std::{
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -36,14 +37,16 @@ pub(crate) fn vault_error(error: EditorError) -> fs::VaultError {
 }
 
 pub(crate) struct NativeBackend {
-    files: FsVault,
+    pub(crate) files: Arc<FsVault>,
     identity: InstanceIdentity,
     intent: Option<DirectoryIntent>,
 }
 impl NativeBackend {
     pub fn open(root: &Path, vault: VaultIdentity) -> fs::Result<Self> {
         Ok(Self {
-            files: FsVault::open(root).map_err(|e| fs::VaultError::new("IO", e.to_string(), ""))?,
+            files: Arc::new(
+                FsVault::open(root).map_err(|e| fs::VaultError::new("IO", e.to_string(), ""))?,
+            ),
             identity: InstanceIdentity {
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 vault: Vault {

@@ -1,7 +1,7 @@
 //! Invalidation feed, serialized by the same lock as the host core.
 //! It carries committed causal versions, never text or operation acknowledgements.
 use super::{fs::Result, VaultIdentity};
-use celestite_core::{EditorDocument, ExternalChangeStatus, Version};
+use celestite_core::{DocumentStatus, ExternalChangeStatus, Version};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
@@ -22,12 +22,12 @@ pub(crate) struct DocumentNotice {
     external_change: Option<ExternalChangeStatus>,
     persistence_error: Option<String>,
 }
-pub(crate) fn exportable(state: &EditorDocument, persistent: bool) -> bool {
+pub(crate) fn exportable(state: &DocumentStatus, persistent: bool) -> bool {
     state.persistence_error.is_none()
-        && (!persistent || state.durable_version.as_ref() == Some(&state.snapshot.version))
+        && (!persistent || state.durable_version.as_ref() == Some(&state.version))
 }
 impl DocumentNotice {
-    fn from_state(state: EditorDocument, persistent: bool) -> Self {
+    fn from_state(state: DocumentStatus, persistent: bool) -> Self {
         let available = exportable(&state, persistent);
         Self {
             id: state.id,
@@ -35,7 +35,7 @@ impl DocumentNotice {
             version: if persistent {
                 state.durable_version
             } else if available {
-                Some(state.snapshot.version)
+                Some(state.version)
             } else {
                 None
             },
@@ -85,7 +85,7 @@ impl DocumentFeed {
             sender: broadcast::channel(128).0,
         }
     }
-    pub fn publish(&mut self, states: Vec<EditorDocument>) -> Result<bool> {
+    pub fn publish(&mut self, states: Vec<DocumentStatus>) -> Result<bool> {
         let states: BTreeMap<_, _> = states
             .into_iter()
             .map(|state| {
@@ -134,19 +134,20 @@ mod tests {
     use crate::vault::documents::Documents;
     use serde_json::Value;
 
-    fn state(documents: &Documents) -> EditorDocument {
-        documents.resident().unwrap().pop().unwrap()
+    fn state(documents: &Documents) -> DocumentStatus {
+        documents
+            .resident()
+            .unwrap()
+            .into_iter()
+            .map(|state| documents.host_document(&state.id, None).unwrap().status)
+            .next()
+            .unwrap()
     }
     fn fixture() -> (tempfile::TempDir, Documents) {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.md"), "base").unwrap();
         let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
-        documents
-            .open_file(
-                &crate::vault::fs::FsVault::open(root.path()).unwrap(),
-                "a.md",
-            )
-            .unwrap();
+        documents.open_file("a.md").unwrap();
         documents.publish_changes().unwrap();
         (root, documents)
     }
@@ -184,7 +185,7 @@ mod tests {
         let initial = state(&documents);
         assert!(initial.durable_version.is_none());
         assert!(exportable(&initial, false));
-        let version = initial.snapshot.version.clone();
+        let version = initial.version.clone();
         feed.publish(vec![initial]).unwrap();
         let event: Value = serde_json::to_value(feed.subscribe().initial).unwrap();
         assert_eq!(event["persistentHistory"], false);

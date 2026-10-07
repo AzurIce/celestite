@@ -51,7 +51,7 @@ fn deleted_and_recreated_paths_join_in_either_order() {
             core.replace_replica_session(inputs).await.unwrap();
             assert!(core.read("old").unwrap().deleted);
             assert_eq!(core.read("new").unwrap().snapshot.text, "new");
-            assert!(core.read("base").unwrap().deleted);
+            assert_eq!(core.read("base").unwrap_err().code, "NotFound");
         }
         let mut core = replica("client", seed("base", "base")).await;
         core.join_replica_document(hosted(seed("new", "new"), "same.md", false))
@@ -406,5 +406,103 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
             "PermissionDenied");
         core.subscribe_preview("file", "readonly-view").unwrap();
         assert!(core.take_preview_task("file").unwrap().is_some());
+    });
+}
+
+#[test]
+fn a_closed_cache_can_rejoin_after_replacing_the_active_session_catalogue() {
+    block_on(async {
+        let closed = seed("closed", "cached");
+        let active = seed("active", "active");
+        let mut core = replica("client", closed.clone()).await;
+        core.join_replica_document(hosted(active.clone(), "b.md", false))
+            .await
+            .unwrap();
+        let writer = core.read("closed").unwrap().writer_id;
+        let subscription = core.subscribe_preview("closed", "view").unwrap();
+        core.replace_replica_session(vec![hosted(active, "b.md", false)])
+            .await
+            .unwrap();
+        assert_eq!(core.read("closed").unwrap_err().code, "NotFound");
+        assert!(!core.unsubscribe_preview(&subscription.subscription_id, "view"));
+        core.join_replica_document(hosted(closed, "a.md", false))
+            .await
+            .unwrap();
+        assert_eq!(core.read("closed").unwrap().snapshot.text, "cached");
+        assert_ne!(core.read("closed").unwrap().writer_id, writer);
+    });
+}
+
+#[test]
+fn released_replica_caches_keep_undo_without_reserving_a_live_path() {
+    block_on(async {
+        let mut core = replica("client", seed("old", "old")).await;
+        // Make this document a host-owned replica before exercising its lifecycle.
+        let packet = core.snapshot("old").unwrap();
+        core.replace_replica_session(vec![hosted(packet, "a.md", false)])
+            .await
+            .unwrap();
+        let state = core.read("old").unwrap();
+        core.apply(
+            "old",
+            BufferCommand::Edit(Edit::replace(&state.snapshot, "draft")),
+        )
+        .await
+        .unwrap();
+        let state = core.read("old").unwrap();
+        core.release_replica_document("old").unwrap();
+        assert!(!core.read("old").unwrap().deleted);
+        assert!(core.read("old").unwrap().undo.can_undo);
+        assert_eq!(
+            core.apply(
+                "old",
+                BufferCommand::Undo {
+                    base: state.snapshot.version.clone(),
+                    context: UndoContext::default()
+                }
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "Closed"
+        );
+        assert_eq!(
+            core.subscribe_preview("old", "view").unwrap_err().code,
+            "Closed"
+        );
+        core.join_replica_document(hosted(seed("new", "new"), "a.md", false))
+            .await
+            .unwrap();
+        core.apply_host_state(
+            "old",
+            ReplicaHostState {
+                path: "renamed.md".into(),
+                version: state.snapshot.version,
+                saved_content: "old".into(),
+                backend_revision: "disk".into(),
+                bom: false,
+                line_ending: "\n".into(),
+                deleted: false,
+                conflict: false,
+                error: None,
+                external_change: None,
+                read_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(core.read("old").unwrap().writer_id, state.writer_id);
+        assert!(core.read("old").unwrap().undo.can_undo);
+        core.apply(
+            "old",
+            BufferCommand::Undo {
+                base: core.read("old").unwrap().snapshot.version,
+                context: UndoContext::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(core.read("old").unwrap().snapshot.text, "old");
+        assert_eq!(core.read("new").unwrap().snapshot.text, "new");
     });
 }

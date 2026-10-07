@@ -2,6 +2,7 @@ pub(crate) mod backend;
 pub(crate) mod changes;
 pub(crate) mod documents;
 pub mod fs;
+pub(crate) mod runtime;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
