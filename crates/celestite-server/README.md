@@ -131,20 +131,22 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 host 返回 `hello`（`sessionId`）和 `ready`，握手不加载文件或发送文档。客户端 `open` 时，host 创建或复用对应 Buffer，分配该会话的十进制 `writerId` 并返回完整快照，同时订阅后续变化。快照与订阅在同一串行边界建立；只有本会话当前订阅的 Buffer 才会推送 `document`（host 元数据、`packet`、writer 和递增 `sequence`）。文本来自 CRDT 包；元数据不重复发送正文，`savedContent` 仅在初次打开或磁盘基线改变时发送。慢消费者只补齐其已订阅 Buffer；无法导出历史时结束会话，客户端冻结并保留正文。
 
-host 同时发送 `members {state}` 全量成员快照，包含成员会话 ID、有效只读权限、正文订阅和视图焦点；允许合并中间状态。成员 ID 与文档 writer 分开。退订清除对应视图，断线或关闭会话清除在线成员。
+host 同时发送 `members {state}` 全量成员快照，包含成员会话 ID、展示名称、颜色、有效只读权限、正文订阅、视图焦点与锚点选区；允许合并中间状态。成员 ID 与文档 writer 分开。退订清除对应视图，断线或关闭会话清除在线成员。
+
+选区为 `{version, ranges: [{anchor, head}], mainIndex}`，位置使用 core 的不透明 CRDT 锚点；`selection` 为 null 时清除位置。每个成员最多 64 个视图，每份选区最多 16 个范围、32 KiB。宿主校验文本订阅、完整因果依赖和历史身份；只读成员可报告位置。客户端按 50 ms 合并视图状态，未接受输入和 IME 期间暂停位置发送，待已接受正文获得 host 确认后发送；接收端等依赖到齐再解析，并映射到自己的待确认正文。
 
 请求均为 `{ sessionId, requestId, method, ...参数 }`，响应为 `{ kind: "reply", requestId, result }` 或 `error`：
 
-| method            | 参数                           | 行为                                                                               |
-| ----------------- | ------------------------------ | ---------------------------------------------------------------------------------- |
-| open              | path 或 id，二选一             | 按路径创建 / 复用 Buffer，或重连时按 ID 加入；返回快照与元数据                     |
-| updates           | id, packet, version, operation | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后在内存接受并确认 |
-| save              | id, version                    | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                       |
-| probe             | id, version                    | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                               |
-| unsubscribe       | id                             | 停止文本订阅，清除对应视图；同会话重新打开沿用 writer                              |
-| set_view          | viewId, documentId, focused    | 登记视图与焦点；documentId 为 null 时移除视图                                      |
-| retry_observation | id                             | 重新排队磁盘观察，不写文件                                                         |
-| ping              | —                              | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                               |
+| method            | 参数                                   | 行为                                                                               |
+| ----------------- | -------------------------------------- | ---------------------------------------------------------------------------------- |
+| open              | path 或 id，二选一                     | 按路径创建 / 复用 Buffer，或重连时按 ID 加入；返回快照与元数据                     |
+| updates           | id, packet, version, operation         | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后在内存接受并确认 |
+| save              | id, version                            | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                       |
+| probe             | id, version                            | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                               |
+| unsubscribe       | id                                     | 停止文本订阅，清除对应视图；同会话重新打开沿用 writer                              |
+| set_view          | viewId, documentId, focused, selection | 登记视图与焦点；documentId 为 null 时移除视图                                      |
+| retry_observation | id                                     | 重新排队磁盘观察，不写文件                                                         |
+| ping              | —                                      | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                               |
 
 `document`、`members`、`tree` 和 `heartbeat` 为主动通知；`tree` 使文件树失效，实际目录仍通过 HTTP 查询。文本操作要求目标 Buffer 已在本会话订阅；非空视图目标也必须已订阅。会话缓存最近 256 条操作回执，同序号同包重发返回原回执，变更载荷或跳号被拒绝；回执过期用因果检查点核对。重连分配新会话与 writer，按 ID 重新打开此前订阅的 Buffer，拒绝旧 writer 的未提交操作，不自动重放。回执只表示内存接受，server 重启后旧历史失效。
 
@@ -211,7 +213,7 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 ## 多实例与可视化调试
 
-多个独立客户端通过生产 WebSocket 会话交换各自 writer 的历史，并接收在线成员、订阅和视图状态。客户端个人撤销在自己的 core 上执行。光标与选区的 presence 传输和渲染尚待实现。
+多个独立客户端通过生产 WebSocket 会话交换各自 writer 的历史，并接收在线成员、订阅和视图状态。客户端个人撤销在自己的 core 上执行。Web 展示在线成员、文档参与状态、只读权限和焦点；CodeMirror 使用姓名、颜色显示远端光标与选区。
 
 Web 提供 `/debug/sync` 调试页，运行最多 6 个独立的生产远端编辑 Worker，支持实时同步、个人撤销、显式保存、版本与确认状态检查。开发时使用 `http://localhost:1420/debug/sync`；构建后配置 `--web-dir web/dist`。详见 [Web 调试说明](../../web/README.md#同步调试页)。调试页复用编辑器的 WebSocket 会话、成员与订阅协议。
 

@@ -90,6 +90,8 @@ export async function serveEditor(
             String(p.viewId),
             p.documentId === null ? null : String(p.documentId),
             Boolean(p.focused),
+            (p.selection ?? null) as
+              import("../contract").VersionedSelection | null,
           );
         case "anchors_at":
           return host.anchorsAt(

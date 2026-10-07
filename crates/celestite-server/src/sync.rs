@@ -1,6 +1,8 @@
 //! One online session per connection. Opening a buffer subscribes that session
 //! to its history. A receipt acknowledges in-memory CRDT acceptance; saving the
 //! ordinary file is a separate command.
+#[cfg(test)]
+mod tests;
 use crate::{
     vault::runtime::{execute, execute_with_tree},
     vault::{changes::Subscription, fs::VaultError, VaultIdentity},
@@ -64,6 +66,7 @@ enum Command {
         view_id: String,
         document_id: Option<String>,
         focused: bool,
+        selection: Option<crate::collaboration::PresenceSelection>,
     },
     Open {
         path: Option<String>,
@@ -220,6 +223,52 @@ async fn command(
         | Command::SetView { .. } => Operation::Read,
     };
     grant.check(operation)?;
+    if let Command::SetView {
+        document_id,
+        selection: Some(selection),
+        ..
+    } = &request.command
+    {
+        let id = document_id
+            .as_ref()
+            .ok_or_else(|| VaultError::new("InvalidEdit", "Selection requires a document", ""))?;
+        {
+            let state = session
+                .lock()
+                .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
+            if request.session_id != state.id
+                || !state.alive.load(Ordering::Acquire)
+                || !state.subscribed(id)
+            {
+                return Err(VaultError::new(
+                    "InvalidEdit",
+                    "Selection requires a live document subscription",
+                    id,
+                )
+                .into());
+            }
+        }
+        if selection.ranges.is_empty()
+            || selection.ranges.len() > 16
+            || selection.main_index >= selection.ranges.len()
+            || serde_json::to_vec(selection).map_or(true, |data| data.len() > 32 * 1024)
+        {
+            return Err(
+                VaultError::new("InvalidEdit", "Selection exceeds presence limits", id).into(),
+            );
+        }
+        let id = id.clone();
+        let selection = selection.clone();
+        execute_with_tree(vault.clone(), false, false, move |_, docs| {
+            let anchors: Vec<_> = selection
+                .ranges
+                .into_iter()
+                .flat_map(|r| [r.anchor, r.head])
+                .collect();
+            docs.validate_presence(&id, &selection.version, &anchors)
+        })
+        .await?;
+    }
     // Membership and heartbeat never acquire the text/IO execution boundary.
     if matches!(
         request.command,
@@ -248,6 +297,7 @@ async fn command(
                 view_id,
                 document_id,
                 focused,
+                selection,
             } => {
                 if view_id.is_empty()
                     || view_id.len() > 128
@@ -264,8 +314,11 @@ async fn command(
                     view_id: view_id.clone(),
                     document_id,
                     focused,
+                    selection,
                 });
-                vault.collaboration.view(&state.id, &view_id, view);
+                if !vault.collaboration.view(&state.id, &view_id, view) {
+                    return Err(VaultError::new("InvalidEdit", "Too many member views", "").into());
+                }
                 return Ok(json!({"updated":true}));
             }
             _ => unreachable!(),

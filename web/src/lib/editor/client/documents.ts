@@ -10,6 +10,8 @@ import type { DocumentsSnapshot } from "../contract";
 import { EditorClient } from "../rpc";
 import { rebaseInputs, sameVersion } from "../view-changes";
 import { EditGroups, undoContext } from "../commands";
+import { DocumentPresence } from "./presence";
+import { minimalChange } from "../view-changes";
 import type { DocumentPreviews, PreviewState } from "../preview/contract";
 import type {
   ConnectionState,
@@ -19,6 +21,7 @@ import type {
   EditorDocument,
   InstanceIdentity,
   SelectionContext,
+  ViewSelection,
   ServiceDocument,
   ViewEdit,
   Version,
@@ -49,6 +52,7 @@ export function applyEdits(
 }
 /** Main-thread view controller. Accepted history/undo/IO live only in the host. */
 export class WorkerDocuments {
+  private presence: DocumentPresence;
   readonly previews: DocumentPreviews = {
     subscribe: (id, listener) => this.subscribePreview(id, listener),
     retry: async (id) => {
@@ -89,6 +93,7 @@ export class WorkerDocuments {
     private terminate: () => void,
     private readonly remote = false,
   ) {
+    this.presence = new DocumentPresence(client, () => this.notify());
     if (remote) {
       this.connection = { status: "online", error: null };
       void client
@@ -168,8 +173,13 @@ export class WorkerDocuments {
   resolveAnchors(id: string, checkpoint: Version, anchors: Anchor[]) {
     return this.client.request("resolve_anchors", { id, checkpoint, anchors });
   }
-  setView(viewId: string, documentId: string | null, focused: boolean) {
-    return this.client.request("set_view", { viewId, documentId, focused });
+  setView(
+    viewId: string,
+    documentId: string | null,
+    focused: boolean,
+    selection?: ViewSelection,
+  ) {
+    return this.presence.setView(viewId, documentId, focused, selection);
   }
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
     const result = this.queue.then(task);
@@ -232,6 +242,11 @@ export class WorkerDocuments {
     };
   }
   private notify() {
+    this.presence.refresh(
+      this.members,
+      this.records.values(),
+      this.remote && this.online() && !this.closing,
+    );
     for (const listener of this.listeners) listener(this.snapshot());
   }
   private subscribePreview(
@@ -293,10 +308,20 @@ export class WorkerDocuments {
       record.acceptedVersion = document.core?.version;
       record.content = rebased.content;
       record.remoteChange = { before: beforeProjection, edits: rebased.edits };
+      this.presence.mapProjection(
+        record,
+        beforeProjection,
+        record.content,
+        rebased.edits,
+      );
     } else if (
       content !== undefined &&
       (replace || record.inputs.length === 0)
     ) {
+      if (record.content !== content)
+        this.presence.mapProjection(record, record.content, content, [
+          minimalChange(record.content, content),
+        ]);
       record.content = content;
       record.acceptedContent = content;
       record.acceptedVersion = document.core?.version;
@@ -440,6 +465,7 @@ export class WorkerDocuments {
   }
   composition(id: string, active: boolean) {
     if (!this.online()) return;
+    this.presence.composition(id, active);
     const send = () => this.client.request("composition", { id, active });
     // Start precedes the first IME transaction; end follows all of its queued
     // inputs, so held remote updates cannot split a composition.
@@ -458,6 +484,12 @@ export class WorkerDocuments {
     )
       return false;
     const pending = { ...input, group: this.groups.next(id, input.userEvent) };
+    this.presence.mapProjection(
+      record,
+      record.content,
+      input.content,
+      input.edits,
+    );
     record.content = input.content;
     record.inputs.push(pending);
     this.notify();
@@ -882,6 +914,7 @@ export class WorkerDocuments {
         throw new VaultError("IO", "未提交的编辑仍保留，不能关闭服务。");
       await this.enqueue(() => this.client.request("close", {}));
       this.unsubscribe();
+      this.presence.close();
       this.unsubscribeFailure();
       this.client.dispose();
       this.terminate();

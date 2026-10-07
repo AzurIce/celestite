@@ -10,6 +10,7 @@ import type {
 } from "./preview/contract";
 
 export interface DocumentSnapshot {
+  collaborators?: RemoteSelection[];
   deleted?: boolean;
   conflictResolution?: "local" | "shared";
   inputFailure?: {
@@ -74,10 +75,34 @@ export interface MemberView {
   viewId: string;
   documentId: string;
   focused: boolean;
+  selection?: PresenceSelection;
+}
+export interface PresenceSelection {
+  version: Version;
+  ranges: { anchor: Anchor; head: Anchor }[];
+  mainIndex: number;
+}
+export interface VersionedSelection {
+  version: Version;
+  selection: SelectionContext;
+}
+export interface ViewSelection {
+  content: string;
+  selection: SelectionContext;
+}
+export interface RemoteSelection extends SelectionContext {
+  sessionId: string;
+  viewId: string;
+  name: string;
+  color: string;
+  focused: boolean;
+  readOnly: boolean;
 }
 export interface CollaborationMember {
   sessionId: string;
   readOnly: boolean;
+  name: string;
+  color: string;
   documents: string[];
   views: MemberView[];
 }
@@ -199,6 +224,7 @@ export interface EditorDocuments {
     viewId: string,
     documentId: string | null,
     focused: boolean,
+    selection?: ViewSelection,
   ): Promise<void>;
   readonly treeBackend: VaultBackend;
   snapshot(): DocumentsSnapshot;
@@ -286,7 +312,12 @@ export interface ServiceMethods {
     result: CollaborationSnapshot | null;
   };
   set_view: {
-    params: { viewId: string; documentId: string | null; focused: boolean };
+    params: {
+      viewId: string;
+      documentId: string | null;
+      focused: boolean;
+      selection: VersionedSelection | null;
+    };
     result: void;
   };
   anchors_at: {

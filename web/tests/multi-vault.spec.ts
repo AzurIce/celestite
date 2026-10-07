@@ -2222,3 +2222,82 @@ test("document leases release presence, keep undo on reopen, and permit path reu
   await expect(editor(page)).toHaveText("recreated");
   await expect.poll(async () => (await mine())?.documents.length).toBe(2);
 });
+
+test("collaboration renders Unicode selections and read-only members, maps concurrent edits, and clears released views", async ({
+  page,
+  browser,
+  api,
+}) => {
+  const name = `presence-${crypto.randomUUID()}.md`;
+  const disk = join(api.root, "notes", name);
+  await writeFile(disk, "A😀BC");
+  await installWorkerHarness(page, true);
+  await page.goto("/");
+  await connect(page, api.url);
+  await page.getByRole("treeitem", { name, exact: true }).click();
+  const context = await browser.newContext();
+  const readerContext = await browser.newContext();
+  try {
+    const other = await context.newPage();
+    const reader = await readerContext.newPage();
+    await other.goto(new URL("/", page.url()).href);
+    await connect(other, api.url);
+    await other.getByRole("treeitem", { name, exact: true }).click();
+    await reader.goto(new URL("/", page.url()).href);
+    await connect(reader, api.urls.reader);
+    await reader.getByRole("treeitem", { name, exact: true }).click();
+    await expect(
+      other.getByRole("status", { name: "在线成员", exact: true }),
+    ).toHaveText("3 人在线 · 3 人查看本文档");
+    await other
+      .getByLabel("协作成员", { exact: true })
+      .locator("summary")
+      .click();
+    await expect(
+      other.getByRole("list", { name: "在线成员列表" }),
+    ).toContainText("只读");
+    const sessionId = await page.evaluate(() => {
+      const events = (window as any).editorMessages as any[];
+      return events
+        .filter((event) => event.kind === "members" && event.state)
+        .at(-1).state.sessionId as string;
+    });
+    const remoteCursor = other.locator(
+      `.cm-collaborator-cursor[data-member-id="${sessionId}"]`,
+    );
+    const remoteSelection = other.locator(
+      `.cm-collaborator-selection[data-member-id="${sessionId}"]`,
+    );
+    await editor(page).focus();
+    await page.keyboard.press("Control+Home");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Shift+ArrowRight");
+    await page.keyboard.press("Shift+ArrowRight");
+    await expect(remoteSelection).toHaveText("😀B");
+    await expect(remoteCursor).toHaveAttribute("data-offset", "4");
+    await expect(editor(other)).toHaveText("A😀BC");
+    await editor(other).focus();
+    await other.keyboard.press("Control+Home");
+    await other.keyboard.insertText("前");
+    for (const peer of [page, other, reader])
+      await expect(editor(peer)).toHaveText("前A😀BC");
+    await expect(remoteSelection).toHaveText("😀B");
+    await expect(remoteCursor).toHaveAttribute("data-offset", "5");
+    expect(await readFile(disk, "utf8")).toBe("A😀BC");
+    await page
+      .getByRole("button", { name: `关闭 ${name}`, exact: true })
+      .click();
+    await expect(remoteCursor).toHaveCount(0);
+    await expect(remoteSelection).toHaveCount(0);
+    await expect(
+      other.getByRole("status", { name: "在线成员", exact: true }),
+    ).toHaveText("3 人在线 · 2 人查看本文档");
+    await readerContext.close();
+    await expect(
+      other.getByRole("status", { name: "在线成员", exact: true }),
+    ).toHaveText("2 人在线 · 1 人查看本文档");
+  } finally {
+    await context.close();
+    await readerContext.close();
+  }
+});

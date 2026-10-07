@@ -89,7 +89,9 @@ function document(): ServiceDocument {
   };
 }
 function setup(reply: (request: WorkerRequest) => unknown, remote = true) {
-  const transport = new Transport(reply);
+  const transport = new Transport((request) =>
+    request.method === "collaboration" ? null : reply(request),
+  );
   const client = new EditorClient(transport);
   transport.emit({
     kind: "ready",

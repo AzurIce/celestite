@@ -38,6 +38,7 @@ import type { VimMode } from "./vim";
 import { SaveConflict } from "./SaveConflict";
 import { DocumentPreview } from "./DocumentPreview";
 import { PreviewSync } from "./preview-sync";
+import { CollaborationBar } from "./CollaborationBar";
 import { vaultPath } from "@/lib/vault/path";
 import "./editor.css";
 
@@ -393,6 +394,11 @@ export function VaultEditor(props: VaultEditorProps) {
             </ContextMenuItem>
           </ContextMenuContent>
         </ContextMenu>
+        <Show when={state().collaboration}>
+          {(members) => (
+            <CollaborationBar state={members()} documentId={state().activeId} />
+          )}
+        </Show>
         <Show
           when={!state().loadingPath}
           fallback={
@@ -592,9 +598,19 @@ export function VaultEditor(props: VaultEditorProps) {
                                 wrap={wrap()}
                                 vim={settings().values["editor.vimMode"]}
                                 onVimMode={setVimMode}
-                                onView={(viewId, documentId, focused) => {
+                                onView={(
+                                  viewId,
+                                  documentId,
+                                  focused,
+                                  selection,
+                                ) => {
                                   void props.documents
-                                    .setView?.(viewId, documentId, focused)
+                                    .setView?.(
+                                      viewId,
+                                      documentId,
+                                      focused,
+                                      selection,
+                                    )
                                     .catch(() => {});
                                 }}
                                 onComposition={(active) =>

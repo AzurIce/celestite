@@ -8,12 +8,14 @@ import type {
   ServiceDocument,
   HostDocument,
   CollaborationSnapshot,
-  MemberView,
+  VersionedSelection,
+  PresenceSelection,
   ServiceEvent,
   SyncPacket,
 } from "../contract";
 import { RemoteTransport, type RemoteReceipt } from "./transport";
 import { SyncSession } from "./session";
+import { anchorPositions } from "../presence";
 
 /** Private online replica: core owns history/undo; the transport carries
  * committed updates. Host file saves remain explicit. */
@@ -21,7 +23,16 @@ export class RemoteEditorHost extends EditorHost {
   private hosts = new Map<string, HostDocument>();
   private subscriptions = new Set<string>();
   private members: CollaborationSnapshot | null = null;
-  private views = new Map<string, MemberView>();
+  private views = new Map<
+    string,
+    {
+      viewId: string;
+      documentId: string;
+      focused: boolean;
+      selection: VersionedSelection | null;
+    }
+  >();
+  private sendingViews = new Set<string>();
   private sync?: SyncSession;
   private unsupported = new Map<string, ServiceDocument>();
   private offline = true;
@@ -167,8 +178,10 @@ export class RemoteEditorHost extends EditorHost {
       this.composing.clear();
       this.deferred.clear();
       for (const view of this.views.values())
-        if (this.subscriptions.has(view.documentId))
+        if (this.subscriptions.has(view.documentId)) {
+          view.selection = null;
           await transport.request("set_view", { ...view });
+        }
       this.offline = false;
       return states.map((state) => this.document(state));
     } catch (error) {
@@ -335,15 +348,77 @@ export class RemoteEditorHost extends EditorHost {
     viewId: string,
     documentId: string | null,
     focused: boolean,
+    selection: VersionedSelection | null = null,
   ) {
-    if (documentId === null) this.views.delete(viewId);
-    else this.views.set(viewId, { viewId, documentId, focused });
-    if (!this.offline)
-      await this.transport!.request("set_view", {
-        viewId,
-        documentId,
-        focused,
-      });
+    if (documentId === null) {
+      this.views.delete(viewId);
+      if (!this.offline)
+        await this.transport!.request("set_view", {
+          viewId,
+          documentId,
+          focused: false,
+          selection: null,
+        });
+      return;
+    }
+    this.views.set(viewId, { viewId, documentId, focused, selection });
+    if (!this.offline) void this.sendView(viewId);
+  }
+  private async sendView(viewId: string) {
+    if (this.sendingViews.has(viewId)) return;
+    this.sendingViews.add(viewId);
+    const transport = this.transport!;
+    try {
+      let sent: unknown;
+      while (!this.offline && this.transport === transport) {
+        const view = this.views.get(viewId);
+        if (!view || view === sent || !this.subscriptions.has(view.documentId))
+          break;
+        sent = view;
+        let selection: PresenceSelection | null = null;
+        if (view.selection) {
+          try {
+            const anchors = await this.anchorsAt(
+              view.documentId,
+              view.selection.version,
+              anchorPositions(view.selection.selection),
+            );
+            await this.sync!.wait(view.documentId, view.selection.version);
+            selection = {
+              version: view.selection.version,
+              ranges: view.selection.selection.ranges.map((_, i) => ({
+                anchor: anchors[i * 2],
+                head: anchors[i * 2 + 1],
+              })),
+              mainIndex: view.selection.selection.mainIndex,
+            };
+          } catch (error) {
+            if (!(error instanceof VaultError) || error.code !== "StaleVersion")
+              throw error;
+          }
+        }
+        this.requireTransport(transport);
+        if (this.views.get(viewId) !== view) continue;
+        await transport.request("set_view", {
+          viewId,
+          documentId: view.documentId,
+          focused: view.focused,
+          selection,
+        });
+      }
+    } catch (error) {
+      if (this.transport === transport && this.connectionFailure(error))
+        this.networkFailure(transport, error);
+    } finally {
+      this.sendingViews.delete(viewId);
+      // Session replacement can finish while an old checkpoint wait unwinds.
+      if (
+        this.transport !== transport &&
+        !this.offline &&
+        this.views.has(viewId)
+      )
+        void this.sendView(viewId);
+    }
   }
   override async releaseDocument(id: string) {
     if (this.subscriptions.has(id)) {

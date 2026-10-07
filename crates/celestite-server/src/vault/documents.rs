@@ -105,6 +105,13 @@ impl Documents {
         self.require_committed(id)?;
         Ok(self.core.status(id).map_err(vault_error)?.version)
     }
+    pub fn validate_presence(&self, id: &str, version: &Version, anchors: &[Anchor]) -> Result<()> {
+        self.require_committed(id)?;
+        self.core
+            .resolve_anchors(id, version, anchors)
+            .map(|_| ())
+            .map_err(vault_error)
+    }
     pub fn refresh_path(&mut self, path: &str) -> Result<()> {
         block_on(self.core.refresh_path(path)).map_err(vault_error)
     }

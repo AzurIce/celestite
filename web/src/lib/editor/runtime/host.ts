@@ -30,6 +30,7 @@ import type {
   Affinity,
   Anchor,
   ResolvedAnchor,
+  VersionedSelection,
 } from "../contract";
 
 interface Patch {
@@ -274,6 +275,7 @@ export class EditorHost {
     _viewId: string,
     _documentId: string | null,
     _focused: boolean,
+    _selection: VersionedSelection | null = null,
   ) {}
   protected publishMembers(state: CollaborationSnapshot | null) {
     this.emit({ kind: "members", sequence: ++this.eventSequence, state });

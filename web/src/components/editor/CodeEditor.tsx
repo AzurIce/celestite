@@ -46,11 +46,13 @@ import type {
   EditorDocument,
   ViewEdit,
   SelectionContext,
+  ViewSelection,
 } from "@/lib/editor/contract";
 import { languageSupport } from "./languages";
 import { syntaxFolds } from "./tree-sitter";
 import { vimExtension, vimNormalMode, vimUserEvent, type VimMode } from "./vim";
 import "./editor.css";
+import { collaboratorField, setCollaborators } from "./collaborators";
 
 import type { EditorBuffer } from "@/lib/editor/buffer";
 import type { PreviewSync } from "./preview-sync";
@@ -64,6 +66,7 @@ interface CodeEditorProps {
     viewId: string,
     documentId: string | null,
     focused: boolean,
+    selection?: ViewSelection,
   ) => void;
   onUndo: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
@@ -108,6 +111,7 @@ export default function CodeEditor(props: CodeEditorProps) {
   let detachPreviewSync: (() => void) | undefined;
   let host!: HTMLDivElement;
   let view: EditorView | undefined;
+  let projectionContent = "";
   let buffer: EditorBuffer;
   let disposed = false;
   let languageRequest = 0;
@@ -125,12 +129,22 @@ export default function CodeEditor(props: CodeEditorProps) {
     const line = state.doc.lineAt(head);
     props.onCursor(line.number, head - line.from + 1);
   };
+  const reportView = () => {
+    if (!view || disposed) return;
+    props.onView?.(
+      viewId,
+      documentId,
+      view.hasFocus && !document.hidden && document.hasFocus(),
+      { content: projectionContent, selection: selectionContext(view.state) },
+    );
+  };
   const undo = (redo: boolean) => (editor: EditorView) => {
     if (!props.document.readOnlyReason && !props.document.core?.historyError)
       props.onUndo(selectionContext(editor.state), redo);
     return true;
   };
   const bindings = () => [
+    collaboratorField,
     Prec.highest(
       keymap.of([
         { key: "Mod-z", run: undo(false), shift: undo(true) },
@@ -171,8 +185,7 @@ export default function CodeEditor(props: CodeEditorProps) {
       autocorrect: "off",
     }),
     EditorView.updateListener.of((update) => {
-      if (update.focusChanged)
-        props.onView?.(viewId, documentId, update.view.hasFocus);
+      if (update.docChanged) projectionContent = update.state.doc.toString();
       if (update.docChanged) previewSync?.invalidateEditor(update.view);
       if (update.geometryChanged || update.viewportChanged)
         previewSync?.editorLayoutChanged(update.view);
@@ -182,7 +195,7 @@ export default function CodeEditor(props: CodeEditorProps) {
           transaction.annotation(serviceUpdate),
         )
       ) {
-        const content = update.state.doc.toString();
+        const content = projectionContent;
         const edits: ViewEdit["edits"] = [];
         update.changes.iterChanges((from, to, _fromB, _toB, insert) =>
           edits.push({ from, to, insert: insert.toString() }),
@@ -218,6 +231,8 @@ export default function CodeEditor(props: CodeEditorProps) {
           });
       }
       if (update.docChanged || update.selectionSet) cursor(update.state);
+      if (update.docChanged || update.selectionSet || update.focusChanged)
+        reportView();
     }),
   ];
   const editable = () => [
@@ -371,6 +386,14 @@ export default function CodeEditor(props: CodeEditorProps) {
         });
     props.onView?.(viewId, documentId, false);
     view = new EditorView({ parent: host, state });
+    projectionContent = state.doc.toString();
+    view.dispatch({
+      effects: setCollaborators.of(props.document.collaborators ?? []),
+    });
+    reportView();
+    window.addEventListener("focus", reportView);
+    window.addEventListener("blur", reportView);
+    document.addEventListener("visibilitychange", reportView);
     view.scrollDOM.scrollTop = buffer.scrollTop;
     view.scrollDOM.scrollLeft = buffer.scrollLeft;
     detachPreviewSync = previewSync?.mountEditor(documentId, view);
@@ -490,10 +513,23 @@ export default function CodeEditor(props: CodeEditorProps) {
       onSettled(() => view?.focus());
     },
   );
+  createEffect(
+    () => ({
+      collaborators: props.document.collaborators,
+      content: props.document.content,
+    }),
+    ({ collaborators, content }) => {
+      if (view && projectionContent === content)
+        view.dispatch({ effects: setCollaborators.of(collaborators ?? []) });
+    },
+  );
   onCleanup(() => {
     props.onView?.(viewId, null, false);
     detachPreviewSync?.();
     disposed = true;
+    window.removeEventListener("focus", reportView);
+    window.removeEventListener("blur", reportView);
+    document.removeEventListener("visibilitychange", reportView);
     observer?.disconnect();
     if (view) {
       props.onCache({

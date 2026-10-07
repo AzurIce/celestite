@@ -1,6 +1,114 @@
 .code-editor {
   --uno: "flex min-h-0 min-w-0 flex-1 flex-col bg-surface";
 }
+.cm-collaborator-cursor {
+  position: relative;
+  display: inline-block;
+  width: 0;
+  height: 1.15em;
+  border-left: 2px solid var(--collaborator-color);
+  margin-right: -2px;
+  vertical-align: text-bottom;
+  pointer-events: none;
+  opacity: 0.55;
+}
+.cm-collaborator-cursor.is-focused {
+  opacity: 1;
+}
+.cm-collaborator-label {
+  position: absolute;
+  bottom: 100%;
+  left: -2px;
+  padding: 1px 5px;
+  border-radius: 3px 3px 3px 0;
+  background: var(--collaborator-color);
+  color: white;
+  font: 11px/1.5 var(--font-ui);
+  white-space: nowrap;
+  opacity: 0;
+}
+.cm-collaborator-cursor.is-focused .cm-collaborator-label {
+  opacity: 1;
+}
+.cm-collaborator-label::after {
+  content: attr(data-name);
+}
+.cm-collaborator-selection {
+  background: color-mix(in srgb, var(--collaborator-color) 14%, transparent);
+}
+.cm-collaborator-selection.is-focused {
+  background: color-mix(in srgb, var(--collaborator-color) 25%, transparent);
+}
+.collaboration-bar {
+  position: relative;
+  flex: none;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+  font-size: 12px;
+  color: var(--color-secondary);
+}
+.collaboration-bar summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.collaboration-bar summary::-webkit-details-marker {
+  display: none;
+}
+.collaboration-avatars {
+  display: flex;
+  padding-left: 4px;
+}
+.collaboration-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 50%;
+  color: white;
+  background: var(--collaborator-color);
+  font-size: 10px;
+}
+.collaboration-avatars .collaboration-avatar {
+  margin-left: -4px;
+  border: 2px solid var(--color-surface);
+}
+.collaboration-bar ul {
+  position: absolute;
+  z-index: 40;
+  top: 100%;
+  right: 8px;
+  width: min(320px, calc(100% - 16px));
+  max-height: min(400px, 50vh);
+  overflow: auto;
+  margin: 4px 0 0;
+  padding: 8px;
+  list-style: none;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface);
+  box-shadow: 0 8px 24px #0002;
+}
+.collaboration-bar li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+}
+.collaboration-member-info {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  color: var(--color-foreground);
+}
+.collaboration-member-info small {
+  color: var(--color-secondary);
+}
 .code-editor-host {
   flex: 1;
   min-height: 0;
