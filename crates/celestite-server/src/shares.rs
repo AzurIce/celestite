@@ -47,8 +47,14 @@ impl Grant {
 pub(crate) fn seed(configured: Option<&str>) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     match configured {
         Some(value) => {
-            if value.len() < 32 || value.trim() != value {
-                return Err("share_key must be a random secret of at least 32 bytes without surrounding whitespace".into());
+            if value.is_empty() {
+                return Err("share_key must be a non-empty string".into());
+            }
+            if value.len() < 32 {
+                tracing::warn!(
+                    len = value.len(),
+                    "share_key is shorter than 32 bytes; anyone guessing it can derive both links, prefer `openssl rand -hex 32`"
+                );
             }
             Ok(blake3::derive_key(
                 "celestite configured share secret v1",

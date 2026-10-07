@@ -46,7 +46,7 @@ pub struct Cli {
     /// Override the Vault's display name (default: Vault)
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
-    /// Share secret of at least 32 bytes; omitted keys generate temporary links
+    /// Share secret; any non-empty string works, short or guessable values weaken links. Omitted keys generate temporary links
     #[arg(long, value_name = "KEY")]
     share_key: Option<String>,
     /// Override the Vault's read-only state

@@ -253,10 +253,19 @@ fn omitted_share_secrets_produce_temporary_links_without_state_files() {
 }
 
 #[test]
-fn public_url_and_configured_secrets_are_validated() {
+fn public_url_is_validated_and_share_secrets_accept_any_nonempty_string() {
     let f = Fixture::new();
     let mut config = f.config();
     config.vault.share_key = Some("a public name".into());
+    let short = build_server(config, f.dir.path()).unwrap();
+    let key = short.links.key(Permission::Edit).to_owned();
+    drop(short);
+    let mut config = f.config();
+    config.vault.share_key = Some("a public name".into());
+    let short = build_server(config, f.dir.path()).unwrap();
+    assert_eq!(short.links.key(Permission::Edit), key);
+    let mut config = f.config();
+    config.vault.share_key = Some("".into());
     assert!(build_server(config, f.dir.path()).is_err());
     for invalid in [
         "ftp://host",

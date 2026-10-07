@@ -29,7 +29,7 @@ Vault share links readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://12
 
 未配置 `share_key` 时，宿主每次启动产生 32 字节随机秘密值，仅保留在内存中，因此重启后链接和 Vault 身份改变。
 
-在 `[vault]` 配置 `share_key`，或通过 CLI 传入 `--share-key`，可保留固定链接。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白。相同秘密值与同一规范根目录保留链接和 Vault 身份，显示名 `name` 不参与派生；改目录或秘密值会同时替换两种链接和 Vault 身份，恢复原配置可能恢复旧链接。每次启动都会生成新的 `historyId`，固定链接不意味着历史跨重启保留。配置不支持动态热更新。
+在 `[vault]` 配置 `share_key`，或通过 CLI 传入 `--share-key`，可保留固定链接。任意非空字符串均可，字节原样参与派生，不做裁剪；短或可猜测的值会同时削弱两条链接的保密性，推荐用 `openssl rand -hex 32` 生成的随机值，较短的值会在启动时输出警告。相同秘密值与同一规范根目录保留链接和 Vault 身份，显示名 `name` 不参与派生；改目录或秘密值会同时替换两种链接和 Vault 身份，恢复原配置可能恢复旧链接。每次启动都会生成新的 `historyId`，固定链接不意味着历史跨重启保留。配置不支持动态热更新。
 
 `[server] public_url` 可设置打印链接使用的公开 HTTP(S) 地址和反向代理前缀，例如 `https://notes.example.com/celestite`；默认使用实际监听地址。该选项只决定链接基址，其 Origin 自动允许，不改变 key 或监听地址。反向代理将该前缀后的请求转发给宿主，并转发 WebSocket upgrade。
 

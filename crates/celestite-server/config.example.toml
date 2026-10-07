@@ -14,7 +14,9 @@ name = "笔记"
 # Existing directory; relative paths are relative to this config file.
 path = "./notes"
 read_only = false
-# Optional random secret of at least 32 bytes. Changing it and restarting rotates both links.
+# Optional secret; any non-empty string works. Prefer random secrets of at least
+# 32 bytes (`openssl rand -hex 32`) so links stay unguessable.
+# Changing it and restarting rotates both links.
 # Omit for temporary links; reuse a secret and the same directory for stable links.
 # Generate with: openssl rand -hex 32
 # share_key = "<random secret>"

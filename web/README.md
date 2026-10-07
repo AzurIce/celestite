@@ -383,7 +383,7 @@ HTML 在 ShadowRoot 中继承应用主题。展开底部诊断可跳转源码；
 
 ## 同步调试页
 
-运行 `bun run dev`，打开 `http://localhost:1420/debug/sync`。server 可由仓库根目录的 `just serve-notist "$share_key"` 启动。`share_key` 是需保存并复用的至少 32 字节随机秘密值，可用 `openssl rand -hex 32` 生成。在页面连接宿主启动日志中的完整 URL，选择文本并点击“打开并重建实例”。使用其他 Vault 时填写该 Vault 的启动链接。
+运行 `bun run dev`，打开 `http://localhost:1420/debug/sync`。server 可由仓库根目录的 `just serve-notist "$share_key"` 启动。`share_key` 是需保存并复用的秘密值，任意非空字符串均可，推荐用 `openssl rand -hex 32` 生成以保持链接不可猜测。在页面连接宿主启动日志中的完整 URL，选择文本并点击“打开并重建实例”。使用其他 Vault 时填写该 Vault 的启动链接。
 
 默认创建 A / B 两个独立 Worker 与 WASM `EditorCore<MemoryBackend>`，可增加至 6 个。分别修改正文，再点击“同步全部”；也可逐个推送、拉取、暂停传输，以及切换每秒同步。个人撤销由各自 core 产生 CRDT 更新。“保存到文件”只写 host 当前正文，未推送的客户端修改不会被保存。
 
