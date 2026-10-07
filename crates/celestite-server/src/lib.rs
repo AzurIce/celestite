@@ -38,7 +38,7 @@ use tokio_stream::{
     StreamExt,
 };
 use tower_http::{
-    cors::CorsLayer,
+    cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -358,7 +358,12 @@ pub fn build_server(
         .layer(middleware::from_fn_with_state(state.clone(), access_check))
         .layer(
             CorsLayer::new()
-                .allow_origin(origin_headers)
+                .allow_origin(if origin_headers.is_empty() {
+                    // No configured origins: emit ACAO for every client, matching access_check.
+                    AllowOrigin::any()
+                } else {
+                    AllowOrigin::list(origin_headers)
+                })
                 .allow_methods([
                     Method::GET,
                     Method::HEAD,
@@ -686,6 +691,47 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static("*"))
+            );
+            assert_eq!(
+                response.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+                "etag"
+            );
+
+            let preflight = router
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri(router.uri("/file"))
+                        .header(header::ORIGIN, origin)
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                        .header(
+                            header::ACCESS_CONTROL_REQUEST_HEADERS,
+                            "content-type,if-match",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(preflight.status(), StatusCode::OK);
+            assert_eq!(
+                preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                "*"
+            );
+            assert!(preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|method| method == "PUT"));
+            assert_eq!(
+                preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+                "content-type,if-match"
+            );
         }
     }
     async fn call(

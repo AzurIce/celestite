@@ -775,6 +775,96 @@ test("startup readonly and edit links to one Vault synchronize with separate per
   }
 });
 
+test("unset allowed origins permit browser connections, editing and conditional HTTP writes", async ({
+  page,
+}) => {
+  const root = await mkdtemp(join(tmpdir(), "celestite-cors-"));
+  let child: ChildProcess | undefined;
+  try {
+    await mkdir(join(root, "notes"));
+    await writeFile(join(root, "notes", "a.md"), "# Original");
+    await writeFile(join(root, "notes", "transport.txt"), "before");
+    child = spawn(
+      binary,
+      [
+        "--no-config",
+        "--vault",
+        "notes",
+        "--listen",
+        "0.0.0.0:0",
+        "--share-key",
+        "0",
+      ],
+      { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let log = "";
+    child.stderr?.on("data", (bytes) => (log += String(bytes)));
+    await expect
+      .poll(
+        () => {
+          if (child!.exitCode !== null || child!.signalCode !== null)
+            throw new Error(`server exited: ${log}`);
+          return log.includes("Celestite server listening");
+        },
+        { timeout: 10000 },
+      )
+      .toBe(true);
+    const url = new URL(startupLinks(log).edit);
+    url.hostname = "127.0.0.1";
+    await page.goto("/");
+    await connect(page, url.href);
+    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+    await expect(editor(page)).toHaveText("# Original");
+    await editor(page).fill("# Saved from browser");
+    await page.keyboard.press("Control+s");
+    await expect
+      .poll(() => readFile(join(root, "notes", "a.md"), "utf8"))
+      .toBe("# Saved from browser");
+
+    // Run in the browser so CORS preflight and ETag visibility are enforced.
+    const result = await page.evaluate(async (url) => {
+      const module = "/src/lib/vault/http.ts";
+      const { openHttpVault } = (await import(
+        module
+      )) as typeof import("../src/lib/vault/http");
+      const { backend } = await openHttpVault(url);
+      try {
+        const path = "transport.txt" as import("../src/lib/vault").VaultPath;
+        const snapshot = await backend.readFileSnapshot(path);
+        const revision = await backend.writeFile(
+          path,
+          new TextEncoder().encode("after"),
+          { mode: "replace", expectedRevision: snapshot.revision },
+        );
+        return {
+          changed: revision !== snapshot.revision,
+          text: new TextDecoder().decode(await backend.readFile(path)),
+        };
+      } finally {
+        await backend.close();
+      }
+    }, url.href);
+    expect(result).toEqual({ changed: true, text: "after" });
+    expect(await readFile(join(root, "notes", "transport.txt"), "utf8")).toBe(
+      "after",
+    );
+  } finally {
+    await page.close();
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const process = child;
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => process.kill("SIGKILL"), 5000);
+        process.once("exit", () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+        process.kill("SIGTERM");
+      });
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("changing share_key and restarting replaces startup links and begins new Vault history", async ({
   page,
   baseURL,
