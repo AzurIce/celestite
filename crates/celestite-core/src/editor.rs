@@ -756,8 +756,8 @@ impl<B: Backend> EditorCore<B> {
         self.records.keys().map(|id| self.read(id)).collect()
     }
 
-    /// Best-effort full observation. One unreadable/invalid file must not starve
-    /// unrelated documents. A history failure freezes the instance until explicit retry.
+    /// Observe loaded buffers without opening other files. One invalid file must
+    /// not starve unrelated documents; history failures require explicit retry.
     pub async fn reconcile_files(&mut self) -> Vec<EditorError> {
         let mut errors = vec![];
         if !self.backend.has_projection() {
@@ -776,56 +776,10 @@ impl<B: Backend> EditorCore<B> {
                 return errors;
             }
         }
-        let mut known_paths: std::collections::BTreeSet<_> = self
-            .records
-            .values()
-            .filter(|record| !record.header.deleted)
-            .map(|record| record.header.path.clone())
-            .collect();
-        let mut directories = vec![String::new()];
-        while let Some(directory) = directories.pop() {
-            let entries = match self.backend.read_dir(&directory).await {
-                Ok(entries) => entries,
-                Err(error) => {
-                    errors.push(error);
-                    continue;
-                }
-            };
-            for entry in entries {
-                if entry.kind == "directory" {
-                    directories.push(entry.path);
-                } else if entry.kind == "file" && known_paths.insert(entry.path.clone()) {
-                    match self.open_file(&entry.path).await {
-                        Ok(_) => {}
-                        Err(error) if matches!(error.code.as_str(), "Unsupported" | "NotFound") => {
-                        }
-                        Err(error) => errors.push(error),
-                    }
-                    if self.failure.is_some() {
-                        return errors;
-                    }
-                }
-            }
-        }
         errors
     }
 
     pub async fn list(&mut self) -> EditorResult<Vec<EditorDocument>> {
-        let mut pending = vec![String::new()];
-        while let Some(directory) = pending.pop() {
-            for entry in self.backend.read_dir(&directory).await? {
-                if entry.kind == "directory" {
-                    pending.push(entry.path);
-                } else if entry.kind == "file" {
-                    match self.open_file(&entry.path).await {
-                        Ok(_) => {}
-                        Err(error) if matches!(error.code.as_str(), "Unsupported" | "NotFound") => {
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-        }
         let ids: Vec<_> = self.records.keys().cloned().collect();
         let mut states = vec![];
         for id in ids {

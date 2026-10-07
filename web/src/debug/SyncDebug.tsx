@@ -138,10 +138,8 @@ export default function SyncDebug() {
               disabled={working()}
             >
               <option value="">选择文档</option>
-              <For each={state().documents}>
-                {(document) => (
-                  <option value={document.path}>{document.path}</option>
-                )}
+              <For each={state().files}>
+                {(file) => <option value={file.path}>{file.path}</option>}
               </For>
             </select>
           </label>
@@ -178,11 +176,8 @@ export default function SyncDebug() {
             每秒同步
           </label>
         </div>
-        <Show when={state().documents.length === 0}>
-          <p class="debug-empty">
-            这个 Vault
-            中没有可编辑文本。先在目录中创建文本文件，再结束会话并重新连接。
-          </p>
+        <Show when={state().files.length === 0}>
+          <p class="debug-empty">这个 Vault 中没有文件。</p>
         </Show>
       </Show>
       <Show when={state().host}>

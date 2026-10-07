@@ -1,19 +1,19 @@
 use celestite_core::{
     Buffer, BufferCommand, Edit, Import, SyncPacket, TextEdit, TextInput, UndoContext,
 };
-use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig, build_server};
+use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+    MaybeTlsStream, WebSocketStream,
 };
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct Host {
     root: tempfile::TempDir,
-    _state: tempfile::TempDir,
     url: String,
     identity: Value,
     stopping: tokio::sync::watch::Sender<bool>,
@@ -22,7 +22,6 @@ struct Host {
 impl Host {
     async fn new(read_only: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.md"), "ab🦀cd\nsecond\n").unwrap();
         std::fs::write(root.path().join("unopened.md"), "untouched").unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -37,8 +36,7 @@ impl Host {
                 vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.path().into(),
-                    state_dir: Some(state.path().into()),
-                    history_mode: HistoryMode::Initialize,
+                    share_key: Some("test-only stable secret 12345678901234567890".into()),
                     read_only,
                     ..Default::default()
                 },
@@ -76,7 +74,6 @@ impl Host {
             .clone();
         Self {
             root,
-            _state: state,
             url,
             identity,
             stopping,
@@ -100,8 +97,7 @@ impl Host {
                 vault: VaultConfig {
                     name: "Notes".into(),
                     path: self.root.path().into(),
-                    state_dir: Some(self._state.path().into()),
-                    history_mode: HistoryMode::Recover,
+                    share_key: Some("test-only stable secret 12345678901234567890".into()),
                     ..Default::default()
                 },
             },
@@ -124,6 +120,15 @@ impl Host {
                 .unwrap();
         });
         self.url = format!("http://{address}/{key}/api/v1");
+        self.identity = reqwest::Client::new()
+            .get(&self.url)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["vaultIdentity"]
+            .clone();
     }
     async fn socket(&self) -> Socket {
         connect_async(self.url.replace("http:", "ws:") + "/sync")
@@ -131,42 +136,46 @@ impl Host {
             .unwrap()
             .0
     }
-    async fn client(&self) -> Replica {
+    async fn connection(&self) -> (Socket, String) {
         let mut socket = self.socket().await;
         send(
             &mut socket,
-            json!({"protocolVersion":1,"vaultIdentity":self.identity}),
+            json!({"protocolVersion":2,"vaultIdentity":self.identity}),
         )
         .await;
         let hello = next(&mut socket).await;
         assert_eq!(hello["kind"], "hello");
-        let mut doc = None;
-        let mut writer = String::new();
         loop {
             let frame = next(&mut socket).await;
+            assert_ne!(frame["kind"], "document", "handshake must not load buffers");
             if frame["kind"] == "ready" {
                 break;
             }
-            if frame["kind"] == "document" && frame["document"]["path"] == "a.md" {
-                let packet: SyncPacket = serde_json::from_value(frame["packet"].clone()).unwrap();
-                if let Some(doc) = doc.as_mut() {
-                    let _ =
-                        Buffer::apply(doc, BufferCommand::Import(Import::new(packet, "initial")))
-                            .unwrap();
-                } else {
-                    writer = frame["writerId"].as_str().unwrap().into();
-                    doc = Some(
-                        Buffer::from_snapshot(&packet, Some(writer.parse().unwrap())).unwrap(),
-                    );
-                }
-            }
         }
+        (socket, hello["sessionId"].as_str().unwrap().into())
+    }
+    async fn client(&self) -> Replica {
+        let (mut socket, session) = self.connection().await;
+        send(
+            &mut socket,
+            json!({"sessionId":session,"requestId":1,"method":"open","path":"a.md"}),
+        )
+        .await;
+        let opened = loop {
+            let frame = next(&mut socket).await;
+            if frame["kind"] == "reply" && frame["requestId"] == 1 {
+                assert!(frame["error"].is_null(), "{frame}");
+                break frame["result"].clone();
+            }
+        };
+        let packet: SyncPacket = serde_json::from_value(opened["packet"].clone()).unwrap();
+        let writer = opened["writerId"].as_str().unwrap().to_string();
         Replica {
             socket,
-            session: hello["sessionId"].as_str().unwrap().into(),
-            document: doc.unwrap(),
+            session,
+            document: Buffer::from_snapshot(&packet, Some(writer.parse().unwrap())).unwrap(),
             writer,
-            next_request: 0,
+            next_request: 1,
             next_operation: 0,
         }
     }
@@ -260,7 +269,104 @@ impl Replica {
     }
 }
 #[tokio::test]
-async fn independent_writers_converge_without_saving_and_acknowledge_durable_history() {
+async fn sessions_subscribe_only_when_they_open_a_buffer() {
+    let host = Host::new(false).await;
+    let (mut socket, session) = host.connection().await;
+    let states = reqwest::Client::new()
+        .get(format!("{}/documents", host.url))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(states, json!([]));
+    let mut editor = host.client().await;
+    let update = editor.edit(0, 0, "live ");
+    assert!(editor.request(update).await["error"].is_null());
+    assert!(tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            assert_ne!(next(&mut socket).await["kind"], "document");
+        }
+    })
+    .await
+    .is_err());
+    send(
+        &mut socket,
+        json!({"sessionId":session,"requestId":1,"method":"probe",
+        "id":editor.document.identity().document_id,"version":editor.document.version()}),
+    )
+    .await;
+    loop {
+        let frame = next(&mut socket).await;
+        if frame["kind"] == "reply" {
+            assert_eq!(frame["error"]["code"], "InvalidEdit");
+            break;
+        }
+    }
+    send(
+        &mut socket,
+        json!({"sessionId":session,"requestId":2,"method":"open","path":"a.md"}),
+    )
+    .await;
+    loop {
+        let frame = next(&mut socket).await;
+        if frame["kind"] == "reply" && frame["requestId"] == 2 {
+            assert!(frame["error"].is_null(), "{frame}");
+            let packet = serde_json::from_value(frame["result"]["packet"].clone()).unwrap();
+            let replica = Buffer::from_snapshot(&packet, None).unwrap();
+            assert_eq!(replica.snapshot().text, editor.document.snapshot().text);
+            assert_eq!(replica.identity(), editor.document.identity());
+            break;
+        }
+    }
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_can_reopen_a_moved_buffer_by_identity() {
+    let host = Host::new(false).await;
+    let mut old = host.client().await;
+    let update = old.edit(0, 0, "unsaved ");
+    assert!(old.request(update).await["error"].is_null());
+    old.socket.close(None).await.unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{}/rename", host.url))
+        .json(&json!({"from":"a.md","to":"renamed.md"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let (mut socket, session) = host.connection().await;
+    send(
+        &mut socket,
+        json!({"sessionId":session,"requestId":1,"method":"open",
+        "id":old.document.identity().document_id}),
+    )
+    .await;
+    loop {
+        let frame = next(&mut socket).await;
+        if frame["kind"] == "reply" {
+            assert!(frame["error"].is_null(), "{frame}");
+            let receipt = &frame["result"];
+            assert_eq!(receipt["document"]["path"], "renamed.md");
+            assert_ne!(receipt["writerId"], old.writer);
+            let packet = serde_json::from_value(receipt["packet"].clone()).unwrap();
+            assert_eq!(
+                Buffer::from_snapshot(&packet, None)
+                    .unwrap()
+                    .snapshot()
+                    .text,
+                old.document.snapshot().text
+            );
+            break;
+        }
+    }
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_writers_converge_in_memory_and_save_files_explicitly() {
     let host = Host::new(false).await;
     let mut a = host.client().await;
     let mut b = host.client().await;
@@ -279,10 +385,7 @@ async fn independent_writers_converge_without_saving_and_acknowledge_durable_his
     );
     let saved=a.request(json!({"method":"save","id":a.document.identity().document_id,"version":a.document.version()})).await;
     assert!(saved["error"].is_null(), "{saved}");
-    assert_eq!(
-        saved["result"]["document"]["durableVersion"],
-        saved["result"]["document"]["snapshot"]["version"]
-    );
+    assert!(saved["result"]["document"]["durableVersion"].is_null());
     assert_eq!(
         std::fs::read_to_string(host.root.path().join("a.md")).unwrap(),
         a.document.snapshot().text
@@ -313,7 +416,7 @@ async fn operation_replay_is_idempotent_and_new_sessions_reject_old_writers() {
     assert_eq!(proof["result"]["committed"], false);
 }
 #[tokio::test]
-async fn external_changes_are_pushed_for_unopened_documents_and_survive_initial_snapshot() {
+async fn external_changes_are_pushed_only_for_open_buffers() {
     let host = Host::new(false).await;
     let mut a = host.client().await;
     std::fs::write(host.root.path().join("a.md"), "external🦀").unwrap();
@@ -323,20 +426,38 @@ async fn external_changes_are_pushed_for_unopened_documents_and_survive_initial_
         "observed without opening",
     )
     .unwrap();
-    loop {
-        let frame = next(&mut a.socket).await;
-        if frame["kind"] == "document" && frame["document"]["path"] == "unopened.md" {
-            if frame["document"]["externalChange"]["phase"] == "pending" {
-                // Metadata can announce queued work before its history commits.
-                continue;
+    assert!(tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            let frame = next(&mut a.socket).await;
+            if frame["kind"] == "document" {
+                assert_eq!(frame["document"]["path"], "a.md");
+                a.accept(frame);
             }
-            assert_eq!(
-                frame["document"]["savedContent"],
-                "observed without opening"
-            );
-            break;
         }
-    }
+    })
+    .await
+    .is_err());
+    let states = reqwest::Client::new()
+        .get(format!("{}/documents", host.url))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(states.as_array().unwrap().len(), 1);
+    let opened = a
+        .request(json!({"method":"open","path":"unopened.md"}))
+        .await;
+    assert!(opened["error"].is_null(), "{opened}");
+    let packet: SyncPacket = serde_json::from_value(opened["result"]["packet"].clone()).unwrap();
+    assert_eq!(
+        Buffer::from_snapshot(&packet, None)
+            .unwrap()
+            .snapshot()
+            .text,
+        "observed without opening"
+    );
     let b = host.client().await;
     assert_eq!(b.document.snapshot().text, "external🦀");
 }
@@ -353,7 +474,7 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
     let mut wrong = host.socket().await;
     send(
         &mut wrong,
-        json!({"protocolVersion":1,"vaultIdentity":{"id":"wrong","historyId":"wrong"}}),
+        json!({"protocolVersion":2,"vaultIdentity":{"id":"wrong","historyId":"wrong"}}),
     )
     .await;
     assert_eq!(next(&mut wrong).await["code"], "Conflict");
@@ -390,7 +511,7 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
 }
 
 #[tokio::test]
-async fn a_lost_receipt_can_be_proven_after_restart_without_replaying_the_old_session() {
+async fn restart_discards_unsaved_history_and_invalidates_old_sessions() {
     let mut host = Host::new(false).await;
     let mut old = host.client().await;
     let update = old.edit(0, 0, "durable");
@@ -399,8 +520,7 @@ async fn a_lost_receipt_can_be_proven_after_restart_without_replaying_the_old_se
     wire["requestId"] = json!(old.next_request);
     wire["sessionId"] = json!(old.session);
     send(&mut old.socket, wire).await;
-    // Deliberately do not read the acknowledgement. Verify durable host state
-    // through an independent observer, then sever the old session.
+    // Acceptance is observable even when the sender does not read its receipt.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let states = reqwest::Client::new()
@@ -426,11 +546,12 @@ async fn a_lost_receipt_can_be_proven_after_restart_without_replaying_the_old_se
     old.socket.close(None).await.unwrap();
     host.restart().await;
     let mut new = host.client().await;
-    assert_eq!(new.document.snapshot().text, old.document.snapshot().text);
+    assert_eq!(new.document.snapshot().text, "ab🦀cd\nsecond\n");
+    assert_ne!(new.document.identity(), old.document.identity());
     assert_ne!(new.session, old.session);
     assert_ne!(new.writer, old.writer);
     let proof=new.request(json!({"method":"probe","id":new.document.identity().document_id,"version":old.document.version()})).await;
-    assert_eq!(proof["result"]["committed"], true);
+    assert_eq!(proof["result"]["committed"], false);
     let mut stale = json!({"method":"ping","sessionId":old.session,"requestId":999});
     stale["sessionId"] = json!(old.session);
     send(&mut new.socket, stale).await;

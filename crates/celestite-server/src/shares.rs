@@ -44,10 +44,7 @@ impl Grant {
     }
 }
 
-pub(crate) fn seed(
-    configured: Option<&str>,
-    fallback: &[u8; 32],
-) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+pub(crate) fn seed(configured: Option<&str>) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     match configured {
         Some(value) => {
             if value.len() < 32 || value.trim() != value {
@@ -58,7 +55,12 @@ pub(crate) fn seed(
                 value.as_bytes(),
             ))
         }
-        None => Ok(*fallback),
+        None => {
+            let mut seed = [0; 32];
+            getrandom::fill(&mut seed)
+                .map_err(|error| format!("Cannot generate share key: {error}"))?;
+            Ok(seed)
+        }
     }
 }
 

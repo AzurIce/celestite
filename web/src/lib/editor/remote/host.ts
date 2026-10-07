@@ -92,7 +92,10 @@ export class RemoteEditorHost extends EditorHost {
     );
     this.transport = transport;
     try {
-      const receipts = await transport.ready;
+      await transport.ready;
+      const receipts: RemoteReceipt[] = [];
+      for (const id of this.hosts.keys())
+        receipts.push(await transport.request<RemoteReceipt>("open", { id }));
       const hosts = new Map<string, CoreDocument>();
       const documents = new Map<
         string,

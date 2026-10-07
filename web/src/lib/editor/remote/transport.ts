@@ -30,10 +30,9 @@ export class RemoteTransport {
   >();
   private closed = false;
   private initialized = false;
-  private initial: RemoteReceipt[] = [];
-  private readyResolve!: (receipts: RemoteReceipt[]) => void;
+  private readyResolve!: () => void;
   private readyReject!: (error: unknown) => void;
-  readonly ready = new Promise<RemoteReceipt[]>((resolve, reject) => {
+  readonly ready = new Promise<void>((resolve, reject) => {
     this.readyResolve = resolve;
     this.readyReject = reject;
   });
@@ -50,7 +49,7 @@ export class RemoteTransport {
     this.socket = new WebSocket(address);
     this.socket.onopen = () =>
       this.socket.send(
-        JSON.stringify({ protocolVersion: 1, vaultIdentity: identity }),
+        JSON.stringify({ protocolVersion: 2, vaultIdentity: identity }),
       );
     this.socket.onmessage = (event) => {
       if (this.closed) return;
@@ -59,15 +58,15 @@ export class RemoteTransport {
         const frame = JSON.parse(String(event.data));
         if (frame.kind === "hello") this.sessionId = frame.sessionId;
         else if (frame.kind === "document") {
-          if (!this.initialized) this.initial.push(frame);
-          else this.receive(frame);
+          if (!this.initialized)
+            throw new Error("Buffer received before session readiness");
+          this.receive(frame);
         } else if (frame.kind === "tree") this.receive(frame);
         else if (frame.kind === "ready") {
           if (!this.sessionId || frame.sessionId !== this.sessionId)
             throw new Error("Invalid session barrier");
           this.initialized = true;
-          this.readyResolve(this.initial);
-          this.initial = [];
+          this.readyResolve();
         } else if (frame.kind === "reply") {
           const pending = this.pending.get(frame.requestId);
           if (!pending) return;

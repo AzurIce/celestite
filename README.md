@@ -23,7 +23,7 @@
 - Tauri App（WIP）
   - Tauri API 存储实现
 - Native Headless Server
-  - Native 存储实现（`NativeBackend`）：访问本机目录，可配置 redb 历史持久化
+  - Native IO 实现（`NativeBackend`）：访问本机目录，server 协作历史仅驻留内存
 
 远端客户端的 `MemoryBackend` 保存文本快照与增量，不提供普通文件或目录映射；目录与附件通过 HTTP 访问 host，文本历史通过 WebSocket 同步。客户端副本随 Worker 结束而释放。状态归属与请求流程见 [Web 当前状态与请求交互](docs/state/web.md)。
 

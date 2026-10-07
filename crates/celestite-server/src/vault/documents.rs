@@ -1,8 +1,8 @@
-//! HTTP compatibility facade over the same EditorCore used by Web.
+//! Host-owned buffers and their committed state feed.
 use super::{
-    backend::{NativeBackend, vault_error},
+    backend::{vault_error, NativeBackend},
     fs::{FsVault, Result},
-    store::VaultIdentity,
+    VaultIdentity,
 };
 use celestite_core::*;
 use futures_lite::future::block_on;
@@ -11,15 +11,13 @@ use std::path::Path;
 pub type DocumentState = EditorDocument;
 pub(crate) struct Documents {
     pub identity: VaultIdentity,
-    pub share_seed: [u8; 32],
     core: EditorCore<NativeBackend>,
     feed: super::changes::DocumentFeed,
     writers: std::collections::HashSet<String>,
 }
 impl Documents {
-    pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> Result<Self> {
-        let backend = NativeBackend::open(state, root, mode)?;
-        let share_seed = backend.share_seed()?;
+    pub fn open(root: &Path, seed: &[u8; 32]) -> Result<Self> {
+        let backend = NativeBackend::open(root, VaultIdentity::new(root, seed))?;
         let core = block_on(EditorCore::open_with_options(
             backend,
             EditorOptions {
@@ -36,7 +34,6 @@ impl Documents {
         let feed = super::changes::DocumentFeed::new(identity.clone(), core.persistent());
         Ok(Self {
             identity,
-            share_seed,
             core,
             feed,
             writers: Default::default(),
@@ -201,19 +198,5 @@ impl Documents {
     }
     pub fn remove(&mut self, _files: &FsVault, path: &str, recursive: bool) -> Result<()> {
         block_on(self.core.remove(path, recursive)).map_err(vault_error)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn state_profile_cannot_be_reused_for_another_vault_root() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let db = state.path().join("notes.redb");
-        drop(Documents::open(Some(&db), first.path(), crate::HistoryMode::Initialize).unwrap());
-        assert!(Documents::open(Some(&db), second.path(), crate::HistoryMode::Recover).is_err());
     }
 }

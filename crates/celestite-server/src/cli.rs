@@ -1,4 +1,4 @@
-use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig};
+use celestite_server::{Config, ServerConfig, VaultConfig};
 use clap::Parser;
 use std::{
     net::SocketAddr,
@@ -46,24 +46,12 @@ pub struct Cli {
     /// Override the Vault's display name (default: Vault)
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
-    /// Share secret of at least 32 bytes; required without a configuration file
+    /// Share secret of at least 32 bytes; omitted keys generate temporary links
     #[arg(long, value_name = "KEY")]
     share_key: Option<String>,
     /// Override the Vault's read-only state
     #[arg(long, value_name = "true|false")]
     read_only: Option<bool>,
-    /// Private state directory containing history.redb (must exist)
-    #[arg(long, value_name = "DIRECTORY", conflicts_with = "ephemeral")]
-    state_dir: Option<PathBuf>,
-    /// Use temporary in-memory history; clears the configured state directory
-    #[arg(long, conflicts_with_all = ["init_vault", "reset_vault"])]
-    ephemeral: bool,
-    /// Initialize new history without overwriting an existing one, then exit
-    #[arg(long, conflicts_with = "reset_vault")]
-    init_vault: bool,
-    /// Archive stopped history and create a new Vault identity, then exit
-    #[arg(long)]
-    reset_vault: bool,
 }
 
 impl Cli {
@@ -76,7 +64,6 @@ impl Cli {
             }
             None => None,
         };
-        let cli_only = path.is_none();
         let mut config = if let Some(path) = path {
             let path = path.canonicalize()?;
             let text = std::fs::read_to_string(&path).map_err(|error| {
@@ -89,7 +76,6 @@ impl Cli {
                 .parent()
                 .ok_or("Configuration has no parent directory")?;
             config.vault.path = base.join(config.vault.path);
-            config.vault.state_dir = config.vault.state_dir.map(|path| base.join(path));
             config.server.web_dir = config.server.web_dir.map(|path| base.join(path));
             config
         } else {
@@ -128,23 +114,6 @@ impl Cli {
         if let Some(read_only) = self.read_only {
             config.vault.read_only = read_only;
         }
-        if let Some(path) = self.state_dir {
-            config.vault.state_dir = Some(cwd.join(path));
-            config.vault.ephemeral = false;
-        }
-        if self.ephemeral {
-            config.vault.state_dir = None;
-            config.vault.ephemeral = true;
-        }
-        if self.init_vault {
-            config.vault.history_mode = HistoryMode::Initialize;
-        }
-        if self.reset_vault {
-            config.vault.history_mode = HistoryMode::Reset;
-        }
-        if cli_only && config.vault.share_key.is_none() {
-            return Err("CLI-only configuration requires --share-key KEY".into());
-        }
         Ok(config)
     }
 }
@@ -166,7 +135,6 @@ web_dir = "assets"
 [vault]
 name = "笔记"
 path = "notes"
-state_dir = "private"
 read_only = true
 "#,
         )
@@ -201,10 +169,10 @@ read_only = true
                 "http://client",
                 "--clear-allowed-origins",
             ],
-            vec!["--state-dir", "state", "--ephemeral"],
-            vec!["--ephemeral", "--init-vault"],
-            vec!["--ephemeral", "--reset-vault"],
-            vec!["--init-vault", "--reset-vault"],
+            vec!["--state-dir", "state"],
+            vec!["--ephemeral"],
+            vec!["--init-vault"],
+            vec!["--reset-vault"],
             vec!["--vault-name", "notes=name"],
             vec!["--vault-share-key", "notes=secret"],
             vec!["--vault-state-dir", "notes=state"],
@@ -217,7 +185,7 @@ read_only = true
         }
     }
     #[test]
-    fn cli_only_accepts_one_directory_and_requires_share_key() {
+    fn cli_only_accepts_one_directory_and_optional_share_key() {
         let cwd = tempfile::tempdir().unwrap();
         let config = Cli::try_parse_from([
             "server",
@@ -229,7 +197,6 @@ read_only = true
             "我的笔记",
             "--read-only",
             "true",
-            "--ephemeral",
         ])
         .unwrap()
         .load(cwd.path())
@@ -238,18 +205,14 @@ read_only = true
         assert_eq!(config.vault.path, cwd.path().join("path=with=equals"));
         assert_eq!(config.vault.name, "我的笔记");
         assert_eq!(config.vault.share_key.as_deref(), Some(KEY));
-        assert!(config.vault.read_only && config.vault.ephemeral);
-        for extra in [vec![], vec!["--init-vault"], vec!["--reset-vault"]] {
-            let mut args = vec!["server", "--vault", "notes"];
-            args.extend(extra);
-            assert!(Cli::try_parse_from(args)
-                .unwrap()
-                .load(cwd.path())
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("--share-key"));
-        }
+        assert!(config.vault.read_only);
+        assert!(Cli::try_parse_from(["server", "--vault", "notes"])
+            .unwrap()
+            .load(cwd.path())
+            .unwrap()
+            .vault
+            .share_key
+            .is_none());
     }
     #[test]
     fn overrides_preserve_config_and_cli_path_bases() {
@@ -264,8 +227,6 @@ read_only = true
             file.to_str().unwrap(),
             "--vault",
             "new-notes",
-            "--state-dir",
-            "new-state",
             "--web-dir",
             "new-assets",
             "--share-key",
@@ -283,7 +244,6 @@ read_only = true
         .load(cwd.path())
         .unwrap();
         assert_eq!(config.vault.path, cwd.path().join("new-notes"));
-        assert_eq!(config.vault.state_dir, Some(cwd.path().join("new-state")));
         assert_eq!(config.server.web_dir, Some(cwd.path().join("new-assets")));
         assert_eq!(config.vault.name, "笔记");
         assert!(!config.vault.read_only);
@@ -299,7 +259,6 @@ read_only = true
             .load(cwd.path())
             .unwrap();
         assert_eq!(config.vault.path, base.join("notes"));
-        assert_eq!(config.vault.state_dir, Some(base.join("private")));
         assert_eq!(config.server.web_dir, Some(base.join("assets")));
         assert!(config.vault.share_key.is_none());
         let text = std::fs::read_to_string(&file).unwrap();
@@ -316,7 +275,7 @@ read_only = true
         );
     }
     #[test]
-    fn default_file_clears_and_history_lifecycle() {
+    fn default_file_and_explicit_clears() {
         let cwd = tempfile::tempdir().unwrap();
         config_file(cwd.path());
         let load = |extra: &[&str]| {
@@ -324,20 +283,9 @@ read_only = true
             args.extend_from_slice(extra);
             Cli::try_parse_from(args).unwrap().load(cwd.path()).unwrap()
         };
-        assert_eq!(load(&[]).vault.state_dir, Some(cwd.path().join("private")));
+        assert_eq!(load(&[]).vault.path, cwd.path().join("notes"));
         let config = load(&["--no-web", "--clear-allowed-origins"]);
         assert!(config.server.web_dir.is_none() && config.server.allowed_origins.is_empty());
-        assert_eq!(
-            load(&["--init-vault"]).vault.history_mode,
-            HistoryMode::Initialize
-        );
-        assert_eq!(
-            load(&["--reset-vault"]).vault.history_mode,
-            HistoryMode::Reset
-        );
-        let config = load(&["--ephemeral"]);
-        assert!(config.vault.ephemeral);
-        assert!(config.vault.state_dir.is_none());
         let config = load(&["--no-config", "--vault", "other", "--share-key", KEY]);
         assert_eq!(config.vault.name, "Vault");
         assert!(!config.vault.read_only);

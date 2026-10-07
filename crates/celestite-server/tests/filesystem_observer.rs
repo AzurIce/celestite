@@ -1,8 +1,8 @@
 //! Observe through the change feed before reading a document: a GET must not be
 //! what causes these filesystem edits to enter host history.
-use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig, build_server};
+use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
 use reqwest::{Client, Response};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::{
     sync::{oneshot, watch},
@@ -17,7 +17,7 @@ struct Host {
     task: JoinHandle<()>,
 }
 impl Host {
-    async fn start(root: &Path, state: &Path, read_only: bool) -> Self {
+    async fn start(root: &Path, read_only: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = build_server(
@@ -29,13 +29,7 @@ impl Host {
                 vault: VaultConfig {
                     name: "Notes".into(),
                     path: root.into(),
-                    state_dir: Some(state.into()),
                     read_only,
-                    history_mode: if state.join("history.redb").exists() {
-                        HistoryMode::Recover
-                    } else {
-                        HistoryMode::Initialize
-                    },
                     ..Default::default()
                 },
             },
@@ -93,6 +87,10 @@ impl Host {
     }
     async fn state(&self, id: &str) -> Value {
         self.request("GET", &format!("/documents/{id}"), Value::Null)
+            .await
+    }
+    async fn open(&self, path: &str) -> Value {
+        self.request("POST", "/documents/open", json!({"path":path}))
             .await
     }
     async fn stop(self) {
@@ -165,53 +163,51 @@ async fn append(host: &Host, id: &str, state: &Value, text: &str) -> Value {
 }
 
 #[tokio::test]
-async fn unopened_files_are_discovered_and_external_changes_commit_before_notification() {
+async fn observation_updates_open_buffers_without_discovering_unopened_files() {
     let root = tempfile::tempdir().unwrap();
-    let history = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("nested")).unwrap();
     std::fs::write(root.path().join("nested/a.md"), "base 😀").unwrap();
     std::fs::write(root.path().join("binary"), [0xff]).unwrap();
-    let host = Host::start(root.path(), history.path(), false).await;
+    let host = Host::start(root.path(), false).await;
     let mut feed = host.feed().await;
     let initial = feed.next().await;
     assert_eq!(initial["kind"], "resync");
-    assert_eq!(initial["documents"].as_array().unwrap().len(), 1);
-    let id = notice(&initial, "nested/a.md")["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let old = notice(&initial, "nested/a.md")["version"].clone();
+    assert_eq!(initial["documents"], json!([]));
+    let opened = host.open("nested/a.md").await;
+    let id = opened["id"].as_str().unwrap().to_owned();
+    let old = opened["snapshot"]["version"].clone();
     std::fs::write(root.path().join("nested/a.md"), "external base 😀").unwrap();
     let changed = feed.until(&id, |notice| notice["version"] != old).await;
     assert_eq!(changed["available"], true);
     assert_eq!(changed["version"], changed["savedVersion"]);
     let state = host.state(&id).await;
     assert_eq!(state["snapshot"]["text"], "external base 😀");
-    assert_eq!(state["durableVersion"], changed["version"]);
+    assert!(state["durableVersion"].is_null());
     // A new file has never been opened or fetched by a client.
     std::fs::write(root.path().join("nested/new.md"), "new").unwrap();
-    loop {
-        let event = feed.next().await;
-        if event["documents"]
+    assert_eq!(
+        host.request("GET", "/documents", Value::Null)
+            .await
             .as_array()
             .unwrap()
-            .iter()
-            .any(|n| n["path"] == "nested/new.md")
-        {
-            break;
-        }
-    }
+            .len(),
+        1
+    );
+    assert_eq!(host.open("nested/new.md").await["snapshot"]["text"], "new");
     drop(feed);
     host.stop().await;
-    let host = Host::start(root.path(), history.path(), false).await;
+    let host = Host::start(root.path(), false).await;
     let mut feed = host.feed().await;
     let recovered = feed.next().await;
     assert_ne!(recovered["streamId"], initial["streamId"]);
-    assert_eq!(recovered["vaultIdentity"], initial["vaultIdentity"]);
-    assert_eq!(notice(&recovered, "nested/a.md")["id"], id);
+    assert_ne!(
+        recovered["vaultIdentity"]["historyId"],
+        initial["vaultIdentity"]["historyId"]
+    );
+    assert_eq!(recovered["documents"], json!([]));
     assert_eq!(
-        notice(&recovered, "nested/a.md")["version"],
-        changed["version"]
+        host.open("nested/a.md").await["snapshot"]["text"],
+        "external base 😀"
     );
     drop(feed);
     host.stop().await;
@@ -220,9 +216,9 @@ async fn unopened_files_are_discovered_and_external_changes_commit_before_notifi
 #[tokio::test]
 async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not_edit_again() {
     let root = tempfile::tempdir().unwrap();
-    let history = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A middle B").unwrap();
-    let host = Host::start(root.path(), history.path(), false).await;
+    let host = Host::start(root.path(), false).await;
+    host.open("a.md").await;
     let mut feed = host.feed().await;
     let initial = feed.next().await;
     let id = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
@@ -274,11 +270,12 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
 #[tokio::test]
 async fn invalid_content_and_external_deletion_do_not_starve_other_files_or_destroy_drafts() {
     let root = tempfile::tempdir().unwrap();
-    let history = tempfile::tempdir().unwrap();
     for name in ["a.md", "b.md"] {
         std::fs::write(root.path().join(name), "base").unwrap();
     }
-    let host = Host::start(root.path(), history.path(), false).await;
+    let host = Host::start(root.path(), false).await;
+    host.open("a.md").await;
+    host.open("b.md").await;
     let mut feed = host.feed().await;
     let initial = feed.next().await;
     let a = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
@@ -320,9 +317,9 @@ async fn invalid_content_and_external_deletion_do_not_starve_other_files_or_dest
 #[tokio::test]
 async fn a_read_only_vault_still_observes_its_hosts_external_files() {
     let root = tempfile::tempdir().unwrap();
-    let history = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "base").unwrap();
-    let host = Host::start(root.path(), history.path(), true).await;
+    let host = Host::start(root.path(), true).await;
+    host.open("a.md").await;
     let mut feed = host.feed().await;
     let initial = feed.next().await;
     let id = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
@@ -342,9 +339,9 @@ async fn independent_replicas_follow_committed_changes_and_keep_their_personal_u
         Buffer, BufferCommand, Edit, Import, SyncPacket, TextEdit, TextInput, UndoContext,
     };
     let root = tempfile::tempdir().unwrap();
-    let history = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "left middle right").unwrap();
-    let host = Host::start(root.path(), history.path(), false).await;
+    let host = Host::start(root.path(), false).await;
+    host.open("a.md").await;
     let mut first = host.feed().await;
     let mut second = host.feed().await;
     let initial = first.next().await;

@@ -423,7 +423,6 @@ mod tests {
             vault: crate::VaultConfig {
                 name: "Docs".into(),
                 path: root.clone(),
-                ephemeral: true,
                 ..Default::default()
             },
         };
@@ -484,10 +483,10 @@ mod tests {
             })
             .unwrap()
             .contains(&package));
-        let mut documents =
-            crate::vault::documents::Documents::open(None, &root, crate::HistoryMode::Recover)
-                .unwrap();
-        documents.reconcile().unwrap();
+        let mut documents = crate::vault::documents::Documents::open(&root, &[0; 32]).unwrap();
+        documents
+            .open_file(&crate::vault::fs::FsVault::open(&root).unwrap(), "a.not")
+            .unwrap();
         assert!(documents
             .resident()
             .unwrap()

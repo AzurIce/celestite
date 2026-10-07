@@ -13,11 +13,9 @@ allowed_origins = ["http://localhost:1420", "http://127.0.0.1:1420"]
 name = "笔记"
 # Existing directory; relative paths are relative to this config file.
 path = "./notes"
-# Existing private directory outside the Vault and web_dir.
-# Initialize once with --init-vault, then start without that flag.
-state_dir = "./state/notes"
 read_only = false
 # Optional random secret of at least 32 bytes. Changing it and restarting rotates both links.
-# Omit to use an automatically persisted secret; generate an override with: openssl rand -hex 32
+# Omit for temporary links; reuse a secret and the same directory for stable links.
+# Generate with: openssl rand -hex 32
 # share_key = "<random secret>"
-# For disposable tests only: remove state_dir and set ephemeral = true.
+# CRDT history is memory-only. Restart discards unsaved edits and starts new history.

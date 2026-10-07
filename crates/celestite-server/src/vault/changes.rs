@@ -1,6 +1,6 @@
 //! Invalidation feed, serialized by the same lock as the host core.
 //! It carries committed causal versions, never text or operation acknowledgements.
-use super::{fs::Result, store::VaultIdentity};
+use super::{fs::Result, VaultIdentity};
 use celestite_core::{EditorDocument, ExternalChangeStatus, Version};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -137,24 +137,23 @@ mod tests {
     fn state(documents: &Documents) -> EditorDocument {
         documents.resident().unwrap().pop().unwrap()
     }
-    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Documents) {
+    fn fixture() -> (tempfile::TempDir, Documents) {
         let root = tempfile::tempdir().unwrap();
-        let history = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.md"), "base").unwrap();
-        let mut documents = Documents::open(
-            Some(&history.path().join("history.redb")),
-            root.path(),
-            crate::HistoryMode::Initialize,
-        )
-        .unwrap();
-        documents.reconcile().unwrap();
+        let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
+        documents
+            .open_file(
+                &crate::vault::fs::FsVault::open(root.path()).unwrap(),
+                "a.md",
+            )
+            .unwrap();
         documents.publish_changes().unwrap();
-        (root, history, documents)
+        (root, documents)
     }
     #[test]
     fn lagged_subscribers_can_atomically_replace_the_snapshot_and_receiver() {
-        let (_root, _history, documents) = fixture();
-        let mut feed = DocumentFeed::new(documents.identity.clone(), true);
+        let (_root, documents) = fixture();
+        let mut feed = DocumentFeed::new(documents.identity.clone(), false);
         feed.publish(vec![state(&documents)]).unwrap();
         let mut old = feed.subscribe();
         for revision in 0..140 {
@@ -179,33 +178,20 @@ mod tests {
         );
     }
     #[test]
-    fn failed_history_is_announced_without_claiming_the_uncommitted_version() {
-        let (_root, _history, documents) = fixture();
-        let mut feed = DocumentFeed::new(documents.identity.clone(), true);
+    fn volatile_history_is_available_without_a_durable_version() {
+        let (_root, documents) = fixture();
+        let mut feed = DocumentFeed::new(documents.identity.clone(), false);
         let initial = state(&documents);
-        let committed = initial.snapshot.version.clone();
+        assert!(initial.durable_version.is_none());
+        assert!(exportable(&initial, false));
+        let version = initial.snapshot.version.clone();
         feed.publish(vec![initial]).unwrap();
-        let mut subscription = feed.subscribe();
-        let mut failed = state(&documents);
-        *failed.snapshot.version.clocks.values_mut().next().unwrap() += 1;
-        failed.snapshot.text = "unconfirmed draft".into();
-        failed.persistence_error = Some("injected failed commit".into());
-        assert!(!exportable(&failed, true));
-        feed.publish(vec![failed]).unwrap();
-        let event: Value = serde_json::to_value(subscription.receiver.try_recv().unwrap()).unwrap();
+        let event: Value = serde_json::to_value(feed.subscribe().initial).unwrap();
+        assert_eq!(event["persistentHistory"], false);
         assert_eq!(
             event["documents"][0]["version"],
-            serde_json::to_value(committed).unwrap()
+            serde_json::to_value(version).unwrap()
         );
-        assert_eq!(event["documents"][0]["available"], false);
-        assert!(!serde_json::to_string(&event)
-            .unwrap()
-            .contains("unconfirmed draft"));
-        // Repeating the same status does not create a new notification.
-        let current = feed.sequence;
-        let mut failed = state(&documents);
-        failed.persistence_error = Some("injected failed commit".into());
-        assert!(!feed.publish(vec![failed]).unwrap());
-        assert_eq!(feed.sequence, current);
+        assert_eq!(event["documents"][0]["available"], true);
     }
 }

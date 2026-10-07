@@ -1,11 +1,9 @@
-//! One online session per VaultInstance. Requests, snapshots and invalidations
-//! all serialize through the host core. A receipt acknowledges committed CRDT
-//! history; saving the ordinary file is a separate command.
+//! One online session per connection. Opening a buffer subscribes that session
+//! to its history. A receipt acknowledges in-memory CRDT acceptance; saving the
+//! ordinary file is a separate command.
 use crate::{
     editor_api::{run_documents, run_documents_with_tree},
-    vault::{
-        changes::Subscription, documents::DocumentState, fs::VaultError, store::VaultIdentity,
-    },
+    vault::{changes::Subscription, documents::DocumentState, fs::VaultError, VaultIdentity},
     ApiError, HostedVault, RemoteAccess, ServerState,
 };
 use axum::{
@@ -66,7 +64,8 @@ struct Hello {
 )]
 enum Command {
     Open {
-        path: String,
+        path: Option<String>,
+        id: Option<String>,
     },
     Updates {
         id: String,
@@ -156,14 +155,14 @@ async fn collect(
     vault: Arc<HostedVault>,
     session: Session,
 ) -> Result<(Vec<Value>, Subscription), ApiError> {
-    run_documents(vault, false, move |_, docs| {
+    run_documents(vault, false, move |files, docs| {
         let mut session = session
             .lock()
             .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
-        let states = docs.resident()?;
-        let frames = states
+        let ids: Vec<_> = session.writers.keys().cloned().collect();
+        let frames = ids
             .into_iter()
-            .map(|state| session.receipt(docs, state))
+            .map(|id| session.receipt(docs, docs.state(files, &id)?))
             .collect::<crate::vault::fs::Result<Vec<_>>>()?;
         // Subscription and all snapshot versions are established in the same
         // serial boundary. New changes queue while frames are transmitted.
@@ -192,9 +191,27 @@ async fn command(
         if !session.alive.load(Ordering::Acquire) || request.session_id != session.id {
             return Err(VaultError::new("Closed","Session expired", ""));
         }
+        match &request.command {
+            Command::Updates { id, .. } | Command::Save { id, .. }
+            | Command::Probe { id, .. } | Command::RetryObservation { id } => {
+                if !session.writers.contains_key(id) {
+                    return Err(VaultError::new("InvalidEdit", "Buffer is not open in this session", id));
+                }
+            }
+            Command::Open { .. } | Command::Ping => {}
+        }
         let value = match request.command {
             Command::Ping => json!({"pong":true}),
-            Command::Open{path} => { let id=docs.open_file(files,&path)?; session.sent.remove(&id); session.saved.remove(&id); session.receipt(docs,docs.state(files,&id)?)? }
+            Command::Open{path,id} => {
+                let id = match (path, id) {
+                    (Some(path), None) => docs.open_file(files, &path)?,
+                    (None, Some(id)) => { docs.refresh(files, &id)?; id },
+                    _ => return Err(VaultError::new("InvalidEdit", "Open requires a path or a buffer ID", "")),
+                };
+                session.sent.remove(&id);
+                session.saved.remove(&id);
+                session.receipt(docs,docs.state(files,&id)?)?
+            }
             Command::Probe{id,version} => { let state=docs.state(files,&id)?; docs.snapshot(&id)?; json!({"committed":contains(&state.snapshot.version,&version),"version":state.snapshot.version}) }
             Command::RetryObservation{id} => {
                 docs.retry_file_observation(&id)?;
@@ -254,7 +271,7 @@ async fn serve(
         _ => None,
     };
     let Some(hello) = parsed else { return };
-    if hello.protocol_version != 1 {
+    if hello.protocol_version != 2 {
         let _=socket.send(Message::Text(json!({"kind":"fatal","code":"PermissionDenied","message":"Invalid handshake or authentication"}).to_string().into())).await;
         return;
     }
@@ -308,30 +325,9 @@ async fn serve(
             json!({"kind":"hello","sessionId":session_id,"vaultIdentity":identity}),
         )
         .await?;
-        let initial = run_documents(vault.clone(), false, |_, docs| docs.subscribe())
+        let subscription = run_documents(vault.clone(), false, |_, docs| docs.subscribe())
             .await
             .map_err(|_| ())?;
-        for notice in initial.initial.documents {
-            let shared = session.clone();
-            let frame = run_documents(vault.clone(), false, move |files, docs| {
-                let mut session = shared
-                    .lock()
-                    .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
-                session.receipt(docs, docs.state(files, &notice.id)?)
-            })
-            .await
-            .map_err(|_| ())?;
-            // Never build an entire Vault's initial JSON snapshots in memory.
-            send(&mut sink, frame).await?;
-        }
-        // Re-establish the barrier after sending the potentially large initial
-        // snapshot. Changes during that transfer are exported as deltas.
-        let (frames, subscription) = collect(vault.clone(), session.clone())
-            .await
-            .map_err(|_| ())?;
-        for frame in frames {
-            send(&mut sink, frame).await?;
-        }
         let mut feed = subscription.receiver;
         send(&mut sink, json!({"kind":"ready","sessionId":session_id})).await?;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
@@ -365,7 +361,11 @@ async fn serve(
                             let result=run_documents(vault.clone(),false,move |files,docs|{
                                 let mut next=next.lock().map_err(|_|VaultError::new("IO","Session lock failed",""))?;
                                 let mut frames=vec![];
-                                for id in ids {frames.push(next.receipt(docs,docs.state(files,&id)?)?);}
+                                for id in ids {
+                                    if next.writers.contains_key(&id) {
+                                        frames.push(next.receipt(docs,docs.state(files,&id)?)?);
+                                    }
+                                }
                                 Ok(frames)
                             }).await.map_err(|_|())?;
                             for frame in result {send(&mut sink,frame).await?;}

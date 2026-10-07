@@ -212,7 +212,7 @@ server 与 Reconciler 不经 JSON 直接调用：
 
 ## 注入契约 `Backend`
 
-native 实现的 redb 表结构与写入协议见 [server/store.md](server/store.md)。
+server 的 `NativeBackend` 只提供普通文件 IO，历史不落盘；`load` 返回空集合，`commit` 直接成功，目录操作意图保留在内存中。本地浏览器的 `BrowserBackend` 仍将私有历史存入 OPFS。
 
 | 组 | 方法 | 约定 |
 | --- | --- | --- |

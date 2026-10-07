@@ -79,14 +79,6 @@ pub struct VaultConfig {
     pub path: PathBuf,
     #[serde(default)]
     pub read_only: bool,
-    /// Private directory containing this Vault's history.redb.
-    pub state_dir: Option<PathBuf>,
-    /// Explicitly discard history on shutdown; intended for temporary tests.
-    #[serde(default)]
-    pub ephemeral: bool,
-    /// Initialization/reset is a one-shot CLI action, never a startup policy in TOML.
-    #[serde(skip)]
-    pub history_mode: HistoryMode,
     /// Optional random secret to derive and rotate the two capability links.
     pub share_key: Option<String>,
 }
@@ -100,21 +92,11 @@ impl Default for VaultConfig {
             name: default_vault_name(),
             path: PathBuf::new(),
             read_only: false,
-            state_dir: None,
-            ephemeral: false,
-            history_mode: HistoryMode::Recover,
             share_key: None,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HistoryMode {
-    #[default]
-    Recover,
-    Initialize,
-    Reset,
-}
 struct HostedVault {
     id: String,
     name: String,
@@ -308,13 +290,12 @@ pub fn build_server(
         profile::PreparedVault {
             config: vault,
             root,
-            history_path,
         },
         web_dir,
     ) = profile::prepare(config.vault, config.server.web_dir.as_deref(), base)?;
     let files = FsVault::open(&root)?;
-    let mut documents = Documents::open(history_path.as_deref(), &root, vault.history_mode)?;
-    let seed = shares::seed(vault.share_key.as_deref(), &documents.share_seed)?;
+    let seed = shares::seed(vault.share_key.as_deref())?;
+    let documents = Documents::open(&root, &seed)?;
     let identity = documents.identity.id.clone();
     let (trigger, observations) = reconcile::channel();
     let reconcile_signal = trigger.clone();
@@ -333,9 +314,6 @@ pub fn build_server(
         }
     })?;
     watcher.watch(&root, notify::RecursiveMode::Recursive)?;
-    // Watch before discovering files so changes during the initial scan are queued.
-    documents.reconcile()?;
-    documents.publish_changes()?;
     tracing::info!(vault_identity = %identity, root = %root.display(), read_only = vault.read_only, persistent_history = documents.persistent(), "Vault initialized");
     let hosted = Arc::new(HostedVault {
         id: identity.clone(),
@@ -670,7 +648,6 @@ mod tests {
                 name: "Notes".into(),
                 path: root.path().into(),
                 read_only,
-                ephemeral: true,
                 ..Default::default()
             },
         };
@@ -926,7 +903,6 @@ mod tests {
                     name: "N".into(),
                     path: root.path().into(),
                     read_only: false,
-                    ephemeral: true,
                     ..Default::default()
                 },
             },
@@ -1027,7 +1003,6 @@ mod tests {
                     name: "N".into(),
                     path: root.path().into(),
                     read_only: false,
-                    ephemeral: true,
                     ..Default::default()
                 },
             },
@@ -1062,7 +1037,6 @@ mod tests {
                 name: "N".into(),
                 path: "vault".into(),
                 read_only: false,
-                ephemeral: true,
                 ..Default::default()
             },
         };
@@ -1113,13 +1087,11 @@ mod tests {
         for vault in [
             VaultConfig {
                 path: root.path().join("missing"),
-                ephemeral: true,
                 ..Default::default()
             },
             VaultConfig {
                 path: root.path().into(),
                 name: " ".into(),
-                ephemeral: true,
                 ..Default::default()
             },
         ] {

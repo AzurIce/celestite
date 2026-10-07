@@ -1,4 +1,5 @@
 import { normalizeVaultUrl } from "../lib/vault/http";
+import type { Entry } from "../lib/vault/types";
 import { ReplicaCore } from "./replica";
 import type { CoreMutation } from "../lib/editor/core";
 import type {
@@ -46,7 +47,7 @@ export interface DebugState {
   connected: boolean;
   url: string;
   readOnly: boolean;
-  documents: DebugDocument[];
+  files: Entry[];
   host: DebugDocument | null;
   replicas: ReplicaView[];
   busy: boolean;
@@ -80,7 +81,7 @@ export function hasUnsent(local: Version, host: Version) {
 export class DebugSession {
   private url = "";
   private descriptor: Descriptor | null = null;
-  private documents: DebugDocument[] = [];
+  private files: Entry[] = [];
   private host: DebugDocument | null = null;
   private replicas: Replica[] = [];
   private busy = 0;
@@ -98,7 +99,7 @@ export class DebugSession {
       connected: !!this.descriptor,
       url: this.url,
       readOnly: this.descriptor?.readOnly ?? false,
-      documents: [...this.documents],
+      files: [...this.files],
       host: this.host,
       replicas: this.replicas.map(({ core: _core, ...replica }) => ({
         ...replica,
@@ -195,13 +196,24 @@ export class DebugSession {
         !descriptor.vaultIdentity.historyId
       )
         throw new Error("Server 未提供兼容的文档 CRDT API");
-      const documents = await this.http<DebugDocument[]>("/documents");
-      this.documents = documents.filter((document) => !document.deleted);
+      const files: Entry[] = [];
+      const directories = [""];
+      while (directories.length) {
+        const path = directories.pop()!;
+        const entries = await this.http<Entry[]>(
+          `/directory?${new URLSearchParams({ path })}`,
+        );
+        for (const entry of entries) {
+          if (entry.kind === "directory") directories.push(entry.path);
+          else if (entry.kind === "file") files.push(entry);
+        }
+      }
+      this.files = files.sort((a, b) => a.path.localeCompare(b.path));
       this.descriptor = descriptor;
       this.record(
         "host",
         "连接",
-        `发现 ${this.documents.length} 个文本；历史${descriptor.capabilities.persistentHistory ? "持久化" : "仅驻留内存"}`,
+        `发现 ${this.files.length} 个文件；历史${descriptor.capabilities.persistentHistory ? "持久化" : "仅驻留内存"}`,
       );
     });
   }
@@ -454,7 +466,7 @@ export class DebugSession {
     this.releaseReplicas();
     this.descriptor = null;
     this.host = null;
-    this.documents = [];
+    this.files = [];
     this.error = null;
     this.record("all", "结束会话", "调试内存实例已释放");
   }

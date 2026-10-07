@@ -1,11 +1,10 @@
-//! Validate the Vault's paths before opening or initializing its history.
-use crate::{HistoryMode, VaultConfig};
+//! Validate the Vault and static Web paths before serving them.
+use crate::VaultConfig;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct PreparedVault {
     pub config: VaultConfig,
     pub root: PathBuf,
-    pub history_path: Option<PathBuf>,
 }
 
 fn overlap(a: &Path, b: &Path) -> bool {
@@ -25,7 +24,6 @@ pub(crate) fn prepare(
     web_dir: Option<&Path>,
     base: &Path,
 ) -> Result<(PreparedVault, Option<PathBuf>), Box<dyn std::error::Error>> {
-    crate::shares::seed(config.share_key.as_deref(), &[0; 32])?;
     if config.name.trim().is_empty() {
         return Err("Vault name must not be empty".into());
     }
@@ -39,33 +37,5 @@ pub(crate) fn prepare(
             return Err("web_dir must not overlap the Vault directory".into());
         }
     }
-    let history_path = if config.ephemeral {
-        if config.state_dir.is_some() || config.history_mode != HistoryMode::Recover {
-            return Err(
-                "ephemeral cannot be combined with state_dir, initialization or reset".into(),
-            );
-        }
-        None
-    } else {
-        let path = config
-            .state_dir
-            .as_ref()
-            .ok_or("Vault requires state_dir; use ephemeral = true only for temporary histories")?;
-        let state = directory(base, path)?;
-        if overlap(&state, &root) {
-            return Err("state_dir must not overlap the Vault directory".into());
-        }
-        if web_dir.as_ref().is_some_and(|web| overlap(&state, web)) {
-            return Err("state_dir must not overlap web_dir".into());
-        }
-        Some(state.join("history.redb"))
-    };
-    Ok((
-        PreparedVault {
-            config,
-            root,
-            history_path,
-        },
-        web_dir,
-    ))
+    Ok((PreparedVault { config, root }, web_dir))
 }

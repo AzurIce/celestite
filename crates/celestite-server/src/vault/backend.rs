@@ -1,7 +1,7 @@
 //! Native platform IO for the shared EditorCore. The caller runs it on a blocking worker.
 use super::{
     fs::{self, FsVault},
-    store::{Store, VaultIdentity},
+    VaultIdentity,
 };
 use celestite_core::*;
 use std::{
@@ -37,49 +37,18 @@ pub(crate) fn vault_error(error: EditorError) -> fs::VaultError {
 
 pub(crate) struct NativeBackend {
     files: FsVault,
-    store: Option<Store>,
     identity: InstanceIdentity,
     intent: Option<DirectoryIntent>,
 }
 impl NativeBackend {
-    pub fn share_seed(&self) -> fs::Result<[u8; 32]> {
-        if let Some(store) = &self.store {
-            return store.share_seed();
-        }
-        let mut seed = [0; 32];
-        getrandom::fill(&mut seed).map_err(super::store::storage_error)?;
-        Ok(seed)
-    }
-    pub fn open(state: Option<&Path>, root: &Path, mode: crate::HistoryMode) -> fs::Result<Self> {
-        let (store, identity) = if let Some(path) = state {
-            let (store, identity) = match mode {
-                crate::HistoryMode::Recover => Store::open(path, root)?,
-                crate::HistoryMode::Initialize => Store::initialize(path, root)?,
-                crate::HistoryMode::Reset => Store::reset(path, root)?,
-            };
-            (Some(store), identity)
-        } else {
-            (
-                None,
-                VaultIdentity {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    history_id: uuid::Uuid::new_v4().to_string(),
-                },
-            )
-        };
-        let instance_id = if let Some(store) = &store {
-            store.instance_id()?
-        } else {
-            uuid::Uuid::new_v4().to_string()
-        };
+    pub fn open(root: &Path, vault: VaultIdentity) -> fs::Result<Self> {
         Ok(Self {
             files: FsVault::open(root).map_err(|e| fs::VaultError::new("IO", e.to_string(), ""))?,
-            store,
             identity: InstanceIdentity {
-                instance_id,
+                instance_id: uuid::Uuid::new_v4().to_string(),
                 vault: Vault {
-                    vault_id: identity.id,
-                    history_id: identity.history_id,
+                    vault_id: vault.id,
+                    history_id: vault.history_id,
                 },
             },
             intent: None,
@@ -91,7 +60,7 @@ impl Backend for NativeBackend {
         &self.identity
     }
     fn persistent(&self) -> bool {
-        self.store.is_some()
+        false
     }
     fn new_id(&self) -> EditorResult<String> {
         Ok(uuid::Uuid::new_v4().to_string())
@@ -106,31 +75,19 @@ impl Backend for NativeBackend {
             .as_millis() as u64
     }
     async fn load(&mut self) -> EditorResult<Vec<StoredDocument>> {
-        self.store
-            .as_ref()
-            .map_or(Ok(vec![]), |store| store.load().map_err(editor_error))
+        Ok(vec![])
     }
     async fn commit(
         &mut self,
-        header: &DocumentHeader,
-        entry: Option<&JournalEntry>,
+        _header: &DocumentHeader,
+        _entry: Option<&JournalEntry>,
     ) -> EditorResult<()> {
-        if let Some(store) = &self.store {
-            store.commit(header, entry).map_err(editor_error)?;
-        }
         Ok(())
     }
     async fn directory_intent(&mut self) -> EditorResult<Option<DirectoryIntent>> {
-        if let Some(store) = &self.store {
-            store.directory_intent().map_err(editor_error)
-        } else {
-            Ok(self.intent.clone())
-        }
+        Ok(self.intent.clone())
     }
     async fn set_directory_intent(&mut self, intent: Option<&DirectoryIntent>) -> EditorResult<()> {
-        if let Some(store) = &self.store {
-            store.set_directory_intent(intent).map_err(editor_error)?;
-        }
         self.intent = intent.cloned();
         Ok(())
     }

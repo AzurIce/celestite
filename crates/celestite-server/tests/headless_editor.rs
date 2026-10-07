@@ -1,8 +1,8 @@
 //! Real HTTP clients and a listening server. No browser or editor view involved.
 use celestite_core::*;
-use celestite_server::{Config, HistoryMode, ServerConfig, VaultConfig, build_server};
+use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
 use reqwest::{Client, StatusCode};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
 
@@ -14,7 +14,7 @@ struct Server {
 }
 
 impl Server {
-    async fn start(root: &Path, state: Option<&Path>, read_only: bool) -> Self {
+    async fn start(root: &Path, read_only: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = build_server(
@@ -27,13 +27,6 @@ impl Server {
                     name: "Notes".into(),
                     path: root.into(),
                     read_only,
-                    state_dir: state.map(Path::to_owned),
-                    ephemeral: state.is_none(),
-                    history_mode: if state.is_some_and(|dir| !dir.join("history.redb").exists()) {
-                        HistoryMode::Initialize
-                    } else {
-                        HistoryMode::Recover
-                    },
                     ..Default::default()
                 },
             },
@@ -154,7 +147,7 @@ fn route(id: &str, action: &str) -> String {
 async fn replica_commit_checks_file_revision_before_import_and_returns_saved_history() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
-    let server = Server::start(root.path(), None, false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     let seed: SyncPacket =
@@ -175,13 +168,11 @@ async fn replica_commit_checks_file_revision_before_import_and_returns_saved_his
     let retained: SyncPacket =
         serde_json::from_value(server.ok("GET", &route(id, "/snapshot"), Value::Null).await)
             .unwrap();
-    assert!(
-        !Buffer::from_snapshot(&retained, None)
-            .unwrap()
-            .snapshot()
-            .text
-            .contains("中文")
-    );
+    assert!(!Buffer::from_snapshot(&retained, None)
+        .unwrap()
+        .snapshot()
+        .text
+        .contains("中文"));
     let mut overwrite = body;
     overwrite["action"] = json!("overwrite");
     server.settled(id).await;
@@ -239,7 +230,7 @@ async fn rejected_imports_leave_the_document_and_history_unchanged() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "base").unwrap();
     std::fs::write(root.path().join("b.md"), "other history").unwrap();
-    let server = Server::start(root.path(), None, false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     let other = server.open("b.md").await;
@@ -305,21 +296,14 @@ async fn rejected_imports_leave_the_document_and_history_unchanged() {
 }
 
 #[tokio::test]
-async fn two_offline_replicas_merge_and_undo_through_real_server() {
+async fn two_independent_replicas_merge_and_undo_through_real_server() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
     std::fs::write(root.path().join("closed.md"), "not opened in a view").unwrap();
     std::fs::write(root.path().join("image.bin"), [0, 255]).unwrap();
-    let server = Server::start(root.path(), None, false).await;
-    // Discovery includes files that have never had a view or explicit open call.
+    let server = Server::start(root.path(), false).await;
     let all = server.ok("GET", "/documents", Value::Null).await;
-    assert_eq!(all.as_array().unwrap().len(), 2);
-    assert!(
-        all.as_array()
-            .unwrap()
-            .iter()
-            .any(|doc| doc["path"] == "closed.md")
-    );
+    assert!(all.as_array().unwrap().is_empty());
     let opened = server.open("a.md").await;
     let id = opened["id"].as_str().unwrap();
     let seed: SyncPacket =
@@ -409,7 +393,7 @@ async fn two_offline_replicas_merge_and_undo_through_real_server() {
 async fn transactions_versions_and_server_writer_history_are_validated() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
-    let server = Server::start(root.path(), None, false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     let base = snapshot(&initial).version;
@@ -459,11 +443,10 @@ async fn transactions_versions_and_server_writer_history_are_validated() {
 }
 
 #[tokio::test]
-async fn pending_packets_and_unsaved_history_survive_server_restart() {
+async fn pending_packets_complete_in_memory_and_unsaved_history_expires_on_restart() {
     let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "base").unwrap();
-    let server = Server::start(root.path(), Some(state.path()), false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap().to_string();
     let seed: SyncPacket = serde_json::from_value(
@@ -487,12 +470,6 @@ async fn pending_packets_and_unsaved_history_survive_server_restart() {
         )
         .await;
     assert_eq!(waiting["update"]["pending"], true);
-    server.stop().await;
-    let server = Server::start(root.path(), Some(state.path()), false).await;
-    let restored = server.open("a.md").await;
-    assert_eq!(restored["id"], id);
-    assert_eq!(snapshot(&restored).text, "base");
-    assert!(restored["durableVersion"].is_object());
     let completed = server
         .ok(
             "POST",
@@ -506,25 +483,21 @@ async fn pending_packets_and_unsaved_history_survive_server_restart() {
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),
         "base"
     );
-    let durable = completed["document"]["durableVersion"].clone();
-    assert_eq!(durable, completed["document"]["snapshot"]["version"]);
+    assert!(completed["document"]["durableVersion"].is_null());
     server.stop().await;
-    let server = Server::start(root.path(), Some(state.path()), false).await;
+    let server = Server::start(root.path(), false).await;
     let restored = server.open("a.md").await;
-    assert_eq!(snapshot(&restored).text, "one base two");
-    assert_eq!(
-        serde_json::to_value(snapshot(&restored).version).unwrap(),
-        durable
-    );
+    assert_eq!(snapshot(&restored).text, "base");
+    assert_ne!(restored["id"], id);
+    assert!(restored["durableVersion"].is_null());
     server.stop().await;
 }
 
 #[tokio::test]
-async fn external_changes_merge_with_dirty_history_and_are_preserved_across_restart() {
+async fn external_changes_merge_with_dirty_buffers_and_saved_bytes_survive_restart() {
     let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "old").unwrap();
-    let server = Server::start(root.path(), Some(state.path()), false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap().to_string();
     std::fs::write(root.path().join("a.md"), "external").unwrap();
@@ -565,11 +538,6 @@ async fn external_changes_merge_with_dirty_history_and_are_preserved_across_rest
         .unwrap();
     assert_eq!(legacy.status(), StatusCode::CONFLICT);
     drop(legacy);
-    server.stop().await;
-    let server = Server::start(root.path(), Some(state.path()), false).await;
-    let recovered = server.open("a.md").await;
-    assert_eq!(snapshot(&recovered).text, "other editor local");
-    assert_eq!(recovered["conflict"], false);
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),
         "other editor"
@@ -578,7 +546,7 @@ async fn external_changes_merge_with_dirty_history_and_are_preserved_across_rest
         .ok(
             "POST",
             &route(&id, "/save"),
-            serde_json::to_value(snapshot(&recovered).version).unwrap(),
+            serde_json::to_value(snapshot(&dirty).version).unwrap(),
         )
         .await;
     assert_eq!(
@@ -586,15 +554,20 @@ async fn external_changes_merge_with_dirty_history_and_are_preserved_across_rest
         "other editor local"
     );
     server.stop().await;
+    let server = Server::start(root.path(), false).await;
+    let reopened = server.open("a.md").await;
+    assert_eq!(snapshot(&reopened).text, "other editor local");
+    assert_ne!(reopened["id"], id);
+    assert_eq!(reopened["dirty"], false);
+    server.stop().await;
 }
 
 #[tokio::test]
 async fn move_preserves_identity_and_delete_cannot_be_undone_by_late_save() {
     let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("folder")).unwrap();
     std::fs::write(root.path().join("folder/a.md"), "base").unwrap();
-    let server = Server::start(root.path(), Some(state.path()), false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("folder/a.md").await;
     let id = initial["id"].as_str().unwrap().to_string();
     server.ok("POST", &route(&id, "/apply"), json!({"kind":"edit","base":snapshot(&initial).version,"origin":"test","input":{"kind":"edits","edits":[{"from": 4, "to": 4, "insert": " edit"}]},"undo":{"metadata":null,"positions":[]}})).await;
@@ -641,9 +614,11 @@ async fn move_preserves_identity_and_delete_cannot_be_undone_by_late_save() {
     assert_eq!(removed["deleted"], true);
     assert_eq!(snapshot(&removed).text, "base edit");
     server.stop().await;
-    let server = Server::start(root.path(), Some(state.path()), false).await;
-    let removed = server.ok("GET", &route(&id, ""), Value::Null).await;
-    assert_eq!(removed["deleted"], true);
+    let server = Server::start(root.path(), false).await;
+    assert_eq!(
+        server.request("GET", &route(&id, ""), Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
     assert!(!root.path().join("renamed").exists());
     server.stop().await;
 }
@@ -652,7 +627,7 @@ async fn move_preserves_identity_and_delete_cannot_be_undone_by_late_save() {
 async fn bom_and_crlf_roundtrip_and_read_only_rejects_editor_mutations() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "\u{feff}a\r\nb\r\n").unwrap();
-    let server = Server::start(root.path(), None, false).await;
+    let server = Server::start(root.path(), false).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     assert_eq!(snapshot(&initial).text, "a\nb\n");
@@ -669,7 +644,7 @@ async fn bom_and_crlf_roundtrip_and_read_only_rejects_editor_mutations() {
         "\u{feff}中😀\r\nb\r\n"
     );
     server.stop().await;
-    let server = Server::start(root.path(), None, true).await;
+    let server = Server::start(root.path(), true).await;
     let initial = server.open("a.md").await;
     let id = initial["id"].as_str().unwrap();
     let packet = server.ok("GET", &route(id, "/snapshot"), Value::Null).await;

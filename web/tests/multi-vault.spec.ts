@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
@@ -62,7 +62,7 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
           const config = join(root, `${id}.toml`);
           await writeFile(
             config,
-            `[server]\nlisten = "127.0.0.1:0"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\n\n[vault]\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\nephemeral = true\n`,
+            `[server]\nlisten = "127.0.0.1:0"\nallowed_origins = [${JSON.stringify(String(workerInfo.project.use.baseURL))}]\n\n[vault]\nname = "${id}"\npath = "${id}"\nread_only = ${id === "readonly"}\n`,
           );
           const child = spawn(binary, ["--config", config], {
             stdio: ["ignore", "pipe", "pipe"],
@@ -775,7 +775,7 @@ test("startup readonly and edit links to one Vault synchronize with separate per
   }
 });
 
-test("changing share_key and restarting replaces both startup links without changing Vault history", async ({
+test("changing share_key and restarting replaces startup links and begins new Vault history", async ({
   page,
   baseURL,
 }) => {
@@ -788,7 +788,7 @@ test("changing share_key and restarting replaces both startup links without chan
   await new Promise<void>((resolve) => reservation.close(() => resolve()));
   const config = join(root, "config.toml");
   const configuration = (key: string) =>
-    `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nstate_dir = "state"\nshare_key = "${key}"\n`;
+    `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nshare_key = "${key}"\n`;
   let child: ChildProcess | undefined;
   const stop = async () => {
     if (!child || child.exitCode !== null) return;
@@ -819,18 +819,11 @@ test("changing share_key and restarting replaces both startup links without chan
   };
   try {
     await mkdir(join(root, "notes"));
-    await mkdir(join(root, "state"));
     await writeFile(join(root, "notes", "a.md"), "# Original");
     await writeFile(
       config,
       configuration("random configuration secret value old 1234567890"),
     );
-    const initialized = spawnSync(
-      binary,
-      ["--config", config, "--init-vault"],
-      { encoding: "utf8", timeout: 10000 },
-    );
-    expect(initialized.status, initialized.stderr).toBe(0);
     const before = await start();
     const identity = (await (await fetch(before.edit + "/api/v1")).json())
       .vaultIdentity;
@@ -860,9 +853,10 @@ test("changing share_key and restarting replaces both startup links without chan
     expect(after.edit).not.toBe(before.edit);
     for (const old of [before.readonly, before.edit])
       expect((await fetch(old + "/api/v1")).status).toBe(404);
-    expect(
-      (await (await fetch(after.edit + "/api/v1")).json()).vaultIdentity,
-    ).toEqual(identity);
+    const rotatedIdentity = (await (await fetch(after.edit + "/api/v1")).json())
+      .vaultIdentity;
+    expect(rotatedIdentity.id).not.toBe(identity.id);
+    expect(rotatedIdentity.historyId).not.toBe(identity.historyId);
     await page
       .getByRole("button", { name: "尝试重新连接", exact: true })
       .click();
@@ -872,7 +866,7 @@ test("changing share_key and restarting replaces both startup links without chan
     await expect(editor(page)).toHaveText("# Preserved shared draft");
     await connect(page, after.edit);
     await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-    await expect(editor(page)).toHaveText("# Preserved shared draft");
+    await expect(editor(page)).toHaveText("# Original");
     await expect(editor(page)).toHaveAttribute("contenteditable", "true");
     expect(await readFile(join(root, "notes", "a.md"), "utf8")).toBe(
       "# Original",
@@ -1351,6 +1345,9 @@ async function openSyncDebug(page: Page, api: Api, path: string) {
   await page.getByLabel("Vault URL", { exact: true }).fill(api.url);
   await page.getByRole("button", { name: "连接 server", exact: true }).click();
   await page.getByLabel("调试文档", { exact: true }).selectOption(path);
+  expect((await hostDocuments(api)).some((doc) => doc.path === path)).toBe(
+    false,
+  );
   await page
     .getByRole("button", { name: "打开并重建实例", exact: true })
     .click();
@@ -1843,12 +1840,12 @@ for (const surface of ["menu", "dialog", "mobile-editor"] as const) {
 }
 
 for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-  test(`persistent server ${signal} restart restores two Web sessions and unsaved history`, async ({
+  test(`server ${signal} restart discards unsaved history and rejects old Web sessions`, async ({
     page,
     browser,
     baseURL,
   }) => {
-    const root = await mkdtemp(join(tmpdir(), "celestite-persistent-browser-"));
+    const root = await mkdtemp(join(tmpdir(), "celestite-memory-browser-"));
     const listener = createServer();
     await new Promise<void>((resolve) =>
       listener.listen(0, "127.0.0.1", resolve),
@@ -1914,20 +1911,14 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
     };
     try {
       await mkdir(join(root, "notes"));
-      await mkdir(join(root, "state"));
       await writeFile(disk, "left 🦀 middle right");
       await writeFile(join(root, "notes", "unopened.md"), "unopened original");
       await writeFile(
         config,
-        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nstate_dir = "state"\n`,
+        `[server]\nlisten = "127.0.0.1:${port}"\nallowed_origins = [${JSON.stringify(baseURL)}]\n\n[vault]\nname = "notes"\npath = "notes"\nshare_key = "browser restart test secret 0123456789"\n`,
       );
-      const initialized = spawnSync(
-        binary,
-        ["--config", config, "--init-vault"],
-        { env, timeout: 10000, encoding: "utf8" },
-      );
-      expect(initialized.status, initialized.stderr).toBe(0);
       await start();
+      expect(await hostDocuments(api)).toEqual([]);
       const identity = (await (await fetch(api.url + "/api/v1", {})).json())
         .vaultIdentity;
       for (const client of [page, other]) {
@@ -1978,8 +1969,6 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
         await expect(overlay.getByRole("heading")).toHaveText("远端连接已断开");
         await expect(editor(client)).toHaveText("A:left 🦀 middle right:B");
       }
-      // Disk edits while the host is stopped reconcile against its persistent
-      // projection baseline, preserving the acknowledged, unsaved A/B edits.
       await writeFile(disk, "left 🦀 disk right");
       await writeFile(
         join(root, "notes", "unopened.md"),
@@ -1989,22 +1978,37 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       const recoveredIdentity = (
         await (await fetch(api.url + "/api/v1", {})).json()
       ).vaultIdentity;
-      expect(recoveredIdentity).toEqual(identity);
-      const expected = "A:left 🦀 disk right:B";
+      expect(recoveredIdentity.id).toBe(identity.id);
+      expect(recoveredIdentity.historyId).not.toBe(identity.historyId);
+      expect(await hostDocuments(api)).toEqual([]);
       for (const client of [page, other]) {
         await client
           .getByRole("button", { name: "尝试重新连接", exact: true })
           .click();
         await expect(
           client.getByRole("region", { name: "远端连接状态" }),
-        ).toHaveCount(0);
+        ).toContainText("远端 Vault 历史已改变");
+        await expect(editor(client)).toHaveAttribute(
+          "contenteditable",
+          "false",
+        );
+        await expect(editor(client)).toHaveText("A:left 🦀 middle right:B");
+      }
+      expect(await hostDocuments(api)).toEqual([]);
+      const expected = "left 🦀 disk right";
+      for (const client of [page, other]) {
+        await client.reload();
+        await connect(client, api.url);
+        await client
+          .getByRole("treeitem", { name: "a.md", exact: true })
+          .click();
         await expect(editor(client)).toHaveAttribute("contenteditable", "true");
         await expect(editor(client)).toHaveText(expected);
       }
       const recoveredDocument = (await hostDocuments(api)).find(
         (doc) => doc.path === "a.md",
       )!;
-      expect(recoveredDocument.id).toBe(documentId);
+      expect(recoveredDocument.id).not.toBe(documentId);
       expect(recoveredDocument.snapshot.text).toBe(expected);
       expect(await readFile(disk, "utf8")).toBe("left 🦀 disk right");
       await editor(page).focus();

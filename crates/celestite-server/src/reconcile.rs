@@ -1,11 +1,11 @@
 //! Filesystem notifications are hints. A bounded wakeup coalesces bursts, and a
-//! periodic full observation repairs missed events without running IO in notify's callback.
-use crate::{HostedVault, vault::fs::ChangeHint};
+//! periodic observation of loaded buffers repairs missed events outside notify's callback.
+use crate::{vault::fs::ChangeHint, HostedVault};
 use std::{
     sync::{
-        Arc, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
+        Arc, Weak,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -178,18 +178,14 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::broadcast;
 
-    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Arc<HostedVault>) {
+    fn fixture() -> (tempfile::TempDir, Arc<HostedVault>) {
         let root = tempfile::tempdir().unwrap();
-        let history = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.md"), "A middle B").unwrap();
         std::fs::write(root.path().join("b.md"), "other").unwrap();
-        let mut documents = Documents::open(
-            Some(&history.path().join("history.redb")),
-            root.path(),
-            crate::HistoryMode::Initialize,
-        )
-        .unwrap();
-        documents.reconcile().unwrap();
+        let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
+        let files = FsVault::open(root.path()).unwrap();
+        documents.open_file(&files, "a.md").unwrap();
+        documents.open_file(&files, "b.md").unwrap();
         let (trigger, _) = channel();
         let (events, _) = broadcast::channel(128);
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
@@ -209,12 +205,12 @@ mod tests {
             reconcile_trigger: trigger,
             reconciler: Mutex::new(None),
         });
-        (root, history, vault)
+        (root, vault)
     }
 
     #[test]
     fn diff_releases_both_vault_locks_and_merges_edits_accepted_while_running() {
-        let (root, _history, vault) = fixture();
+        let (root, vault) = fixture();
         let (ready, prepared) = mpsc::sync_channel(1);
         let (resume, released) = mpsc::sync_channel(1);
         std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
@@ -303,7 +299,7 @@ mod tests {
 
     #[test]
     fn failure_is_published_without_losing_readable_history_and_manual_retry_commits() {
-        let (root, _history, vault) = fixture();
+        let (root, vault) = fixture();
         let mut subscription = vault.documents.lock().unwrap().subscribe().unwrap();
         std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
         observe_with(&vault, &AtomicBool::new(false), |task| {
@@ -355,7 +351,7 @@ mod tests {
 
     #[test]
     fn rename_during_diff_discards_the_old_path_result_then_reconciles_the_new_path() {
-        let (root, _history, vault) = fixture();
+        let (root, vault) = fixture();
         std::fs::write(root.path().join("a.md"), "A1 middle B1").unwrap();
         let task = with_documents(&vault, |docs| {
             docs.reconcile()?;
@@ -381,11 +377,9 @@ mod tests {
                 .rename(&files, "a.md", "renamed.md")
                 .unwrap();
         }
-        assert!(
-            !with_documents(&vault, |docs| docs
-                .complete_file_observation(task.compute()))
-            .unwrap()
-        );
+        assert!(!with_documents(&vault, |docs| docs
+            .complete_file_observation(task.compute()))
+        .unwrap());
         let interim = vault
             .documents
             .lock()
@@ -411,14 +405,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_scan_repairs_missing_notifications_and_stop_joins_before_reopening_history() {
+    async fn periodic_observation_repairs_missing_notifications_and_stop_joins_the_worker() {
         let root = tempfile::tempdir().unwrap();
-        let history = tempfile::tempdir().unwrap();
-        let db = history.path().join("history.redb");
         std::fs::write(root.path().join("a.md"), "base").unwrap();
-        let mut documents =
-            Documents::open(Some(&db), root.path(), crate::HistoryMode::Initialize).unwrap();
-        documents.reconcile().unwrap();
+        let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
+        documents
+            .open_file(&FsVault::open(root.path()).unwrap(), "a.md")
+            .unwrap();
         let mut subscription = documents.subscribe().unwrap();
         let (trigger, receiver) = channel();
         // Intentionally never register this watcher: no notification can wake the worker.
@@ -471,10 +464,13 @@ mod tests {
         assert_eq!(state.snapshot.text, "missed notification");
         worker.stop();
         drop(vault);
-        // No background commit or redb owner survives stop/drop.
-        let mut recovered =
-            Documents::open(Some(&db), root.path(), crate::HistoryMode::Recover).unwrap();
-        recovered.reconcile().unwrap();
-        assert_eq!(recovered.resident().unwrap()[0].snapshot, state.snapshot);
+        let mut reopened = Documents::open(root.path(), &[0; 32]).unwrap();
+        assert!(reopened.resident().unwrap().is_empty());
+        reopened
+            .open_file(&FsVault::open(root.path()).unwrap(), "a.md")
+            .unwrap();
+        let next = reopened.resident().unwrap().pop().unwrap().snapshot;
+        assert_eq!(next.text, state.snapshot.text);
+        assert_ne!(next.version.identity, state.snapshot.version.identity);
     }
 }

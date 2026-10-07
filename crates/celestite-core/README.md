@@ -49,25 +49,27 @@ cargo test -p celestite-core
 cargo check -p celestite-core --target wasm32-unknown-unknown --features wasm
 ```
 
-默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `BufferBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<BrowserBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录并可配置 redb 历史存储。64 位 writer ID 在 JSON 中保持字符串。
+默认编译纯 Rust 库；`wasm` feature 在 `wasm32` target 导出异步 `EditorBinding`、`MemoryEditorBinding` 和底层 `BufferBinding`。本地 Web Worker 通过 `EditorBinding` 构造 `EditorCore<BrowserBackend>`，浏览器 IO 桥只提供文件和私有存储读写；远端 Web Worker 通过 `MemoryEditorBinding` 构造 `EditorCore<MemoryBackend>`。server 构造同一内核类型的 `EditorCore<NativeBackend>`，访问普通目录，CRDT 历史仅驻留内存。64 位 writer ID 在 JSON 中保持字符串。
 
 `BufferBinding` 直接拥有 Buffer，`apply(commandJson)` 同步返回 `BufferUpdate`，其余接口仅用于读取、锚点和历史导出。没有第二套编辑方法或通知队列。EditorBinding / MemoryEditorBinding 的 `call(method, paramsJson)` 异步返回 `{ status, value | error, mutations }`；即便文件 IO 最终失败，先前已接受的修改仍会随同返回。Worker 先消费 mutations，再处理命令结果。
 
 ## Backend 与服务接口
 
-`Backend` 定义身份、时钟、历史加载、幂等提交、目录恢复意图及可选的普通文件 IO。`has_projection()` 决定实例是否映射普通目录；没有映射时，只提交私有历史，不报告普通文件已保存。异步方法不要求 `Send`，OPFS IO 可以留在 Worker 中；native 包装在阻塞任务中执行文件和 redb IO。
+`Backend` 定义身份、时钟、历史加载、幂等提交、目录恢复意图及可选的普通文件 IO。`has_projection()` 决定实例是否映射普通目录；没有映射时，只提交私有历史，不报告普通文件已保存。异步方法不要求 `Send`，OPFS IO 可以留在 Worker 中；native 包装在阻塞任务中执行文件 IO。
 
-| 实现             | 历史存储                            | 普通文件映射            | 使用位置                              |
-| ---------------- | ----------------------------------- | ----------------------- | ------------------------------------- |
-| `BrowserBackend` | OPFS 私有历史目录                   | OPFS 或获授权的本机目录 | 本地 Web Vault                        |
-| `MemoryBackend`  | Rust 内存集合，非持久化             | 无                      | 远端 Web 客户端、无头副本与同步调试器 |
-| `NativeBackend`  | 可配置 redb；未配置时历史仅驻留内存 | 本机普通目录            | server host                           |
+| 实现             | 历史存储                             | 普通文件映射            | 使用位置                              |
+| ---------------- | ------------------------------------ | ----------------------- | ------------------------------------- |
+| `BrowserBackend` | OPFS 私有历史目录                    | OPFS 或获授权的本机目录 | 本地 Web Vault                        |
+| `MemoryBackend`  | Rust 内存集合，非持久化              | 无                      | 远端 Web 客户端、无头副本与同步调试器 |
+| `NativeBackend`  | 无私有历史存储；活动 Buffer 驻留内存 | 本机普通目录            | server host                           |
 
 [`MemoryBackend`](src/memory.rs) 是公开的 `Backend` 实现，以 `BTreeMap<String, StoredDocument>` 保存文档头、初始 CRDT 快照与增量 journal。`commit()` 校验序号与重发内容后更新记录，`load()` 返回内存记录，`replace_volatile_documents()` 原子替换整批记录并清空增量。它的 `persistent()` 和 `has_projection()` 均为 `false`，文件与目录 IO 返回 `Unsupported`；编辑与撤销由 `EditorCore` 中的活动文档执行。后端随 core 释放，不跨 Worker 或进程重启保留数据。
 
 EditorCore 的文本入口统一为 `apply(id, BufferCommand)`，返回 `EditorMutation { document, update, history }`。只有准入失败返回错误；已接受修改的历史提交结果单独表达为 `HistoryCommit::Committed` 或 `Failed`。网络确认和文件保存通过 `require_committed()` 检查提交状态，不能把提交失败误判成文本未修改。
 
 所有活动 Buffer 的结果经同一个流程登记历史、更新派生状态并发布。运行时在每次命令后调用 `take_mutations()` 取走批次；WASM 的 `call` 自动执行该步骤。Rust 返回值和批次共享同一回执，重试历史 IO 不产生第二次文本修改。`open_file`、`read`、`save`、`resolve`、`rename`、`remove` 等负责文档集合与文件业务，不另建编辑历史。
+
+`open_file` 按需创建或复用 Buffer；`list` 和 `reconcile_files` 只核对已加载记录，不扫描其他文件建立 CRDT。文件发现由目录元数据接口承担。server 重启生成新的历史身份，打开文件时从当前磁盘字节建立历史，未写回的正文和操作意图不跨重启保留。
 
 Web 使用同一处理层消费 Buffer 结果、维护版本化视图映射并交付命令回复 / 外部变化。远端只发送结果中的本地操作包，不在编辑或撤销后另行导出；本机目录不从前后字符串重新猜测差异。视图端按输入时间和显式 Vim 会话选择组 ID，core 不解释 UI 命令名称。
 
@@ -83,7 +85,7 @@ Web 使用同一处理层消费 Buffer 结果、维护版本化视图映射并�
 
 host 的 `commit_replica` 在导入客户端快照前核对磁盘版本，再通过既有保存逻辑写回；覆盖动作选择客户端正文，丢弃动作以 host 最新文件为准。传输包装只负责认证、请求与回执，不复制编辑或文件冲突策略。
 
-`tests/editor_backend.rs` 验证统一业务的故障恢复与服务契约；server 的 `headless_editor` 测试验证真实 HTTP / redb；Web 的编辑器回归验证 WASM / OPFS，包括旧日志兼容。实时单 host 协作、Catalog CRDT、Vim、Tree-sitter 和 LSP 按项目路线图继续推进。
+`tests/editor_backend.rs` 验证统一业务的故障恢复与服务契约；server 的 `headless_editor` 测试验证真实 HTTP、内存历史和普通文件保存；Web 的编辑器回归验证 WASM / OPFS，包括旧日志兼容。后续阶段见项目路线图。
 
 ## 预览计算与会话
 

@@ -1,11 +1,11 @@
 use axum::{
-    Router,
     body::Body,
     http::{Request, StatusCode},
+    Router,
 };
-use celestite_server::{Config, HistoryMode, Permission, Server, VaultConfig, build_server};
+use celestite_server::{build_server, Config, Permission, Server, VaultConfig};
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{fs, time::Duration};
 use tower::ServiceExt;
 
@@ -15,26 +15,23 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        for path in ["notes", "state"] {
-            fs::create_dir(dir.path().join(path)).unwrap();
-        }
+        fs::create_dir(dir.path().join("notes")).unwrap();
         fs::write(dir.path().join("notes/a.md"), "original").unwrap();
         Self { dir }
     }
-    fn config(&self, mode: HistoryMode) -> Config {
+    fn config(&self) -> Config {
         Config {
             server: Default::default(),
             vault: VaultConfig {
                 name: "Private notes".into(),
                 path: "notes".into(),
-                state_dir: Some("state".into()),
-                history_mode: mode,
+                share_key: Some("test-only stable secret 12345678901234567890".into()),
                 ..Default::default()
             },
         }
     }
-    fn start(&self, mode: HistoryMode) -> Server {
-        build_server(self.config(mode), self.dir.path()).unwrap()
+    fn start(&self) -> Server {
+        build_server(self.config(), self.dir.path()).unwrap()
     }
 }
 fn uri(key: &str, tail: &str) -> String {
@@ -68,7 +65,7 @@ async fn read(response: axum::response::Response) -> Value {
 #[tokio::test]
 async fn independent_links_share_identity_and_readonly_blocks_every_write_entry() {
     let f = Fixture::new();
-    let server = f.start(HistoryMode::Initialize);
+    let server = f.start();
     let reader = server.links.key(Permission::Readonly).to_owned();
     let editor = server.links.key(Permission::Edit).to_owned();
     assert!(reader.starts_with("ro-"));
@@ -178,21 +175,25 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
 #[tokio::test]
 async fn restart_and_display_rename_preserve_links_and_key_rotation_invalidates_both_roles() {
     let f = Fixture::new();
-    let server = f.start(HistoryMode::Initialize);
+    let server = f.start();
     let reader = server.links.key(Permission::Readonly).to_owned();
     let editor = server.links.key(Permission::Edit).to_owned();
     let before = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
     drop(server);
-    let mut config = f.config(HistoryMode::Recover);
+    let mut config = f.config();
     config.vault.name = "Renamed notes".into();
     let server = build_server(config, f.dir.path()).unwrap();
     assert_eq!(server.links.key(Permission::Readonly), reader.as_str());
     assert_eq!(server.links.key(Permission::Edit), editor.as_str());
     let after = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
-    assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
+    assert_eq!(before["vaultIdentity"]["id"], after["vaultIdentity"]["id"]);
+    assert_ne!(
+        before["vaultIdentity"]["historyId"],
+        after["vaultIdentity"]["historyId"]
+    );
     assert_eq!(before["shareId"], after["shareId"]);
     drop(server);
-    let mut config = f.config(HistoryMode::Recover);
+    let mut config = f.config();
     config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
     let server = build_server(config, f.dir.path()).unwrap();
     for old in [&reader, &editor] {
@@ -205,28 +206,18 @@ async fn restart_and_display_rename_preserve_links_and_key_rotation_invalidates_
     }
     let rotated = server.links.key(Permission::Edit).to_owned();
     let after = read(response(&server.router, &rotated, "GET", "", Value::Null).await).await;
-    assert_eq!(before["vaultIdentity"], after["vaultIdentity"]);
+    assert_ne!(before["vaultIdentity"], after["vaultIdentity"]);
     drop(server);
-    let mut config = f.config(HistoryMode::Recover);
+    let mut config = f.config();
     config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
     let server = build_server(config, f.dir.path()).unwrap();
     assert_eq!(server.links.key(Permission::Edit), rotated.as_str());
-    drop(server);
-    let mut config = f.config(HistoryMode::Reset);
-    config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
-    let server = build_server(config, f.dir.path()).unwrap();
-    assert_eq!(
-        response(&server.router, &rotated, "GET", "", Value::Null)
-            .await
-            .status(),
-        StatusCode::NOT_FOUND
-    );
 }
 
 #[tokio::test]
 async fn shutdown_ends_both_event_feeds() {
     let f = Fixture::new();
-    let server = f.start(HistoryMode::Initialize);
+    let server = f.start();
     let reader = server.links.key(Permission::Readonly);
     let mut feeds = Vec::new();
     for tail in ["/events", "/documents/events"] {
@@ -238,71 +229,44 @@ async fn shutdown_ends_both_event_feeds() {
     }
     server.shutdown.send_replace(true);
     for mut body in feeds {
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), body.frame())
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 
 #[test]
-fn existing_history_automatically_acquires_a_private_seed_without_share_initialization() {
-    use redb::TableDefinition;
+fn omitted_share_secrets_produce_temporary_links_without_state_files() {
     let f = Fixture::new();
-    drop(f.start(HistoryMode::Initialize));
-    let path = f.dir.path().join("state/history.redb");
-    let db = redb::Database::open(&path).unwrap();
-    let tx = db.begin_write().unwrap();
-    tx.open_table(TableDefinition::<&str, &[u8]>::new("editor_metadata"))
-        .unwrap()
-        .remove("share-seed")
-        .unwrap();
-    tx.commit().unwrap();
-    drop(db);
-    let server = f.start(HistoryMode::Recover);
+    let mut config = f.config();
+    config.vault.share_key = None;
+    let server = build_server(config, f.dir.path()).unwrap();
     let key = server.links.key(Permission::Edit).to_owned();
     assert_ne!(server.links.readonly, server.links.edit);
-    assert!(!f.dir.path().join("state/shares.redb").exists());
     drop(server);
-    assert!(
-        !fs::read(&path)
-            .unwrap()
-            .windows(key.len())
-            .any(|part| part == key.as_bytes())
-    );
-    let server = f.start(HistoryMode::Recover);
-    assert_eq!(server.links.key(Permission::Edit), key.as_str());
-    drop(server);
-    let db = redb::Database::open(&path).unwrap();
-    let tx = db.begin_write().unwrap();
-    tx.open_table(TableDefinition::<&str, &[u8]>::new("editor_metadata"))
-        .unwrap()
-        .insert("share-seed", b"corrupted".as_slice())
-        .unwrap();
-    tx.commit().unwrap();
-    drop(db);
-    assert!(build_server(f.config(HistoryMode::Recover), f.dir.path()).is_err());
+    let mut config = f.config();
+    config.vault.share_key = None;
+    let server = build_server(config, f.dir.path()).unwrap();
+    assert_ne!(server.links.key(Permission::Edit), key);
+    assert_eq!(fs::read_dir(f.dir.path()).unwrap().count(), 1);
 }
 
 #[test]
-fn public_url_and_configured_secrets_are_validated_before_initialization() {
+fn public_url_and_configured_secrets_are_validated() {
     let f = Fixture::new();
-    let mut config = f.config(HistoryMode::Initialize);
+    let mut config = f.config();
     config.vault.share_key = Some("a public name".into());
     assert!(build_server(config, f.dir.path()).is_err());
-    assert!(!f.dir.path().join("state/history.redb").exists());
     for invalid in [
         "ftp://host",
         "https://user:pass@host",
         "https://host/?",
         "https://host/#",
     ] {
-        let mut config = f.config(HistoryMode::Initialize);
+        let mut config = f.config();
         config.server.public_url = Some(invalid.into());
         assert!(build_server(config, f.dir.path()).is_err());
-        assert!(!f.dir.path().join("state/history.redb").exists());
     }
     let listen = "127.0.0.1:7437".parse().unwrap();
     assert_eq!(
@@ -320,7 +284,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     let f = Fixture::new();
-    let server = f.start(HistoryMode::Initialize);
+    let server = f.start();
     let reader = server.links.key(Permission::Readonly).to_owned();
     let description = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
     let document = read(
@@ -352,7 +316,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
         .unwrap();
     socket
         .send(Message::Text(
-            json!({"protocolVersion":1,"vaultIdentity":description["vaultIdentity"]})
+            json!({"protocolVersion":2,"vaultIdentity":description["vaultIdentity"]})
                 .to_string()
                 .into(),
         ))
@@ -405,7 +369,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
 #[tokio::test]
 async fn public_url_origin_is_allowed_for_the_hosted_client() {
     let f = Fixture::new();
-    let mut config = f.config(HistoryMode::Initialize);
+    let mut config = f.config();
     config.server.public_url = Some("https://host.example/deploy".into());
     let server = build_server(config, f.dir.path()).unwrap();
     let key = server.links.key(Permission::Readonly);

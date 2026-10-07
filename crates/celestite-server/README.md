@@ -8,9 +8,8 @@
 
 ```sh
 cargo build -p celestite-server
-mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
+mkdir -p /tmp/celestite-demo/notes
 cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
-./target/debug/celestite-server --config /tmp/celestite-demo/config.toml --init-vault
 ./target/debug/celestite-server --config /tmp/celestite-demo/config.toml
 ```
 
@@ -22,35 +21,33 @@ Vault share links readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://12
 
 打开 Web 客户端，在底部“管理 Vault”中粘贴其中一条完整 URL。链接到 key 为止，客户端自动追加 `/api/v1/...`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；其他客户端来源要加入 `allowed_origins`。没有分享初始化或分享管理命令。
 
-配置内目录必须已经存在；相对路径以配置文件目录为基准。`[vault]` 指定唯一的 Vault，无配置 ID。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。分享绑定持久化的 Vault 身份，修改显示名称保留已有链接。更改目录继续遵守 profile 的根目录迁移校验。多 Vault 的集中托管留待 SaaS 场景再设计。
+配置内目录必须已经存在；相对路径以配置文件目录为基准。`[vault]` 指定唯一的 Vault，无配置 ID。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。server 不读写私有状态库，CRDT 历史只在进程内存中保留；普通文件保存仍写入 Vault 目录。多 Vault 的集中托管留待 SaaS 场景再设计。
 
 ## 链接配置与轮换
 
-每个 Vault 固定提供 readonly / edit 两条链接，由秘密值与持久化的逻辑 Vault 身份分别派生。`ro-` 属于完整凭证，两个权限使用不同派生域；增删前缀不能转换权限。`read_only = true` 仍限制整个 Vault，因此它的 edit 链接也只有读取能力。
+每个 Vault 固定提供 readonly / edit 两条链接，由秘密值与 Vault 身份分别派生。Vault 身份由秘密值与规范化的 Vault 根目录确定。`ro-` 属于完整凭证，两个权限使用不同派生域；增删前缀不能转换权限。`read_only = true` 仍限制整个 Vault，因此它的 edit 链接也只有读取能力。
 
-使用配置文件且不配置 `share_key` 时，宿主自动产生 32 字节随机秘密值，保存在 `history.redb` 的私有宿主元数据里，不进入正文 CRDT、编辑历史或文件树。已有历史库在正常启动时自动补齐，无需额外初始化。正常重启和修改显示名称保留链接；临时 Vault 每次启动产生新逻辑身份和新链接。
+未配置 `share_key` 时，宿主每次启动产生 32 字节随机秘密值，仅保留在内存中，因此重启后链接和 Vault 身份改变。
 
-在 `[vault]` 中配置可选的 `share_key` 可显式控制凭证。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白；显示名 `name` 不参与派生。修改 `share_key` 并重启，会同时使旧 readonly / edit 链接失效，不改变正文或历史身份。配置启动时读取，不支持动态热更新。纯 CLI 配置必须显式传入同样要求的秘密值，重启时复用；传入新值并重启同样轮换两种链接。相同秘密值与同一 Vault 身份派生相同链接：改回旧配置、移除覆盖值恢复默认秘密值或恢复旧状态备份，可能恢复相应旧链接。
+在 `[vault]` 配置 `share_key`，或通过 CLI 传入 `--share-key`，可保留固定链接。使用 `openssl rand -hex 32` 生成随机值，至少 32 字节，不带首尾空白。相同秘密值与同一规范根目录保留链接和 Vault 身份，显示名 `name` 不参与派生；改目录或秘密值会同时替换两种链接和 Vault 身份，恢复原配置可能恢复旧链接。每次启动都会生成新的 `historyId`，固定链接不意味着历史跨重启保留。配置不支持动态热更新。
 
 `[server] public_url` 可设置打印链接使用的公开 HTTP(S) 地址和反向代理前缀，例如 `https://notes.example.com/celestite`；默认使用实际监听地址。该选项只决定链接基址，其 Origin 自动允许，不改变 key 或监听地址。反向代理将该前缀后的请求转发给宿主，并转发 WebSocket upgrade。
 
 完整链接是凭证，按要求打印在启动日志中，日志的可读者也获得对应权限。普通请求日志继续脱敏 key。客户端连接记录为重连保存完整链接，转发链接即转交权限。宿主退出关闭 HTTP 监听与活动 WebSocket / SSE；轮换后需从新启动日志复制链接重新连接，客户端保留未确认正文供恢复。
 
-旧的按配置 ID 连接 URL、连接 token 和动态分享管理已删除。旧配置移除 `token_env` / `management_socket`；无需 `--init-shares`。本分支早期版本留下的 `shares.redb` 不再读取，可在停服后删除。`--reset-vault` 归档历史并创建新 Vault 身份，也会产生新链接。
-
 ## 命令行
 
-使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，必须提供 `--vault PATH` 和 `--share-key KEY`，包括初始化 / 重置命令。读取默认或显式指定的配置文件时，`share_key` 仍为可选，CLI 可覆盖文件配置。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
+使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，必须提供 `--vault PATH`。`share_key` 在配置文件和 CLI 中均为可选。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。
 
 ```sh
-# 完全通过命令行启动临时 Vault，目录必须已经存在
-# 保存秘密值供后续启动复用；临时 Vault 的身份仍会在重启时改变
+# 完全通过命令行启动 Vault，目录必须已经存在
+# 保存秘密值供后续启动复用，链接保持不变；CRDT 历史每次重新建立
 share_key=$(openssl rand -hex 32)
 ./target/debug/celestite-server --no-config \
   --listen 127.0.0.1:7437 \
   --allowed-origin http://localhost:1420 \
   --vault ./notes --name '我的笔记' \
-  --share-key "$share_key" --ephemeral
+  --share-key "$share_key"
 
 # 覆盖部分配置
 ./target/debug/celestite-server --config ./config.toml \
@@ -60,24 +57,20 @@ share_key=$(openssl rand -hex 32)
   --read-only false
 ```
 
-| 参数                      | 行为                                                             |
-| ------------------------- | ---------------------------------------------------------------- |
-| `-c, --config FILE`       | 读取指定 TOML 文件                                               |
-| `--no-config`             | 不读取默认配置文件，与 `--config` 互斥                           |
-| `--public-url URL`        | 覆盖启动链接的公开 HTTP(S) 基址；不改变监听地址                  |
-| `--listen IP:PORT`        | 覆盖监听地址；内置默认 `127.0.0.1:7437`                          |
-| `--allowed-origin ORIGIN` | 可重复；整体替换配置中的来源列表                                 |
-| `--clear-allowed-origins` | 清空显式来源列表；server 自身来源仍允许                          |
-| `--web-dir DIRECTORY`     | 覆盖静态 Web 资源目录                                            |
-| `--no-web`                | 禁用配置中的静态 Web 资源目录                                    |
-| `--vault PATH`            | 指定或覆盖唯一 Vault 的目录                                      |
-| `--name NAME`             | 覆盖显示名称；默认 `Vault`                                       |
-| `--share-key KEY`         | 设置分享秘密值；未加载配置文件时必须提供                         |
-| `--read-only true\|false` | 覆盖 Vault 的只读状态                                            |
-| `--state-dir DIRECTORY`   | 设置 Vault 的私有状态目录，使用 `history.redb`；覆盖临时历史配置 |
-| `--ephemeral`             | 明确使用临时内存历史，清除配置中的状态目录                       |
-| `--init-vault`            | 首次初始化历史，完成后退出；已有数据库报错                       |
-| `--reset-vault`           | 归档旧历史，创建新身份，完成后退出                               |
+| 参数                      | 行为                                            |
+| ------------------------- | ----------------------------------------------- |
+| `-c, --config FILE`       | 读取指定 TOML 文件                              |
+| `--no-config`             | 不读取默认配置文件，与 `--config` 互斥          |
+| `--public-url URL`        | 覆盖启动链接的公开 HTTP(S) 基址；不改变监听地址 |
+| `--listen IP:PORT`        | 覆盖监听地址；内置默认 `127.0.0.1:7437`         |
+| `--allowed-origin ORIGIN` | 可重复；整体替换配置中的来源列表                |
+| `--clear-allowed-origins` | 清空显式来源列表；server 自身来源仍允许         |
+| `--web-dir DIRECTORY`     | 覆盖静态 Web 资源目录                           |
+| `--no-web`                | 禁用配置中的静态 Web 资源目录                   |
+| `--vault PATH`            | 指定或覆盖唯一 Vault 的目录                     |
+| `--name NAME`             | 覆盖显示名称；默认 `Vault`                      |
+| `--share-key KEY`         | 可选分享秘密值；省略时生成临时链接              |
+| `--read-only true\|false` | 覆盖 Vault 的只读状态                           |
 
 命令行目录路径以**当前工作目录**为基准，配置文件中的路径以**配置文件所在目录**为基准。覆盖目录保留显示名称、秘密值与只读状态，除非另行覆盖。路径和秘密值中的 `=` 为普通字符，不再使用 `ID=VALUE`。包含空格的参数应加引号。重复的单值参数、互斥设置都会报错；只有允许来源列表接受重复参数。
 
@@ -128,7 +121,7 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "vaultIdentity": {
     "id": "描述接口的 id",
     "historyId": "描述接口的 historyId"
@@ -136,19 +129,19 @@ notify 提供粗粒度提示，服务写操作也主动发送提示。监听不�
 }
 ```
 
-host 返回 `hello`（`sessionId`），然后按文档发送 `document`（元数据、`packet`、分配的十进制 `writerId`、递增 `sequence`），在快照补齐屏障后发送 `ready`。文本来自 CRDT 包；元数据不重复发送正文，`savedContent` 仅在磁盘基线改变时发送。首次传快照，之后主动广播增量，覆盖未打开文件。慢消费者丢失提示后重新补齐；无法导出已提交历史时结束会话，客户端冻结并保留正文。
+host 返回 `hello`（`sessionId`）和 `ready`，握手不加载文件或发送文档。客户端 `open` 时，host 创建或复用对应 Buffer，分配该会话的十进制 `writerId` 并返回完整快照，同时订阅后续变化。快照与订阅在同一串行边界建立；只有本会话打开过的 Buffer 才会推送 `document`（元数据、`packet`、writer 和递增 `sequence`）。文本来自 CRDT 包；元数据不重复发送正文，`savedContent` 仅在初次打开或磁盘基线改变时发送。慢消费者只补齐其已订阅 Buffer；无法导出历史时结束会话，客户端冻结并保留正文。
 
 请求均为 `{ sessionId, requestId, method, ...参数 }`，响应为 `{ kind: "reply", requestId, result }` 或 `error`：
 
-| method  | 参数                           | 行为                                                                             |
-| ------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| open    | path                           | 取得文档完整历史及元数据；非文本通过普通文件 API 下载                            |
-| updates | id, packet, version, operation | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后持久提交并确认 |
-| save    | id, version                    | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                     |
-| probe   | id, version                    | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                             |
-| ping    | —                              | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                             |
+| method  | 参数                           | 行为                                                                               |
+| ------- | ------------------------------ | ---------------------------------------------------------------------------------- |
+| open    | path 或 id，二选一             | 按路径创建 / 复用 Buffer，或重连时按 ID 加入；返回快照与元数据                     |
+| updates | id, packet, version, operation | 按会话递增序号提交本 writer 的增量；完整依赖、身份和 writer 验证后在内存接受并确认 |
+| save    | id, version                    | 指定已见因果版本，单独条件写回物理文件；版本过期先补齐再重试                       |
+| probe   | id, version                    | 查询已提交历史是否包含给定因果检查点，核对丢失的确认                               |
+| ping    | —                              | 返回 pong；host 每 10 秒发送 heartbeat，超时终止会话                               |
 
-`document`、`tree` 和 `heartbeat` 为主动通知；`tree` 使文件树失效，实际目录仍通过 HTTP 查询。会话缓存最近 256 条操作回执，同序号同包重发返回原回执，变更载荷或跳号被拒绝；回执过期用因果检查点核对。重连分配新会话与 writer，拒绝旧 writer 的未提交操作，不自动重放。已确认操作的恢复依据持久 CRDT 历史，临时测试 Vault 的回执仅代表内存提交。
+`document`、`tree` 和 `heartbeat` 为主动通知；`tree` 使文件树失效，实际目录仍通过 HTTP 查询。除 `open` 和 `ping` 外，命令要求目标 Buffer 已在本会话打开。会话缓存最近 256 条操作回执，同序号同包重发返回原回执，变更载荷或跳号被拒绝；回执过期用因果检查点核对。重连分配新会话与 writer，按 ID 重新打开此前订阅的 Buffer，拒绝旧 writer 的未提交操作，不自动重放。回执只表示内存接受，server 重启后旧历史失效。
 
 客户端的个人撤销也生成自己的 CRDT 增量。输入同步不隐式保存普通文件；保存可能写回已经合入的其他 writer 修改。外部文件变化按磁盘历史分支合并，客户端不能用“丢弃”清除所有人的共享未保存历史。客户端导入保留当前 writer / 撤销，UI 映射待确认输入和选区，IME 期间暂缓导入；断线时整个 Vault 工作区（文件树与编辑区）显示遮罩并禁止交互，重新认证核对历史身份并从 host 重建会话；未确认输入可导出正文或明确丢弃，不自动重放。`probe` 保留为调试与因果检查接口，首期 Web 重连流程不使用它恢复旧输入。
 
@@ -158,7 +151,7 @@ host 返回 `hello`（`sessionId`），然后按文档发送 `document`（元数
 
 | 方法 | 路径                                  | 请求 / 行为                                                                                     |
 | ---- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| GET  | `/documents`                          | 扫描整个目录，返回可编辑文本状态，包括未在 UI 打开的文件                                        |
+| GET  | `/documents`                          | 核对并返回已加载的 Buffer，不扫描或加载未打开文件                                               |
 | POST | `/documents/open`                     | `{ "path": "a.md" }`，登记文件并返回稳定文档 ID 与状态                                          |
 | GET  | `/documents/<document>`               | 正文、因果版本、撤销与保存状态；重新核对磁盘                                                    |
 | GET  | `/documents/<document>/snapshot`      | 完整 `SyncPacket`，新副本从这里加入同一历史                                                     |
@@ -200,40 +193,28 @@ host 有尚未写回的正文时，客户端丢弃返回冲突，保留 host 修
 
 协作客户端各自从完整快照建立 `Buffer`，使用新的 writer，只发送命令结果中的本地 CRDT 操作。重复和乱序包按 CRDT 语义处理；依赖未齐的包保留，后续补齐。个人撤销也由客户端产生操作，不请求 server 代为撤销。直接向此 HTTP API 发出本地编辑 / 撤销命令会使用 server writer，因此该入口用于无头控制与开发测试，而非分配协作者身份。
 
-### 持久化和磁盘保存
+### 内存历史与磁盘保存
 
-每个正式 Vault 在 `[vault]` 中配置 `state_dir`；正常启动仅打开已有历史。以下两条命令分别初始化和运行：
+server 的 Buffer、CRDT 历史、待补齐依赖、磁盘基线和操作意图只保留在内存中。启动无需状态目录或历史初始化：
 
 ```sh
-mkdir -p /tmp/celestite-demo/notes /tmp/celestite-demo/state/notes
+mkdir -p /tmp/celestite-demo/notes
 share_key=$(openssl rand -hex 32)  # 保存该值，后续启动复用
 cargo run -p celestite-server -- --no-config \
   --vault /tmp/celestite-demo/notes \
-  --share-key "$share_key" \
-  --state-dir /tmp/celestite-demo/state/notes --init-vault
-cargo run -p celestite-server -- --no-config \
-  --vault /tmp/celestite-demo/notes \
-  --share-key "$share_key" \
-  --state-dir /tmp/celestite-demo/state/notes
+  --share-key "$share_key"
 
 # 仓库内 ../notist/docs 的开发入口：
-just init-notist "$share_key"  # 首次执行，已有历史时拒绝覆盖
 just serve-notist "$share_key"
 ```
 
-状态目录必须存在，不能与 Vault 或静态资源目录重叠；符号链接别名按实际路径校验。一个 profile 同时只允许一个 host 打开。状态库包含稳定 Vault / 文档 / host 实例身份、初始快照、追加更新日志、pending 依赖包、磁盘基线和恢复意图；每次历史事务提交成功后才报告 `durableVersion`。更改显示名称，保留相同物理目录与私有状态目录时保留内部身份。更改物理目录则拒绝恢复，需要另行迁移。
+描述接口始终报告 `persistentHistory: false`，文档的 `durableVersion` 为 null。`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）。内存历史确认不等于写回 `.md`，`/save` 是独立动作。没有可见文本变化的导入也可能推进因果版本；等待依赖的包不会被虚报为已应用版本。
 
-未指定状态目录时拒绝启动。临时测试可显式配置 `ephemeral = true` 或 `--ephemeral`：重启建立新身份和历史，`durableVersion` 为 null。初始化 / 重置是一次性 CLI 操作，不能配置为每次启动执行。目录与参数会在打开或初始化历史之前统一校验。
+server 重启丢弃未写回正文和历史，并生成新的 `historyId` 与实例身份；打开文件时从当前磁盘字节建立新文档 ID 和历史。旧客户端保留内存正文并拒绝重连到新历史，需要保留正文后重新打开连接。同一进程内重连可以恢复 host 已接受的编辑，包括回执丢失的操作。
 
-正常恢复遇到数据库缺失、损坏、身份 / schema / 根目录不匹配时失败，不从普通文件静默重建。`--init-vault` 使用独占创建，不覆盖任何已有文件。`--reset-vault` 要求原 profile 可校验且没有其他 owner，先将完整旧数据库移入同一状态目录的 `reset-<uuid>/history.redb`，同步归档目录后创建新身份；普通文件保持原样，未写回的旧正文仍在归档内。重置中断或失败时保留归档和任何已创建文件，不自动推断恢复；损坏库应先单独保留并处理，不通过 reset 忽略损坏。
+保存通过哈希条件检查与暂存替换写文件，core 在进程内保留保存阶段和回执。结果不确定时暂停自动处理并保留正文；这些意图不跨重启恢复。普通文件 IO 不提供外部写入来源证明或跨程序 CAS，也不重放崩溃前的目录操作。
 
-迁移旧配置时，将 `[[vaults]]` 改为 `[vault]`，删除 `id`，每个 Vault 使用独立进程。旧 `[server].state_dir` 已删除；先停服并备份，将原 `<配置 id>.redb` 移入该 Vault 的私有状态目录并命名为 `history.redb`，在 `[vault].state_dir` 指定目录。保留原物理 Vault 根目录与数据库即可恢复原内部身份和历史，无需重新初始化。
-
-`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）；`durableVersion` 是已提交历史的应用版本。持久化历史不等于写回 `.md`，`/save` 是显式动作。没有可见文本变化的导入也可能推进因果版本。等待依赖的包已经写入日志，但不会被虚报为已应用版本。
-
-保存先持久化 Prepared 意图，再持久化 Started 阶段，随后通过哈希条件检查与暂存替换写文件，最后持久化回执。恢复 Prepared 时可以确定该次文件 IO 尚未开始；Started / 旧格式意图仅在磁盘字节匹配目标时完成回执，否则保留意图并暂停自动处理，包括磁盘仍为旧内容的情况。后端能证明失败发生在投影写入前时，core 先持久化回退至 Prepared，允许安全重试。目标匹配属于普通文件协调的恢复契约，不提供外部写入来源证明或跨程序 CAS。日志提交失败会使该宿主停止后续写入，并在状态中保留最后成功提交的版本、报告 `persistenceError`；应核对状态，不能把失败响应视为已保存。
-
-host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改合并，存储 Backend 只负责 IO。core 保留磁盘的精确字节和历史版本；外部变化从该版本 fork，以独立 writer 生成有时间预算的 Unicode 细粒度 diff，再合入当前正文。连续观察沿磁盘分支推进；操作 journal 与新磁盘基线在同一事务中提交，提交成功后才更新活动文档，保留其 writer、个人撤销和订阅。重复提示及自身写回不生成额外文本操作，格式变化仅更新基线；超时、非法正文与不确定写回不会退化为整篇替换。启动时先注册递归监听，再发现全库文本；运行时由有界合并的监听唤醒后台串行核对，每 30 秒全库观察兜底漏报。访问事件不触发协调，重复提示及自身写回不会产生新文本操作。单个无效 / 不可读文件不会阻止其他文件；历史提交失败仍冻结 core，监听不自动重试历史。外部删除保留原文档、未保存正文和历史并报告缺失；外部移动不按相同内容推断身份，稳定移动通过 host API 完成。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持文档 ID；删除保留历史，延迟保存不能重建旧路径。
+host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改合并，Backend 只负责 IO。core 保留磁盘的精确字节和历史版本；外部变化从该版本 fork，以独立 writer 生成有时间预算的 Unicode 细粒度 diff，再合入当前正文。连续观察沿磁盘分支推进，保留活动 Buffer 的 writer、个人撤销和订阅。重复提示及自身写回不生成额外文本操作，格式变化仅更新基线；超时、非法正文与不确定写回不会退化为整篇替换。启动注册递归监听；运行时由有界合并的监听唤醒后台核对，每 30 秒核对已加载 Buffer 以兜底漏报，不加载未打开文件。目录变化仍向全部客户端提示。单个无效 / 不可读文件不会阻止其他文件。外部删除保留原文档、未保存正文和历史并报告缺失；外部移动不按相同内容推断身份，稳定移动通过 host API 完成。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持已加载文档 ID；删除保留进程内历史，延迟保存不能重建旧路径。
 
 ### 文档变化通知
 
@@ -241,21 +222,21 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 待协调时保存返回 `409 FilesystemReconciliationPending`，计算超时返回 `409 FilesystemDiffTimeout`，两者都携带文件路径并保留历史和磁盘内容。相同失败输入从 30 秒退避至最多 5 分钟；新内容绕过退避。`POST /documents/<document>/retry-observation` 或 WebSocket `retry_observation`（参数 `id`）立即重新排队，返回当前文档状态；重试只协调，不写回物理文件，也允许只读 Vault 使用。
 
-`GET /<key>/api/v1/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全量文档元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已提交 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文。
+`GET /<key>/api/v1/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全部已加载 Buffer 元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vaultIdentity` 和 `persistentHistory`。各条目包含文档 ID、路径、已接受 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文，也不加载其他文件。
 
-初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全量状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId`，保留 Vault / 文档历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容；私有历史提交失败不会把未提交正文版本宣布为已确认版本；此时 `/snapshot` 与 `/updates` 暂停导出，避免通知后的一次失败提交被后续拉取当作已确认历史。
+初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全部驻留状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId` 和历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容。
 
 描述接口报告 `documentEvents: true`。此通道是状态核对提示，不确认编辑请求，也不提供会话有效性、重发去重或在线租约；在线编辑由 WebSocket 会话协议提供这些约束。原 `/events` 继续提供文件树提示。
 
 ### 当前范围
 
-已实现独立文本 CRDT 与单个 server 的文件协调。`/documents` 当前扫描并加载全部合格文本，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、日志压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
+已实现独立文本 CRDT 与单个 server 的文件协调。打开文本时才建立 Buffer，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。当前关闭标签不取消订阅，已加载的 host Buffer 保留到进程结束，以保留已接受但未保存的编辑。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、历史压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
 
-移动 / 删除与 redb 元数据不是跨资源原子事务，正常重启保留结果，core 先记录目录操作意图以恢复崩溃窗口；存在源 / 目标歧义时停止恢复并保留文件与历史。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入保留为无头 / 调试传输，SSE 保留为变化提示；远端 Web 使用自己的 Rust WASM core 和实时 WebSocket 会话。Vim、Tree-sitter、LSP 尚未接入。
+移动 / 删除的物理结果保留在文件系统中，内存元数据与目录操作不构成跨资源原子事务。外部程序 rename 的稳定身份识别暂未实现。HTTP 导入保留为无头 / 调试传输，SSE 保留为变化提示；远端 Web 使用自己的 Rust WASM core 和实时 WebSocket 会话。
 
 ## 多实例与可视化调试
 
-多个独立客户端可从同一快照加入，通过 `/updates` 与 `/import` 交换各自 writer 的历史。生产连接使用 WebSocket 会话、心跳和主动广播；调试页保留 HTTP 主动拉取，不提供在线成员 / presence 列表。客户端个人撤销在自己的 core 上执行，不能用服务端 `/undo` 替代。
+多个独立客户端可从同一快照加入，通过 `/updates` 与 `/apply` 的 import 命令交换各自 writer 的历史。生产连接使用 WebSocket 会话、心跳和主动广播；调试页通过目录元数据列出文件，选择文档后才打开，保留 HTTP 主动拉取，不提供在线成员 / presence 列表。客户端个人撤销在自己的 core 上执行，不能用服务端 writer 的 undo 命令替代。
 
 Web 提供 `/debug/sync` 调试页，显示 host 与最多 6 个独立 WASM core，支持手动 / 每秒同步、暂停传输、个人撤销、显式保存、版本与提交回执检查。开发时使用 `http://localhost:1420/debug/sync`；构建后配置 `--web-dir web/dist`，也可从 server 的同一路径打开。详见 [Web 调试说明](../../web/README.md#同步调试页)。调试页用现有文档 API，沿用令牌、来源和只读检查。
 
@@ -275,7 +256,7 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 
 浏览器测试启动临时真实 server，使用临时目录和随机端口。默认寻找 `target/debug/celestite-server`，可以用 `CELESTITE_SERVER_BIN` 指定其他构建产物；自定义 Chromium 路径用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`。覆盖二进制文件、目录操作、版本冲突、外部监听、认证、连接持久化、Vault 切换和撤销历史、只读与移动端。
 
-无头 Rust 测试使用临时目录、随机端口及独立 redb profile，覆盖双副本离线合并、个人撤销、未打开文件发现、过期版本、非法 / 跨历史导入、乱序更新重启补齐、未保存正文恢复、外部修改冲突、移动 / 删除、BOM / CRLF 与只读约束。另有写完文件但回执未写时的恢复契约测试。
+无头 Rust 测试使用临时目录和随机端口，覆盖独立副本合并、个人撤销、按需打开与会话订阅、过期版本、非法 / 跨历史导入、进程内乱序更新补齐、重启丢弃未保存历史、外部修改、移动 / 删除、BOM / CRLF 与只读约束。
 
 ## 预览 package 资源
 

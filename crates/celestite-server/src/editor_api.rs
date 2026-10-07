@@ -4,15 +4,15 @@ use crate::vault::{
     documents::{DocumentState, Documents},
     fs::{ChangeHint, FsVault, Result, VaultError},
 };
-use crate::{ApiError, HostedVault, RemoteAccess, ServerState, failure};
+use crate::{failure, ApiError, HostedVault, RemoteAccess, ServerState};
 use axum::{
-    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, State},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
     routing::{get, post},
+    Extension, Json, Router,
 };
 use celestite_core::{BufferCommand, EditorMutation, SyncPacket, Version};
 use serde::Deserialize;
@@ -276,7 +276,7 @@ mod tests {
     use crate::testing::Host;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     async fn request(router: &Host, method: &str, path: &str, body: Value) -> Value {
@@ -329,7 +329,6 @@ mod tests {
                 vault: crate::VaultConfig {
                     name: "Notes".into(),
                     path: root.path().into(),
-                    ephemeral: true,
                     ..Default::default()
                 },
             },
@@ -338,8 +337,7 @@ mod tests {
         .unwrap();
         let stopping = server.shutdown.clone();
         let router = Host::new(server);
-        let docs = request(&router, "GET", "/documents", Value::Null).await;
-        let mut state = docs[0].clone();
+        let mut state = request(&router, "POST", "/documents/open", json!({"path":"a.md"})).await;
         let id = state["id"].as_str().unwrap().to_owned();
         let response = router
             .router
@@ -399,11 +397,9 @@ mod tests {
             state["snapshot"]["version"]
         );
         stopping.send_replace(true);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), body.frame())
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .unwrap()
+            .is_none());
     }
 }

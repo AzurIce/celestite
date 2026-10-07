@@ -2,7 +2,7 @@
 
 本文描述 Web 当前实现的状态归属、存储、加载范围与远端请求流程。目标架构见 [architecture.md](../architecture.md)，实施阶段见 [roadmap.md](../roadmap.md)。行为变化时同步维护本文。
 
-当前远端 Vault 的 UI 按打开的标签建立编辑 buffer，但 Worker 会同步 host 已登记的全部文本历史；目录树按展开范围读取条目，非文本内容按需取得。客户端文本副本驻留内存，没有 OPFS 持久化或普通目录镜像。
+远端 Vault 在打开文本时创建或复用 host Buffer，并在客户端 Worker 中从快照建立副本；连接本身不加载正文。目录树按展开范围读取条目，非文本内容按需取得。host 和客户端的 CRDT 历史均驻留内存，普通文件只保存在 host 目录。
 
 ## 实例与职责
 
@@ -55,7 +55,7 @@ UI 的正文是 core 已接受正文与待确认输入的投影；已接受正�
 
 一个 server 进程只托管一个 Vault，Web 可连接多个独立 server。远端连接以 `https://host/<key>` 为基址，接口追加 `/api/v1/...`。不同分享即使指向同一 Vault，也保留独立实例和权限。宿主启动时固定提供 readonly / edit 两条链接；修改 `share_key` 并重启同时轮换这对链接。宿主退出终止 WebSocket 与 SSE，客户端冻结工作区并保留待确认正文。管理列表显示服务器与有效权限，完整链接通过明确的复制操作取得。
 
-host 的历史是否跨重启保留取决于服务端是否配置持久化存储，描述响应通过 `persistentHistory` 报告。历史提交与普通文件保存分别确认：host 已确认但尚未写回普通文件的正文，在启用持久化历史时仍可跨 host 重启恢复。
+host 不使用私有状态库，描述响应的 `persistentHistory` 为 false。历史确认与普通文件保存分别完成：已确认但尚未写回的正文只保留到 host 进程结束。每次启动生成新的 `historyId`；配置固定 `share_key` 和相同根目录可保留链接，但不能恢复旧历史。
 
 客户端刷新后从 host 重建会话。未获 host 确认的输入没有客户端 OPFS 恢复副本；它们只能在当前页面仍存活时保留和导出。
 
@@ -77,17 +77,17 @@ expanded          = {"notes"}
 
 ### 文本历史
 
-host 启动时恢复私有历史，并递归核对普通目录，尝试将可编辑文本载入 core；监听和定期核对继续覆盖未打开文件。非 UTF-8 文本、超过当前文本限制的文件等不会作为新的可编辑文本加入。
+host 启动时没有已加载文档，目录列表和文件监听不创建 Buffer。首次打开文本时读取文件、验证编码与大小并建立 CRDT，后续打开复用该 Buffer；监听和定期核对只协调已加载 Buffer。非 UTF-8 文本、超过当前文本限制的文件等不会作为可编辑文本加入。
 
-客户端初次连接收到 host 已登记文档的 CRDT 快照，通常覆盖全库受支持文本。其后变化持续向各连接推送，不以客户端打开的标签作为筛选条件。客户端 Worker 保存这些文档的正文、历史与 host 元数据；`MemoryBackend` 同时保存内存中的历史记录。
+客户端初次连接只收到 `hello` 和 `ready`。打开标签时发送 `open {path}`，取得对应快照、元数据和会话 writer，Worker 建立副本后创建 UI buffer。server 只向打开过该 Buffer 的会话推送其变化；`MemoryBackend` 保存这些副本的内存历史记录。
 
-打开标签后，主线程才建立该文档的视图记录与编辑 buffer。关闭标签移除视图记录和 buffer，Worker 中的文档继续保留并同步；当前没有文档级卸载或取消同步订阅。
+关闭标签移除视图记录和 UI buffer，Worker 中的文档继续保留并同步；host 的 Buffer 也继续驻留，保留已接受但未保存的修改。当前没有文档级卸载或取消订阅。
 
-因此，文本内存占用随已同步的库内容与历史增长，不只随标签数量增长。当前初始同步需要完成后才开放交互，尚未实现活动文档优先、其他正文后台补齐或有界历史工作集。
+文本内存占用随本进程曾打开的文档及其历史增长，不随全库正文增长，也不只随当前标签数量增长。连接无需等待整库快照；有界工作集和 Buffer 回收尚未实现。
 
 ### 非文本与预览资源
 
-图片、PDF 等文件不会随初始文本快照全量传输，下载或使用资源时再读取字节。预览资源通过只读文件访问取得；组件资源可能按所需目录递归读取，并缓存任务资源快照。这些资源读取独立于文件树的展开范围，也不建立普通目录镜像。
+图片、PDF 等文件在下载或使用资源时才读取字节。预览资源通过只读文件访问取得；组件资源可能按所需目录递归读取，并缓存任务资源快照。这些资源读取独立于文件树的展开范围，也不建立 CRDT 或普通目录镜像。
 
 ## 远端请求通道
 
@@ -100,7 +100,6 @@ flowchart LR
   S[server 请求入口]
   H[host EditorCore]
   B[NativeBackend]
-  P[可选私有历史存储]
   F[普通文件目录]
   U <-->|Worker RPC 与事件| W
   W <--> C
@@ -110,7 +109,6 @@ flowchart LR
   S <--> H
   S <--> F
   H <--> B
-  B <--> P
   B <--> F
 ```
 
@@ -124,6 +122,7 @@ UI 调用统一的文档和文件接口，经 Worker RPC 到编辑 Worker。远�
 | 读取目录           | HTTP `GET /directory?path=…`                         | 直接子项，更新目录缓存                                                 |
 | 查询条目信息       | HTTP `GET /stat?path=…`                              | 类型、大小、修改时间或不存在                                           |
 | 打开文本标签       | WebSocket `open {path}`                              | 文档元数据、CRDT 快照与 writer，建立 UI buffer                         |
+| 重连已加入的文本   | WebSocket `open {id}`                                | 按身份恢复订阅，路径移动或复用不混淆历史                               |
 | 编辑、撤销、重做   | WebSocket `updates {id, packet, version, operation}` | host 提交确认，并推送文档变化                                          |
 | 保存文本           | WebSocket `save {id, version}`                       | host 按版本写回文件，返回文档与保存状态                                |
 | 查询编辑是否已提交 | WebSocket `probe {id, version}`                      | host 是否已包含指定因果版本；协议支持，当前生产 Web 编辑流程不主动调用 |
@@ -142,11 +141,11 @@ UI 调用统一的文档和文件接口，经 Worker RPC 到编辑 Worker。远�
 
 1. HTTP 读取 Vault 描述；创建 Worker、内存后端与客户端 core。
 2. WebSocket upgrade 前根据 URL 的完整 key 校验分享授权；首条握手提交协议版本与 Vault / 历史身份，server 校验后返回会话 ID。
-3. server 逐文档发送初始快照和分配的 writer，避免一次构建整库的初始 JSON 快照集合。
-4. 在 host 的同一串行边界核对已发送版本、补齐传输期间变化并建立后续订阅，随后发送 `ready`。
-5. 客户端整批校验初始快照、补齐增量、最终路径和删除状态，再原子替换会话；全部成功后开放交互。删除记录不占用活动路径，重连失败保留旧正文、writer、撤销和预览订阅。
+3. server 建立变化监听并发送 `ready`，不发送文档快照。
+4. 用户打开文件时发送 `open {path}`；host 在同一串行边界创建或复用 Buffer、分配 writer 并建立该会话的订阅，返回快照。
+5. 客户端导入快照与元数据，建立对应编辑视图后开放文本编辑，后续变化按版本增量推送。
 
-server 逐文档发送不代表客户端只驻留一个文档：客户端传输层会收集初始帧，直到 `ready` 后交给 core 导入。连接完成后已有的 Worker 文档也不会自动变成打开的 UI 标签。
+同一 host 历史内重连时，客户端在 `ready` 后按 ID 重新打开此前加入的 Buffer。快照、最终路径与删除状态整批校验后原子替换会话；删除记录不占用活动路径，失败保留旧正文、writer、撤销与预览订阅。
 
 ### 编辑与保存
 
@@ -155,7 +154,7 @@ UI 即时显示输入
   → Worker core 接受编辑并生成 CRDT 增量
   → WebSocket updates
   → host 校验会话、writer 与因果依赖，合入并提交历史
-  → 返回提交确认，向连接的客户端推送文档变化
+  → 返回内存接受确认，向已打开该 Buffer 的客户端推送变化
   → 客户端 core 导入，更新已打开标签的正文投影
 ```
 
@@ -181,7 +180,7 @@ HTTP 目录或普通文件操作
 
 非文本替换是完整字节版本的条件写入，不合并二进制内容。一个客户端成功替换后，另一个客户端使用旧 ETag 替换会收到冲突。目录操作由 host 排序执行，例如移动目标已存在时返回错误；当前目录操作没有 Catalog CRDT 历史。
 
-host 普通目录的外部修改由文件监听提示和定期核对发现。文本修改通过 host 的文件系统桥接转为历史操作，再沿 WebSocket 推送；目录与普通文件变化提示使客户端重新查询相关状态。
+host 普通目录的外部修改由文件监听提示和定期核对发现。已加载 Buffer 的文本修改通过文件系统桥接转为历史操作，再沿 WebSocket 推送给订阅者；未加载文件只提示目录变化，打开时读取最新字节。
 
 ## 关闭与重连
 
@@ -193,8 +192,9 @@ host 普通目录的外部修改由文件监听提示和定期核对发现。文
 | 重新连接                     | 核对身份后采用 host 快照重建活动历史，分配新 writer，清空个人撤销；不重放旧会话操作 |
 | 删除远端连接记录             | 未确认输入阻止关闭；确认后释放实例，不隐式保存或删除 host 文件                      |
 | 页面刷新、关闭或 Worker 终止 | 客户端内存副本结束；下次打开从 host 建立新会话                                      |
+| host 重启                    | 未保存历史丢失；旧客户端保留正文并拒绝复用，新连接按需从磁盘建立历史                |
 
-有未确认输入时，重新连接需要先导出正文或明确选择丢弃。迟到的旧连接回复不导入新会话；host 已提交但回执丢失的编辑可以随新会话历史返回。客户端内存中的历史提交不代表本机持久化成功，host 回执也不改变这一点。
+有未确认输入时，重新连接需要先导出正文或明确选择丢弃。迟到的旧连接回复不导入新会话；同一 host 进程中已接受但回执丢失的编辑可以随新会话历史返回。host 已重启时历史身份改变，旧客户端需保留正文后重新打开连接。客户端和 host 的内存接受均不代表普通文件已保存。
 
 ## 实现入口
 
@@ -205,5 +205,5 @@ host 普通目录的外部修改由文件监听提示和定期核对发现。文
 - [RemoteEditorHost](../../web/src/lib/editor/remote/host.ts)、[RemoteTransport](../../web/src/lib/editor/remote/transport.ts)：远端命令、快照导入、请求关联与重连。
 - [HTTP 文件适配器](../../web/src/lib/vault/http.ts)、[预览资源读取](../../web/src/lib/editor/preview/resources.ts)：普通文件访问与只读资源。
 - [BrowserBackend](../../crates/celestite-core/src/browser.rs)、[MemoryBackend](../../crates/celestite-core/src/memory.rs)：客户端存储实现。
-- [EditorCore](../../crates/celestite-core/src/editor.rs)：历史恢复、文件发现、编辑、身份与保存。
+- [EditorCore](../../crates/celestite-core/src/editor.rs)：Buffer 集合、按需打开、编辑、身份与保存。
 - [server 同步](../../crates/celestite-server/src/sync.rs)、[HTTP 文件入口](../../crates/celestite-server/src/lib.rs)、[文件核对](../../crates/celestite-server/src/reconcile.rs)：host 协作与普通目录协调。
