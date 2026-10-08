@@ -258,8 +258,9 @@ read_only = true
             .unwrap()
             .load(cwd.path())
             .unwrap();
-        assert_eq!(config.vault.path, base.join("notes"));
-        assert_eq!(config.server.web_dir, Some(base.join("assets")));
+        let config_base = base.canonicalize().unwrap();
+        assert_eq!(config.vault.path, config_base.join("notes"));
+        assert_eq!(config.server.web_dir, Some(config_base.join("assets")));
         assert!(config.vault.share_key.is_none());
         let text = std::fs::read_to_string(&file).unwrap();
         std::fs::write(&file, text + &format!("share_key = \"{KEY}\"\n")).unwrap();
@@ -283,7 +284,10 @@ read_only = true
             args.extend_from_slice(extra);
             Cli::try_parse_from(args).unwrap().load(cwd.path()).unwrap()
         };
-        assert_eq!(load(&[]).vault.path, cwd.path().join("notes"));
+        assert_eq!(
+            load(&[]).vault.path,
+            cwd.path().canonicalize().unwrap().join("notes")
+        );
         let config = load(&["--no-web", "--clear-allowed-origins"]);
         assert!(config.server.web_dir.is_none() && config.server.allowed_origins.is_empty());
         let config = load(&["--no-config", "--vault", "other", "--share-key", KEY]);

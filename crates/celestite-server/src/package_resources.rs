@@ -380,8 +380,11 @@ mod tests {
     #[tokio::test]
     async fn sibling_packages_use_notist_configuration_and_stay_out_of_document_history() {
         let repository = tempfile::tempdir().unwrap();
-        let root = repository.path().join("docs");
-        let package = repository.path().join("packages/widgets");
+        // Requests use the same canonical identities exposed by the server;
+        // macOS temporary paths commonly pass through the /var symlink.
+        let repository_root = repository.path().canonicalize().unwrap();
+        let root = repository_root.join("docs");
+        let package = repository_root.join("packages/widgets");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(package.join("components/panel")).unwrap();
         std::fs::write(
@@ -395,7 +398,7 @@ mod tests {
             "[package]\nname = 'widgets'\n[dependencies]\nkatex = {path = '../katex'}\n",
         )
         .unwrap();
-        let transitive = repository.path().join("packages/katex");
+        let transitive = repository_root.join("packages/katex");
         std::fs::create_dir_all(&transitive).unwrap();
         std::fs::write(
             transitive.join("Notist.toml"),
@@ -426,7 +429,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let router = Host::new(crate::build_server(config, repository.path()).unwrap());
+        let router = Host::new(crate::build_server(config, &repository_root).unwrap());
         let context = serde_json::json!({"documentPath": "a.not", "overlays": {}});
         let declaration = call(&router, "resources", serde_json::json!({"context":context, "request":{"path":package.join("lib.notc"), "read":true}})).await;
         assert_eq!(declaration.status(), StatusCode::OK);
@@ -457,7 +460,7 @@ mod tests {
         );
         for path in [
             package.join("private.txt"),
-            repository.path().join("secret.txt"),
+            repository_root.join("secret.txt"),
             package.join("components/../private.txt"),
         ] {
             let denied = call(

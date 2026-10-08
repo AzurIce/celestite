@@ -10,8 +10,6 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-const TEMP_PREFIX: &str = ".celestite-tmp-";
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultError {
@@ -81,7 +79,7 @@ pub fn validate_path(path: &str) -> Result<()> {
         || (!path.is_empty()
             && path
                 .split('/')
-                .any(|p| p.is_empty() || p == "." || p == ".." || p.starts_with(TEMP_PREFIX)))
+                .any(|p| p.is_empty() || p == "." || p == ".."))
     {
         return Err(VaultError::new(
             "InvalidPath",
@@ -186,9 +184,6 @@ impl FsVault {
                     path,
                 )
             })?;
-            if name.starts_with(TEMP_PREFIX) {
-                continue;
-            }
             let child = if path.is_empty() {
                 name
             } else {
@@ -258,15 +253,11 @@ impl FsVault {
         expected: Option<&str>,
     ) -> Result<String> {
         let (parent, name) = self.parent(path)?;
+        let mut options = OpenOptions::new();
+        options.write(true);
         match mode {
             "create" => {
-                if self.stat(path)?.is_some() {
-                    return Err(VaultError::new(
-                        "AlreadyExists",
-                        "Target already exists",
-                        path,
-                    ));
-                }
+                options.create_new(true);
             }
             "replace" => {
                 self.require_file(path)?;
@@ -279,6 +270,7 @@ impl FsVault {
                         ));
                     }
                 }
+                options.truncate(true);
             }
             _ => {
                 return Err(VaultError::new(
@@ -288,29 +280,12 @@ impl FsVault {
                 ))
             }
         }
-        let temporary = format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4());
-        let result = (|| {
-            let mut file = parent
-                .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
-                .map_err(|e| io_error(e, path))?;
-            if mode == "replace" {
-                let permissions = parent
-                    .symlink_metadata(&name)
-                    .map_err(|e| io_error(e, path))?
-                    .permissions();
-                file.set_permissions(permissions)
-                    .map_err(|e| io_error(e, path))?;
-            }
-            file.write_all(bytes).map_err(|e| io_error(e, path))?;
-            file.sync_all().map_err(|e| io_error(e, path))?;
-            drop(file);
-            commit(&parent, &temporary, &parent, &name, mode == "replace")
-                .map_err(|e| io_error(e, path))?;
-            Ok(revision(bytes))
-        })();
-        // After commit the temporary name is gone; on failure, clean the staged data.
-        let _ = parent.remove_file(&temporary);
-        result
+        let mut file = parent
+            .open_with(&name, &options)
+            .map_err(|e| io_error(e, path))?;
+        file.write_all(bytes).map_err(|e| io_error(e, path))?;
+        file.sync_all().map_err(|e| io_error(e, path))?;
+        Ok(revision(bytes))
     }
     pub fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
         split(path)?;
@@ -371,30 +346,17 @@ impl FsVault {
                 to,
             ));
         }
-        commit(&source, &source_name, &target, &target_name, false).map_err(|e| io_error(e, to))
+        if self.stat(to)?.is_some() {
+            return Err(VaultError::new(
+                "AlreadyExists",
+                "Target already exists",
+                to,
+            ));
+        }
+        source
+            .rename(&source_name, &target, &target_name)
+            .map_err(|e| io_error(e, to))
     }
-}
-#[cfg(target_os = "linux")]
-fn commit(from: &Dir, source: &str, to: &Dir, target: &str, replace: bool) -> io::Result<()> {
-    rustix::fs::renameat_with(
-        from,
-        source,
-        to,
-        target,
-        if replace {
-            rustix::fs::RenameFlags::empty()
-        } else {
-            rustix::fs::RenameFlags::NOREPLACE
-        },
-    )
-    .map_err(Into::into)
-}
-#[cfg(not(target_os = "linux"))]
-fn commit(_: &Dir, _: &str, _: &Dir, _: &str, _: bool) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Safe commit is currently implemented for Linux only",
-    ))
 }
 
 #[cfg(test)]
@@ -404,15 +366,7 @@ mod tests {
     fn paths_and_root_are_protected() {
         let tmp = tempfile::tempdir().unwrap();
         let vault = FsVault::open(tmp.path()).unwrap();
-        for path in [
-            "/etc/passwd",
-            "../x",
-            "a//b",
-            "a/./b",
-            "C:/x",
-            "a\\b",
-            ".celestite-tmp-x",
-        ] {
+        for path in ["/etc/passwd", "../x", "a//b", "a/./b", "C:/x", "a\\b"] {
             assert_eq!(vault.stat(path).unwrap_err().code, "InvalidPath");
         }
         assert_eq!(vault.remove("", true).unwrap_err().code, "InvalidPath");
@@ -420,13 +374,12 @@ mod tests {
         assert!(vault.stat("missing/file").unwrap().is_none());
     }
     #[test]
-    #[cfg(target_os = "linux")]
     fn complete_file_contract_and_conflicts() {
         let tmp = tempfile::tempdir().unwrap();
         let vault = FsVault::open(tmp.path()).unwrap();
         vault.mkdir("a/b", true).unwrap();
         let version = vault
-            .write_file("a/b/x.md", b"old", "create", None)
+            .write_file("a/b/x.md", b"long original content", "create", None)
             .unwrap();
         assert_eq!(
             vault
@@ -467,6 +420,21 @@ mod tests {
                 .code,
             "NotFound"
         );
+    }
+
+    #[test]
+    fn rename_rejects_an_existing_file_without_changing_either_file() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = FsVault::open(root.path()).unwrap();
+        vault.write_file("source", b"new", "create", None).unwrap();
+        vault.write_file("target", b"old", "create", None).unwrap();
+
+        assert_eq!(
+            vault.rename("source", "target").unwrap_err().code,
+            "AlreadyExists"
+        );
+        assert_eq!(vault.read_file("source").unwrap(), b"new");
+        assert_eq!(vault.read_file("target").unwrap(), b"old");
     }
     #[test]
     fn limited_reads_reject_oversize_files() {
