@@ -182,7 +182,9 @@ export function FileTree(props: FileTreeProps) {
     },
   );
   onSettled(() => {
-    if (props.viewState) tree.scrollTop = props.viewState.scrollTop;
+    // A new tree already starts at zero. Assigning scrollTop during mounting
+    // forces layout before the rest of the workspace has finished rendering.
+    if (props.viewState?.scrollTop) tree.scrollTop = props.viewState.scrollTop;
     void model.refresh();
     void props.backend
       .watch(() => model.invalidate())

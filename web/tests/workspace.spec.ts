@@ -6,7 +6,15 @@ const test = base.extend<{ runtimeErrors: string[] }>({
       const errors: string[] = [];
       page.on("pageerror", (error) => errors.push(error.message));
       page.on("console", (message) => {
-        if (message.type() === "error") errors.push(message.text());
+        const diagnostic = message.text();
+        const workspaceRead =
+          diagnostic.includes("[STRICT_READ_UNTRACKED]") &&
+          /in .*<VaultWorkspace>\s*(?:\n|$)/.test(diagnostic);
+        const vaultDialogFeedback =
+          /\[(EFFECT_WRITES_OWN_SOURCE|EFFECT_RELAY_TEAR)\]/.test(diagnostic) &&
+          diagnostic.includes("<VaultConnections> › <Dialog> › effect");
+        if (message.type() === "error" || workspaceRead || vaultDialogFeedback)
+          errors.push(message.text());
       });
       await use(errors);
       expect(errors).toEqual([]);
@@ -55,6 +63,25 @@ test("the sidebar keeps its default width and exposes a labelled divider", async
   await expect(sidebar(page)).toHaveCSS("width", "300px");
   await expect(page.getByRole("tree", { name: "文件树" })).toBeVisible();
   await expect(page.getByRole("region", { name: "文件编辑器" })).toBeVisible();
+});
+
+test("the vault dialog can reopen without reactive feedback and restores focus", async ({
+  page,
+}) => {
+  const trigger = page.getByRole("button", { name: "管理 Vault", exact: true });
+  const dialog = page.getByRole("dialog");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await trigger.click();
+    await expect(dialog).toBeVisible();
+    if (attempt === 1) await page.keyboard.press("Escape");
+    else
+      await dialog
+        .getByRole("button", { name: "关闭弹窗", exact: true })
+        .click();
+    await expect(dialog).toBeHidden();
+    await expect(trigger).toBeFocused();
+  }
+  await expect(page.getByRole("tree", { name: "文件树" })).toBeVisible();
 });
 
 test("the panels start at the top and share a full-width bottom status bar", async ({

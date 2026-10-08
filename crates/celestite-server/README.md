@@ -35,6 +35,53 @@ Vault share links readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://12
 
 完整链接是凭证，按要求打印在启动日志中，日志的可读者也获得对应权限。普通请求日志继续脱敏 key。客户端连接记录为重连保存完整链接，转发链接即转交权限。宿主退出关闭 HTTP 监听与活动 WebSocket / SSE；轮换后需从新启动日志复制链接重新连接，客户端保留未确认正文供恢复。
 
+## GitHub Pages 与 HTTPS 部署
+
+GitHub Pages 客户端通过 HTTPS 加载，公网 server 也需要提供浏览器信任的 HTTPS 地址。浏览器会阻止 HTTPS 页面连接 HTTP server；请求失败时客户端补充 HTTPS / HTTP 协议提示；localhost 和浏览器支持的本地网络 HTTP 请求仍由浏览器判定。server 当前使用 HTTP 监听，`public_url` 只决定分享链接的公开基址，不能启用 TLS。
+
+可在同一台机器使用 Caddy 终止 TLS 并反向代理到 server。先将自己的域名（下面用 `sync.example.com`）解析到服务器，允许公网访问 80 / 443 端口。在 Caddyfile 中配置：
+
+```caddyfile
+sync.example.com {
+    reverse_proxy 127.0.0.1:3250
+}
+```
+
+Celestite 配置的 `[server]` 部分使用：
+
+```toml
+[server]
+listen = "127.0.0.1:3250"
+public_url = "https://sync.example.com"
+allowed_origins = ["https://azurice.github.io"]
+```
+
+`allowed_origins` 使用页面的 Origin，不包含 `/celestite/` 路径；省略时仍按默认规则允许所有来源。本地开发还需加入 `http://localhost:1420` 和 `http://127.0.0.1:1420`，两者是不同来源。命令行可重复使用 `--allowed-origin`；显式指定时整体替换来源列表，因此需同时列出 GitHub Pages 和开发来源。保留已有 `[vault]` 配置。按 [Caddy HTTPS 指南](https://caddyserver.com/docs/quick-starts/https) 启动代理后，用宿主输出的 `https://sync.example.com/<key>` 分享链接连接。Caddy 处理 WebSocket upgrade，客户端由 HTTPS 地址自动使用 WSS；普通文件请求与协作连接经过同一代理。域名及端口条件不满足时，可使用支持 WebSocket 的 HTTPS 隧道提供公开入口，并将其基址设为 `public_url`。
+
+### 家用公网 IP 与自定义端口
+
+如果路由器已经把公网 `:3250` 映射到家用机器的 `:3250`，可以保留该映射：让 Caddy 在家用机器监听 3250 并提供 TLS，Celestite 改到 `127.0.0.1:7437`。将域名指向当前公网 IP，并安装与域名匹配、浏览器信任的证书。公网 IP 改变时更新 DNS。
+
+```caddyfile
+sync.example.com:3250 {
+    tls /path/to/fullchain.pem /path/to/privkey.pem
+    reverse_proxy 127.0.0.1:7437
+}
+```
+
+```toml
+[server]
+listen = "127.0.0.1:7437"
+public_url = "https://sync.example.com:3250"
+allowed_origins = ["https://azurice.github.io"]
+```
+
+证书可以通过 DNS-01 验证签发并定期续期，验证不要求开放家里的 80 / 443 端口。上例使用已签发的 PEM 证书；Caddy 自动 DNS 验证需按 DNS 服务商安装相应模块并配置凭证。证书中的域名必须与分享链接一致；仅把 `http://IP:3250` 文本改成 `https://IP:3250` 不能使现有 HTTP 监听提供 TLS。
+
+没有域名也可以使用 HTTPS，但证书必须包含访问使用的公网 IP。[Let’s Encrypt 已支持 IPv4 / IPv6 证书](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability)，有效期为 160 小时，需要自动续期并让代理加载更新后的证书。[IP 证书验证只支持 HTTP-01 或 TLS-ALPN-01](https://letsencrypt.org/2025/07/01/issuing-our-first-ip-address-certificate)，分别要求公网 80 或 443 端口可达；只有 3250 端口转发不能完成这两种验证。证书签发后，业务 HTTPS 仍可使用 3250 端口。自签名证书只有在每个客户端显式信任后才可使用。
+
+TLS 可以由反向代理提供，无需修改 Celestite 的 HTTP 实现。部署完成后设置 `public_url` 为实际 HTTPS 入口，并使用新的 HTTPS 分享链接；若配置了 `allowed_origins`，需包含 GitHub Pages 的 Origin。反向代理还必须支持 WebSocket upgrade，以承载 WSS 协作连接。
+
 ## 命令行
 
 使用 clap 解析参数，`--help` 查看全部选项，`--version` 查看版本。优先级为 **命令行 > 配置文件 > 内置默认值**。不指定 `--config` 时读取当前目录的 `config.toml`（如果存在）；没有配置文件时，必须提供 `--vault PATH`。`share_key` 在配置文件和 CLI 中均为可选。`--no-config` 忽略默认配置文件。显式指定的配置文件不存在、内容无效或默认文件无效时会报错，不会静默回退。

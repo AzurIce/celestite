@@ -4,6 +4,7 @@ import {
   createSignal,
   onCleanup,
   onSettled,
+  untrack,
 } from "solid-js";
 import { GlobalSettings } from "@/components/settings/GlobalSettings";
 import { VaultEditor } from "@/components/editor";
@@ -67,7 +68,9 @@ export default function VaultWorkspace() {
   let dragStart = { x: 0, width: clampSidebarWidth(0) };
   // Solid 的 signal 写入在微任务提交，setter 之后同步读到的仍是旧值；
   // 夹取结果与持久化都用这个同步镜像。
-  let appliedWidth = clampSidebarWidth(settings().values["sidebar.width"]);
+  let appliedWidth = untrack(() =>
+    clampSidebarWidth(settings().values["sidebar.width"]),
+  );
 
   let settingsVault: string | null = null;
   createEffect(

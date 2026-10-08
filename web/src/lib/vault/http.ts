@@ -173,11 +173,18 @@ export class HttpVaultBackend implements VaultBackend {
       return response;
     } catch (error) {
       if (error instanceof VaultError) throw error;
+      // Blob Workers retain the HTTPS page's origin. Let browsers decide local
+      // network exceptions; add guidance only after a request actually fails.
+      const transportHelp =
+        globalThis.location?.origin.startsWith("https://") &&
+        url.protocol === "http:"
+          ? " 当前页面使用 HTTPS，HTTP 连接可能被浏览器阻止，请检查浏览器提示，或改用 HTTPS 分享链接。"
+          : "";
       throw new VaultError(
         "IO",
-        init.method && init.method !== "GET" && !route.startsWith("/preview/")
+        (init.method && init.method !== "GET" && !route.startsWith("/preview/")
           ? "远端请求未完成，写操作可能已提交，请刷新核对后再重试。"
-          : "远端请求未完成，请检查连接。",
+          : "远端请求未完成，请检查连接。") + transportHelp,
         undefined,
         error,
       );

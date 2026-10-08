@@ -12,8 +12,12 @@ DismissableLayer 原先在 `onSettled` 内读取 DOM ref。ref 的 signal 写入
 
 TextField 初始化时对 value 的一次性受控模式判断使用 `untrack`；输入事件调用 onChange 后使用 `flush()` 提交写入，再将最终受控值写回原生 input，避免读取旧值重置输入。这是需要同步观察状态的原生 DOM 边界。
 
+## 弹窗挂载
+
+DialogRoot 的内容和遮罩使用零时长 `createPresence`，其 effect 把打开状态转存到 signal，导致自身写入反馈和中间帧状态撕裂。改为直接通过 `createMemo` 派生挂载状态，保留 `forceMount` 和打开状态的语义。
+
 ## 升级与移除
 
-升级 Kobalte 后先核对这两处上游代码。修复已包含时移除 `patchedDependencies` 对应条目和 patch 文件，再更新锁文件。
+升级 Kobalte 后先核对上述三处上游代码。修复已包含时移除 `patchedDependencies` 对应条目和 patch 文件，再更新锁文件。
 
 运行 `bun run typecheck`、`bun run build` 和 `bun run test:ui`。测试覆盖连续输入、弹窗反复挂载/卸载、Escape/按钮/外部点击关闭、焦点归还、body 指针状态，以及菜单交互。此补丁不代表所有 Kobalte 组件均已验证兼容。

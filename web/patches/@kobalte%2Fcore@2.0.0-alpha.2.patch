@@ -1,6 +1,29 @@
-diff --git a/node_modules/@kobalte/core/.bun-tag-60fdca3269d91ab9 b/.bun-tag-60fdca3269d91ab9
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/dialog/BOdIttv5.js b/dist/dialog/BOdIttv5.js
+--- a/dist/dialog/BOdIttv5.js
++++ b/dist/dialog/BOdIttv5.js
+@@ -9,2 +9 @@
+-import { Show, createContext, createEffect, createSignal, createUniqueId, merge, omit, useContext } from "solid-js";
+-import { createPresence } from "@solid-primitives/presence";
++import { Show, createContext, createEffect, createMemo, createSignal, createUniqueId, merge, omit, useContext } from "solid-js";
+@@ -240,2 +239,3 @@
+-	const { isMounted: overlayPresent } = createPresence(() => shouldMount() || void 0, { transitionDuration: 0 });
+-	const { isMounted: contentPresent } = createPresence(() => shouldMount() || void 0, { transitionDuration: 0 });
++	// No transition delay: mounted state is a direct derivation of open state.
++	const contentPresent = createMemo(shouldMount);
++	const overlayPresent = contentPresent;
+diff --git a/dist/dialog/Dqui1AYx.jsx b/dist/dialog/Dqui1AYx.jsx
+--- a/dist/dialog/Dqui1AYx.jsx
++++ b/dist/dialog/Dqui1AYx.jsx
+@@ -8,2 +8 @@
+-import { Show, createContext, createEffect, createSignal, createUniqueId, merge, omit, useContext } from "solid-js";
+-import { createPresence } from "@solid-primitives/presence";
++import { Show, createContext, createEffect, createMemo, createSignal, createUniqueId, merge, omit, useContext } from "solid-js";
+@@ -174,2 +173,3 @@
+-	const { isMounted: overlayPresent } = createPresence(() => shouldMount() || void 0, { transitionDuration: 0 });
+-	const { isMounted: contentPresent } = createPresence(() => shouldMount() || void 0, { transitionDuration: 0 });
++	// No transition delay: mounted state is a direct derivation of open state.
++	const contentPresent = createMemo(shouldMount);
++	const overlayPresent = contentPresent;
 diff --git a/dist/dismissable-layer/DXLD03yU.js b/dist/dismissable-layer/DXLD03yU.js
 index fde40e74ee904abceeb2c1daa3ce86f8dd9e38c8..2fbc6eb8356862414addb3e5609ebba40f5238e1 100644
 --- a/dist/dismissable-layer/DXLD03yU.js
