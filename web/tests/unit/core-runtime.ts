@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import init, {
   EditorBinding,
+  PreviewBinding,
 } from "../../src/lib/editor/generated/celestite_core";
 import { createBrowserIo } from "../../src/lib/editor/local/io";
 import { EditorHost } from "../../src/lib/editor/runtime/host";
@@ -18,6 +19,7 @@ import type {
 } from "../../src/lib/editor/contract";
 import { VaultError } from "../../src/lib/vault/errors";
 import type { VaultBackend } from "../../src/lib/vault/types";
+import { PreviewResources } from "../../src/lib/preview/resources";
 
 const ready = readFile(
   new URL(
@@ -87,6 +89,8 @@ export async function createTestEditor(
     return {
       identity,
       host: new EditorHost(core, backend, emit, schedule),
+      previewBinding: new PreviewBinding(),
+      previewResources: new PreviewResources(backend),
       dispose: () => core.free(),
     };
   }).catch((error) => client.fail(error));

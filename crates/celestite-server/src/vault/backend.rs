@@ -3,7 +3,13 @@ use super::{
     fs::{self, FsVault},
     VaultIdentity,
 };
-use celestite_core::*;
+use celestite_core::{
+    backend::{
+        Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileEntry,
+        FileSnapshot, JournalEntry, StoredDocument,
+    },
+    instance::{InstanceIdentity, Vault},
+};
 use std::{
     path::Path,
     sync::Arc,

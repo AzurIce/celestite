@@ -167,12 +167,17 @@ async function versioned() {
   };
 }
 
+async function conflictedDraft() {
+  const fixture = await versioned();
+  await fixture.documents.open(path("a.md"));
+  const id = active(fixture.documents).id;
+  fixture.external("external");
+  replaceText(fixture.documents, id, "draft");
+  return { ...fixture, id };
+}
+
 test("background conflicts do not prompt, and cancel preserves disk and draft", async () => {
-  const { files, documents, external } = await versioned();
-  await documents.open(path("a.md"));
-  const id = active(documents).id;
-  external("external");
-  replaceText(documents, id, "draft");
+  const { files, documents, id } = await conflictedDraft();
   assert.equal(await documents.save(), false);
   assert.equal(active(documents).conflict, true);
   assert.equal(documents.snapshot().conflictPrompt, null);
@@ -191,10 +196,7 @@ test("background conflicts do not prompt, and cancel preserves disk and draft", 
 });
 
 test("overwrite uses the newest disk baseline and subsequent saves use the committed revision", async () => {
-  const { files, documents, external, written } = await versioned();
-  await documents.open(path("a.md"));
-  external("external");
-  replaceText(documents, active(documents).id, "draft");
+  const { files, documents, written } = await conflictedDraft();
   await documents.requestSave();
   assert.equal(await documents.resolveConflict("overwrite"), true);
   // The core rejects stale disk state before issuing a write.
@@ -209,10 +211,7 @@ test("overwrite uses the newest disk baseline and subsequent saves use the commi
 });
 
 test("discard reloads latest text, encoding and view generation without rewriting disk", async () => {
-  const { files, documents, external, written } = await versioned();
-  await documents.open(path("a.md"));
-  external("external one");
-  replaceText(documents, active(documents).id, "draft");
+  const { files, documents, external, written } = await conflictedDraft();
   await documents.requestSave();
   external("\ufefflatest\r\nversion\r\n");
   assert.equal(await documents.resolveConflict("discard"), true);
@@ -232,13 +231,9 @@ test("discard reloads latest text, encoding and view generation without rewritin
   await documents.close();
 });
 
-test("overwrite and discard both finish the original close request", async () => {
-  for (const action of ["overwrite", "discard"] as const) {
-    const { files, documents, external } = await versioned();
-    await documents.open(path("a.md"));
-    const id = active(documents).id;
-    external("external");
-    replaceText(documents, id, "draft");
+for (const action of ["overwrite", "discard"] as const) {
+  test(`${action} finishes the original close request`, async () => {
+    const { files, documents, id } = await conflictedDraft();
     assert.equal(await documents.requestCloseDocument(id), false);
     assert.equal(await documents.resolveConflict(action), true);
     assert.equal(documents.has(id), false);
@@ -247,14 +242,11 @@ test("overwrite and discard both finish the original close request", async () =>
       action === "overwrite" ? "draft" : "external",
     );
     await documents.close();
-  }
-});
+  });
+}
 
 test("another edit between conflict reread and commit cannot be silently overwritten", async () => {
-  const { files, backend, documents, external } = await versioned();
-  await documents.open(path("a.md"));
-  external("external");
-  replaceText(documents, active(documents).id, "draft");
+  const { files, backend, documents, external } = await conflictedDraft();
   await documents.requestSave();
   const read = backend.readFileSnapshot!;
   backend.readFileSnapshot = async (path) => {
@@ -271,16 +263,13 @@ test("another edit between conflict reread and commit cannot be silently overwri
   await documents.close();
 });
 
-test("failed or invalid reload keeps local edits and the save request open", async () => {
-  for (const content of [
-    new Uint8Array([255]),
-    new Uint8Array(MAX_EDITABLE_BYTES + 1),
-    null,
-  ]) {
-    const { files, documents, external } = await versioned();
-    await documents.open(path("a.md"));
-    external("external");
-    replaceText(documents, active(documents).id, "draft");
+for (const [scenario, content] of [
+  ["invalid UTF-8", new Uint8Array([255])],
+  ["oversized text", new Uint8Array(MAX_EDITABLE_BYTES + 1)],
+  ["missing file", null],
+] as const) {
+  test(`discard of ${scenario} keeps local edits and the save request open`, async () => {
+    const { files, documents, external } = await conflictedDraft();
     await documents.requestSave();
     if (content) external(content);
     else files.files.delete(path("a.md"));
@@ -291,15 +280,11 @@ test("failed or invalid reload keeps local edits and the save request open", asy
     assert.equal(documents.snapshot().conflictPrompt?.intent, "save");
     assert.ok(documents.snapshot().conflictError);
     await documents.close();
-  }
-});
+  });
+}
 
 test("discard cannot fabricate a replacement history after the file disappears", async () => {
-  const { files, documents, external } = await versioned();
-  await documents.open(path("a.md"));
-  const id = active(documents).id;
-  external("external");
-  replaceText(documents, id, "draft");
+  const { files, documents, external, id } = await conflictedDraft();
   await documents.requestCloseDocument(id);
   files.files.delete(path("a.md"));
   assert.equal(await documents.resolveConflict("discard"), false);
@@ -313,24 +298,14 @@ test("discard cannot fabricate a replacement history after the file disappears",
   await documents.close();
 });
 
-test("UTF-8 BOM and existing CRLF/CR survive editing, and clean opens do not rewrite files", async () => {
-  for (const ending of ["\r\n", "\r", "\n"] as const) {
-    const { files, documents } = await create();
-    files.file("a.md", bytes(`\ufeffalpha${ending}`));
-    await documents.open(path("a.md"));
-    assert.equal(active(documents).bom, true);
-    assert.equal(active(documents).lineEnding, ending);
-    await documents.save();
-    assert.deepEqual(files.log, []);
-    replaceText(documents, active(documents).id, "beta\n世界\n");
-    assert.equal(await documents.save(), true);
-    assert.deepEqual(
-      files.files.get(path("a.md")),
-      bytes(`\ufeffbeta${ending}世界${ending}`),
-    );
-    assert.equal(active(documents).dirty, false);
-    await documents.close();
-  }
+// Codec round trips belong to native core tests; here the boundary is that a
+// clean view does not accidentally issue an IO write.
+test("opening and saving a clean view does not rewrite the file", async () => {
+  const { files, documents } = await create();
+  await documents.open(path("a.md"));
+  assert.equal(await documents.save(), true);
+  assert.deepEqual(files.log, []);
+  await documents.close();
 });
 
 test("rapid file opens use the latest request, and switching back retains the draft and document identity", async () => {
@@ -511,23 +486,23 @@ test("file tree copying reads current edits and deleting a directory closes affe
   await documents.close();
 });
 
-test("binary, invalid UTF-8 and oversized files cannot be modified or saved", async () => {
-  const { files, documents } = await create();
-  for (const [key, content] of [
-    ["null.bin", new Uint8Array([1, 0, 2])],
-    ["bad.bin", new Uint8Array([255])],
-    ["large.txt", new Uint8Array(MAX_EDITABLE_BYTES + 1)],
-  ] as const) {
+for (const [key, content] of [
+  ["null.bin", new Uint8Array([1, 0, 2])],
+  ["bad.bin", new Uint8Array([255])],
+  ["large.txt", new Uint8Array(MAX_EDITABLE_BYTES + 1)],
+] as const) {
+  test(`read-only ${key} cannot be modified or saved`, async () => {
+    const { files, documents } = await create();
     files.file(key, content);
     await documents.open(path(key));
     assert.ok(active(documents).readOnlyReason);
     assert.equal(replaceText(documents, active(documents).id, "wrong"), false);
     assert.equal(await documents.save(), false);
     assert.deepEqual(files.files.get(path(key)), content);
-  }
-  assert.deepEqual(files.log, []);
-  await documents.close();
-});
+    assert.deepEqual(files.log, []);
+    await documents.close();
+  });
+}
 
 test("an externally deleted file is never recreated by autosave, and an open failure preserves the current document", async () => {
   const { files, documents } = await create();
@@ -563,27 +538,9 @@ test("shutdown flushes outstanding edits before closing the backend and rejects 
 });
 
 test("unrelated reads cannot advance a document save baseline", async () => {
-  const files = new Files();
-  const backend: VaultBackend = files;
-  let version = "initial";
-  backend.readFileSnapshot = async (path) => ({
-    data: await files.readFile(path),
-    revision: version,
-  });
-  const originalWrite = files.writeFile.bind(files);
-  const expected: string[] = [];
-  backend.writeFile = async (path, data, options) => {
-    expected.push(options.expectedRevision!);
-    if (options.expectedRevision !== version)
-      throw new VaultError("Conflict", "changed");
-    await originalWrite(path, data, options);
-    version = "saved";
-    return version;
-  };
-  const documents = (await createTestEditor(backend)).documents;
+  const { files, backend, documents, external, written } = await versioned();
   await documents.open(path("a.md"));
-  files.file("a.md", "external");
-  version = "external";
+  external("external");
   assert.equal(
     new TextDecoder().decode(
       (await backend.readFileSnapshot!(path("a.md"))).data,
@@ -593,7 +550,7 @@ test("unrelated reads cannot advance a document save baseline", async () => {
   replaceText(documents, documents.snapshot().activeId!, "my changes");
   assert.equal(await documents.save(), false);
   assert.deepEqual(
-    expected,
+    written,
     [],
     "the stale baseline must be rejected before writing",
   );

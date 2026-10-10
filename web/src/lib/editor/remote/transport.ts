@@ -2,14 +2,88 @@ import { VaultError } from "../../vault/errors";
 import { decodeError } from "../rpc";
 import type { RpcError } from "../contract";
 import type { HostDocument, CollaborationSnapshot } from "../contract";
-import type { SyncPacket } from "../contract";
+import type { HistoryPacket, Version } from "../contract";
 
 export interface RemoteReceipt {
   kind: "document";
   sequence: number;
   document: Omit<HostDocument, "savedContent"> & { savedContent?: string };
-  packet: SyncPacket;
-  writerId: string;
+  packet: HistoryPacket;
+  peerId: string;
+}
+
+/** v3 spelling compatibility exists only at this network boundary. */
+function canonicalField(
+  object: Record<string, unknown>,
+  canonical: string,
+  legacy: string,
+  equal: (a: unknown, b: unknown) => boolean = Object.is,
+) {
+  if (
+    Object.prototype.hasOwnProperty.call(object, canonical) &&
+    Object.prototype.hasOwnProperty.call(object, legacy) &&
+    !equal(object[canonical], object[legacy])
+  )
+    throw new VaultError(
+      "IO",
+      `Protocol error: conflicting ${canonical}/${legacy}`,
+    );
+  const value = Object.prototype.hasOwnProperty.call(object, canonical)
+    ? object[canonical]
+    : object[legacy];
+  delete object[legacy];
+  object[canonical] = value;
+}
+
+function equalVersion(a: unknown, b: unknown): boolean {
+  if (a === null || b === null) return a === b;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  const left = a as Version;
+  const right = b as Version;
+  return (
+    left.identity?.document_id === right.identity?.document_id &&
+    left.identity?.history_id === right.identity?.history_id &&
+    !!left.clocks &&
+    !!right.clocks &&
+    Object.keys(left.clocks).length === Object.keys(right.clocks).length &&
+    Object.entries(left.clocks).every(
+      ([peer, clock]) =>
+        Object.prototype.hasOwnProperty.call(right.clocks, peer) &&
+        right.clocks[peer] === clock,
+    )
+  );
+}
+
+export function normalizeRemoteReceipt(value: unknown): RemoteReceipt {
+  if (!value || typeof value !== "object")
+    throw new VaultError("IO", "Protocol error: invalid document receipt");
+  const receipt = { ...value } as Record<string, unknown>;
+  canonicalField(receipt, "peerId", "writerId");
+  if (
+    typeof receipt.peerId !== "string" ||
+    receipt.peerId.length > 20 ||
+    !/^(0|[1-9][0-9]*)$/.test(receipt.peerId) ||
+    BigInt(receipt.peerId) > 18446744073709551615n
+  )
+    throw new VaultError("IO", "Protocol error: invalid peerId");
+  if (!receipt.document || typeof receipt.document !== "object")
+    throw new VaultError("IO", "Protocol error: invalid document metadata");
+  const document = { ...receipt.document } as Record<string, unknown>;
+  canonicalField(document, "persistedVersion", "durableVersion", equalVersion);
+  canonicalField(document, "fileRevision", "backendRevision");
+  receipt.document = document;
+  return receipt as unknown as RemoteReceipt;
+}
+
+function normalizeRemoteResult(value: unknown): unknown {
+  if (
+    value &&
+    typeof value === "object" &&
+    "kind" in value &&
+    value.kind === "document"
+  )
+    return normalizeRemoteReceipt(value);
+  return value;
 }
 /** Network replies resolve outside the core queue. Push imports are scheduled
  * by the host, so a request awaiting its acknowledgement cannot deadlock. */
@@ -65,7 +139,7 @@ export class RemoteTransport {
         else if (frame.kind === "document") {
           if (!this.initialized)
             throw new Error("Buffer received before session readiness");
-          this.receive(frame);
+          this.receive(normalizeRemoteReceipt(frame));
         } else if (frame.kind === "members")
           this.receive({
             kind: "members",
@@ -80,13 +154,16 @@ export class RemoteTransport {
         } else if (frame.kind === "reply") {
           const pending = this.pending.get(frame.requestId);
           if (!pending) return;
+          const result = frame.error
+            ? undefined
+            : normalizeRemoteResult(frame.result);
           clearTimeout(pending.timer);
           this.pending.delete(frame.requestId);
           this.queuedCharacters -= pending.payload.length;
           this.active.delete(frame.requestId);
           this.pump();
           if (frame.error) pending.reject(decodeError(frame.error as RpcError));
-          else pending.resolve(frame.result);
+          else pending.resolve(result);
         } else if (frame.kind === "fatal") this.fail(decodeError(frame));
       } catch (error) {
         this.fail(error);

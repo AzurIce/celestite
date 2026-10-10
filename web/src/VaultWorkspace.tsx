@@ -248,9 +248,23 @@ export default function VaultWorkspace() {
                   <span class="workspace-divider-line" />
                 </div>
                 <VaultEditor
+                  settings={{
+                    previewMode: settings().values["editor.previewMode"],
+                    wordWrap: settings().values["editor.wordWrap"],
+                    vimMode: settings().values["editor.vimMode"],
+                    wordWrapFromProject:
+                      settings().source["editor.wordWrap"] === "project",
+                  }}
+                  onSettingsChange={(patch) => {
+                    if (patch.previewMode !== undefined)
+                      void setSetting("editor.previewMode", patch.previewMode);
+                    if (patch.wordWrap !== undefined)
+                      void setSetting("editor.wordWrap", patch.wordWrap);
+                    if (patch.vimMode !== undefined)
+                      void setSetting("editor.vimMode", patch.vimMode);
+                  }}
                   authorizeResources={workspace.authorizeResources}
                   documents={workspace.documents}
-                  buffers={workspace.editorBuffers}
                   statusMount={editorStatusMount}
                 />
               </div>

@@ -1,9 +1,13 @@
-import init, { MemoryEditorBinding } from "../generated/celestite_core";
+import init, {
+  MemoryEditorBinding,
+  PreviewBinding,
+} from "../generated/celestite_core";
 import { openHttpVault } from "../../vault/http";
 import { VaultError } from "../../vault/errors";
 import { RemoteEditorHost } from "./host";
 import { serveEditor, type EditorServicePort } from "../runtime/service";
 import { encodeError } from "../rpc";
+import { PreviewResources } from "../../preview/resources";
 let initialized = false;
 self.addEventListener("message", (event) => {
   if (event.data?.kind !== "initialize" || initialized) return;
@@ -45,7 +49,17 @@ self.addEventListener("message", (event) => {
           binding.free();
           throw error;
         }
-        return { identity, host, dispose: () => binding.free() };
+        return {
+          identity,
+          host,
+          previewBinding: new PreviewBinding(),
+          previewResources: new PreviewResources(
+            backend,
+            backend.packageResources(descriptor),
+          ),
+          invalidateResourcesOnTree: true,
+          dispose: () => binding.free(),
+        };
       } catch (error) {
         await backend.close();
         throw error;

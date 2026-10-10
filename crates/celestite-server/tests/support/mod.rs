@@ -1,5 +1,14 @@
 #![allow(dead_code)]
-use celestite_core::*;
+use celestite_buffer::types::{HistoryPacket, Version};
+use celestite_core::{
+    backend::memory::MemoryBackend,
+    editor::{
+        replica::ReplicaDocument,
+        types::{EditorDocument, EditorMutation, ReplicaHostState},
+        EditorCore,
+    },
+    instance::{InstanceIdentity, Vault},
+};
 use celestite_server::{build_server, Config, Permission, ServerConfig, VaultConfig};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -23,6 +32,7 @@ impl Host {
             Config {
                 server: ServerConfig {
                     listen: address,
+                    allowed_origins: vec!["http://allowed".into()],
                     ..Default::default()
                 },
                 vault: VaultConfig {
@@ -88,8 +98,17 @@ impl Host {
             serde_json::from_slice(&bytes).unwrap()
         }
     }
-    pub async fn peer(&self) -> Peer {
-        Peer::connect(&self.url).await
+    pub async fn client_replica(&self) -> ClientReplica {
+        ClientReplica::connect(&self.url).await
+    }
+    pub async fn identity(&self) -> Value {
+        self.json("GET", "", Value::Null).await["vaultIdentity"].clone()
+    }
+    pub async fn socket(&self) -> Socket {
+        connect_async(self.url.replace("http:", "ws:") + "/sync")
+            .await
+            .unwrap()
+            .0
     }
     pub async fn stop(mut self) {
         self.stopping.send_replace(true);
@@ -110,18 +129,18 @@ impl Drop for Host {
 
 /// The headless client runs the production EditorCore and session protocol.
 /// It does not call privileged HTTP edit/import/save endpoints.
-pub struct Peer {
+pub struct ClientReplica {
     pub core: EditorCore<MemoryBackend>,
     pub session: String,
     pub members: Value,
-    socket: Socket,
+    pub socket: Socket,
     sequence: HashMap<String, u64>,
     saved: HashMap<String, String>,
     request: u64,
     operation: u64,
     read_only: bool,
 }
-impl Peer {
+impl ClientReplica {
     pub async fn connect(url: &str) -> Self {
         let descriptor = reqwest::get(url)
             .await
@@ -146,6 +165,7 @@ impl Peer {
         assert_eq!(hello["kind"], "hello");
         loop {
             let frame = next(&mut socket).await;
+            assert_ne!(frame["kind"], "document", "handshake must not load buffers");
             if frame["kind"] == "ready" {
                 break;
             }
@@ -221,7 +241,7 @@ impl Peer {
         if sequence <= self.sequence.get(&id).copied().unwrap_or(0) {
             return;
         }
-        let packet: SyncPacket = serde_json::from_value(frame["packet"].clone()).unwrap();
+        let packet: HistoryPacket = serde_json::from_value(frame["packet"].clone()).unwrap();
         if let Some(saved) = host["savedContent"].as_str() {
             self.saved.insert(id.clone(), saved.into());
         }
@@ -229,7 +249,7 @@ impl Peer {
             path: host["path"].as_str().unwrap().into(),
             version: serde_json::from_value(host["version"].clone()).unwrap(),
             saved_content: self.saved.get(&id).expect("initial saved content").clone(),
-            backend_revision: host["backendRevision"].as_str().unwrap().into(),
+            file_revision: host["backendRevision"].as_str().unwrap().into(),
             bom: host["bom"].as_bool().unwrap(),
             line_ending: host["lineEnding"].as_str().unwrap().into(),
             deleted: host["deleted"].as_bool().unwrap(),
@@ -240,19 +260,16 @@ impl Peer {
         };
         if self.core.read(&id).is_ok() {
             assert_eq!(
-                self.core.read(&id).unwrap().writer_id,
-                frame["writerId"].as_str().unwrap()
+                self.core.peer_id(&id).unwrap(),
+                frame["writerId"].as_str().unwrap().parse::<u64>().unwrap()
             );
-            self.core
-                .apply(&id, BufferCommand::Import(Import::new(packet, "peer")))
-                .await
-                .unwrap();
+            self.core.import(&id, packet).await.unwrap();
             self.core.apply_host_state(&id, state).await.unwrap();
         } else {
             self.core
                 .join_replica_document(ReplicaDocument {
                     packets: vec![packet],
-                    writer_id: Some(frame["writerId"].as_str().unwrap().into()),
+                    peer_id: Some(frame["writerId"].as_str().unwrap().parse().unwrap()),
                     state,
                 })
                 .await
@@ -261,8 +278,11 @@ impl Peer {
         self.core.take_mutations();
         self.sequence.insert(id, sequence);
     }
-    pub async fn apply(&mut self, id: &str, command: BufferCommand) -> EditorDocument {
-        let mutation = self.core.apply(id, command).await.unwrap();
+    pub async fn publish(
+        &mut self,
+        id: &str,
+        mutation: std::sync::Arc<EditorMutation>,
+    ) -> EditorDocument {
         mutation.require_committed().unwrap();
         if let Some(packet) = &mutation.update.operation {
             self.operation += 1;
@@ -274,42 +294,20 @@ impl Peer {
         self.core.read(id).unwrap()
     }
     pub async fn edit(&mut self, id: &str, from: usize, to: usize, insert: &str) -> EditorDocument {
-        let base = self.core.read(id).unwrap().snapshot.version;
-        self.apply(
-            id,
-            BufferCommand::Edit(Edit::new(
-                base,
-                vec![TextEdit {
-                    from,
-                    to,
-                    insert: insert.into(),
-                }],
-            )),
-        )
-        .await
+        let mutation = self.core.edit(id, [(from..to, insert)]).await.unwrap();
+        self.publish(id, mutation).await
     }
     pub async fn replace(&mut self, id: &str, text: &str) -> EditorDocument {
-        let snapshot = self.core.read(id).unwrap().snapshot;
-        self.apply(id, BufferCommand::Edit(Edit::replace(&snapshot, text)))
-            .await
+        let mutation = self.core.replace_text(id, text).await.unwrap();
+        self.publish(id, mutation).await
     }
     pub async fn undo(&mut self, id: &str, redo: bool) -> EditorDocument {
-        let base = self.core.read(id).unwrap().snapshot.version;
-        self.apply(
-            id,
-            if redo {
-                BufferCommand::Redo {
-                    base,
-                    context: UndoContext::default(),
-                }
-            } else {
-                BufferCommand::Undo {
-                    base,
-                    context: UndoContext::default(),
-                }
-            },
-        )
-        .await
+        let mutation = if redo {
+            self.core.redo(id).await.unwrap()
+        } else {
+            self.core.undo(id).await.unwrap()
+        };
+        self.publish(id, mutation).await
     }
     pub async fn next_members(&mut self, predicate: impl Fn(&Value) -> bool) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -328,7 +326,13 @@ impl Peer {
         self.socket.close(None).await.unwrap();
     }
 }
-async fn next(socket: &mut Socket) -> Value {
+pub async fn send(socket: &mut Socket, value: Value) {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .unwrap();
+}
+pub async fn next(socket: &mut Socket) -> Value {
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             if let Message::Text(text) = socket.next().await.expect("live socket").unwrap() {

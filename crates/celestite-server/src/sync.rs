@@ -17,7 +17,7 @@ use axum::{
     routing::get,
     Extension, Router,
 };
-use celestite_core::{SyncPacket, Version};
+use celestite_buffer::types::{HistoryPacket, Version};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -74,7 +74,7 @@ enum Command {
     },
     Updates {
         id: String,
-        packet: SyncPacket,
+        packet: HistoryPacket,
         version: Version,
         operation: u64,
     },
@@ -101,7 +101,7 @@ struct Request {
 }
 type Session = Arc<Mutex<SessionState>>;
 struct DocumentSession {
-    writer: String,
+    peer_id: u64,
     subscribed: bool,
     sent: Option<Version>,
     saved: Option<String>,
@@ -147,7 +147,7 @@ impl SessionState {
             self.documents.insert(
                 id.into(),
                 DocumentSession {
-                    writer: docs.allocate_writer(id)?,
+                    peer_id: docs.allocate_peer_id(id)?,
                     subscribed: true,
                     sent: None,
                     saved: None,
@@ -162,10 +162,10 @@ impl SessionState {
         let state = docs.host_document(id, document.saved.as_deref())?;
         document.subscribed = true;
         document.sent = Some(state.status.version.clone());
-        document.saved = Some(state.status.backend_revision.clone());
+        document.saved = Some(state.status.file_revision.clone());
         self.sequence += 1;
         Ok(
-            json!({"kind":"document","sequence":self.sequence,"document":state,"packet":packet,"writerId":document.writer}),
+            json!({"kind":"document","sequence":self.sequence,"document":crate::wire::host_document(&state),"packet":packet,"writerId":document.peer_id.to_string()}),
         )
     }
     fn reset_receipt(&mut self, id: &str) {
@@ -389,12 +389,12 @@ async fn command(
                     if operation != session.next_operation {
                         return Err(VaultError::new("InvalidEdit", "Operation sequence is discontinuous", &id));
                     }
-                    let writer = &session.documents.get(&id)
-                        .ok_or_else(|| VaultError::new("InvalidEdit", "Document not subscribed in this session", &id))?.writer;
-                    docs.import_session(&id, packet, writer, &version)?;
+                    let peer_id = session.documents.get(&id)
+                        .ok_or_else(|| VaultError::new("InvalidEdit", "Document not subscribed in this session", &id))?.peer_id;
+                    docs.import_session(&id, packet, peer_id, &version)?;
                     let version = docs.committed_version(&id)?;
                     let ack = json!({"operation": operation, "version": version});
-                    tracing::debug!(document_id=%id, session_id=%session.id, writer_id=%writer, operation, "Committed session CRDT update");
+                    tracing::debug!(document_id=%id, session_id=%session.id, peer_id=%peer_id, operation, "Committed session CRDT update");
                     session.next_operation += 1;
                     session.receipts.push_back((operation, digest, ack.clone()));
                     if session.receipts.len() > 256 {

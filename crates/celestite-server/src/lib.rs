@@ -18,6 +18,7 @@ mod profile;
 mod reconcile;
 mod shares;
 mod sync;
+mod wire;
 pub use shares::{Permission, VaultLinks};
 pub mod vault;
 use notify::Watcher;
@@ -617,10 +618,15 @@ mod tests {
         );
         assert_eq!(super::log_path("/assets/app.js"), "/assets/app.js");
     }
-    use super::*;
+    use super::{build_server, Config, ServerConfig, VaultConfig};
     use crate::testing::Host;
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::Body,
+        http::{header, HeaderValue, Request, StatusCode},
+        response::Response,
+    };
     use http_body_util::BodyExt;
+    use std::time::Duration;
     use tower::ServiceExt;
     fn fixture(read_only: bool) -> (tempfile::TempDir, Host) {
         let root = tempfile::tempdir().unwrap();

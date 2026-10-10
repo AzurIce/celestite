@@ -1,24 +1,21 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
-import type {
-  Entry,
-  EntryStat,
-  VaultBackend,
-  WriteFileOptions,
-} from "../../vault/types";
+import type { VaultBackend } from "../../vault/types";
+import { fileBackend, type FileMethod, type FileParams } from "../files";
 import type { DocumentsSnapshot } from "../contract";
 import { EditorClient } from "../rpc";
-import { rebaseInputs, sameVersion } from "../view-changes";
+import { TaskQueue } from "../queue";
 import { EditGroups, undoContext } from "../commands";
 import { DocumentPresence } from "./presence";
-import { minimalChange } from "../view-changes";
-import type { DocumentPreviews, PreviewState } from "../preview/contract";
+import { DocumentSession, type PendingInput } from "./session";
+import { startEditorWorker } from "./worker";
+export { applyEdits } from "./session";
+import type { DocumentPreviews, PreviewState } from "../../preview/contract";
 import type {
   ConnectionState,
   CollaborationSnapshot,
   Affinity,
   Anchor,
-  EditorDocument,
   InstanceIdentity,
   SelectionContext,
   ViewSelection,
@@ -27,28 +24,8 @@ import type {
   Version,
 } from "../contract";
 
-interface PendingInput extends ViewEdit {
-  group: string | null;
-}
-interface ViewRecord extends EditorDocument {
-  savedContent: string;
-  acceptedContent: string;
-  acceptedVersion?: Version;
-  inputs: PendingInput[];
-  blocked: boolean;
-}
 function within(path: VaultPath, parent: VaultPath) {
   return path === parent || parent === "" || path.startsWith(parent + "/");
-}
-export function applyEdits(
-  text: string,
-  edits: readonly { from: number; to: number; insert: string }[],
-) {
-  for (let i = edits.length - 1; i >= 0; i--) {
-    const edit = edits[i];
-    text = text.slice(0, edit.from) + edit.insert + text.slice(edit.to);
-  }
-  return text;
 }
 /** Main-thread view controller. Accepted history/undo/IO live only in the host. */
 export class WorkerDocuments {
@@ -68,11 +45,11 @@ export class WorkerDocuments {
   private members?: CollaborationSnapshot;
   private replacingSession = false;
   private generation = 0;
-  private records = new Map<string, ViewRecord>();
+  private records = new Map<string, DocumentSession>();
   private groups = new EditGroups();
   private treeListeners = new Set<Parameters<VaultBackend["watch"]>[0]>();
   private listeners = new Set<(state: DocumentsSnapshot) => void>();
-  private queue: Promise<unknown> = Promise.resolve();
+  private queue = new TaskQueue();
   private saves = new Map<string, Promise<boolean>>();
   private activeId: string | null = null;
   private activation = 0;
@@ -134,38 +111,19 @@ export class WorkerDocuments {
       this.openError = error.message;
       if (this.connection)
         this.connection = { status: "offline", error: error.message };
-      for (const record of this.records.values()) {
-        record.blocked = true;
-        record.locked = true;
-        record.error = error.message;
-      }
+      for (const record of this.records.values()) record.suspend(error.message);
       this.notify();
     });
-    this.treeBackend = {
-      readDir: (path) => this.readDir(path),
-      stat: (path) => this.file("stat", { path }) as Promise<EntryStat | null>,
-      readFile: (path) =>
-        this.file("readFile", { path }) as Promise<Uint8Array>,
-      readFileSnapshot: (path) =>
-        this.file("readFileSnapshot", { path }) as Promise<{
-          data: Uint8Array;
-          revision: string;
-        }>,
-      writeFile: (path, data, options) =>
-        this.file("writeFile", { path, data, options }) as Promise<string>,
-      mkdir: (path, options) =>
-        this.file("mkdir", { path, options }) as Promise<void>,
-      rename: (from, to) => this.file("rename", { from, to }) as Promise<void>,
-      remove: (path, options) =>
-        this.file("remove", { path, options }) as Promise<void>,
-      watch: async (listener) => {
+    this.treeBackend = fileBackend(
+      (method, params) => this.file(method, params),
+      async (listener) => {
         this.treeListeners.add(listener);
         return () => {
           this.treeListeners.delete(listener);
         };
       },
-      close: () => this.close(),
-    };
+      () => this.close(),
+    );
   }
   anchorsAt(id: string, version: Version, positions: [number, Affinity][]) {
     return this.client.request("anchors_at", { id, version, positions });
@@ -182,16 +140,10 @@ export class WorkerDocuments {
     return this.presence.setView(viewId, documentId, focused, selection);
   }
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.queue.then(task);
-    this.queue = result.catch(() => {});
-    return result;
+    return this.queue.run(task);
   }
   private start<T>(task: () => Promise<T>): Promise<T> {
-    return this.enqueue(async () => {
-      const pending = task();
-      void pending.catch(() => {});
-      return { pending };
-    }).then(({ pending }) => pending);
+    return this.queue.start(task);
   }
   snapshot(): DocumentsSnapshot {
     return {
@@ -214,23 +166,13 @@ export class WorkerDocuments {
       conflictResolving: this.conflictResolving,
       conflictError: this.conflictError,
       documents: [...this.records.values()].map((record) => {
-        const {
-          inputs,
-          savedContent,
-          acceptedContent,
-          acceptedVersion,
-          blocked,
-          ...document
-        } = record;
+        const document = record.snapshot();
         return {
           ...document,
-          locked: document.locked || blocked,
           readOnlyReason:
             this.connection && this.connection.status !== "online"
               ? "远端连接已断开，请重新连接。"
               : document.readOnlyReason,
-          dirty: document.content !== savedContent,
-          pending: inputs.length,
         };
       }),
     };
@@ -285,50 +227,7 @@ export class WorkerDocuments {
     };
   }
   private merge(document: ServiceDocument, replace = false) {
-    const record = this.records.get(document.id);
-    if (!record) return;
-    const { content, savedContent, change, ...metadata } = document;
-    if (change && content !== undefined) {
-      if (
-        !record.acceptedVersion ||
-        !sameVersion(record.acceptedVersion, change.before)
-      ) {
-        record.blocked = true;
-        record.error = "远端投影版本不连续，输入仍保留。请复制正文后重新连接。";
-        record.inputFailure = { outcome: "projection", message: record.error };
-        return;
-      }
-      const beforeProjection = record.content;
-      const rebased = rebaseInputs(
-        record.acceptedContent,
-        change.edits,
-        record.inputs,
-      );
-      record.acceptedContent = content;
-      record.acceptedVersion = document.core?.version;
-      record.content = rebased.content;
-      record.remoteChange = { before: beforeProjection, edits: rebased.edits };
-      this.presence.mapProjection(
-        record,
-        beforeProjection,
-        record.content,
-        rebased.edits,
-      );
-    } else if (
-      content !== undefined &&
-      (replace || record.inputs.length === 0)
-    ) {
-      if (record.content !== content)
-        this.presence.mapProjection(record, record.content, content, [
-          minimalChange(record.content, content),
-        ]);
-      record.content = content;
-      record.acceptedContent = content;
-      record.acceptedVersion = document.core?.version;
-    }
-    Object.assign(record, metadata);
-    if (savedContent !== undefined) record.savedContent = savedContent;
-    if (document.core?.historyError) record.error = document.core.historyError;
+    this.records.get(document.id)?.merge(document, replace);
   }
   async reconnectSession(discardUnconfirmed = false) {
     if (this.replacingSession) throw new VaultError("Busy", "正在重新连接。");
@@ -344,7 +243,7 @@ export class WorkerDocuments {
     try {
       // Let in-flight RPCs settle first; their outcome decides whether input
       // needs explicit discard. Queued edits see reconnecting and do not run.
-      await this.queue;
+      await this.queue.idle();
       if (!discardUnconfirmed && this.snapshot().connection?.unconfirmed)
         throw new VaultError(
           "Conflict",
@@ -354,14 +253,7 @@ export class WorkerDocuments {
       for (const document of documents) {
         const record = this.records.get(document.id);
         if (!record) continue;
-        record.inputs = [];
-        record.blocked = false;
-        record.locked = false;
-        delete record.remoteChange;
-        delete record.restoredSelection;
-        delete record.inputFailure;
-        this.merge(document, true);
-        record.reloadVersion++;
+        record.withdraw(document, true);
       }
       this.openError = null;
       this.connection = { status: "online", error: null };
@@ -435,19 +327,12 @@ export class WorkerDocuments {
             await this.client.request("release_document", { id: document.id });
           return false;
         }
-        this.records.set(document.id, {
-          ...document,
-          content: document.content ?? "",
-          acceptedContent: document.content ?? "",
-          acceptedVersion: document.core?.version,
-          savedContent: document.savedContent ?? "",
-          dirty: false,
-          saving: false,
-          locked: false,
-          reloadVersion: 0,
-          inputs: [],
-          blocked: false,
-        });
+        this.records.set(
+          document.id,
+          new DocumentSession(document, (session, before, after, edits) =>
+            this.presence.mapProjection(session, before, after, edits),
+          ),
+        );
         this.activeId = document.id;
         return true;
       } catch (error) {
@@ -484,27 +369,21 @@ export class WorkerDocuments {
     )
       return false;
     const pending = { ...input, group: this.groups.next(id, input.userEvent) };
-    this.presence.mapProjection(
-      record,
-      record.content,
-      input.content,
-      input.edits,
-    );
-    record.content = input.content;
-    record.inputs.push(pending);
+    record.stage(pending);
     this.notify();
     void this.enqueue(() => this.performEdit(record, pending)).catch(
       (error) => {
-        record.blocked = true;
-        record.error = `编辑尚未确认，输入已保留。${error instanceof Error ? error.message : String(error)}`;
-        record.inputFailure = { outcome: "unknown", message: record.error };
+        record.fail(
+          "unknown",
+          `编辑尚未确认，输入已保留。${error instanceof Error ? error.message : String(error)}`,
+        );
         this.notify();
       },
     );
     return true;
   }
   private async performEdit(
-    record: ViewRecord,
+    record: DocumentSession,
     input: PendingInput,
   ): Promise<boolean> {
     if (!record.inputs.includes(input)) return true;
@@ -523,24 +402,15 @@ export class WorkerDocuments {
         base: record.acceptedVersion!,
         input: { kind: "edits", edits: input.edits },
         undo: undoContext(input.before),
-        origin: input.userEvent,
         group: input.group,
       },
     });
     if (result.rejection) {
-      record.blocked = true;
-      record.error = result.rejection.message;
-      record.inputFailure = {
-        outcome: "rejected",
-        message: result.rejection.message,
-      };
+      record.fail("rejected", result.rejection.message);
       this.notify();
       return false;
     }
-    record.inputs.shift();
-    record.acceptedContent = result.document.content ?? input.content;
-    record.acceptedVersion = result.document.core?.version;
-    this.merge(result.document);
+    record.accept(input, result.document);
     this.notify();
     return !record.core?.historyError;
   }
@@ -559,16 +429,12 @@ export class WorkerDocuments {
       // Drain older queued requests, then adopt the current accepted history.
       // Later optimistic inputs depend on the rejected one and are withdrawn too.
       const document = await this.client.request("read", { id });
-      record.inputs = [];
-      record.blocked = false;
-      delete record.inputFailure;
-      this.merge(document, true);
-      record.reloadVersion++;
+      record.withdraw(document);
       this.notify();
       return true;
     });
   }
-  private async flushInputs(record: ViewRecord) {
+  private async flushInputs(record: DocumentSession) {
     if (record.blocked) return false;
     if (record.core?.historyError) {
       const document = await this.client.request("retry_history", {
@@ -619,13 +485,7 @@ export class WorkerDocuments {
           record.error = result.rejection.message;
           return false;
         }
-        record.content = applyEdits(record.content, result.edits);
-        this.merge(result.document);
-        if (result.restoredSelection)
-          record.restoredSelection = {
-            ...result.restoredSelection,
-            revision: (record.restoredSelection?.revision ?? 0) + 1,
-          };
+        record.history(result.document, result.edits, result.restoredSelection);
         return true;
       });
     } catch (error) {
@@ -678,7 +538,7 @@ export class WorkerDocuments {
       }
     });
   }
-  private async saveRecord(record: ViewRecord, flush = true) {
+  private async saveRecord(record: DocumentSession, flush = true) {
     if (!this.online()) return false;
     const generation = this.generation;
     record.saving = true;
@@ -728,7 +588,7 @@ export class WorkerDocuments {
     this.prompt(record, "save");
     return false;
   }
-  private prompt(record: ViewRecord, intent: "save" | "close") {
+  private prompt(record: DocumentSession, intent: "save" | "close") {
     if (!record.conflict || this.conflictPrompt) return;
     this.activate(record.id);
     this.conflictPrompt = { id: record.id, intent };
@@ -832,20 +692,7 @@ export class WorkerDocuments {
       this.activeId = [...this.records.keys()][this.records.size - 1] ?? null;
     if (this.conflictPrompt?.id === id) this.conflictPrompt = null;
   }
-  private async *readDir(path: VaultPath) {
-    const entries = (await this.file("readDir", { path })) as Entry[];
-    yield* entries;
-  }
-  private async file(
-    method: string,
-    params: {
-      path?: VaultPath;
-      from?: VaultPath;
-      to?: VaultPath;
-      data?: Uint8Array;
-      options?: WriteFileOptions | { recursive?: boolean };
-    },
-  ) {
+  private async file(method: FileMethod, params: FileParams) {
     if (this.closing) throw new VaultError("Closed", "Vault is closing");
     this.requireOnline();
     if (
@@ -938,37 +785,23 @@ export async function openLocalEditor(
   const worker = new Worker(new URL("../local/worker.ts", import.meta.url), {
     type: "module",
   });
-  const client = new EditorClient(worker);
-  const error = () =>
-    client.fail(
-      new VaultError("IO", "编辑 Worker 已停止，尚未确认的输入仍保留。"),
-    );
-  worker.addEventListener("error", error);
-  worker.addEventListener("messageerror", error);
-  worker.postMessage({ kind: "initialize", source });
-  try {
-    const identity = await client.ready;
-    const documents = new WorkerDocuments(client, () => {
-      worker.terminate();
-    });
-
-    return {
-      identity,
-      documents,
-      backend: documents.treeBackend,
-      ...(source.kind === "directory"
-        ? {
-            setResourceScope: async (scope: FileSystemDirectoryHandle) => {
-              await client.request("set_resource_scope", { scope });
-            },
-          }
-        : {}),
-    };
-  } catch (error) {
-    client.dispose();
-    worker.terminate();
-    throw error;
-  }
+  const { client, identity, terminate } = await startEditorWorker(worker, {
+    kind: "initialize",
+    source,
+  });
+  const documents = new WorkerDocuments(client, terminate);
+  return {
+    identity,
+    documents,
+    backend: documents.treeBackend,
+    ...(source.kind === "directory"
+      ? {
+          setResourceScope: async (scope: FileSystemDirectoryHandle) => {
+            await client.request("set_resource_scope", { scope });
+          },
+        }
+      : {}),
+  };
 }
 
 export async function openRemoteEditor(
@@ -982,36 +815,14 @@ export async function openRemoteEditor(
   const worker = new Worker(new URL("../remote/worker.ts", import.meta.url), {
     type: "module",
   });
-  const client = new EditorClient(worker);
-  const error = () =>
-    client.fail(
-      new VaultError("IO", "远端编辑 Worker 已停止，尚未确认的输入仍保留。"),
-    );
-  worker.addEventListener("error", error);
-  worker.addEventListener("messageerror", error);
-  worker.postMessage({ kind: "initialize", url });
-  try {
-    const identity = await client.ready;
-    const documents = new WorkerDocuments(
-      client,
-      () => {
-        worker.terminate();
-        void backend.close();
-      },
-      true,
-    );
-    documents.reconnect = async (discardUnconfirmed = false) => {
-      await documents.reconnectSession(discardUnconfirmed);
-    };
-    return {
-      identity,
-      documents,
-      backend: documents.treeBackend,
-    };
-  } catch (error) {
-    client.dispose();
-    worker.terminate();
-    await backend.close();
-    throw error;
-  }
+  const { client, identity, terminate } = await startEditorWorker(
+    worker,
+    { kind: "initialize", url },
+    backend,
+  );
+  const documents = new WorkerDocuments(client, terminate, true);
+  documents.reconnect = async (discardUnconfirmed = false) => {
+    await documents.reconnectSession(discardUnconfirmed);
+  };
+  return { identity, documents, backend: documents.treeBackend };
 }

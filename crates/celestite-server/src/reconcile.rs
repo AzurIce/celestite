@@ -1,6 +1,7 @@
 //! Filesystem notifications are hints. A bounded wakeup coalesces bursts, and a
 //! periodic observation of loaded buffers repairs missed events outside notify's callback.
 use crate::HostedVault;
+use celestite_core::editor::observation::{FileObservationResult, FileObservationTask};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -106,9 +107,7 @@ fn observe(vault: &HostedVault, stopping: &AtomicBool) -> crate::vault::fs::Resu
 fn observe_with(
     vault: &HostedVault,
     stopping: &AtomicBool,
-    mut execute: impl FnMut(
-        celestite_core::FileObservationTask,
-    ) -> celestite_core::FileObservationResult,
+    mut execute: impl FnMut(FileObservationTask) -> FileObservationResult,
 ) -> crate::vault::fs::Result<()> {
     crate::vault::runtime::execute_locked(vault, false, true, |_, docs| docs.reconcile())?;
     let count = crate::vault::runtime::execute_locked(vault, false, true, |_, docs| {
@@ -156,10 +155,14 @@ fn observe_with(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{channel, observe, observe_with, Reconciler};
     use crate::vault::documents::Documents;
-    use celestite_core::{Edit, TextInput, UndoContext};
-    use std::sync::Mutex;
+    use crate::HostedVault;
+    use std::{
+        sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+        thread,
+        time::Duration,
+    };
     use tokio::sync::broadcast;
 
     fn fixture() -> (tempfile::TempDir, Arc<HostedVault>) {
@@ -219,47 +222,9 @@ mod tests {
                 .expect("diff must not hold the document lock");
             let states = docs.resident().unwrap();
             let a = states.iter().find(|s| s.path == "a.md").unwrap();
-            docs.apply(
-                &a.id,
-                celestite_core::BufferCommand::Edit(Edit {
-                    base: a.snapshot.version.clone(),
-                    input: TextInput::Edits {
-                        edits: vec![celestite_core::TextEdit {
-                            from: 2,
-                            to: 8,
-                            insert: "MIDDLE".into(),
-                        }],
-                    },
-                    origin: "local".into(),
-                    group: None,
-                    undo: UndoContext {
-                        metadata: None,
-                        positions: vec![],
-                    },
-                }),
-            )
-            .unwrap();
+            docs.edit(&a.id, [(2..8, "MIDDLE")]).unwrap();
             let b = states.iter().find(|s| s.path == "b.md").unwrap();
-            docs.apply(
-                &b.id,
-                celestite_core::BufferCommand::Edit(Edit {
-                    base: b.snapshot.version.clone(),
-                    input: TextInput::Edits {
-                        edits: vec![celestite_core::TextEdit {
-                            from: 5,
-                            to: 5,
-                            insert: " saved".into(),
-                        }],
-                    },
-                    origin: "local".into(),
-                    group: None,
-                    undo: UndoContext {
-                        metadata: None,
-                        positions: vec![],
-                    },
-                }),
-            )
-            .unwrap();
+            docs.edit(&b.id, [(5..5, " saved")]).unwrap();
             let version = docs.state(&b.id).unwrap().snapshot.version;
             docs.save(&b.id, version).unwrap();
         }
@@ -272,7 +237,8 @@ mod tests {
                 .find(|s| s.path == "a.md")
                 .unwrap()
                 .snapshot
-                .text,
+                .text
+                .as_ref(),
             "A1 MIDDLE B1"
         );
         assert_eq!(
@@ -312,7 +278,8 @@ mod tests {
                 .find(|s| s.id == id)
                 .unwrap()
                 .snapshot
-                .text,
+                .text
+                .as_ref(),
             "A middle B"
         );
         docs.reconcile().unwrap();
@@ -329,7 +296,7 @@ mod tests {
             .into_iter()
             .find(|s| s.id == id)
             .unwrap();
-        assert_eq!(state.snapshot.text, "A1 middle B1");
+        assert_eq!(state.snapshot.text.as_ref(), "A1 middle B1");
         assert!(state.external_change.is_none());
     }
 
@@ -387,7 +354,7 @@ mod tests {
             .into_iter()
             .find(|s| s.id == old.id)
             .unwrap();
-        assert_eq!(state.snapshot.text, "A1 middle B1");
+        assert_eq!(state.snapshot.text.as_ref(), "A1 middle B1");
     }
 
     #[tokio::test]
@@ -446,14 +413,14 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        assert_eq!(state.snapshot.text, "missed notification");
+        assert_eq!(state.snapshot.text.as_ref(), "missed notification");
         worker.stop();
         drop(vault);
         let mut reopened = Documents::open(root.path(), &[0; 32]).unwrap();
         assert!(reopened.resident().unwrap().is_empty());
         reopened.open_file("a.md").unwrap();
         let next = reopened.resident().unwrap().pop().unwrap().snapshot;
-        assert_eq!(next.text, state.snapshot.text);
-        assert_ne!(next.version.identity, state.snapshot.version.identity);
+        assert_eq!(next.text.as_ref(), state.snapshot.text.as_ref());
+        assert_ne!(next.version.identity(), state.snapshot.version.identity());
     }
 }

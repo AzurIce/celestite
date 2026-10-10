@@ -66,7 +66,8 @@ async function ex(page: Page, command: string) {
 }
 
 async function toggleVim(page: Page, enabled: boolean) {
-  await page.getByRole("button", { name: "全局设置", exact: true }).click();
+  const trigger = page.getByRole("button", { name: "全局设置", exact: true });
+  await trigger.click();
   const dialog = page.getByRole("dialog", { name: "全局设置", exact: true });
   await dialog
     .getByRole("checkbox", { name: "Vim 模式", exact: true })
@@ -75,6 +76,9 @@ async function toggleVim(page: Page, enabled: boolean) {
     "已保存",
   );
   await dialog.getByRole("button", { name: "关闭弹窗" }).click();
+  // Modal focus restoration completes after teardown. Do not race its delayed
+  // restore with the next editor command (which can open a Vim input panel).
+  await expect(trigger).toBeFocused();
   await editor(page).focus();
 }
 

@@ -4,12 +4,12 @@ import {
   SyncSession,
   containsVersion,
 } from "../../src/lib/editor/remote/session";
-import type { Version, SyncPacket } from "../../src/lib/editor/contract";
+import type { Version, HistoryPacket } from "../../src/lib/editor/contract";
 const version = (clock: number, id = "a"): Version => ({
   identity: { document_id: id, history_id: "history" },
   clocks: { "1": clock },
 });
-const packet = (id = "a"): SyncPacket => ({
+const packet = (id = "a"): HistoryPacket => ({
   identity: version(0, id).identity,
   kind: "updates",
   data: [1, 2],

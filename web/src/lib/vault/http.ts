@@ -1,7 +1,4 @@
-import type {
-  PackageResourceProvider,
-  PreviewTask,
-} from "../editor/preview/contract";
+import type { PackageResourceProvider, PreviewTask } from "../preview/contract";
 import { VaultError, type VaultErrorCode } from "./errors";
 import { vaultPath, type VaultPath } from "./path";
 import type {
@@ -125,7 +122,7 @@ export class HttpVaultBackend implements VaultBackend {
     if (!descriptor.previewResourceRoot) return;
     const context = (task: PreviewTask) => {
       const overlays: Record<string, string> = {};
-      for (const [path, resource] of Object.entries(task.resources))
+      for (const [path, resource] of Object.entries(task.resources ?? {}))
         if (
           (path === "Notist.toml" || path.endsWith("/Notist.toml")) &&
           resource.data
@@ -133,7 +130,7 @@ export class HttpVaultBackend implements VaultBackend {
           overlays[path] = new TextDecoder().decode(
             new Uint8Array(resource.data),
           );
-      for (const [path, source] of Object.entries(task.overlays))
+      for (const [path, source] of Object.entries(task.overlays ?? {}))
         if (path === "Notist.toml" || path.endsWith("/Notist.toml"))
           overlays[path] = source;
       return { documentPath: task.ticket.path, overlays };

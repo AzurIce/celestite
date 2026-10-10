@@ -17,20 +17,18 @@ import type {
   PreviewResult,
   PreviewState,
   PreviewDiagnostic,
-} from "@/lib/editor/preview/contract";
+} from "@/lib/preview/contract";
 import contentStyle from "./preview-content.css?inline";
 import type { PreviewSync } from "./preview-sync";
 import "./preview.css";
-import { loadComponents } from "@/lib/editor/preview/components";
+import { loadComponents } from "@/lib/preview/components";
 
 function sameVersion(a: Version, b: Version) {
   return (
     a.identity.document_id === b.identity.document_id &&
     a.identity.history_id === b.identity.history_id &&
     Object.keys(a.clocks).length === Object.keys(b.clocks).length &&
-    Object.entries(a.clocks).every(
-      ([writer, clock]) => b.clocks[writer] === clock,
-    )
+    Object.entries(a.clocks).every(([peer, clock]) => b.clocks[peer] === clock)
   );
 }
 export function DocumentPreview(props: {
@@ -142,7 +140,7 @@ export function DocumentPreview(props: {
             untrack(() => state()?.target.taskId) !== result.ticket.taskId
           )
             return;
-          return loadComponents(result.output.usedComponents, assets);
+          return loadComponents(result.output.usedComponents ?? [], assets);
         })
         .catch((error) => {
           if (

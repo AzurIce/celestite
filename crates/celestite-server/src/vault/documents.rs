@@ -4,7 +4,14 @@ use super::{
     fs::{FsVault, Result},
     VaultIdentity,
 };
-use celestite_core::*;
+use celestite_buffer::types::{Anchor, HistoryPacket, HistoryPacketKind, Version};
+#[cfg(test)]
+use celestite_core::editor::types::EditorMutation;
+use celestite_core::editor::{
+    observation::{FileObservationResult, FileObservationTask},
+    types::{EditorDocument, HostDocument},
+    EditorCore, EditorOptions, ExternalChangePolicy,
+};
 use futures_lite::future::block_on;
 use std::path::Path;
 
@@ -13,7 +20,7 @@ pub(crate) struct Documents {
     pub files: std::sync::Arc<FsVault>,
     core: EditorCore<NativeBackend>,
     feed: super::changes::DocumentFeed,
-    writers: std::collections::HashSet<String>,
+    peer_ids: std::collections::HashSet<u64>,
 }
 impl Documents {
     pub fn open(root: &Path, seed: &[u8; 32]) -> Result<Self> {
@@ -38,7 +45,7 @@ impl Documents {
             files,
             core,
             feed,
-            writers: Default::default(),
+            peer_ids: Default::default(),
         })
     }
     pub fn reconcile(&mut self) -> Result<()> {
@@ -98,7 +105,7 @@ impl Documents {
     pub fn host_document(&self, id: &str, known_revision: Option<&str>) -> Result<HostDocument> {
         let status = self.core.status(id).map_err(vault_error)?;
         self.core
-            .host_document(id, known_revision != Some(status.backend_revision.as_str()))
+            .host_document(id, known_revision != Some(status.file_revision.as_str()))
             .map_err(vault_error)
     }
     pub fn committed_version(&self, id: &str) -> Result<Version> {
@@ -107,8 +114,21 @@ impl Documents {
     }
     pub fn validate_presence(&self, id: &str, version: &Version, anchors: &[Anchor]) -> Result<()> {
         self.require_committed(id)?;
+        if !self
+            .core
+            .status(id)
+            .map_err(vault_error)?
+            .version
+            .contains(version)
+        {
+            return Err(super::fs::VaultError::new(
+                "StaleVersion",
+                "Unknown presence checkpoint",
+                id,
+            ));
+        }
         self.core
-            .resolve_anchors(id, version, anchors)
+            .resolve_anchors(id, anchors)
             .map(|_| ())
             .map_err(vault_error)
     }
@@ -119,12 +139,12 @@ impl Documents {
         block_on(self.core.refresh(id)).map_err(vault_error)
     }
     #[cfg(test)]
-    pub fn apply(
+    pub fn edit<'a>(
         &mut self,
         id: &str,
-        command: BufferCommand,
+        edits: impl IntoIterator<Item = (std::ops::Range<usize>, &'a str)>,
     ) -> Result<std::sync::Arc<EditorMutation>> {
-        block_on(self.core.apply(id, command)).map_err(vault_error)
+        block_on(self.core.edit(id, edits)).map_err(vault_error)
     }
     fn require_committed(&self, id: &str) -> Result<()> {
         let state = self.core.status(id).map_err(vault_error)?;
@@ -137,45 +157,47 @@ impl Documents {
         }
         Ok(())
     }
-    pub fn snapshot(&self, id: &str) -> Result<SyncPacket> {
+    pub fn snapshot(&self, id: &str) -> Result<HistoryPacket> {
         self.require_committed(id)?;
         self.core.snapshot(id).map_err(vault_error)
     }
-    pub fn updates(&self, id: &str, version: &Version) -> Result<SyncPacket> {
+    pub fn updates(&self, id: &str, version: &Version) -> Result<HistoryPacket> {
         self.require_committed(id)?;
         self.core.updates(id, version).map_err(vault_error)
     }
-    /// Writers are reserved for the lifetime of this host, even before their
-    /// first operation. A reconnect always receives a new writer.
-    pub fn allocate_writer(&mut self, id: &str) -> Result<String> {
+    /// Peer IDs are reserved for the lifetime of this host, even before their
+    /// first operation. A reconnect always receives a new peer ID.
+    pub fn allocate_peer_id(&mut self, id: &str) -> Result<u64> {
         self.require_committed(id)?;
         let version = self.core.status(id).map_err(vault_error)?.version;
-        let host_writer = self.core.writer_id(id).map_err(vault_error)?;
+        let host_peer_id = self.core.peer_id(id).map_err(vault_error)?;
         loop {
             let mut bytes = [0_u8; 8];
             getrandom::fill(&mut bytes)
                 .map_err(|e| super::fs::VaultError::new("IO", e.to_string(), id))?;
-            let writer = u64::from_le_bytes(bytes).to_string();
-            if writer != host_writer
-                && !version.clocks.contains_key(&writer)
-                && self.writers.insert(writer.clone())
+            let peer_id = u64::from_le_bytes(bytes);
+            // Loro reserves MAX; a wire-valid integer is not always a peer ID.
+            if peer_id != u64::MAX
+                && peer_id != host_peer_id
+                && version.clock(peer_id) == 0
+                && self.peer_ids.insert(peer_id)
             {
-                return Ok(writer);
+                return Ok(peer_id);
             }
         }
     }
 
     /// Validate on an isolated history before touching live state or undo.
-    /// Clients may only advance their assigned writer, with complete causal
-    /// dependencies; an old session's unsent writer cannot be smuggled in.
+    /// Clients may only advance their assigned peer ID, with complete causal
+    /// dependencies; an old session's unsent peer cannot be smuggled in.
     pub fn import_session(
         &mut self,
         id: &str,
-        packet: SyncPacket,
-        writer: &str,
+        packet: HistoryPacket,
+        peer_id: u64,
         claimed: &Version,
     ) -> Result<()> {
-        if packet.kind != PacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
+        if packet.kind != HistoryPacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
             return Err(super::fs::VaultError::new(
                 "InvalidEdit",
                 "Expected bounded CRDT updates",
@@ -183,22 +205,19 @@ impl Documents {
             ));
         }
         self.require_committed(id)?;
-        let prepared = self
-            .core
-            .prepare_import(id, Import::new(packet, "peer"))
-            .map_err(vault_error)?;
+        let prepared = self.core.prepare_import(id, packet).map_err(vault_error)?;
         let before = prepared.before();
         let after = &prepared.preview().version;
         if prepared.preview().pending
             || !after.contains(claimed)
-            || after.clocks.iter().any(|(peer, clock)| {
-                peer != writer && *clock > before.clocks.get(peer).copied().unwrap_or(0)
-            })
-            || claimed.clocks.get(writer) != after.clocks.get(writer)
+            || after
+                .iter()
+                .any(|(peer, clock)| peer != peer_id && clock > before.clock(peer))
+            || claimed.clock(peer_id) != after.clock(peer_id)
         {
             return Err(super::fs::VaultError::new(
                 "InvalidEdit",
-                "Invalid session writer or causal dependencies",
+                "Invalid session peer ID or causal dependencies",
                 id,
             ));
         }

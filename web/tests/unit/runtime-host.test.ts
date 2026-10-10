@@ -30,9 +30,9 @@ const version = (clock: number): Version => ({
 const before: CoreDocument = {
   id: "doc",
   path: "a.md",
-  snapshot: { text: "base", version: version(4), revision: 0 },
+  snapshot: { text: "base", version: version(4), stateRevision: 0 },
   undo: { canUndo: false, canRedo: false },
-  writerId: "1",
+  peerId: "1",
   savedContent: "base",
   savedVersion: version(4),
   dirty: false,
@@ -40,27 +40,27 @@ const before: CoreDocument = {
   lineEnding: "\n",
   deleted: false,
   conflict: false,
-  durableVersion: null,
+  persistedVersion: null,
   persistenceError: null,
   error: null,
   autosaveDelay: null,
-  backendRevision: "disk",
+  fileRevision: "disk",
 };
 const mutation: CoreMutation = {
   document: {
     ...before,
-    snapshot: { text: "baseX", version: version(5), revision: 1 },
+    snapshot: { text: "baseX", version: version(5), stateRevision: 1 },
     undo: { canUndo: true, canRedo: false },
     dirty: true,
   },
   update: {
-    cause: { kind: "local", origin: "typing" },
+    cause: { kind: "local" },
     changed: true,
     before: version(4),
     after: version(5),
     beforeLen: 4,
     afterLen: 5,
-    revision: 1,
+    stateRevision: 1,
     edits: [{ from: 4, to: 4, insert: "X" }],
     undo: { canUndo: true, canRedo: false },
     restored: null,
@@ -71,7 +71,7 @@ const mutation: CoreMutation = {
       data: [1, 2, 3],
     },
   },
-  history: { status: "committed", version: version(5), durable: false },
+  history: { status: "committed", version: version(5), persisted: false },
 };
 const command: BufferCommand = {
   kind: "edit",
@@ -81,6 +81,48 @@ const command: BufferCommand = {
 };
 
 // These tests exercise the transport contract, not a replacement text engine.
+test("readonly source captures use the core queue and request only explicit bodies", async () => {
+  const requests: { method: string; params: Record<string, unknown> }[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const source = {
+    epoch: 1,
+    documents: [{ id: "doc", path: "a.md", version: before.snapshot.version }],
+    snapshots: [],
+  };
+  const host = new EditorHost(
+    {
+      async call(method, json) {
+        requests.push({ method, params: JSON.parse(json) });
+        if (requests.length === 1) await gate;
+        return JSON.stringify({ status: "ok", value: source, mutations: [] });
+      },
+    },
+    {} as VaultBackend,
+    () => {},
+    () => {},
+  );
+  const metadata = host.withSource([], (captured) => {
+    // A later core request cannot start between capture and consumption.
+    assert.equal(requests.length, 1);
+    return captured;
+  });
+  const ids = Object.freeze(["doc"]);
+  const bodies = host.readSource(ids);
+  await Promise.resolve();
+  assert.equal(requests.length, 1);
+  release();
+  assert.deepEqual(await metadata, source);
+  await bodies;
+  assert.deepEqual(requests, [
+    { method: "document_source", params: { ids: [] } },
+    { method: "document_source", params: { ids: ["doc"] } },
+  ]);
+  assert.deepEqual(ids, ["doc"]);
+});
+
 function port(reply: CoreReply): CorePort {
   return {
     async call(method) {
@@ -144,7 +186,7 @@ test("accepted external changes are dispatched before a failing IO command repor
     ...mutation,
     update: {
       ...mutation.update,
-      cause: { kind: "import", origin: "filesystem" },
+      cause: { kind: "import" },
     },
   };
   const { instance, events } = host({
@@ -240,7 +282,7 @@ test("concurrent open replies join a replica once and accept metadata in receipt
       return {
         kind: "document",
         sequence: current,
-        writerId: "2",
+        peerId: "2",
         document: {
           ...before,
           version: version(current + 4),

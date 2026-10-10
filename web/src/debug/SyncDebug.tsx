@@ -145,9 +145,7 @@ export default function SyncDebug() {
                 <p class="debug-meta">
                   instance {replica().identity.instanceId}
                 </p>
-                <p class="debug-meta">
-                  writer {replica().document.core?.writerId}
-                </p>
+                <p class="debug-meta">peer {replica().document.core?.peerId}</p>
                 <textarea
                   aria-label={`实例 ${replica().name} 正文`}
                   value={replica().document.content}
@@ -224,7 +222,7 @@ export default function SyncDebug() {
                   />
                   <VersionView
                     label="本机历史提交"
-                    version={replica().document.core?.durableVersion}
+                    version={replica().document.core?.persistedVersion}
                   />
                 </div>
               </section>

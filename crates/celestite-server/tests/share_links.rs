@@ -147,11 +147,12 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     let task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let mut peer = support::Peer::connect(&format!("http://{address}/{editor}/api/v1")).await;
-    assert_eq!(peer.open("a.md").await, id);
-    let edited = peer.edit(id, 0, 0, "edited ").await;
-    assert_eq!(edited.snapshot.text, "edited original");
-    peer.close().await;
+    let mut client =
+        support::ClientReplica::connect(&format!("http://{address}/{editor}/api/v1")).await;
+    assert_eq!(client.open("a.md").await, id);
+    let edited = client.edit(id, 0, 0, "edited ").await;
+    assert_eq!(edited.snapshot.text.as_ref(), "edited original");
+    client.close().await;
     task.abort();
     let visible = read(
         response(
@@ -301,23 +302,11 @@ fn public_url_is_validated_and_share_secrets_accept_any_nonempty_string() {
 
 #[tokio::test]
 async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_session() {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     let f = Fixture::new();
     let server = f.start();
     let reader = server.links.key(Permission::Readonly).to_owned();
-    let description = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
-    let document = read(
-        response(
-            &server.router,
-            &reader,
-            "POST",
-            "/documents/open",
-            json!({"path":"a.md"}),
-        )
-        .await,
-    )
-    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = server.router.clone();
@@ -331,50 +320,24 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
     assert!(
         matches!(connect_async(invalid).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(reply) if reply.status()==404)
     );
-    let (mut socket, _) = connect_async(format!("ws://{address}{}/sync", uri(&reader, "")))
-        .await
-        .unwrap();
-    socket
-        .send(Message::Text(
-            json!({"protocolVersion":3,"vaultIdentity":description["vaultIdentity"]})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-    let mut session = Value::Null;
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let Message::Text(text) = frame else { continue };
-        let value: Value = serde_json::from_str(&text).unwrap();
-        if value["kind"] == "hello" {
-            session = value["sessionId"].clone();
-        }
-        if value["kind"] == "ready" {
-            break;
-        }
-    }
-    socket.send(Message::Text(json!({"sessionId":session,"requestId":1,"method":"save","id":document["id"],"version":document["snapshot"]["version"]}).to_string().into())).await.unwrap();
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let Message::Text(text) = frame else { continue };
-        let value: Value = serde_json::from_str(&text).unwrap();
-        if value["kind"] == "reply" {
-            assert_eq!(value["error"]["code"], "PermissionDenied");
-            break;
-        }
-    }
+    let mut client = support::ClientReplica::connect(&format!(
+        "http://{address}{reader_path}",
+        reader_path = uri(&reader, "")
+    ))
+    .await;
+    let id = client.open("a.md").await;
+    assert_eq!(
+        client
+            .request(
+                "save",
+                json!({"id":id,"version":client.core.read(&id).unwrap().snapshot.version})
+            )
+            .await["error"]["code"],
+        "PermissionDenied"
+    );
     server.shutdown.send_replace(true);
     tokio::time::timeout(Duration::from_secs(2), async {
-        while let Some(frame) = socket.next().await {
+        while let Some(frame) = client.socket.next().await {
             if matches!(frame, Ok(Message::Close(_)) | Err(_)) {
                 break;
             }

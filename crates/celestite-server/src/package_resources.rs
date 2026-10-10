@@ -4,7 +4,7 @@ use crate::{
     ApiError, RemoteAccess, ServerState,
 };
 use axum::{routing::post, Extension, Json, Router};
-use celestite_core::{PreviewResource, PreviewResourceKind, PreviewResourceRequest};
+use celestite_core::preview::{PreviewResource, PreviewResourceKind, PreviewResourceRequest};
 use notify::{RecursiveMode, Watcher};
 use notist::{resources::ResourceKind, ResourceError, Resources};
 use serde::Deserialize;
@@ -349,13 +349,15 @@ async fn directory(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Context, PackageResources};
     use crate::testing::Host;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
+    use std::collections::BTreeMap;
+    use tokio::sync::broadcast;
     use tower::ServiceExt;
 
     async fn call(

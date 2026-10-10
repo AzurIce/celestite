@@ -1648,7 +1648,7 @@ async function cursorOffset(page: Page) {
         .selection.main.head,
   );
 }
-test("two online editors converge live and undo only their own writer", async ({
+test("two online editors converge live and undo only their own peer", async ({
   page,
   browser,
   api,

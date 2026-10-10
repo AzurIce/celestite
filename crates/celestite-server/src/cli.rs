@@ -120,8 +120,10 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use clap::{error::ErrorKind, CommandFactory};
+    use super::Cli;
+    use celestite_server::ServerConfig;
+    use clap::{error::ErrorKind, CommandFactory, Parser};
+    use std::path::Path;
     const KEY: &str = "0123456789abcdef0123456789abcdef";
     fn config_file(base: &Path) {
         std::fs::write(

@@ -1,8 +1,6 @@
 import type { EditorClient } from "../rpc";
 import type {
   CollaborationSnapshot,
-  RemoteSelection,
-  Version,
   ViewEdit,
   ViewSelection,
 } from "../contract";
@@ -13,16 +11,17 @@ import {
 } from "../presence";
 import { containsVersion } from "../remote/session";
 import { sameVersion } from "../view-changes";
+import { mapCollaborators, type DocumentSession } from "./session";
 
-interface Projection {
-  id: string;
-  content: string;
-  acceptedContent: string;
-  acceptedVersion?: Version;
-  inputs: ViewEdit[];
-  blocked: boolean;
-  collaborators?: RemoteSelection[];
-}
+type Projection = Pick<
+  DocumentSession,
+  | "id"
+  | "content"
+  | "acceptedContent"
+  | "acceptedVersion"
+  | "blocked"
+  | "collaborators"
+> & { inputs: readonly ViewEdit[] };
 interface LocalView {
   documentId: string;
   focused: boolean;
@@ -79,15 +78,12 @@ export class DocumentPresence {
     this.schedule();
   }
   mapProjection(
-    record: Projection,
+    record: Pick<Projection, "id" | "collaborators">,
     before: string,
     after: string,
     edits: ViewEdit["edits"],
   ) {
-    record.collaborators = record.collaborators?.map((member) => ({
-      ...member,
-      ...mapViewSelection(member, before.length, edits),
-    }));
+    mapCollaborators(record, before, edits);
     for (const view of this.views.values()) {
       if (view.documentId !== record.id || view.position?.content !== before)
         continue;
@@ -184,8 +180,8 @@ export class DocumentPresence {
           let offset = 0;
           record.collaborators = remote.map(({ member, view, selection }) => {
             const ranges = selection.ranges.map(() => ({
-              anchor: resolved[offset++].offset,
-              head: resolved[offset++].offset,
+              anchor: resolved[offset++],
+              head: resolved[offset++],
             }));
             const projected = projectSelection(
               { ranges, mainIndex: selection.mainIndex },

@@ -164,11 +164,35 @@ test("presence waits for text dependencies and discards resolution after a peer 
   const left = members(6);
   left.members.pop();
   presence.refresh(left, [doc], true);
-  resolve([version(5), [{ offset: 1 }, { offset: 3 }]]);
+  resolve([version(5), [1, 3]]);
   await Promise.resolve();
   assert.deepEqual(doc.collaborators, []);
   assert.equal(changes, 0);
   presence.close();
+});
+
+test("a numeric anchor response from an older accepted version cannot publish a selection", async () => {
+  let resolve!: (value: unknown) => void;
+  let changes = 0;
+  const client = {
+    request: () =>
+      new Promise((done) => {
+        resolve = done;
+      }),
+  } as unknown as EditorClient;
+  const presence = new DocumentPresence(client, () => changes++);
+  const doc = record();
+  try {
+    presence.refresh(members(), [doc], true);
+    doc.acceptedVersion = version(5);
+    doc.acceptedContent = doc.content = "前A😀B";
+    resolve([version(), [1, 3]]);
+    await Promise.resolve();
+    assert.deepEqual(doc.collaborators, []);
+    assert.equal(changes, 0);
+  } finally {
+    presence.close();
+  }
 });
 
 test("received anchors resolve against accepted text and project through pending input; disconnect clears them", async () => {
@@ -177,7 +201,7 @@ test("received anchors resolve against accepted text and project through pending
     changed = resolve;
   });
   const client = {
-    request: async () => [version(), [{ offset: 1 }, { offset: 3 }]],
+    request: async () => [version(), [1, 3]],
   } as unknown as EditorClient;
   const presence = new DocumentPresence(client, changed);
   const doc = record();
@@ -258,12 +282,12 @@ test("a delayed resolution cannot attach to a closed and reopened document proje
     current = reopened;
     presence.refresh(members(), [reopened], true);
     assert.equal(pending.length, 1);
-    pending[0]([version(), [{ offset: 1 }, { offset: 3 }]]);
+    pending[0]([version(), [1, 3]]);
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(first.collaborators.length, 0);
     assert.equal(reopened.collaborators.length, 0);
     assert.equal(pending.length, 2);
-    pending[1]([version(), [{ offset: 1 }, { offset: 3 }]]);
+    pending[1]([version(), [1, 3]]);
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(reopened.collaborators[0].sessionId, "peer");
     presence.mapProjection(reopened, reopened.content, "前A😀B", [

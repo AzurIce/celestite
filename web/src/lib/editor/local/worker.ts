@@ -1,4 +1,7 @@
-import init, { EditorBinding } from "../generated/celestite_core";
+import init, {
+  EditorBinding,
+  PreviewBinding,
+} from "../generated/celestite_core";
 import { openOpfsVault } from "../../vault/opfs";
 import {
   openDirectoryVault,
@@ -13,6 +16,7 @@ import { DirectoryEditorHost } from "./host";
 import { encodeError } from "../rpc";
 import { serveEditor, type EditorServicePort } from "../runtime/service";
 import { DirectoryPackageResources } from "./package-resources";
+import { PreviewResources } from "../../preview/resources";
 
 export type LocalEditorSource =
   | { kind: "opfs"; id: "default" }
@@ -61,33 +65,28 @@ async function start(source: LocalEditorSource) {
                     source.handle,
                   ).catch(() => undefined)
                 : undefined;
+            const previewResources = new PreviewResources(backend, packages);
             const host =
               source.kind === "directory"
-                ? new DirectoryEditorHost(
-                    binding,
-                    backend,
-                    emit,
-                    schedule,
-                    packages,
-                  )
+                ? new DirectoryEditorHost(binding, backend, emit, schedule)
                 : new EditorHost(binding, backend, emit, schedule);
             return {
               identity: store.identity,
-              host: Object.assign(
-                host,
-                source.kind === "directory"
-                  ? {
-                      setResourceScope: async (scope: LocalDirectoryHandle) => {
-                        host.previewResources.setPackages(
-                          await DirectoryPackageResources.open(
-                            scope,
-                            source.handle,
-                          ),
-                        );
-                      },
-                    }
-                  : {},
-              ),
+              host,
+              previewBinding: new PreviewBinding(),
+              previewResources,
+              ...(source.kind === "directory"
+                ? {
+                    setResourceScope: async (scope: LocalDirectoryHandle) => {
+                      previewResources.setPackages(
+                        await DirectoryPackageResources.open(
+                          scope,
+                          source.handle,
+                        ),
+                      );
+                    },
+                  }
+                : {}),
               dispose: () => binding.free(),
             };
           } catch (error) {

@@ -1,5 +1,5 @@
-//! Online membership is volatile and independent of text history and writers.
-use celestite_core::{Anchor, Version};
+//! Online membership is volatile and independent of text history and Loro peers.
+use celestite_buffer::types::{Anchor, Version};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio::sync::watch;

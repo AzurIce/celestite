@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-celestite-core = { path = "../celestite-core" }
-notist = { workspace = true }
+celestite-buffer.workspace = true
+celestite-core.workspace = true
+notist.workspace = true
 futures-lite = "2.6.1"
 cap-std = "4"
 blake3 = "1"
@@ -33,3 +34,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 tokio-tungstenite = "0.29"
+
+[lints]
+workspace = true

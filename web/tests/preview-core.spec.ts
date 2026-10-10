@@ -1,9 +1,8 @@
 import { expect, test } from "@playwright/test";
 import type {
   PreviewCompletion,
-  PreviewCoreMethods,
   PreviewTask,
-} from "../src/lib/editor/preview/contract";
+} from "../src/lib/preview/contract";
 type CoreModule = typeof import("../src/lib/editor/generated/celestite_core");
 
 test("WASM preview tasks execute in an independent Worker and reject stale results", async ({
@@ -28,7 +27,7 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         document_id: "doc",
         history_id: "history",
       }),
-      "100",
+      "18446744073709551614",
       "= 标题\n\n😀中文 #unknown[ok]",
     );
     const blob = new Blob(
@@ -39,7 +38,7 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
       self.onmessage = async event => {
         try {
           await ready;
-          self.postMessage({ result: JSON.parse(render_preview(JSON.stringify(event.data))) });
+          self.postMessage({ result: render_preview(event.data) });
         } catch (error) { self.postMessage({ error: String(error) }); }
       };
     `,
@@ -48,15 +47,25 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
     );
     const url = URL.createObjectURL(blob);
     const worker = new Worker(url, { type: "module" });
-    const execute = async <K extends keyof PreviewCoreMethods>(
-      method: K,
-      params: PreviewCoreMethods[K]["params"],
-    ): Promise<PreviewCoreMethods[K]["result"]> =>
-      (await call(method, params)).value;
+    const previews = new wasm.PreviewBinding();
     const call = async (method: string, params: object) => {
       const reply = JSON.parse(await core.call(method, JSON.stringify(params)));
       if (reply.status === "error") throw new Error(reply.error.message);
       return reply;
+    };
+    const synchronize = async () => {
+      previews.synchronize((await call("document_source", { ids: [] })).value);
+    };
+    const takeTask = async () => {
+      await synchronize();
+      return previews.take_task(
+        "doc",
+        (
+          await call("document_source", {
+            ids: previews.required_snapshots("doc"),
+          })
+        ).value,
+      )!;
     };
     const render = (task: PreviewTask) =>
       new Promise<PreviewCompletion>((resolve, reject) => {
@@ -80,16 +89,13 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         path: "note.not",
         packet: JSON.parse(seed.export_snapshot()),
       });
-      await execute("preview_subscribe", {
-        id: "doc",
-        clientSession: "client",
-      });
-      const task = (await execute("preview_take_task", { id: "doc" }))!;
+      await synchronize();
+      previews.subscribe("doc", "client");
+      const task = await takeTask();
       const computed = await render(task);
-      const accepted = await execute("preview_complete", {
-        completion: computed,
-      });
-      const first = await execute("preview_state", { id: "doc" });
+      await synchronize();
+      const accepted = previews.complete(computed);
+      const first = previews.state("doc");
       await call("apply", {
         id: "doc",
         command: {
@@ -98,16 +104,14 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
           input: { kind: "text", text: "= 新标题\n\n未保存正文" },
         },
       });
-      await execute("preview_retry", { id: "doc" });
-      const latest = (await execute("preview_take_task", { id: "doc" }))!;
-      const staleAccepted = await execute("preview_complete", {
-        completion: computed,
-      });
+      await synchronize();
+      previews.retry("doc");
+      const latest = await takeTask();
+      const staleAccepted = previews.complete(computed);
       const current = await render(latest);
-      const currentAccepted = await execute("preview_complete", {
-        completion: current,
-      });
-      const last = await execute("preview_state", { id: "doc" });
+      await synchronize();
+      const currentAccepted = previews.complete(current);
+      const last = previews.state("doc");
       const document = (await call("read", { id: "doc" })).value;
       return {
         accepted,
@@ -115,15 +119,16 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         currentAccepted,
         first: first.result?.output,
         last: last.result?.output,
-        pairedVersion:
-          JSON.stringify(last.result?.ticket.version) ===
-          JSON.stringify(document.snapshot.version),
+        previewVersion: last.result?.ticket.version,
+        documentVersion: document.snapshot.version,
         savedVersion: document.savedVersion,
+        initialVersion: task.ticket.version,
       };
     } finally {
       worker.terminate();
       URL.revokeObjectURL(url);
       seed.free();
+      previews.free();
       core.free();
     }
   });
@@ -131,14 +136,128 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
   expect(result.staleAccepted).toBe(false);
   expect(result.currentAccepted).toBe(true);
   expect(result.first?.html).toContain("标题");
-  expect(result.first?.sourceMap.length).toBeGreaterThan(0);
+  expect(result.first?.sourceMap?.length).toBeGreaterThan(0);
   expect(result.first?.diagnostics).toHaveLength(2);
   for (const diagnostic of result.first!.diagnostics)
     expect([diagnostic.from, diagnostic.to]).toEqual([11, 23]);
   expect(result.last?.html).toContain("新标题");
   expect(result.last?.html).toContain("未保存正文");
-  expect(result.pairedVersion).toBe(true);
+  expect(result.previewVersion).toEqual(result.documentVersion);
   expect(result.savedVersion).toBeNull();
+  expect(Object.getPrototypeOf(result.initialVersion)).toBe(Object.prototype);
+  expect(Object.getPrototypeOf(result.initialVersion.clocks)).toBe(
+    Object.prototype,
+  );
+  expect(Object.keys(result.initialVersion.clocks)).toContain(
+    "18446744073709551614",
+  );
+  expect(
+    Object.values(result.initialVersion.clocks).every(Number.isInteger),
+  ).toBe(true);
+});
+
+test("preview bindings accept cloneable objects and defaults, and reject malformed inputs", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const result = await page.evaluate(async () => {
+    const wasm = (await import(
+      new URL("/src/lib/editor/generated/celestite_core.js", location.href).href
+    )) as CoreModule;
+    await wasm.default();
+    const task: PreviewTask = {
+      ticket: {
+        taskId: "object-boundary",
+        sessionId: "object-session",
+        documentId: "doc",
+        path: "note.not",
+        renderGeneration: "object-test",
+        version: {
+          identity: { document_id: "doc", history_id: "history" },
+          clocks: { "18446744073709551614": 1 },
+        },
+      },
+      source: "😀 $x$",
+    };
+    const completion = wasm.render_preview(task);
+    const requests = wasm.preview_resource_requests(task);
+    const explicit: PreviewTask = {
+      ...task,
+      overlays: {},
+      resourceRoot: "/vault",
+      resources: {
+        "missing.not": { kind: null, data: null, error: null },
+        "bytes.not": { kind: "file", data: [0, 127, 255], error: null },
+      },
+    };
+    const cloned = structuredClone(explicit);
+    const explicitCompletion = wasm.render_preview(cloned);
+    const malformed = [
+      {},
+      { ...explicit, source: 42 },
+      ...[[-1], [256], [1.5], ["1"], [null], "AQ=="].map((data) => ({
+        ...explicit,
+        resources: {
+          "unused.not": { kind: "file", data, error: null },
+        },
+      })),
+    ];
+    const rejected = malformed.map((input) =>
+      [wasm.render_preview, wasm.preview_resource_requests].map((binding) => {
+        try {
+          // Exercise invalid JS callers without claiming they are valid tasks.
+          Reflect.apply(binding, undefined, [input]);
+          return false;
+        } catch {
+          return true;
+        }
+      }),
+    );
+    return {
+      completion,
+      explicitCompletion,
+      requests,
+      rejected,
+      plain:
+        Object.getPrototypeOf(completion) === Object.prototype &&
+        Object.getPrototypeOf(completion.outcome) === Object.prototype &&
+        Object.getPrototypeOf(cloned.overlays) === Object.prototype &&
+        Object.getPrototypeOf(cloned.resources) === Object.prototype &&
+        Object.getPrototypeOf(cloned.ticket.version.clocks) ===
+          Object.prototype,
+      resources: cloned.resources,
+    };
+  });
+  expect(result.plain).toBe(true);
+  expect(Array.isArray(result.requests)).toBe(true);
+  expect(result.requests.length).toBeGreaterThan(0);
+  for (const request of result.requests) {
+    expect(Object.getPrototypeOf(request)).toBe(Object.prototype);
+    expect(typeof request.path).toBe("string");
+    expect(typeof request.read).toBe("boolean");
+  }
+  expect(result.completion).toEqual(result.explicitCompletion);
+  expect(result.completion.outcome.kind).toBe("success");
+  if (result.completion.outcome.kind !== "success")
+    throw new Error(result.completion.outcome.message);
+  const output = result.completion.outcome.output;
+  expect(Object.getPrototypeOf(output)).toBe(Object.prototype);
+  expect(Array.isArray(output.diagnostics)).toBe(true);
+  expect(Array.isArray(output.sourceMap)).toBe(true);
+  expect(Array.isArray(output.usedComponents)).toBe(true);
+  expect(output.sourceMap).toContainEqual(
+    expect.objectContaining({ from: 3, to: 6 }),
+  );
+  expect(result.resources?.["missing.not"]).toEqual({
+    kind: null,
+    data: null,
+    error: null,
+  });
+  expect(result.resources?.["bytes.not"].data).toEqual([0, 127, 255]);
+  expect(Array.isArray(result.resources?.["bytes.not"].data)).toBe(true);
+  expect(result.rejected.every((bindings) => bindings.every(Boolean))).toBe(
+    true,
+  );
 });
 
 test("preview Worker applies package default transforms and retains Unicode diagnostic ranges", async ({
@@ -147,7 +266,7 @@ test("preview Worker applies package default transforms and retains Unicode diag
   await page.goto("/");
   const completion = await page.evaluate(async () => {
     const worker = new Worker(
-      new URL("/src/lib/editor/preview/worker.ts", location.href),
+      new URL("/src/lib/preview/worker.ts", location.href),
       { type: "module" },
     );
     const task: PreviewTask = {
@@ -205,9 +324,9 @@ test("preview Worker applies package default transforms and retains Unicode diag
     throw new Error(completion.outcome.message);
   const output = completion.outcome.output;
   expect(output.html).toContain("<katex-math");
-  expect(output.usedComponents[0].package).toBe("katex");
+  expect(output.usedComponents?.[0]?.package).toBe("katex");
   expect(
-    output.sourceMap.some((mapping) => mapping.from === 3 && mapping.to === 6),
+    output.sourceMap?.some((mapping) => mapping.from === 3 && mapping.to === 6),
   ).toBe(true);
   expect(output.diagnostics).toContainEqual(
     expect.objectContaining({

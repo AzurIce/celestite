@@ -7,9 +7,24 @@ import type {
   PreviewLink,
   PreviewState,
   PreviewSubscription,
-} from "./preview/contract";
+} from "../preview/contract";
+import type {
+  Affinity,
+  Anchor,
+  BufferCommand,
+  ExternalChangeStatus,
+  InstanceIdentity,
+  LineEnding,
+  RpcError,
+  SelectionContext,
+  TextEdit,
+  UndoState,
+  Version,
+} from "./protocol";
+export type * from "./protocol";
 
-export interface DocumentSnapshot {
+/** Visible projection; accepted history remains in Rust and provisional input in its session. */
+export interface EditorDocument {
   collaborators?: RemoteSelection[];
   deleted?: boolean;
   conflictResolution?: "local" | "shared";
@@ -21,6 +36,7 @@ export interface DocumentSnapshot {
   core?: EditorProjection;
   pending?: number;
   restoredSelection?: SelectionContext & { revision: number };
+  remoteChange?: { before: string; edits: TextEdit[] };
   id: string;
   path: VaultPath;
   content: string;
@@ -32,13 +48,13 @@ export interface DocumentSnapshot {
   reloadVersion: number;
   readOnlyReason: string | null;
   canPreview: boolean;
-  lineEnding: "\n" | "\r\n" | "\r";
+  lineEnding: LineEnding;
   bom: boolean;
 }
 export interface DocumentsSnapshot {
   connection?: ConnectionState;
   collaboration?: CollaborationSnapshot;
-  documents: readonly DocumentSnapshot[];
+  documents: readonly EditorDocument[];
   activeId: string | null;
   loadingPath: VaultPath | null;
   openError: string | null;
@@ -48,29 +64,6 @@ export interface DocumentsSnapshot {
   conflictError: string | null;
 }
 
-export interface Vault {
-  vaultId: string;
-  historyId: string;
-}
-export interface InstanceIdentity {
-  vault: Vault;
-  instanceId: string;
-}
-export interface DocumentIdentity {
-  document_id: string;
-  history_id: string;
-}
-export interface Version {
-  identity: DocumentIdentity;
-  clocks: Record<string, number>;
-}
-/** Serialized CRDT positions are opaque outside core. */
-export type Anchor = { readonly __anchor: unique symbol };
-export type Affinity = "before" | "after";
-export interface ResolvedAnchor {
-  offset: number;
-  refreshed: Anchor;
-}
 export interface MemberView {
   viewId: string;
   documentId: string;
@@ -116,8 +109,8 @@ export interface HostDocument {
   path: string;
   version: Version;
   savedVersion: Version | null;
-  durableVersion: Version | null;
-  backendRevision: string;
+  persistedVersion: Version | null;
+  fileRevision: string;
   dirty: boolean;
   deleted: boolean;
   conflict: boolean;
@@ -128,57 +121,6 @@ export interface HostDocument {
   bom: boolean;
   lineEnding: "\n" | "\r\n" | "\r";
 }
-export interface TextEdit {
-  from: number;
-  to: number;
-  insert: string;
-}
-export interface SelectionContext {
-  ranges: { anchor: number; head: number }[];
-  mainIndex: number;
-}
-export interface UndoState {
-  canUndo: boolean;
-  canRedo: boolean;
-}
-export interface UndoContext {
-  metadata?: unknown;
-  positions: number[];
-}
-export type BufferCommand =
-  | {
-      kind: "edit";
-      base: Version;
-      input:
-        { kind: "edits"; edits: TextEdit[] } | { kind: "text"; text: string };
-      origin?: string;
-      group?: string | null;
-      undo: UndoContext;
-    }
-  | { kind: "undo" | "redo"; base: Version; context: UndoContext }
-  | { kind: "import"; packet: SyncPacket; origin?: string; resetUndo?: boolean }
-  | { kind: "clear_undo" };
-export interface BufferUpdate {
-  cause:
-    | { kind: "local" | "import"; origin: string }
-    | { kind: "undo" | "redo" | "history_cleared" };
-  changed: boolean;
-  before: Version;
-  after: Version;
-  beforeLen: number;
-  afterLen: number;
-  revision: number;
-  edits: TextEdit[];
-  undo: UndoState;
-  restored: UndoContext | null;
-  operation: SyncPacket | null;
-  pending: boolean;
-}
-export interface TextSnapshot {
-  text: string;
-  version: Version;
-  revision: number;
-}
 export interface ViewEdit {
   edits: TextEdit[];
   content: string;
@@ -188,17 +130,10 @@ export interface ViewEdit {
 }
 export interface EditorProjection {
   version: Version;
-  durableVersion: Version | null;
+  persistedVersion: Version | null;
   undo: UndoState;
-  writerId: string;
+  peerId: string;
   historyError: string | null;
-}
-/** UI consumes a view projection, never a raw Buffer or an IO handle. */
-export interface EditorDocument extends DocumentSnapshot {
-  remoteChange?: { before: string; edits: TextEdit[] };
-  core?: EditorProjection;
-  pending?: number;
-  restoredSelection?: SelectionContext & { revision: number };
 }
 /** Connection state for the remote editor session. */
 export interface ConnectionState {
@@ -219,7 +154,7 @@ export interface EditorDocuments {
     id: string,
     checkpoint: Version,
     anchors: Anchor[],
-  ): Promise<[Version, ResolvedAnchor[]]>;
+  ): Promise<[Version, number[]]>;
   setView?(
     viewId: string,
     documentId: string | null,
@@ -257,7 +192,7 @@ export interface ServiceDocument {
   content?: string;
   savedContent?: string;
   bom: boolean;
-  lineEnding: DocumentSnapshot["lineEnding"];
+  lineEnding: LineEnding;
   readOnlyReason: string | null;
   canPreview: boolean;
   error: string | null;
@@ -275,21 +210,6 @@ export type ServiceEvent =
   | { kind: "document"; sequence: number; document: ServiceDocument }
   | { kind: "tree"; sequence: number }
   | { kind: "connection"; sequence: number; connection: ConnectionState };
-export interface RpcError {
-  writeNotStarted?: boolean;
-  code: string;
-  message: string;
-  path?: string;
-  rename?: {
-    from: string;
-    to: string;
-    phase: "copy" | "remove-source";
-    cleanup?: RpcError;
-  };
-}
-export type ExternalChangeStatus =
-  | { phase: "pending" }
-  | { phase: "failed"; code: string; message: string; retryAt: number };
 export type WorkerMessage =
   | { kind: "ready"; identity: InstanceIdentity; sessionId: string }
   | { kind: "reply"; requestId: number; result?: unknown; error?: RpcError }
@@ -326,7 +246,7 @@ export interface ServiceMethods {
   };
   resolve_anchors: {
     params: { id: string; checkpoint: Version; anchors: Anchor[] };
-    result: [Version, ResolvedAnchor[]];
+    result: [Version, number[]];
   };
   read: { params: { id: string }; result: ServiceDocument };
   preview_assets: {
@@ -364,10 +284,4 @@ export interface ServiceMethods {
     result: unknown;
   };
   close: { params: Record<string, never>; result: void };
-}
-
-export interface SyncPacket {
-  identity: DocumentIdentity;
-  kind: "snapshot" | "updates";
-  data: number[];
 }

@@ -36,11 +36,13 @@ test("standalone WASM Buffer commands return exact effects without a host or not
         kind: "edit",
         base: snapshot(buffer).version,
         input: { kind: "edits", edits },
-        origin: "keyboard",
         undo: { metadata: { selection: "before-share" }, positions: [] },
       });
     try {
+      const emojiEnd = local.anchor_at(3, "before");
+      const initialAnchorOffset = local.resolve_anchor(emojiEnd);
       const localUpdate = edit(local, [{ from: 0, to: 0, insert: "local " }]);
+      const shiftedAnchorOffset = local.resolve_anchor(emojiEnd);
       const initial = snapshot(local);
       guest = wasm.BufferBinding.from_snapshot(local.export_snapshot(), "2");
       const guestUndo = JSON.parse(guest.undo_state());
@@ -50,7 +52,6 @@ test("standalone WASM Buffer commands return exact effects without a host or not
       const importedUpdate = apply(local, {
         kind: "import",
         packet: peerUpdate.operation!,
-        origin: "peer",
       });
       const imported = snapshot(local);
       const undoneUpdate = apply(local, {
@@ -72,6 +73,8 @@ test("standalone WASM Buffer commands return exact effects without a host or not
         failure = JSON.parse(String(error));
       }
       return {
+        initialAnchorOffset,
+        shiftedAnchorOffset,
         initial,
         localUpdate,
         peerUpdate,
@@ -84,8 +87,8 @@ test("standalone WASM Buffer commands return exact effects without a host or not
         redoneUpdate,
         failure,
         afterFailure: snapshot(local),
-        writer: local.writer_id(),
-        guestWriter: guest.writer_id(),
+        peer: local.peer_id(),
+        guestPeer: guest.peer_id(),
         hasOldApis:
           "edit" in local ||
           "take_events" in local ||
@@ -96,7 +99,14 @@ test("standalone WASM Buffer commands return exact effects without a host or not
       local.free();
     }
   });
+  expect(result.initialAnchorOffset).toBe(3);
+  expect(result.shiftedAnchorOffset).toBe(9);
   expect(result.initial.text).toBe("local A😀B");
+  expect(result.localUpdate.beforeLen).toBe(4);
+  expect(result.localUpdate.afterLen).toBe(10);
+  expect(result.localUpdate.edits).toEqual([
+    { from: 0, to: 0, insert: "local " },
+  ]);
   expect(result.localUpdate.operation).not.toBeNull();
   expect(result.guestUndo.canUndo).toBe(false);
   expect(result.importedUpdate.operation).toEqual(result.peerUpdate.operation);
@@ -111,7 +121,7 @@ test("standalone WASM Buffer commands return exact effects without a host or not
   expect(result.redoneUpdate.operation).not.toBeNull();
   expect(result.failure?.code).toBe("invalid_position");
   expect(result.afterFailure).toEqual(result.redone);
-  expect(result.writer).toBe("1");
-  expect(result.guestWriter).toBe("2");
+  expect(result.peer).toBe(1n);
+  expect(result.guestPeer).toBe(2n);
   expect(result.hasOldApis).toBe(false);
 });

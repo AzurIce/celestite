@@ -1,5 +1,5 @@
 import { VaultError, VaultRenameError } from "../vault/errors";
-import type { PreviewEvent } from "./preview/contract";
+import type { PreviewEvent } from "../preview/contract";
 import type {
   ServiceMethods,
   InstanceIdentity,
@@ -32,6 +32,24 @@ export function encodeError(error: unknown): RpcError {
           ? { cleanup: encodeError(error.cleanupError) }
           : {}),
       },
+    };
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    "message" in error &&
+    typeof error.message === "string"
+  )
+    return {
+      code: error.code,
+      message: error.message,
+      ...("path" in error && typeof error.path === "string"
+        ? { path: error.path }
+        : {}),
+      ...("writeNotStarted" in error && error.writeNotStarted === true
+        ? { writeNotStarted: true }
+        : {}),
     };
   return {
     ...(error instanceof VaultError && error.writeNotStarted

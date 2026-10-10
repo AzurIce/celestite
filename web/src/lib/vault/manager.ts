@@ -1,5 +1,4 @@
 import { FileTreeModel } from "../file-tree/model";
-import type { EditorBuffer } from "../editor/buffer";
 import { openAppDocument, type SettingsFile } from "../settings/app-file";
 import { openHttpVault, normalizeVaultUrl } from "./http";
 import { openLocalEditor, openRemoteEditor } from "../editor/client/documents";
@@ -33,7 +32,6 @@ export interface VaultInstance {
   backend: VaultBackend;
   documents: EditorDocuments;
   tree: FileTreeModel;
-  editorBuffers: Map<string, EditorBuffer>;
   treeView: { scrollTop: number };
   readOnly: boolean;
 }
@@ -205,7 +203,6 @@ export class VaultManager {
           backend,
           documents,
           tree: new FileTreeModel(backend),
-          editorBuffers: new Map(),
           treeView: { scrollTop: 0 },
           readOnly: false,
           ...(setResourceScope
@@ -440,7 +437,6 @@ export class VaultManager {
       name: connection.name,
       ...editor,
       tree: new FileTreeModel(editor.backend),
-      editorBuffers: new Map(),
       treeView: { scrollTop: 0 },
       readOnly,
     };
@@ -470,7 +466,6 @@ export class VaultManager {
       if (vault) {
         await vault.documents.close();
         vault.tree.dispose();
-        vault.editorBuffers.clear();
       }
       if (this.active?.id === id && fallback) {
         this.selection++;
@@ -523,7 +518,6 @@ export class VaultManager {
     );
     for (const vault of this.runtimes.values()) {
       vault.tree.dispose();
-      vault.editorBuffers.clear();
     }
     await this.persistence;
     this.resourceSetters.clear();

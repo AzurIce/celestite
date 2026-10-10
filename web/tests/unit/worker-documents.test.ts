@@ -4,6 +4,7 @@ import { WorkerDocuments } from "../../src/lib/editor/client/documents";
 import { EditorClient, type MessageTransport } from "../../src/lib/editor/rpc";
 import { vaultPath } from "../../src/lib/vault/path";
 import type {
+  BufferCommand,
   ServiceDocument,
   WorkerMessage,
   WorkerRequest,
@@ -81,8 +82,8 @@ function document(): ServiceDocument {
         identity: { document_id: "file", history_id: "history" },
         clocks: { "1": 4 },
       },
-      durableVersion: null,
-      writerId: "2",
+      persistedVersion: null,
+      peerId: "2",
       undo: { canUndo: false, canRedo: false },
       historyError: null,
     },
@@ -105,6 +106,119 @@ function setup(reply: (request: WorkerRequest) => unknown, remote = true) {
   return { transport, client, documents };
 }
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+test("consecutive input receipts advance accepted history without replacing the optimistic projection", async () => {
+  let accepted = document();
+  const projections: string[] = [];
+  const { transport, client, documents } = setup((request) => {
+    if (request.method !== "apply") return accepted;
+    const command = request.params.command as BufferCommand;
+    assert.equal(command.kind, "edit");
+    if (command.kind !== "edit") throw new Error("expected edit");
+    assert.deepEqual(command.base, accepted.core!.version);
+    accepted = {
+      ...accepted,
+      content: accepted.content + (accepted.content === "base" ? "X" : "Y"),
+      core: {
+        ...accepted.core!,
+        version: {
+          ...accepted.core!.version,
+          clocks: { "1": 4, "2": accepted.content === "base" ? 1 : 2 },
+        },
+      },
+    };
+    return { document: accepted, edits: [] };
+  });
+  await documents.open(vaultPath("a.md"));
+  documents.subscribe((state) => projections.push(state.documents[0].content));
+  assert.equal(documents.edit("file", input("baseX")), true);
+  assert.equal(documents.edit("file", input("baseXY")), true);
+  await settle();
+  assert.deepEqual(projections, ["baseX", "baseXY", "baseXY", "baseXY"]);
+  const view = documents.snapshot().documents[0];
+  assert.equal(view.pending, 0);
+  assert.equal(view.dirty, true);
+  assert.equal("acceptedContent" in view, false);
+  assert.equal("inputs" in view, false);
+  assert.equal(transport.sent.filter((r) => r.method === "apply").length, 2);
+  client.dispose();
+});
+
+test("an accepted native history failure consumes its input, not its dependent draft", async () => {
+  const initial = document();
+  const failed = {
+    ...initial,
+    content: "baseX",
+    core: {
+      ...initial.core!,
+      version: { ...initial.core!.version, clocks: { "1": 4, "2": 1 } },
+      historyError: "native append failed",
+    },
+  };
+  const { transport, client, documents } = setup((request) =>
+    request.method === "apply" ? { document: failed, edits: [] } : initial,
+  );
+  await documents.open(vaultPath("a.md"));
+  documents.edit("file", input("baseX"));
+  documents.edit("file", input("baseXY"));
+  await settle();
+  const view = documents.snapshot().documents[0];
+  assert.equal(view.content, "baseXY");
+  assert.equal(view.pending, 1);
+  assert.equal(view.error, "native append failed");
+  assert.equal(view.inputFailure, undefined);
+  assert.equal(await documents.discardRejectedInput("file"), false);
+  assert.equal(transport.sent.filter((r) => r.method === "apply").length, 1);
+  client.dispose();
+});
+
+for (const discard of [false, true]) {
+  test(`reconnect observes the in-flight input outcome before replacing the session (discard=${discard})`, async () => {
+    const initial = document();
+    const accepted = {
+      ...initial,
+      content: "baseX",
+      core: {
+        ...initial.core!,
+        version: { ...initial.core!.version, clocks: { "1": 4, "2": 1 } },
+      },
+    };
+    const { transport, client, documents } = setup((request) =>
+      request.method === "reconnect" ? [accepted] : initial,
+    );
+    try {
+      await documents.open(vaultPath("a.md"));
+      const post = transport.postMessage.bind(transport);
+      let pending!: WorkerRequest;
+      transport.postMessage = (request) => {
+        if (request.method !== "apply") return post(request);
+        pending = request;
+        transport.sent.push(request);
+      };
+      documents.edit("file", input("baseX"));
+      await settle();
+      assert.equal(pending.method, "apply");
+      const reconnecting = documents.reconnectSession(discard);
+      await settle();
+      assert.equal(
+        transport.sent.some((r) => r.method === "reconnect"),
+        false,
+      );
+      assert.equal(documents.snapshot().documents[0].pending, 1);
+      transport.emit({
+        kind: "reply",
+        requestId: pending.requestId,
+        result: { document: accepted, edits: [] },
+      });
+      await reconnecting;
+      assert.equal(documents.snapshot().documents[0].pending, 0);
+      assert.equal(documents.snapshot().documents[0].content, "baseX");
+      assert.equal(documents.snapshot().connection?.status, "online");
+    } finally {
+      client.dispose();
+    }
+  });
+}
 
 test("rejected input retains its projection and withdraws dependent inputs using current accepted text", async () => {
   let accepted = document();

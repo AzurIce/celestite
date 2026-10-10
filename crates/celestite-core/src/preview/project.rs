@@ -1,8 +1,10 @@
 //! Notist drives resource discovery; platforms answer queries asynchronously.
-use super::*;
+use super::{PreviewResourceKind, PreviewResourceRequest, PreviewTask};
+use crate::editor::validate_editor_path;
 use notist::{ResourceError, Resources, resources::ResourceKind};
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
@@ -49,7 +51,7 @@ impl<'a> SnapshotResources<'a> {
             });
         }
         if !key.starts_with('/') {
-            crate::validate_editor_path(&key).map_err(|error| ResourceError::Access {
+            validate_editor_path(&key).map_err(|error| ResourceError::Access {
                 path: resolved,
                 message: error.message,
             })?;

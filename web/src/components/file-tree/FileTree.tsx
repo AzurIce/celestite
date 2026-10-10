@@ -93,7 +93,6 @@ export function FileTree(props: FileTreeProps) {
   let searchAt = 0;
   let disposed = false;
   let previousDisabled: boolean | undefined;
-  let dialogActive = false;
   let unwatch: (() => void) | undefined;
   const itemId = (path: VaultPath) => `${id}-${encodeURIComponent(path)}`;
   /**
@@ -109,14 +108,12 @@ export function FileTree(props: FileTreeProps) {
     }, 0);
   };
   const closeDialog = () => {
-    dialogActive = false;
     setDialog(null);
   };
   const requestDialog = (value: TreeDialog) => {
     if (!props.disabled && !model.snapshot().busy) {
       model.clearError();
       setLocalError(null);
-      dialogActive = true;
       setDialog(value);
     }
   };
@@ -151,6 +148,21 @@ export function FileTree(props: FileTreeProps) {
   const paste = (parent: VaultPath) => {
     void model.paste(parent).then(focusTree);
   };
+  // These operations are the same in the toolbar and context menu; only the
+  // destination differs (current selection versus the clicked row/root).
+  const creationActions = [
+    {
+      label: "新建文件",
+      icon: FilePlus,
+      run: (parent: VaultPath) => requestCreate("create-file", parent),
+    },
+    {
+      label: "新建文件夹",
+      icon: FolderPlus,
+      run: (parent: VaultPath) => requestCreate("create-directory", parent),
+    },
+    { label: "导入文件", icon: Upload, run: importFiles },
+  ];
   const stopHover = () => {
     clearTimeout(hoverTimer);
     hoverPath = null;
@@ -405,110 +417,127 @@ export function FileTree(props: FileTreeProps) {
     dragPaths = [];
   }
 
+  // Menu presentation only: selection and operation eligibility remain owned by
+  // the model and the call site, rather than a second command/state registry.
+  function MenuAction(action: {
+    icon: typeof FilePlus;
+    label: string;
+    shortcut?: string;
+    disabled?: boolean;
+    danger?: boolean;
+    onSelect: () => void;
+  }) {
+    return (
+      <ContextMenuItem
+        class={action.danger ? "text-danger" : undefined}
+        disabled={state().busy || action.disabled}
+        onSelect={action.onSelect}
+      >
+        <action.icon size={15} />
+        {action.label}
+        <Show when={action.shortcut}>
+          <span class="ml-auto text-ui-sm text-secondary">
+            {action.shortcut}
+          </span>
+        </Show>
+      </ContextMenuItem>
+    );
+  }
   function MenuItems(menuProps: { path?: VaultPath }) {
     const destination = () =>
       menuProps.path ? model.directoryFor(menuProps.path) : ROOT_PATH;
     return (
       <>
-        <ContextMenuItem
-          disabled={state().busy}
-          onSelect={() => requestCreate("create-file", destination())}
-        >
-          <FilePlus size={15} />
-          新建文件
-        </ContextMenuItem>
-        <ContextMenuItem
-          disabled={state().busy}
-          onSelect={() => requestCreate("create-directory", destination())}
-        >
-          <FolderPlus size={15} />
-          新建文件夹
-        </ContextMenuItem>
-        <ContextMenuItem
-          disabled={state().busy}
-          onSelect={() => importFiles(destination())}
-        >
-          <Upload size={15} />
-          导入文件…
-        </ContextMenuItem>
+        <For each={creationActions}>
+          {(action) => (
+            <MenuAction
+              icon={action.icon}
+              label={action.icon === Upload ? `${action.label}…` : action.label}
+              onSelect={() => action.run(destination())}
+            />
+          )}
+        </For>
         <ContextMenuSeparator />
         <Show when={menuProps.path}>
-          <ContextMenuItem
-            disabled={state().busy || state().selected.size !== 1}
-            onSelect={() => open(menuProps.path!)}
+          <For
+            each={[
+              {
+                icon: FileText,
+                label: "打开",
+                shortcut: "Enter",
+                onSelect: () => open(menuProps.path!),
+              },
+              {
+                icon: Pencil,
+                label: "重命名…",
+                shortcut: "F2",
+                onSelect: requestRename,
+              },
+            ]}
           >
-            <FileText size={15} />
-            打开<span class="ml-auto text-ui-sm text-secondary">Enter</span>
-          </ContextMenuItem>
-          <ContextMenuItem
-            disabled={state().busy || state().selected.size !== 1}
-            onSelect={requestRename}
+            {(action) => (
+              <MenuAction {...action} disabled={state().selected.size !== 1} />
+            )}
+          </For>
+          <For
+            each={[
+              {
+                icon: Scissors,
+                label: "剪切",
+                shortcut: "Ctrl X",
+                onSelect: () => model.cutSelection(),
+              },
+              {
+                icon: Copy,
+                label: "复制",
+                shortcut: "Ctrl C",
+                onSelect: () => model.copySelection(),
+              },
+              { icon: Move, label: "移动到…", onSelect: requestMove },
+            ]}
           >
-            <Pencil size={15} />
-            重命名…<span class="ml-auto text-ui-sm text-secondary">F2</span>
-          </ContextMenuItem>
-          <ContextMenuItem
-            disabled={state().busy || !state().selected.size}
-            onSelect={() => model.cutSelection()}
-          >
-            <Scissors size={15} />
-            剪切<span class="ml-auto text-ui-sm text-secondary">Ctrl X</span>
-          </ContextMenuItem>
-          <ContextMenuItem
-            disabled={state().busy || !state().selected.size}
-            onSelect={() => model.copySelection()}
-          >
-            <Copy size={15} />
-            复制<span class="ml-auto text-ui-sm text-secondary">Ctrl C</span>
-          </ContextMenuItem>
-          <ContextMenuItem
-            disabled={state().busy || !state().selected.size}
-            onSelect={requestMove}
-          >
-            <Move size={15} />
-            移动到…
-          </ContextMenuItem>
+            {(action) => (
+              <MenuAction {...action} disabled={!state().selected.size} />
+            )}
+          </For>
         </Show>
-        <ContextMenuItem
-          disabled={state().busy || !state().clipboard.count}
+        <MenuAction
+          icon={ClipboardPaste}
+          label="粘贴"
+          shortcut="Ctrl V"
+          disabled={!state().clipboard.count}
           onSelect={() => paste(destination())}
-        >
-          <ClipboardPaste size={15} />
-          粘贴<span class="ml-auto text-ui-sm text-secondary">Ctrl V</span>
-        </ContextMenuItem>
+        />
         <Show
           when={
             menuProps.path &&
             state().byPath.get(menuProps.path)?.kind === "file"
           }
         >
-          <ContextMenuItem
-            disabled={state().busy || state().selected.size !== 1}
+          <MenuAction
+            icon={Download}
+            label="下载"
+            disabled={state().selected.size !== 1}
             onSelect={() => void download(menuProps.path!)}
-          >
-            <Download size={15} />
-            下载
-          </ContextMenuItem>
+          />
         </Show>
         <Show when={menuProps.path}>
           <ContextMenuSeparator />
-          <ContextMenuItem
-            class="text-danger"
-            disabled={state().busy || !state().selected.size}
+          <MenuAction
+            icon={Trash2}
+            label="删除…"
+            shortcut="Del"
+            danger
+            disabled={!state().selected.size}
             onSelect={requestDelete}
-          >
-            <Trash2 size={15} />
-            删除…<span class="ml-auto text-ui-sm text-secondary">Del</span>
-          </ContextMenuItem>
+          />
         </Show>
         <ContextMenuSeparator />
-        <ContextMenuItem
-          disabled={state().busy}
+        <MenuAction
+          icon={RefreshCw}
+          label="刷新"
           onSelect={() => void model.refresh()}
-        >
-          <RefreshCw size={15} />
-          刷新
-        </ContextMenuItem>
+        />
       </>
     );
   }
@@ -530,7 +559,7 @@ export function FileTree(props: FileTreeProps) {
       <ContextMenu
         onOpenChange={(opened) => {
           if (opened && !props.disabled) model.contextSelect(rowProps.path);
-          else if (!dialogActive) focusTree();
+          else if (!dialog()) focusTree();
         }}
       >
         <div
@@ -667,7 +696,7 @@ export function FileTree(props: FileTreeProps) {
         <ContextMenuContent
           onCloseAutoFocus={(event) => {
             event.preventDefault();
-            if (!dialogActive) focusTree();
+            if (!dialog()) focusTree();
           }}
         >
           <MenuItems path={rowProps.path} />
@@ -825,51 +854,45 @@ export function FileTree(props: FileTreeProps) {
     >
       <header class="tree-toolbar">
         <span class="mr-auto min-w-0 truncate px-1 text-ui-sm">文件</span>
-        <IconButton
-          aria-label="新建文件"
-          title="新建文件"
-          size="sm"
-          disabled={state().busy}
-          onClick={() => requestCreate("create-file")}
+        <For each={creationActions}>
+          {(action) => (
+            <IconButton
+              aria-label={action.label}
+              title={action.label}
+              size="sm"
+              disabled={state().busy}
+              onClick={() => action.run(newParent())}
+            >
+              <action.icon size={16} />
+            </IconButton>
+          )}
+        </For>
+        <For
+          each={[
+            {
+              label: "折叠全部",
+              icon: ChevronsUp,
+              run: () => model.collapseAll(),
+            },
+            {
+              label: "刷新文件树",
+              icon: RefreshCw,
+              run: () => void model.refresh(),
+            },
+          ]}
         >
-          <FilePlus size={16} />
-        </IconButton>
-        <IconButton
-          aria-label="新建文件夹"
-          title="新建文件夹"
-          size="sm"
-          disabled={state().busy}
-          onClick={() => requestCreate("create-directory")}
-        >
-          <FolderPlus size={16} />
-        </IconButton>
-        <IconButton
-          aria-label="导入文件"
-          title="导入文件"
-          size="sm"
-          disabled={state().busy}
-          onClick={() => importFiles(newParent())}
-        >
-          <Upload size={16} />
-        </IconButton>
-        <IconButton
-          aria-label="折叠全部"
-          title="折叠全部"
-          size="sm"
-          disabled={state().busy}
-          onClick={() => model.collapseAll()}
-        >
-          <ChevronsUp size={16} />
-        </IconButton>
-        <IconButton
-          aria-label="刷新文件树"
-          title="刷新文件树"
-          size="sm"
-          disabled={state().busy}
-          onClick={() => void model.refresh()}
-        >
-          <RefreshCw size={16} />
-        </IconButton>
+          {(action) => (
+            <IconButton
+              aria-label={action.label}
+              title={action.label}
+              size="sm"
+              disabled={state().busy}
+              onClick={action.run}
+            >
+              <action.icon size={16} />
+            </IconButton>
+          )}
+        </For>
       </header>
       <div
         class="tree-region"
@@ -891,7 +914,7 @@ export function FileTree(props: FileTreeProps) {
             <ContextMenu
               onOpenChange={(opened) => {
                 if (opened && !props.disabled) model.clearSelection(true);
-                else if (!dialogActive) focusTree();
+                else if (!dialog()) focusTree();
               }}
             >
               <ContextMenuTrigger
@@ -928,7 +951,7 @@ export function FileTree(props: FileTreeProps) {
               <ContextMenuContent
                 onCloseAutoFocus={(event) => {
                   event.preventDefault();
-                  if (!dialogActive) focusTree();
+                  if (!dialog()) focusTree();
                 }}
               >
                 <MenuItems />

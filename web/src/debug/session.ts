@@ -4,7 +4,7 @@ import type { Entry } from "../lib/vault/types";
 import { openRemoteEditor } from "../lib/editor/client/documents";
 import { minimalChange } from "../lib/editor/view-changes";
 import type {
-  DocumentSnapshot,
+  EditorDocument,
   EditorDocuments,
   InstanceIdentity,
 } from "../lib/editor/contract";
@@ -14,7 +14,7 @@ interface Replica {
   identity: InstanceIdentity;
   documents: EditorDocuments;
   detach: () => void;
-  document: DocumentSnapshot;
+  document: EditorDocument;
   online: boolean;
   unconfirmed: boolean;
   error: string | null;

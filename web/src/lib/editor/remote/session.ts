@@ -1,18 +1,18 @@
 import { VaultError } from "../../vault/errors";
-import type { SyncPacket, Version } from "../contract";
+import type { HistoryPacket, Version } from "../contract";
 
 export function containsVersion(current: Version, checkpoint: Version) {
   return (
     current.identity.document_id === checkpoint.identity.document_id &&
     current.identity.history_id === checkpoint.identity.history_id &&
     Object.entries(checkpoint.clocks).every(
-      ([writer, clock]) => clock >= 0 && (current.clocks[writer] ?? 0) >= clock,
+      ([peer, clock]) => clock >= 0 && (current.clocks[peer] ?? 0) >= clock,
     )
   );
 }
 interface Outgoing {
   id: string;
-  packet: SyncPacket;
+  packet: HistoryPacket;
   version: Version;
   operation: number;
 }
@@ -44,7 +44,7 @@ export class SyncSession {
   get unconfirmed() {
     return this.queue.length > 0;
   }
-  enqueue(id: string, packet: SyncPacket, version: Version) {
+  enqueue(id: string, packet: HistoryPacket, version: Version) {
     if (this.closed)
       throw this.failure ?? new VaultError("Closed", "协作会话已关闭。");
     this.queue.push({ id, packet, version, operation: ++this.operation });

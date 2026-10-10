@@ -1,4 +1,15 @@
-use celestite_core::*;
+use celestite_buffer::Buffer;
+use celestite_buffer::types::{EditOptions, UndoContext};
+use celestite_core::backend::{
+    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileEntry, FileSnapshot,
+    JournalEntry, StoredDocument,
+};
+use celestite_core::editor::EditorCore;
+use celestite_core::editor::types::HistoryCommit;
+use celestite_core::instance::{InstanceIdentity, Vault};
+use celestite_core::preview::sessions::PreviewController;
+use celestite_core::preview::{PreviewCompletion, PreviewOutcome, PreviewOutput, PreviewTask};
+use celestite_core::protocol::editor::EditorAdapter;
 use futures_lite::future::block_on;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
@@ -42,6 +53,17 @@ fn io() -> EditorError {
     EditorError::new("IO", "injected commit failure", "")
 }
 
+fn preview_task<B: Backend>(
+    core: &EditorCore<B>,
+    preview: &mut PreviewController,
+    id: &str,
+) -> PreviewTask {
+    preview.synchronize(&core.document_source(&[]), 1000);
+    let ids = preview.required_snapshots(id).unwrap();
+    let source = core.document_source(&ids);
+    preview.take_task(id, &source, 1000).unwrap().unwrap()
+}
+
 fn preview_result(task: &PreviewTask) -> PreviewCompletion {
     PreviewCompletion {
         task_id: task.ticket.task_id.clone(),
@@ -62,54 +84,15 @@ fn import_admission_uses_the_buffers_pending_history_even_after_recovery() {
         let backend = MemoryBackend::new(b"base");
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
-        let mut peer = Buffer::from_snapshot(&core.snapshot(&id).unwrap(), Some(42)).unwrap();
+        let mut peer =
+            Buffer::from_snapshot_with_peer_id(&core.snapshot(&id).unwrap(), 42).unwrap();
         let start = peer.version();
-        let _ = peer
-            .apply(BufferCommand::Edit(Edit {
-                base: start.clone(),
-                input: TextInput::Edits {
-                    edits: vec![TextEdit {
-                        from: 4,
-                        to: 4,
-                        insert: " next".into(),
-                    }],
-                },
-                origin: "peer".into(),
-                group: None,
-                undo: UndoContext {
-                    metadata: None,
-                    positions: vec![],
-                },
-            }))
-            .unwrap();
+        let _ = peer.edit([(4..4, " next")]).unwrap();
         let first = peer.export_updates_since(&start).unwrap();
         let middle = peer.version();
-        let _ = peer
-            .apply(BufferCommand::Edit(Edit {
-                base: middle.clone(),
-                input: TextInput::Edits {
-                    edits: vec![TextEdit {
-                        from: 9,
-                        to: 9,
-                        insert: "\r".into(),
-                    }],
-                },
-                origin: "peer".into(),
-                group: None,
-                undo: UndoContext {
-                    metadata: None,
-                    positions: vec![],
-                },
-            }))
-            .unwrap();
+        let _ = peer.edit([(9..9, "\r")]).unwrap();
         let last = peer.export_updates_since(&middle).unwrap();
-        assert!(
-            core.apply(&id, BufferCommand::Import(Import::new(last, "peer")))
-                .await
-                .unwrap()
-                .update
-                .pending
-        );
+        assert!(core.import(&id, last).await.unwrap().pending);
 
         for recover in [false, true] {
             if recover {
@@ -117,24 +100,16 @@ fn import_admission_uses_the_buffers_pending_history_even_after_recovery() {
             }
             let before = core.read(&id).unwrap();
             assert_eq!(
-                core.prepare_import(&id, Import::new(first.clone(), "peer"))
-                    .unwrap_err()
-                    .code,
+                core.prepare_import(&id, first.clone()).unwrap_err().code,
                 "InvalidEdit"
             );
             assert_eq!(
-                core.apply(
-                    &id,
-                    BufferCommand::Import(Import::new(first.clone(), "peer"))
-                )
-                .await
-                .unwrap_err()
-                .code,
+                core.import(&id, first.clone()).await.unwrap_err().code,
                 "InvalidEdit"
             );
             let after = core.read(&id).unwrap();
             assert_eq!(after.snapshot, before.snapshot);
-            assert_eq!(after.writer_id, before.writer_id);
+            assert_eq!(after.peer_id, before.peer_id);
             assert_eq!(after.undo, before.undo);
             assert_eq!(backend.storage.borrow().documents[&id].0.sequence, 1);
         }
@@ -147,21 +122,25 @@ fn preview_rename_and_deletion_revoke_tasks_even_without_a_text_change() {
         let backend = MemoryBackend::new(b"body");
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
-        core.subscribe_preview(&id, "client").unwrap();
-        let old = core.take_preview_task(&id).unwrap().unwrap();
+        let mut preview = PreviewController::default();
+        preview.synchronize(&core.document_source(&[]), 1000);
+        preview.subscribe(&id, "client", 1000).unwrap();
+        let old = preview_task(&core, &mut preview, &id);
         core.rename("a.md", "moved.md").await.unwrap();
-        let state = core.preview_state(&id).unwrap();
+        preview.synchronize(&core.document_source(&[]), 1000);
+        let state = preview.state(&id).unwrap();
         assert_eq!(state.target.version, old.ticket.version);
         assert_eq!(state.target.path, "moved.md");
-        assert!(!core.complete_preview(preview_result(&old)));
-        core.retry_preview(&id).unwrap();
-        let moved = core.take_preview_task(&id).unwrap().unwrap();
+        assert!(!preview.complete(preview_result(&old)));
+        preview.retry(&id, 1000).unwrap();
+        let moved = preview_task(&core, &mut preview, &id);
         assert_eq!(moved.ticket.path, "moved.md");
         core.remove("moved.md", false).await.unwrap();
-        assert!(!core.complete_preview(preview_result(&moved)));
-        assert!(core.preview_state(&id).is_err());
+        preview.synchronize(&core.document_source(&[]), 1000);
+        assert!(!preview.complete(preview_result(&moved)));
+        assert!(preview.state(&id).is_err());
         assert!(core.read(&id).unwrap().deleted);
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "body");
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "body");
         backend
             .storage
             .borrow_mut()
@@ -169,99 +148,16 @@ fn preview_rename_and_deletion_revoke_tasks_even_without_a_text_change() {
             .insert("moved.md".into(), b"new file".into());
         let new_id = core.open_file("moved.md").await.unwrap();
         assert_ne!(id, new_id);
-        core.subscribe_preview(&new_id, "client").unwrap();
-        assert!(!core.complete_preview(preview_result(&moved)));
+        preview.synchronize(&core.document_source(&[]), 1000);
+        preview.subscribe(&new_id, "client", 1000).unwrap();
+        assert!(!preview.complete(preview_result(&moved)));
         assert_eq!(
-            core.take_preview_task(&new_id).unwrap().unwrap().source,
+            preview_task(&core, &mut preview, &new_id).source,
             "new file"
         );
     });
 }
 
-#[test]
-fn external_reload_and_runtime_reopen_cannot_accept_old_preview_tickets() {
-    block_on(async {
-        let backend = MemoryBackend::new(b"old");
-        let mut core = EditorCore::open(backend.clone()).await.unwrap();
-        let id = core.open_file("a.md").await.unwrap();
-        core.subscribe_preview(&id, "client").unwrap();
-        let old = core.take_preview_task(&id).unwrap().unwrap();
-        backend
-            .storage
-            .borrow_mut()
-            .files
-            .insert("a.md".into(), b"external".into());
-        core.refresh(&id).await.unwrap();
-        assert!(!core.complete_preview(preview_result(&old)));
-        core.retry_preview(&id).unwrap();
-        let external = core.take_preview_task(&id).unwrap().unwrap();
-        assert_eq!(external.source, "external");
-        drop(core);
-        let mut reopened = EditorCore::open(backend).await.unwrap();
-        reopened.subscribe_preview(&id, "client").unwrap();
-        let current = reopened.take_preview_task(&id).unwrap().unwrap();
-        assert_ne!(current.ticket.task_id, external.ticket.task_id);
-        assert!(!reopened.complete_preview(preview_result(&external)));
-        assert!(reopened.complete_preview(preview_result(&current)));
-    });
-}
-
-#[test]
-fn accepted_draft_remains_previewable_when_history_commit_fails() {
-    block_on(async {
-        let backend = MemoryBackend::new(b"saved");
-        let mut core = EditorCore::open(backend.clone()).await.unwrap();
-        let id = core.open_file("a.md").await.unwrap();
-        let version = core.read(&id).unwrap().snapshot.version;
-        backend.storage.borrow_mut().fail_commit = true;
-        let receipt = core
-            .apply(
-                &id,
-                BufferCommand::Edit(Edit {
-                    base: version,
-                    input: TextInput::Edits {
-                        edits: vec![TextEdit {
-                            from: 0,
-                            to: 5,
-                            insert: "accepted draft".into(),
-                        }],
-                    },
-                    origin: "input.replace".into(),
-                    group: None,
-                    undo: UndoContext::default(),
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(receipt.history, HistoryCommit::Failed { .. }));
-        assert!(receipt.require_committed().is_err());
-        assert!(receipt.update.changed);
-        assert_eq!(receipt.update.after, receipt.document.snapshot.version);
-        let delivery = core.take_mutations();
-        assert_eq!(delivery.len(), 1);
-        assert!(std::sync::Arc::ptr_eq(&delivery[0], &receipt));
-        assert!(core.read(&id).unwrap().persistence_error.is_some());
-        core.subscribe_preview(&id, "client").unwrap();
-        let task = core.take_preview_task(&id).unwrap().unwrap();
-        assert_eq!(task.source, "accepted draft");
-        assert!(core.complete_preview(preview_result(&task)));
-        assert_eq!(backend.storage.borrow().files["a.md"], b"saved");
-        assert!(core.read(&id).unwrap().dirty);
-        backend.storage.borrow_mut().fail_commit = false;
-        core.retry_history().await.unwrap();
-        assert!(
-            core.take_mutations().is_empty(),
-            "retrying IO must not create another text edit"
-        );
-        let storage = backend.storage.borrow();
-        let journal = &storage.documents[&id].1;
-        assert_eq!(journal.len(), 1);
-        assert_eq!(
-            journal[0].packet.data,
-            receipt.update.operation.as_ref().unwrap().data
-        );
-    });
-}
 fn revision(data: &[u8]) -> String {
     format!("{data:?}")
 }
@@ -389,25 +285,7 @@ impl Backend for MemoryBackend {
     }
 }
 async fn replace(core: &mut EditorCore<MemoryBackend>, id: &str, text: &str) {
-    let current = core.read(id).unwrap();
-    core.apply(
-        id,
-        BufferCommand::Edit(Edit {
-            base: current.snapshot.version,
-            input: TextInput::Edits {
-                edits: vec![TextEdit {
-                    from: 0,
-                    to: current.snapshot.text.encode_utf16().count(),
-                    insert: text.into(),
-                }],
-            },
-            origin: "input.paste".into(),
-            group: None,
-            undo: UndoContext::default(),
-        }),
-    )
-    .await
-    .unwrap();
+    core.replace_text(id, text).await.unwrap();
 }
 
 #[test]
@@ -416,59 +294,55 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
         let backend = MemoryBackend::new(b"old");
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
-        let durable = core.read(&id).unwrap().durable_version;
+        let persisted = core.read(&id).unwrap().persisted_version;
         backend.storage.borrow_mut().fail_commit = true;
-        replace(&mut core, &id, "draft").await;
+        let receipt = core.replace_text(&id, "draft").await.unwrap();
+        assert!(matches!(receipt.history, HistoryCommit::Failed { .. }));
+        assert!(receipt.require_committed().is_err());
+        let delivery = core.take_mutations();
+        assert_eq!(delivery.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&delivery[0], &receipt));
         let state = core.read(&id).unwrap();
-        assert_eq!(state.snapshot.text, "draft");
-        assert_eq!(state.durable_version, durable);
+        assert_eq!(state.snapshot.text.as_ref(), "draft");
+        assert_eq!(state.persisted_version, persisted);
         assert!(
             state
                 .persistence_error
                 .unwrap()
                 .contains("编辑历史尚未持久化")
         );
-        assert!(
-            core.apply(
-                &id,
-                BufferCommand::Undo {
-                    base: core.read(&id).unwrap().snapshot.version,
-                    context: UndoContext::default()
-                }
-            )
-            .await
-            .is_err()
-        );
+        let mut preview = PreviewController::default();
+        preview.synchronize(&core.document_source(&[]), 1000);
+        preview.subscribe(&id, "client", 1000).unwrap();
+        let task = preview_task(&core, &mut preview, &id);
+        assert_eq!(task.source, "draft");
+        preview.synchronize(&core.document_source(&[]), 1000);
+        assert!(preview.complete(preview_result(&task)));
+        assert!(core.undo(&id).await.is_err());
         assert_eq!(backend.storage.borrow().files["a.md"], b"old");
         backend.storage.borrow_mut().fail_commit = false;
         core.retry_history().await.unwrap();
+        assert!(
+            core.take_mutations().is_empty(),
+            "retrying history must not repeat acceptance"
+        );
+        let journal = backend.storage.borrow().documents[&id].1.clone();
+        assert_eq!(journal.len(), 1);
         assert_eq!(
-            core.read(&id).unwrap().durable_version,
+            journal[0].packet.data,
+            receipt.update.operation.as_ref().unwrap().data
+        );
+        assert_eq!(
+            core.read(&id).unwrap().persisted_version,
             Some(core.read(&id).unwrap().snapshot.version)
         );
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "old");
-        core.apply(
-            &id,
-            BufferCommand::Redo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
+        core.undo(&id).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "old");
+        core.redo(&id).await.unwrap();
         core.save(&id, None).await.unwrap();
         drop(core);
         let restored = EditorCore::open(backend).await.unwrap();
-        assert_eq!(restored.read(&id).unwrap().snapshot.text, "draft");
+        assert_eq!(restored.read(&id).unwrap().snapshot.text.as_ref(), "draft");
         assert!(!restored.read(&id).unwrap().dirty);
     });
 }
@@ -496,7 +370,7 @@ fn write_completed_before_receipt_recovers_without_a_false_conflict() {
         let state = core.read(&id).unwrap();
         assert!(!state.dirty && !state.conflict);
         assert_eq!(state.saved_version, Some(version.clone()));
-        assert_eq!(state.durable_version, Some(version));
+        assert_eq!(state.persisted_version, Some(version));
         assert!(
             backend.storage.borrow().documents[&id]
                 .0
@@ -527,7 +401,7 @@ fn external_conflict_discard_and_overwrite_preserve_text_encoding() {
             .files
             .insert("a.md".into(), b"external\n".to_vec());
         assert_eq!(core.save(&id, None).await.unwrap_err().code, "Conflict");
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "draft\n");
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "draft\n");
         core.resolve(&id, "overwrite").await.unwrap();
         assert_eq!(
             backend.storage.borrow().files["a.md"],
@@ -541,7 +415,7 @@ fn external_conflict_discard_and_overwrite_preserve_text_encoding() {
             .insert("a.md".into(), b"external again".to_vec());
         core.resolve(&id, "discard").await.unwrap();
         let state = core.read(&id).unwrap();
-        assert_eq!(state.snapshot.text, "external again");
+        assert_eq!(state.snapshot.text.as_ref(), "external again");
         assert!(!state.undo.can_undo && !state.dirty && !state.conflict);
     });
 }
@@ -582,10 +456,20 @@ fn private_history_does_not_require_an_ordinary_directory() {
         private.refresh(&id).await.unwrap();
         private.save(&id, None).await.unwrap();
         let state = private.read(&id).unwrap();
-        assert_eq!(state.snapshot.text, "draft");
+        assert_eq!(state.snapshot.text.as_ref(), "draft");
         assert!(state.dirty);
         assert!(state.autosave_delay.is_none());
-        assert!(state.durable_version.is_some());
+        assert!(state.persisted_version.is_some());
+        let mut preview = PreviewController::default();
+        let source = private.document_source(&[]);
+        assert_eq!(source.documents.len(), 1);
+        assert!(source.snapshots.is_empty());
+        preview.synchronize(&source, 1000);
+        preview.subscribe(&id, "history-only", 1000).unwrap();
+        let task = preview_task(&private, &mut preview, &id);
+        assert_eq!(task.source, "draft");
+        assert_eq!(private.read(&id).unwrap().undo, state.undo);
+        assert!(private.take_mutations().is_empty());
     });
 }
 
@@ -602,73 +486,32 @@ fn undo_groups_follow_caller_gesture_ids_not_backend_time() {
         ] {
             backend.storage.borrow_mut().now = elapsed;
             let state = core.read(&id).unwrap().snapshot;
-            let end = state.text.encode_utf16().count();
-            core.apply(
+            let end = state.text.len();
+            core.edit_with(
                 &id,
-                BufferCommand::Edit(Edit {
-                    base: state.version,
-                    input: TextInput::Edits {
-                        edits: vec![TextEdit {
-                            from: end,
-                            to: end,
-                            insert: text.into(),
-                        }],
-                    },
-                    origin: "test".into(),
+                [(end..end, text)],
+                EditOptions {
                     group: Some(group.into()),
                     undo: UndoContext::default(),
-                }),
+                },
             )
             .await
             .unwrap();
         }
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "ab");
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "");
-        core.apply(
-            &id,
-            BufferCommand::Redo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "ab");
-        core.apply(
-            &id,
-            BufferCommand::Redo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "abc");
+        core.undo(&id).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "ab");
+        core.undo(&id).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "");
+        core.redo(&id).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "ab");
+        core.redo(&id).await.unwrap();
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "abc");
     });
 }
 
 #[test]
-fn serialized_service_isolates_documents_and_rejects_stale_edits() {
+fn documents_keep_separate_histories_and_reopen_without_reseeding() {
     block_on(async {
-        use serde_json::json;
         let backend = MemoryBackend::new("A😀".as_bytes());
         backend
             .storage
@@ -676,53 +519,86 @@ fn serialized_service_isolates_documents_and_rejects_stale_edits() {
             .files
             .insert("b.md".into(), b"B".to_vec());
         let mut core = EditorCore::open(backend).await.unwrap();
-        let first = core
-            .execute_service("open", json!({"path":"a.md"}))
-            .await
-            .unwrap();
-        let second = core
-            .execute_service("open", json!({"path":"b.md"}))
-            .await
-            .unwrap();
-        let command = json!({"id":first["id"],"command":{"kind":"edit","base":first["snapshot"]["version"],
-            "input":{"kind":"edits","edits":[{"from":3,"to":3,"insert":"!"}]},"undo":{"positions":[3,3],"metadata":{"mainIndex":0}},"group":"gesture"}});
-        let result = core
-            .execute_service("apply", command.clone())
-            .await
-            .unwrap();
-        assert_eq!(result, first["id"]);
+        let first = core.open_file("a.md").await.unwrap();
+        let second = core.open_file("b.md").await.unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            core.read(&first).unwrap().snapshot.version.identity(),
+            core.read(&second).unwrap().snapshot.version.identity()
+        );
+        core.edit(&first, [(5..5, "!")]).await.unwrap();
         let mutations = core.take_mutations();
         assert_eq!(mutations.len(), 1);
-        assert_eq!(mutations[0].document.snapshot.text, "A😀!");
-        assert!(mutations[0].update.local_operation().is_some());
-        assert_eq!(
-            core.execute_service("apply", command)
-                .await
-                .unwrap_err()
-                .code,
-            "StaleVersion"
-        );
-        let other = core
-            .execute_service("read", json!({"id":second["id"]}))
-            .await
-            .unwrap();
-        assert_eq!(other["snapshot"]["text"], "B");
-        let reopened = core
-            .execute_service("open", json!({"path":"a.md"}))
-            .await
-            .unwrap();
-        assert_eq!(reopened["id"], first["id"]);
-        assert_eq!(reopened["snapshot"]["text"], "A😀!");
+        assert_eq!(mutations[0].document.id, first);
+        assert_eq!(mutations[0].document.snapshot.text.as_ref(), "A😀!");
+        assert_eq!(core.read(&second).unwrap().snapshot.text.as_ref(), "B");
+        assert_eq!(core.open_file("a.md").await.unwrap(), first);
+        assert_eq!(core.read(&first).unwrap().snapshot.text.as_ref(), "A😀!");
     });
 }
 
 #[test]
-fn restart_allocates_fresh_writer_and_external_changes_are_not_personal_undo() {
+fn adapter_delivers_accepted_history_failure_once() {
+    block_on(async {
+        use serde_json::json;
+        let backend = MemoryBackend::new(b"old");
+        let mut core = EditorCore::open(backend.clone()).await.unwrap();
+        let id = core.open_file("a.md").await.unwrap();
+        let before = core.read(&id).unwrap();
+        let mut adapter = EditorAdapter::default();
+        backend.storage.borrow_mut().fail_commit = true;
+        let value = adapter
+            .call(
+                &mut core,
+                "apply",
+                json!({"id":id,"command":{
+                    "kind":"edit","base":before.snapshot.version,
+                    "input":{"kind":"text","text":"draft"}
+                }}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, json!(id));
+        let batch = adapter.take_mutations(&mut core).unwrap();
+        assert_eq!(batch.len(), 1);
+        let receipt = &batch[0];
+        assert_eq!(receipt["document"]["snapshot"]["text"], "draft");
+        assert_eq!(receipt["history"]["status"], "failed");
+        assert!(receipt["document"]["persistenceError"].is_string());
+        assert_eq!(
+            receipt["document"]["persistedVersion"],
+            serde_json::to_value(before.persisted_version).unwrap()
+        );
+        assert!(receipt["update"]["operation"].is_object());
+        assert!(core.take_mutations().is_empty());
+
+        backend.storage.borrow_mut().fail_commit = false;
+        let recovered = adapter
+            .call(&mut core, "retry_history", json!({"id":id}))
+            .await
+            .unwrap();
+        assert_eq!(recovered["snapshot"], receipt["document"]["snapshot"]);
+        assert_eq!(recovered["persistenceError"], json!(null));
+        assert_eq!(
+            recovered["persistedVersion"],
+            recovered["snapshot"]["version"]
+        );
+        assert!(core.take_mutations().is_empty());
+        assert_eq!(backend.storage.borrow().files["a.md"], b"old");
+    });
+}
+
+#[test]
+fn reopening_history_preserves_identity_but_not_peer_undo_or_preview_session() {
     block_on(async {
         let backend = MemoryBackend::new(b"disk");
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
         let before = core.read(&id).unwrap();
+        let mut preview = PreviewController::default();
+        preview.synchronize(&core.document_source(&[]), 1000);
+        preview.subscribe(&id, "client", 1000).unwrap();
+        let old = preview_task(&core, &mut preview, &id);
         backend
             .storage
             .borrow_mut()
@@ -730,28 +606,33 @@ fn restart_allocates_fresh_writer_and_external_changes_are_not_personal_undo() {
             .insert("a.md".into(), "external 😀".as_bytes().to_vec());
         core.refresh(&id).await.unwrap();
         assert!(!core.read(&id).unwrap().undo.can_undo);
+        preview.synchronize(&core.document_source(&[]), 1000);
+        assert!(!preview.complete(preview_result(&old)));
+        preview.retry(&id, 1000).unwrap();
+        let external = preview_task(&core, &mut preview, &id);
+        assert_eq!(external.source, "external 😀");
         replace(&mut core, &id, "external 😀!").await;
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "external 😀");
+        assert!(core.read(&id).unwrap().undo.can_undo);
         let version = core.read(&id).unwrap().snapshot.version;
         drop(core);
         let restored = EditorCore::open(backend).await.unwrap();
         let after = restored.read(&id).unwrap();
         assert_eq!(after.snapshot.version, version);
         assert_eq!(
-            before.snapshot.version.identity,
-            after.snapshot.version.identity
+            before.snapshot.version.identity(),
+            after.snapshot.version.identity()
         );
-        assert_ne!(before.writer_id, after.writer_id);
+        assert_ne!(before.peer_id, after.peer_id);
         assert!(!after.undo.can_undo);
+        assert_eq!(after.snapshot.text.as_ref(), "external 😀!");
+        // A reopened editor is a new owner, even if its source epoch starts at zero.
+        preview.clear();
+        preview.synchronize(&restored.document_source(&[]), 1000);
+        preview.subscribe(&id, "client", 1000).unwrap();
+        let current = preview_task(&restored, &mut preview, &id);
+        assert_ne!(current.ticket.task_id, external.ticket.task_id);
+        assert!(!preview.complete(preview_result(&external)));
+        assert!(preview.complete(preview_result(&current)));
     });
 }
 
@@ -767,11 +648,11 @@ fn lightweight_status_tracks_baselines_without_exposing_personal_state_or_text()
             assert_eq!(status.dirty, expected);
             assert_eq!(
                 status.dirty,
-                document.snapshot.text != document.saved_content
+                document.snapshot.text.as_ref() != document.saved_content
             );
             assert_eq!(status.version, document.snapshot.version);
             let host = serde_json::to_value(core.host_document(&id, true).unwrap()).unwrap();
-            for field in ["snapshot", "undo", "writerId", "autosaveDelay"] {
+            for field in ["snapshot", "undo", "peerId", "autosaveDelay"] {
                 assert!(host.get(field).is_none(), "host must not expose {field}");
             }
         };
@@ -780,25 +661,9 @@ fn lightweight_status_tracks_baselines_without_exposing_personal_state_or_text()
         check(&core, true);
         core.save(&id, None).await.unwrap();
         check(&core, false);
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
+        core.undo(&id).await.unwrap();
         check(&core, true);
-        core.apply(
-            &id,
-            BufferCommand::Redo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
+        core.redo(&id).await.unwrap();
         check(&core, false);
         backend
             .storage

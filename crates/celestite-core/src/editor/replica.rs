@@ -1,11 +1,33 @@
 //! Host snapshots and metadata are validated together before replacing a session.
-use super::*;
+use super::observation::ObservationCoordinator;
+use super::types::ReplicaHostState;
+use super::{EditorCore, Record, validate_editor_path, validate_text};
+use crate::backend::{Backend, DocumentHeader, EditorError, EditorResult};
+use celestite_buffer::Buffer;
+use celestite_buffer::types::{HistoryPacket, HistoryPacketKind};
+use std::collections::BTreeMap;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Client access and subscription state, independent of deletion and persistence.
+/// host_authoritative means host metadata governs this client replica; it is not a host role.
+pub(super) struct ReplicaState {
+    pub(super) host_authoritative: bool,
+    pub(super) attached: bool,
+    pub(super) read_only: bool,
+}
+
+impl Default for ReplicaState {
+    fn default() -> Self {
+        Self {
+            host_authoritative: false,
+            attached: true,
+            read_only: false,
+        }
+    }
+}
+
 pub struct ReplicaDocument {
-    pub packets: Vec<SyncPacket>,
-    pub writer_id: Option<String>,
+    pub packets: Vec<HistoryPacket>,
+    pub peer_id: Option<u64>,
     pub state: ReplicaHostState,
 }
 
@@ -20,12 +42,6 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
             &state.path,
         ));
     }
-    let writer = input
-        .writer_id
-        .as_deref()
-        .map(str::parse::<u64>)
-        .transpose()
-        .map_err(|e| EditorError::new("InvalidEdit", e.to_string(), &state.path))?;
     let mut packets = input.packets.into_iter();
     let seed = packets
         .next()
@@ -37,19 +53,20 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
             &state.path,
         ));
     }
-    let mut document = Buffer::from_snapshot(&seed, writer)?;
+    let mut document = match input.peer_id {
+        Some(peer_id) => Buffer::from_snapshot_with_peer_id(&seed, peer_id)?,
+        None => Buffer::from_snapshot(&seed)?,
+    };
     for packet in packets {
-        if packet.kind != PacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
+        if packet.kind != HistoryPacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
                 "InvalidEdit",
                 "Invalid session update",
                 &state.path,
             ));
         }
-        if document
-            .apply(BufferCommand::Import(Import::new(packet, "session")))?
-            .pending
-        {
+        let _ = document.import(packet)?;
+        if document.has_pending_imports() {
             return Err(EditorError::new(
                 "InvalidEdit",
                 "Session history has missing dependencies",
@@ -73,7 +90,7 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
         sequence: 0,
         applied: snapshot.version,
         saved_text: state.saved_content,
-        disk_revision: state.backend_revision,
+        disk_revision: state.file_revision,
         saved_version: None,
         pending_write: None,
         disk_cursor: None,
@@ -85,15 +102,17 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
     observation.remote = state.external_change;
     Ok(Record {
         observation,
-        hosted: true,
-        attached: true,
-        read_only: state.read_only,
+        replica: ReplicaState {
+            host_authoritative: true,
+            attached: true,
+            read_only: state.read_only,
+        },
         dirty: !document.content_matches(&header.saved_text),
         header,
         buffer: document,
         pending_observation: None,
         uncommitted: vec![],
-        durable: None,
+        persisted_version: None,
         conflict: state.conflict,
         error: state.error,
 
@@ -105,15 +124,17 @@ impl<B: Backend> EditorCore<B> {
     /// Stop a remote subscription while keeping the Buffer and its personal undo.
     /// A closed cache releases its path reservation; it is not a deleted file.
     pub fn release_replica_document(&mut self, id: &str) -> EditorResult<()> {
-        if self.backend.has_projection() || self.backend.persistent() || !self.record(id)?.hosted {
+        if self.backend.has_projection()
+            || self.backend.persistent()
+            || !self.record(id)?.replica.host_authoritative
+        {
             return Err(EditorError::new(
                 "Unsupported",
                 "Only volatile hosted replicas can release a subscription",
                 id,
             ));
         }
-        self.records.get_mut(id).unwrap().attached = false;
-        self.previews.close(id);
+        self.records.get_mut(id).unwrap().replica.attached = false;
         Ok(())
     }
     /// A new document's deletion flag participates in path validation immediately.
@@ -131,7 +152,9 @@ impl<B: Backend> EditorCore<B> {
         if self.records.contains_key(&id)
             || (!next.header.deleted
                 && self.records.values().any(|old| {
-                    old.attached && !old.header.deleted && old.header.path == next.header.path
+                    old.replica.attached
+                        && !old.header.deleted
+                        && old.header.path == next.header.path
                 }))
         {
             return Err(EditorError::new(
@@ -142,7 +165,6 @@ impl<B: Backend> EditorCore<B> {
         }
         self.backend.commit(&next.header, None).await?;
         self.records.insert(id.clone(), next);
-        self.sync_preview(&id);
         Ok(id)
     }
 
@@ -189,16 +211,15 @@ impl<B: Backend> EditorCore<B> {
         // unsubscribed caches must not be resurrected as phantom tombstones.
         let headers: Vec<_> = next.values().map(|record| record.header.clone()).collect();
         self.backend.replace_volatile_documents(&headers).await?;
-        for id in self.records.keys().filter(|id| !next.contains_key(*id)) {
-            self.previews.close(id);
-        }
         self.records = next;
-        self.mutations.clear();
+        self.source_epoch = self
+            .source_epoch
+            .checked_add(1)
+            .expect("source epoch exhausted");
+        // Accepted effects are owned receipts, not borrowed session state.
+        // Replacement must not erase an undrained native owner's batch.
         self.failure = None;
         self.requires_reopen = false;
-        for id in self.records.keys().cloned().collect::<Vec<_>>() {
-            self.sync_preview(&id);
-        }
         Ok(())
     }
 }

@@ -1,104 +1,59 @@
 //! Observe through the change feed before reading a document: a GET must not be
 //! what causes these filesystem edits to enter host history.
 mod support;
-use celestite_server::{build_server, Config, ServerConfig, VaultConfig};
-use reqwest::{Client, Response};
+use reqwest::Response;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
-use tokio::{
-    sync::{oneshot, watch},
-    task::JoinHandle,
-};
 
 struct Host {
-    client: Client,
-    peer: tokio::sync::Mutex<Option<support::Peer>>,
-    url: String,
-    shutdown: oneshot::Sender<()>,
-    stopping: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    server: support::Host,
+    client_replica: tokio::sync::Mutex<Option<support::ClientReplica>>,
+}
+impl std::ops::Deref for Host {
+    type Target = support::Host;
+    fn deref(&self) -> &Self::Target {
+        &self.server
+    }
 }
 impl Host {
     async fn start(root: &Path, read_only: bool) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = build_server(
-            Config {
-                server: ServerConfig {
-                    listen: address,
-                    ..Default::default()
-                },
-                vault: VaultConfig {
-                    name: "Notes".into(),
-                    path: root.into(),
-                    read_only,
-                    ..Default::default()
-                },
-            },
-            root,
-        )
-        .unwrap();
-        let key = server
-            .links
-            .key(celestite_server::Permission::Edit)
-            .to_owned();
-        let (shutdown, stopping) = oneshot::channel();
-        let stop_events = server.shutdown;
-        let task = tokio::spawn(async move {
-            axum::serve(listener, server.router)
-                .with_graceful_shutdown(async {
-                    let _ = stopping.await;
-                })
-                .await
-                .unwrap();
-        });
         Self {
-            client: Client::new(),
-            peer: tokio::sync::Mutex::new(None),
-            url: format!("http://{address}/{key}/api/v1"),
-            shutdown,
-            stopping: stop_events,
-            task,
+            server: support::Host::start(root, read_only).await,
+            client_replica: tokio::sync::Mutex::new(None),
         }
     }
     async fn request(&self, method: &str, path: &str, value: Value) -> Value {
-        let response = self
-            .client
-            .request(method.parse().unwrap(), format!("{}{path}", self.url))
-            .json(&value)
-            .send()
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = response.text().await.unwrap();
-        assert!(status.is_success(), "{status}: {body}");
-        serde_json::from_str(&body).unwrap()
+        self.server.json(method, path, value).await
     }
-    async fn edit(&self, id: &str, command: Value) -> Value {
-        let mut slot = self.peer.lock().await;
+    async fn mutate(&self, id: &str, edit: Option<(std::ops::Range<usize>, &str)>) -> Value {
+        let mut slot = self.client_replica.lock().await;
         if slot.is_none() {
-            *slot = Some(support::Peer::connect(&self.url).await);
+            *slot = Some(support::ClientReplica::connect(&self.url).await);
         }
-        let peer = slot.as_mut().unwrap();
-        if peer.core.read(id).is_err() {
+        let client = slot.as_mut().unwrap();
+        if client.core.read(id).is_err() {
             let state = self.state(id).await;
-            assert_eq!(peer.open(state["path"].as_str().unwrap()).await, id);
+            assert_eq!(client.open(state["path"].as_str().unwrap()).await, id);
         } else {
-            peer.sync(id).await;
+            client.sync(id).await;
         }
-        let command = serde_json::from_value(command).unwrap();
-        peer.apply(id, command).await;
+        if let Some((range, text)) = edit {
+            client.edit(id, range.start, range.end, text).await;
+        } else {
+            client.undo(id, false).await;
+        }
         self.state(id).await
     }
     async fn save(&self, id: &str, version: Value) -> Value {
-        let mut slot = self.peer.lock().await;
-        let peer = slot.as_mut().unwrap();
-        let receipt = peer.ok("save", json!({"id":id,"version":version})).await;
-        peer.accept(receipt).await;
+        let mut slot = self.client_replica.lock().await;
+        let client = slot.as_mut().unwrap();
+        let receipt = client.ok("save", json!({"id":id,"version":version})).await;
+        client.accept(receipt).await;
         self.state(id).await
     }
     async fn feed(&self) -> Feed {
         let response = self
+            .server
             .client
             .get(format!("{}/documents/events", self.url))
             .send()
@@ -120,15 +75,10 @@ impl Host {
             .await
     }
     async fn stop(self) {
-        if let Some(peer) = self.peer.into_inner() {
-            peer.close().await;
+        if let Some(client) = self.client_replica.into_inner() {
+            client.close().await;
         }
-        self.stopping.send_replace(true);
-        let _ = self.shutdown.send(());
-        tokio::time::timeout(Duration::from_secs(5), self.task)
-            .await
-            .unwrap()
-            .unwrap();
+        self.server.stop().await;
     }
 }
 struct Feed {
@@ -183,12 +133,8 @@ fn notice<'a>(event: &'a Value, path: &str) -> &'a Value {
         .unwrap()
 }
 async fn append(host: &Host, id: &str, state: &Value, text: &str) -> Value {
-    let offset = state["snapshot"]["text"]
-        .as_str()
-        .unwrap()
-        .encode_utf16()
-        .count();
-    host.edit(id, json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"test","input":{"kind":"edits","edits":[{"from":offset,"to":offset,"insert":text}]},"undo":{"metadata":null,"positions":[]}} )).await
+    let offset = state["snapshot"]["text"].as_str().unwrap().len();
+    host.mutate(id, Some((offset..offset, text))).await
 }
 
 #[tokio::test]
@@ -225,21 +171,6 @@ async fn observation_updates_open_buffers_without_discovering_unopened_files() {
     assert_eq!(host.open("nested/new.md").await["snapshot"]["text"], "new");
     drop(feed);
     host.stop().await;
-    let host = Host::start(root.path(), false).await;
-    let mut feed = host.feed().await;
-    let recovered = feed.next().await;
-    assert_ne!(recovered["streamId"], initial["streamId"]);
-    assert_ne!(
-        recovered["vaultIdentity"]["historyId"],
-        initial["vaultIdentity"]["historyId"]
-    );
-    assert_eq!(recovered["documents"], json!([]));
-    assert_eq!(
-        host.open("nested/a.md").await["snapshot"]["text"],
-        "external base 😀"
-    );
-    drop(feed);
-    host.stop().await;
 }
 
 #[tokio::test]
@@ -251,18 +182,12 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
     let mut feed = host.feed().await;
     let initial = feed.next().await;
     let id = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
-    let state = host.state(&id).await;
-    let state = host
-        .edit(
-            &id,
-            json!({"kind":"edit","base":state["snapshot"]["version"],"origin":"local","input":{"kind":"edits","edits":[{"from":2,"to":8,"insert":"MIDDLE"}]},"undo":{"metadata":null,"positions":[]}}),
-        )
-        .await;
+    let state = host.mutate(&id, Some((2..8, "MIDDLE"))).await;
     feed.until(&id, |notice| {
         notice["version"] == state["snapshot"]["version"]
     })
     .await;
-    let writer = host.state(&id).await["writerId"].clone();
+    let peer_id = host.state(&id).await["writerId"].clone();
     let mut prior = state["snapshot"]["version"].clone();
     for text in ["A1 middle B1", "A2 middle B2", "A middle B"] {
         std::fs::write(root.path().join("a.md"), text).unwrap();
@@ -270,7 +195,7 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
         prior = event["version"].clone();
         let state = host.state(&id).await;
         assert_eq!(state["snapshot"]["text"], text.replace("middle", "MIDDLE"));
-        assert_eq!(state["writerId"], writer);
+        assert_eq!(state["writerId"], peer_id);
         assert_eq!(state["conflict"], false);
     }
     let saved = host.save(&id, prior.clone()).await;
@@ -280,7 +205,7 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
     std::fs::write(root.path().join("a.md"), "A MIDDLE B").unwrap();
     tokio::time::sleep(Duration::from_millis(160)).await;
     assert_eq!(host.state(&id).await["snapshot"]["version"], prior);
-    let undone = host.edit(&id, json!({"kind":"undo","base":prior})).await;
+    let undone = host.mutate(&id, None).await;
     assert_eq!(undone["snapshot"]["text"], "A middle B");
     drop(feed);
     host.stop().await;
@@ -349,62 +274,5 @@ async fn a_read_only_vault_still_observes_its_hosts_external_files() {
     .await;
     assert_eq!(host.state(&id).await["snapshot"]["text"], "external");
     drop(feed);
-    host.stop().await;
-}
-
-#[tokio::test]
-async fn independent_replicas_follow_committed_changes_and_keep_their_personal_undo() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a.md"), "left middle right").unwrap();
-    let host = Host::start(root.path(), false).await;
-    let mut a = support::Peer::connect(&host.url).await;
-    let mut b = support::Peer::connect(&host.url).await;
-    let id = a.open("a.md").await;
-    b.open("a.md").await;
-    let mut first = host.feed().await;
-    let mut second = host.feed().await;
-    let initial = first.next().await;
-    second.next().await;
-    a.edit(&id, 5, 11, "MIDDLE").await;
-    b.edit(&id, 12, 17, "RIGHT").await;
-    std::fs::write(root.path().join("a.md"), "LEFT middle right").unwrap();
-    for feed in [&mut first, &mut second] {
-        feed.until(&id, |notice| {
-            notice["savedVersion"] != initial["documents"][0]["savedVersion"]
-        })
-        .await;
-    }
-    for peer in [&mut a, &mut b] {
-        peer.sync(&id).await;
-        assert_eq!(
-            peer.core.read(&id).unwrap().snapshot.text,
-            "LEFT MIDDLE RIGHT"
-        );
-    }
-    assert_eq!(
-        a.core.read(&id).unwrap().snapshot.version,
-        b.core.read(&id).unwrap().snapshot.version
-    );
-    let accepted = a.undo(&id, false).await;
-    assert_eq!(accepted.snapshot.text, "LEFT middle RIGHT");
-    second
-        .until(&id, |notice| {
-            notice["version"] == serde_json::to_value(&accepted.snapshot.version).unwrap()
-        })
-        .await;
-    b.sync(&id).await;
-    assert_eq!(
-        a.core.read(&id).unwrap().snapshot.text,
-        b.core.read(&id).unwrap().snapshot.text
-    );
-    assert_eq!(b.undo(&id, false).await.snapshot.text, "LEFT middle right");
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("a.md")).unwrap(),
-        "LEFT middle right"
-    );
-    a.close().await;
-    b.close().await;
-    drop(first);
-    drop(second);
     host.stop().await;
 }

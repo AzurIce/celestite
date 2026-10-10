@@ -13,11 +13,8 @@ import {
 } from "../core";
 import { restoredSelection } from "../commands";
 import { editsOf, sameVersion } from "../view-changes";
-import type {
-  PackageResourceProvider,
-  PreviewCoreMethods,
-} from "../preview/contract";
-import { PreviewResources } from "../preview/resources";
+import type { DocumentSourceSnapshot } from "../generated/celestite_core";
+import { TaskQueue } from "../queue";
 import type {
   BufferCommand,
   ConnectionState,
@@ -29,7 +26,6 @@ import type {
   CollaborationSnapshot,
   Affinity,
   Anchor,
-  ResolvedAnchor,
   VersionedSelection,
 } from "../contract";
 
@@ -41,9 +37,8 @@ interface Patch {
 
 /** Worker transport, view projections and timers; Rust owns all editor policy. */
 export class EditorHost {
-  readonly previewResources: PreviewResources;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private previews = new Map<string, ServiceDocument>();
+  private placeholders = new Map<string, ServiceDocument>();
   private eventSequence = 0;
   private patches = new Map<string, Patch[]>();
   constructor(
@@ -51,16 +46,8 @@ export class EditorHost {
     protected backend: VaultBackend,
     private emit: (event: ServiceEvent) => void,
     private schedule: (task: () => Promise<unknown>) => void,
-    packages?: PackageResourceProvider,
-  ) {
-    this.previewResources = new PreviewResources(backend, packages);
-  }
-  private coreQueue: Promise<unknown> = Promise.resolve();
-  private serialize<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.coreQueue.then(task);
-    this.coreQueue = result.catch(() => {});
-    return result;
-  }
+  ) {}
+  private coreQueue = new TaskQueue();
   private async call(
     method: string,
     params: Record<string, unknown> = {},
@@ -76,7 +63,7 @@ export class EditorHost {
     params: Record<string, unknown> = {},
     replyFor?: string,
   ): Promise<CoreReply> {
-    return this.serialize(() => this.call(method, params, replyFor));
+    return this.coreQueue.run(() => this.call(method, params, replyFor));
   }
   protected async execute<T>(
     method: string,
@@ -159,7 +146,7 @@ export class EditorHost {
       : { ...command, base: version, context };
   }
   apply(id: string, command: BufferCommand): Promise<MutationResult> {
-    return this.serialize(async () => {
+    return this.coreQueue.run(async () => {
       this.ensureMutationAllowed();
       const current = coreValue<CoreDocument>(await this.call("read", { id }));
       try {
@@ -197,11 +184,21 @@ export class EditorHost {
       };
     });
   }
-  executePreview<K extends keyof PreviewCoreMethods>(
-    method: K,
-    params: PreviewCoreMethods[K]["params"],
-  ): Promise<PreviewCoreMethods[K]["result"]> {
-    return this.execute(method, params);
+  readSource(ids: readonly string[]): Promise<DocumentSourceSnapshot> {
+    return this.withSource(ids, (source) => source);
+  }
+  /** Synchronously consume a readonly capture before another core call can run.
+   * Computation and IO must happen after this lease, using the owned snapshot. */
+  withSource<T>(
+    ids: readonly string[],
+    consume: (source: DocumentSourceSnapshot) => T,
+  ): Promise<T> {
+    return this.coreQueue.run(async () => {
+      const source = coreValue<DocumentSourceSnapshot>(
+        await this.call("document_source", { ids: [...ids] }),
+      );
+      return consume(source);
+    });
   }
   protected document(raw: CoreDocument, content = true): ServiceDocument {
     return {
@@ -220,9 +217,9 @@ export class EditorHost {
       conflict: raw.conflict,
       core: {
         version: raw.snapshot.version,
-        durableVersion: raw.durableVersion,
+        persistedVersion: raw.persistedVersion,
         undo: raw.undo,
-        writerId: raw.writerId,
+        peerId: raw.peerId,
         historyError: raw.persistenceError,
       },
     };
@@ -291,13 +288,13 @@ export class EditorHost {
     id: string,
     checkpoint: Version,
     anchors: Anchor[],
-  ): Promise<[Version, ResolvedAnchor[]]> {
+  ): Promise<[Version, number[]]> {
     return this.execute("resolve_anchors", { id, checkpoint, anchors });
   }
   async releaseDocument(id: string) {
     clearTimeout(this.timers.get(id));
     this.timers.delete(id);
-    this.previews.delete(id);
+    this.placeholders.delete(id);
   }
   async composition(_id: string, _active: boolean) {}
   async open(path: VaultPath): Promise<ServiceDocument> {
@@ -323,7 +320,7 @@ export class EditorHost {
         error: null,
         conflict: false,
       };
-      this.previews.set(preview.id, preview);
+      this.placeholders.set(preview.id, preview);
       return preview;
     }
   }
@@ -341,7 +338,7 @@ export class EditorHost {
     return this.document(raw);
   }
   async save(id: string) {
-    const preview = this.previews.get(id);
+    const preview = this.placeholders.get(id);
     if (preview) return preview;
     const raw = await this.execute<CoreDocument>("save", { id });
     this.publish(raw);
@@ -384,8 +381,6 @@ export class EditorHost {
           : {}),
       });
     } finally {
-      if (["writeFile", "mkdir", "rename", "remove"].includes(method))
-        await this.executePreview("preview_invalidate_project", {});
       await this.refreshViews();
     }
     if (method === "readFile") return new Uint8Array(result as number[]);

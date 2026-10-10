@@ -1,8 +1,12 @@
 //! Derived document previews. Scheduling policy lives here; platforms execute
 //! immutable tasks separately from editing and persistence.
-use crate::{EditorError, EditorResult, TextSnapshot, Version};
+use crate::backend::{EditorError, EditorResult};
+#[cfg(feature = "preview")]
+use crate::editor::MAX_TEXT_BYTES;
+use crate::editor::validate_editor_path;
+use celestite_buffer::types::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub const PREVIEW_DEBOUNCE_MS: u64 = 120;
 pub const PREVIEW_MAX_WAIT_MS: u64 = 500;
@@ -25,6 +29,8 @@ fn preview_extension(path: &str) -> Option<String> {
 /// document version its output belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewTicket {
     pub task_id: String,
     pub session_id: String,
@@ -36,6 +42,8 @@ pub struct PreviewTicket {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewTask {
     pub ticket: PreviewTicket,
     pub source: String,
@@ -53,6 +61,8 @@ fn default_resource_root() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewResource {
     pub kind: Option<PreviewResourceKind>,
     pub data: Option<Vec<u8>>,
@@ -61,6 +71,7 @@ pub struct PreviewResource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 pub enum PreviewResourceKind {
     File,
     Directory,
@@ -68,6 +79,8 @@ pub enum PreviewResourceKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewResourceRequest {
     pub path: String,
     pub read: bool,
@@ -75,6 +88,8 @@ pub struct PreviewResourceRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewComponent {
     pub package: String,
     pub name: String,
@@ -84,12 +99,11 @@ pub struct PreviewComponent {
 }
 
 #[cfg(feature = "preview")]
-mod project;
-#[cfg(feature = "preview")]
-pub use project::preview_resource_requests;
+pub mod project;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 pub enum PreviewDiagnosticOrigin {
     Analysis,
     Transform,
@@ -100,6 +114,8 @@ pub enum PreviewDiagnosticOrigin {
 /// Half-open UTF-16 offsets in the task's LF source, not the UI input projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewDiagnostic {
     pub from: usize,
     pub to: usize,
@@ -113,6 +129,8 @@ pub struct PreviewDiagnostic {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewOutput {
     pub html: String,
     pub diagnostics: Vec<PreviewDiagnostic>,
@@ -124,6 +142,7 @@ pub struct PreviewOutput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 pub enum PreviewMappingKind {
     Block,
     Inline,
@@ -133,6 +152,8 @@ pub enum PreviewMappingKind {
 /// Output element ID scoped to the result ticket, with a half-open UTF-16 range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewSourceMapping {
     pub node_id: usize,
     pub from: usize,
@@ -173,6 +194,8 @@ impl PreviewOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub enum PreviewOutcome {
     Success {
         output: PreviewOutput,
@@ -186,6 +209,8 @@ pub enum PreviewOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewCompletion {
     pub task_id: String,
     pub outcome: PreviewOutcome,
@@ -193,6 +218,8 @@ pub struct PreviewCompletion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewResult {
     pub ticket: PreviewTicket,
     pub output: PreviewOutput,
@@ -200,6 +227,7 @@ pub struct PreviewResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 pub enum PreviewStatus {
     Unsupported,
     Pending,
@@ -210,6 +238,8 @@ pub enum PreviewStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewState {
     pub target: PreviewTicket,
     pub status: PreviewStatus,
@@ -223,6 +253,8 @@ pub struct PreviewState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewSubscription {
     pub subscription_id: String,
     pub state: PreviewState,
@@ -230,6 +262,8 @@ pub struct PreviewSubscription {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub struct PreviewEvent {
     pub sequence: u64,
     pub document_id: String,
@@ -239,6 +273,8 @@ pub struct PreviewEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
 pub enum PreviewLink {
     Fragment {
         fragment: String,
@@ -328,7 +364,7 @@ pub fn resolve_preview_target(path: &str, target: &str) -> EditorResult<PreviewL
         }
     }
     let path = segments.join("/");
-    crate::validate_editor_path(&path)?;
+    validate_editor_path(&path)?;
     if path.is_empty() {
         return Err(invalid());
     }
@@ -341,7 +377,7 @@ pub fn resolve_preview_target(path: &str, target: &str) -> EditorResult<PreviewL
 pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
     let mut environment_diagnostics = Vec::new();
     let computed = (|| -> EditorResult<PreviewOutput> {
-        if task.source.len() > crate::MAX_TEXT_BYTES || task.source.contains('\r') {
+        if task.source.len() > MAX_TEXT_BYTES || task.source.contains('\r') {
             return Err(EditorError::new(
                 "InvalidPreview",
                 "Preview requires bounded LF source",
@@ -521,366 +557,4 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
     }
 }
 
-struct Session {
-    subscribers: BTreeMap<String, String>,
-    state: PreviewState,
-    running: Option<PreviewTicket>,
-    dirty_since: Option<u64>,
-}
-
-pub(crate) struct PreviewSessions {
-    scope: String,
-    next_id: u64,
-    sequence: u64,
-    sessions: BTreeMap<String, Session>,
-    changed: BTreeSet<String>,
-    generation: u64,
-}
-
-impl Default for PreviewSessions {
-    fn default() -> Self {
-        Self {
-            // A volatile backend's new_id can restart its counter on reopen.
-            // Use the same random runtime identity source as Buffer writers.
-            scope: loro::LoroDoc::new().peer_id().to_string(),
-            next_id: 0,
-            sequence: 0,
-            sessions: BTreeMap::new(),
-            changed: BTreeSet::new(),
-            generation: 0,
-        }
-    }
-}
-
-impl PreviewSessions {
-    pub fn invalidate_project(&mut self, now: u64) {
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .expect("preview generation exhausted");
-        let ids: Vec<_> = self.sessions.keys().cloned().collect();
-        for id in ids {
-            let task_id = self.token();
-            let session = self.sessions.get_mut(&id).unwrap();
-            session.state.target.task_id = task_id;
-            session.state.target.render_generation =
-                format!("notist-project-v1:{}", self.generation);
-            session.state.error = None;
-            session.state.diagnostics.clear();
-            if supports_preview(&session.state.target.path) {
-                let first = *session.dirty_since.get_or_insert(now);
-                session.state.status = PreviewStatus::Pending;
-                session.state.due_at = Some(
-                    now.saturating_add(PREVIEW_DEBOUNCE_MS)
-                        .min(first.saturating_add(PREVIEW_MAX_WAIT_MS)),
-                );
-            }
-            self.changed.insert(id);
-        }
-    }
-
-    fn token(&mut self) -> String {
-        self.next_id = self.next_id.checked_add(1).expect("preview ID exhausted");
-        format!("{}:{}", self.scope, self.next_id)
-    }
-
-    pub fn contains(&self, id: &str) -> bool {
-        self.sessions.contains_key(id)
-    }
-
-    pub fn document_for_task(&self, task_id: &str) -> Option<String> {
-        self.sessions.iter().find_map(|(id, session)| {
-            session
-                .running
-                .as_ref()
-                .filter(|ticket| ticket.task_id == task_id)
-                .map(|_| id.clone())
-        })
-    }
-
-    pub fn subscribe(
-        &mut self,
-        id: &str,
-        client: &str,
-        snapshot: &TextSnapshot,
-        path: &str,
-        now: u64,
-    ) -> PreviewSubscription {
-        let subscription_id = self.token();
-        if !self.sessions.contains_key(id) {
-            let session_id = self.token();
-            let task_id = self.token();
-            let supported = supports_preview(path);
-            self.sessions.insert(
-                id.into(),
-                Session {
-                    subscribers: BTreeMap::new(),
-                    state: PreviewState {
-                        target: PreviewTicket {
-                            task_id,
-                            session_id,
-                            document_id: id.into(),
-                            version: snapshot.version.clone(),
-                            path: path.into(),
-                            render_generation: format!("notist-project-v1:{}", self.generation),
-                        },
-                        status: if supported {
-                            PreviewStatus::Pending
-                        } else {
-                            PreviewStatus::Unsupported
-                        },
-                        result: None,
-                        error: None,
-                        diagnostics: vec![],
-                        due_at: supported.then_some(now),
-                    },
-                    running: None,
-                    dirty_since: None,
-                },
-            );
-            self.changed.insert(id.into());
-        }
-        let session = self.sessions.get_mut(id).unwrap();
-        session
-            .subscribers
-            .insert(subscription_id.clone(), client.into());
-        PreviewSubscription {
-            subscription_id,
-            state: session.state.clone(),
-        }
-    }
-
-    pub fn unsubscribe(&mut self, subscription: &str, client: &str) -> bool {
-        let id = self.sessions.iter().find_map(|(id, session)| {
-            (session
-                .subscribers
-                .get(subscription)
-                .is_some_and(|owner| owner == client))
-            .then(|| id.clone())
-        });
-        let Some(id) = id else {
-            return false;
-        };
-        let session = self.sessions.get_mut(&id).unwrap();
-        session.subscribers.remove(subscription);
-        if session.subscribers.is_empty() {
-            self.close(&id);
-        }
-        true
-    }
-
-    pub fn release_client(&mut self, client: &str) {
-        let mut closed = Vec::new();
-        for (id, session) in &mut self.sessions {
-            session.subscribers.retain(|_, owner| owner != client);
-            if session.subscribers.is_empty() {
-                closed.push(id.clone());
-            }
-        }
-        for id in closed {
-            self.close(&id);
-        }
-    }
-
-    pub fn close(&mut self, id: &str) {
-        if self.sessions.remove(id).is_some() {
-            self.changed.insert(id.into());
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.changed.extend(self.sessions.keys().cloned());
-        self.sessions.clear();
-    }
-
-    pub fn reconcile(&mut self, id: &str, version: &Version, path: &str, now: u64) {
-        let Some(session) = self.sessions.get(id) else {
-            return;
-        };
-        if session.state.target.version == *version && session.state.target.path == path {
-            return;
-        }
-        let task_id = self.token();
-        let session = self.sessions.get_mut(id).unwrap();
-        session.state.target.task_id = task_id;
-        session.state.target.version = version.clone();
-        session.state.target.path = path.into();
-        session.state.error = None;
-        session.state.diagnostics.clear();
-        if supports_preview(path) {
-            let first = *session.dirty_since.get_or_insert(now);
-            session.state.status = PreviewStatus::Pending;
-            session.state.due_at = Some(
-                now.saturating_add(PREVIEW_DEBOUNCE_MS)
-                    .min(first.saturating_add(PREVIEW_MAX_WAIT_MS)),
-            );
-        } else {
-            session.state.status = PreviewStatus::Unsupported;
-            session.state.result = None;
-            session.state.due_at = None;
-            session.dirty_since = None;
-        }
-        self.changed.insert(id.into());
-    }
-
-    pub fn state(&self, id: &str) -> EditorResult<PreviewState> {
-        self.sessions
-            .get(id)
-            .map(|s| s.state.clone())
-            .ok_or_else(|| EditorError::new("NotFound", "Preview session not found", id))
-    }
-
-    pub fn take_task(&mut self, id: &str, snapshot: TextSnapshot, now: u64) -> Option<PreviewTask> {
-        let session = self.sessions.get_mut(id)?;
-        if session.running.is_some()
-            || session.state.status != PreviewStatus::Pending
-            || session.state.due_at.is_none_or(|deadline| deadline > now)
-        {
-            return None;
-        }
-        debug_assert_eq!(session.state.target.version, snapshot.version);
-        let ticket = session.state.target.clone();
-        session.running = Some(ticket.clone());
-        session.state.status = PreviewStatus::Computing;
-        session.state.due_at = None;
-        session.dirty_since = None;
-        self.changed.insert(id.into());
-        Some(PreviewTask {
-            ticket,
-            source: snapshot.text,
-            overlays: BTreeMap::new(),
-            resources: BTreeMap::new(),
-            resource_root: default_resource_root(),
-        })
-    }
-
-    /// Wrong, duplicate or revoked task IDs never mutate the current session.
-    pub fn complete(&mut self, completion: PreviewCompletion) -> bool {
-        let id = self.sessions.iter().find_map(|(id, session)| {
-            session
-                .running
-                .as_ref()
-                .filter(|t| t.task_id == completion.task_id)
-                .map(|_| id.clone())
-        });
-        let Some(id) = id else {
-            return false;
-        };
-        let cached_elsewhere = self
-            .sessions
-            .iter()
-            .filter(|(other, _)| *other != &id)
-            .fold(0usize, |size, (_, session)| {
-                size.saturating_add(
-                    session
-                        .state
-                        .result
-                        .as_ref()
-                        .map_or(0, |result| result.output.bytes()),
-                )
-                .saturating_add(diagnostic_bytes(&session.state.diagnostics))
-            });
-        let outcome = match completion.outcome {
-            PreviewOutcome::Success { output } => {
-                if output.bytes() > MAX_PREVIEW_OUTPUT_BYTES
-                    || cached_elsewhere.saturating_add(output.bytes()) > MAX_PREVIEW_CACHE_BYTES
-                {
-                    PreviewOutcome::Failure {
-                        message: "预览内容超过缓存容量，请缩小文档或关闭其他预览。".into(),
-                        diagnostics: vec![],
-                    }
-                } else {
-                    PreviewOutcome::Success { output }
-                }
-            }
-            PreviewOutcome::Failure {
-                message,
-                mut diagnostics,
-            } => {
-                let bytes = diagnostic_bytes(&diagnostics);
-                let retained = self.sessions[&id]
-                    .state
-                    .result
-                    .as_ref()
-                    .map_or(0, |result| result.output.bytes());
-                if bytes > MAX_PREVIEW_OUTPUT_BYTES
-                    || cached_elsewhere
-                        .saturating_add(retained)
-                        .saturating_add(bytes)
-                        > MAX_PREVIEW_CACHE_BYTES
-                {
-                    diagnostics.clear();
-                }
-                PreviewOutcome::Failure {
-                    message,
-                    diagnostics,
-                }
-            }
-        };
-        let session = self.sessions.get_mut(&id).unwrap();
-        let ticket = session.running.take().unwrap();
-        if ticket != session.state.target {
-            self.changed.insert(id);
-            return false;
-        }
-        match outcome {
-            PreviewOutcome::Success { output } => {
-                session.state.result = Some(PreviewResult { ticket, output });
-                session.state.status = PreviewStatus::Ready;
-                session.state.error = None;
-                session.state.diagnostics.clear();
-            }
-            PreviewOutcome::Failure {
-                message,
-                diagnostics,
-            } => {
-                session.state.status = PreviewStatus::Failed;
-                session.state.error = Some(message);
-                session.state.diagnostics = diagnostics;
-            }
-        }
-        self.changed.insert(id);
-        true
-    }
-
-    pub fn retry(&mut self, id: &str, now: u64) -> EditorResult<()> {
-        self.state(id)?;
-        let task_id = self.token();
-        let session_id = self.token();
-        let session = self.sessions.get_mut(id).unwrap();
-        session.state.target.task_id = task_id;
-        session.state.target.session_id = session_id;
-        session.running = None;
-        session.state.error = None;
-        session.state.diagnostics.clear();
-        session.dirty_since = None;
-        let supported = supports_preview(&session.state.target.path);
-        session.state.status = if supported {
-            PreviewStatus::Pending
-        } else {
-            PreviewStatus::Unsupported
-        };
-        session.state.due_at = supported.then_some(now);
-        self.changed.insert(id.into());
-        Ok(())
-    }
-
-    /// Coalesce undelivered states; assign sequence numbers on delivery so a
-    /// slow consumer sees continuous events without retaining every HTML copy.
-    pub fn take_events(&mut self) -> Vec<PreviewEvent> {
-        std::mem::take(&mut self.changed)
-            .into_iter()
-            .map(|id| {
-                self.sequence = self
-                    .sequence
-                    .checked_add(1)
-                    .expect("preview event sequence exhausted");
-                PreviewEvent {
-                    sequence: self.sequence,
-                    state: self.sessions.get(&id).map(|s| s.state.clone()),
-                    document_id: id,
-                }
-            })
-            .collect()
-    }
-}
+pub mod sessions;

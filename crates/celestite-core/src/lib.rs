@@ -1,18 +1,10 @@
 //! Shared, host-independent Celestite editing kernel.
-pub mod buffer;
-pub use buffer::*;
-pub mod instance;
-pub use instance::*;
 pub mod backend;
 pub mod editor;
-pub use backend::*;
-pub use editor::*;
-pub mod memory;
-pub use memory::MemoryBackend;
+pub mod instance;
 pub mod preview;
-pub use preview::*;
+pub mod protocol;
+pub mod source;
 
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-mod browser;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;

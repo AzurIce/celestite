@@ -111,3 +111,11 @@ test("RPC errors preserve partial rename phase and cleanup failures", async () =
   );
   client.dispose();
 });
+
+test("structured WASM errors preserve their code, message and path", () => {
+  for (const code of ["NotFound", "StaleVersion", "InvalidPath"]) {
+    const error = { code, message: "preview request rejected", path: "a.md" };
+    assert.deepEqual(encodeError(error), error);
+  }
+  assert.equal(encodeError({ code: 42, message: "invalid error" }).code, "IO");
+});

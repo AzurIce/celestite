@@ -1,7 +1,7 @@
 import type {
   PackageResourceProvider,
   PreviewResourceRequest,
-} from "../preview/contract";
+} from "../../preview/contract";
 import type { LocalDirectoryHandle } from "../../vault/file-system-access";
 import { fileSystemError, VaultError } from "../../vault/errors";
 import { vaultPath } from "../../vault/path";

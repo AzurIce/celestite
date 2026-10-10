@@ -6,7 +6,7 @@ import type {
   TextSnapshot,
   UndoState,
   Version,
-} from "./contract";
+} from "./protocol";
 
 export interface CorePort {
   call(method: string, params: string): Promise<string>;
@@ -17,7 +17,7 @@ export interface CoreDocument {
   path: string;
   snapshot: TextSnapshot;
   undo: UndoState;
-  writerId: string;
+  peerId: string;
   savedContent: string;
   savedVersion: Version | null;
   dirty: boolean;
@@ -25,17 +25,17 @@ export interface CoreDocument {
   lineEnding: "\n" | "\r\n" | "\r";
   deleted: boolean;
   conflict: boolean;
-  durableVersion: Version | null;
+  persistedVersion: Version | null;
   persistenceError: string | null;
   error: string | null;
   autosaveDelay: number | null;
-  backendRevision: string;
+  fileRevision: string;
 }
 export interface CoreMutation {
   document: CoreDocument;
   update: BufferUpdate;
   history:
-    | { status: "committed"; version: Version; durable: boolean }
+    | { status: "committed"; version: Version; persisted: boolean }
     | { status: "failed"; error: RpcError };
 }
 export type CoreReply =

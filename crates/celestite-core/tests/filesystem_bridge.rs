@@ -1,4 +1,10 @@
-use celestite_core::*;
+use celestite_core::backend::{
+    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileSnapshot,
+    JournalEntry, StoredDocument, WritePhase,
+};
+use celestite_core::editor::observation::ExternalChangeStatus;
+use celestite_core::editor::{EditorCore, EditorOptions, ExternalChangePolicy, MAX_TEXT_BYTES};
+use celestite_core::instance::{InstanceIdentity, Vault};
 use futures_lite::future::block_on;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
@@ -187,7 +193,7 @@ fn detached_observation_merges_into_newer_live_edits_and_keeps_personal_undo() {
         let backend = HostBackend::new(b"A middle B");
         let mut core = open_deferred(backend.clone()).await;
         let id = core.open_file("a.md").await.unwrap();
-        let writer = core.read(&id).unwrap().writer_id;
+        let peer_id = core.read(&id).unwrap().peer_id;
         backend.external(b"A1 middle B1");
         core.refresh(&id).await.unwrap();
         let task = core.take_file_observation().unwrap().unwrap();
@@ -206,20 +212,15 @@ fn detached_observation_merges_into_newer_live_edits_and_keeps_personal_undo() {
                 .unwrap()
         );
         let state = core.read(&id).unwrap();
-        assert_eq!(state.snapshot.text, "A1 MIDDLE B1");
+        assert_eq!(state.snapshot.text.as_ref(), "A1 MIDDLE B1");
         assert_eq!(state.saved_content, "A1 middle B1");
-        assert_eq!(state.writer_id, writer);
+        assert_eq!(state.peer_id, peer_id);
         assert!(state.external_change.is_none());
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "A1 middle B1");
+        core.undo(&id).await.unwrap();
+        assert_eq!(
+            core.read(&id).unwrap().snapshot.text.as_ref(),
+            "A1 middle B1"
+        );
         let sequence = backend.header(&id).sequence;
         core.refresh(&id).await.unwrap();
         assert!(!core.has_file_observations());
@@ -257,7 +258,7 @@ fn changed_disk_invalidates_old_success_or_timeout_and_coalesces_one_latest_task
                     .await
                     .unwrap()
             );
-            assert_eq!(core.read(&id).unwrap().snapshot.text, "latest");
+            assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "latest");
             assert_eq!(backend.header(&id).sequence, 1);
         }
     });
@@ -282,14 +283,14 @@ fn advancing_disk_cursor_invalidates_detached_results() {
                 .await
                 .unwrap()
         );
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "base\n");
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "base\n");
         assert_eq!(backend.header(&id).sequence, 0);
         assert_eq!(backend.header(&id).disk_cursor.unwrap().bytes, b"base\r\n");
     });
 }
 
 #[test]
-fn timeout_preserves_history_exposes_status_blocks_writes_and_backs_off() {
+fn timeout_backoff_preserves_history_and_retries_only_after_an_explicit_trigger() {
     block_on(async {
         let backend = HostBackend::new(b"base");
         let mut core = open_deferred(backend.clone()).await;
@@ -336,69 +337,42 @@ fn timeout_preserves_history_exposes_status_blocks_writes_and_backs_off() {
                 ..
             })
         ));
+        // A different observation bypasses the old input's backoff immediately.
+        backend.external(b"changed");
+        core.refresh(&id).await.unwrap();
+        let changed = core.take_file_observation().unwrap().unwrap();
+        core.complete_file_observation(changed.compute_with_budget(std::time::Duration::ZERO))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            core.read(&id).unwrap().external_change,
+            Some(ExternalChangeStatus::Failed {
+                retry_at: 61_000,
+                ..
+            })
+        ));
+        // A manual retry also bypasses backoff, this time for unchanged input.
         core.retry_file_observation(&id).await.unwrap();
         let retry = core.take_file_observation().unwrap().unwrap();
         core.complete_file_observation(retry.compute())
             .await
             .unwrap();
         assert!(core.read(&id).unwrap().external_change.is_none());
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "next");
-    });
-}
-
-#[test]
-fn changed_input_bypasses_timeout_backoff() {
-    block_on(async {
-        let backend = HostBackend::new(b"base");
-        let mut core = open_deferred(backend.clone()).await;
-        let id = core.open_file("a.md").await.unwrap();
-        backend.external(b"next");
-        core.refresh(&id).await.unwrap();
-        let task = core.take_file_observation().unwrap().unwrap();
-        core.complete_file_observation(task.compute_with_budget(std::time::Duration::ZERO))
-            .await
-            .unwrap_err();
-        backend.external(b"changed");
-        core.refresh(&id).await.unwrap();
-        let task = core.take_file_observation().unwrap().unwrap();
-        core.complete_file_observation(task.compute())
-            .await
-            .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "changed");
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "changed");
     });
 }
 
 async fn edit(core: &mut EditorCore<HostBackend>, id: &str, from: usize, to: usize, insert: &str) {
-    core.apply(
-        id,
-        BufferCommand::Edit(Edit {
-            base: core.read(id).unwrap().snapshot.version,
-            input: TextInput::Edits {
-                edits: vec![TextEdit {
-                    from,
-                    to,
-                    insert: insert.into(),
-                }],
-            },
-            origin: "local".into(),
-            group: None,
-            undo: UndoContext {
-                metadata: None,
-                positions: vec![],
-            },
-        }),
-    )
-    .await
-    .unwrap();
+    core.edit(id, [(from..to, insert)]).await.unwrap();
 }
 
 #[test]
-fn fine_diff_and_continuous_disk_branch_preserve_live_writer_and_personal_undo() {
+fn fine_diff_and_continuous_disk_branch_preserve_live_peer_and_personal_undo() {
     block_on(async {
         let backend = HostBackend::new(b"A middle B");
         let mut core = open_host(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
-        let writer = core.read(&id).unwrap().writer_id;
+        let peer_id = core.read(&id).unwrap().peer_id;
         edit(&mut core, &id, 2, 8, "MIDDLE").await;
         for (disk, expected) in [
             ("A1 middle B1", "A1 MIDDLE B1"),
@@ -407,24 +381,19 @@ fn fine_diff_and_continuous_disk_branch_preserve_live_writer_and_personal_undo()
             backend.external(disk.as_bytes());
             core.refresh(&id).await.unwrap();
             let state = core.read(&id).unwrap();
-            assert_eq!(state.snapshot.text, expected);
+            assert_eq!(state.snapshot.text.as_ref(), expected);
             assert_eq!(state.saved_content, disk);
             assert_ne!(state.saved_version.as_ref(), Some(&state.snapshot.version));
-            assert_eq!(state.writer_id, writer);
+            assert_eq!(state.peer_id, peer_id);
             let sequence = backend.header(&id).sequence;
             core.refresh(&id).await.unwrap();
             assert_eq!(backend.header(&id).sequence, sequence);
         }
-        core.apply(
-            &id,
-            BufferCommand::Undo {
-                base: core.read(&id).unwrap().snapshot.version,
-                context: UndoContext::default(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "A12 middle B12");
+        core.undo(&id).await.unwrap();
+        assert_eq!(
+            core.read(&id).unwrap().snapshot.text.as_ref(),
+            "A12 middle B12"
+        );
     });
 }
 
@@ -440,7 +409,10 @@ fn observed_aba_and_restart_keep_disk_version_separate_from_merged_version() {
             core.refresh(&id).await.unwrap();
         }
         let merged = core.read(&id).unwrap().snapshot.text;
-        assert!(merged == "Xa" || merged == "aX", "{merged}");
+        assert!(
+            merged.as_ref() == "Xa" || merged.as_ref() == "aX",
+            "{merged}"
+        );
         let sequence = backend.header(&id).sequence;
         drop(core);
         let mut core = open_host(backend.clone()).await.unwrap();
@@ -488,17 +460,15 @@ fn failed_or_lost_commit_receipts_do_not_publish_and_retry_the_same_operation() 
                     serde_json::to_value(&attempts[attempt + 1]).unwrap()
                 );
             }
-            assert_eq!(core.read(&id).unwrap().snapshot.text, "external base local");
-            core.apply(
-                &id,
-                BufferCommand::Undo {
-                    base: core.read(&id).unwrap().snapshot.version,
-                    context: UndoContext::default(),
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(core.read(&id).unwrap().snapshot.text, "external base");
+            assert_eq!(
+                core.read(&id).unwrap().snapshot.text.as_ref(),
+                "external base local"
+            );
+            core.undo(&id).await.unwrap();
+            assert_eq!(
+                core.read(&id).unwrap().snapshot.text.as_ref(),
+                "external base"
+            );
         }
     });
 }
@@ -516,7 +486,7 @@ fn committed_observation_with_lost_receipt_recovers_after_process_restart() {
         let mut core = open_host(backend.clone()).await.unwrap();
         let sequence = backend.header(&id).sequence;
         core.refresh(&id).await.unwrap();
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "new base");
+        assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "new base");
         assert_eq!(backend.header(&id).sequence, sequence);
     });
 }
@@ -633,7 +603,7 @@ fn completed_write_recovers_receipt_but_a_third_disk_state_is_not_merged() {
             let mut core = open_host(backend.clone()).await.unwrap();
             core.refresh(&id).await.unwrap();
             let state = core.read(&id).unwrap();
-            assert_eq!(state.snapshot.text, "new");
+            assert_eq!(state.snapshot.text.as_ref(), "new");
             assert_eq!(state.conflict, third);
             assert_eq!(backend.header(&id).pending_write.is_some(), third);
             assert_eq!(backend.state.borrow().writes, 1);
@@ -654,7 +624,10 @@ fn save_reconciles_disk_then_rejects_a_now_stale_requested_version() {
             core.save(&id, Some(version)).await.unwrap_err().code,
             "StaleVersion"
         );
-        assert_eq!(core.read(&id).unwrap().snapshot.text, "external base local");
+        assert_eq!(
+            core.read(&id).unwrap().snapshot.text.as_ref(),
+            "external base local"
+        );
         assert_eq!(backend.state.borrow().writes, 0);
         let version = core.read(&id).unwrap().snapshot.version;
         core.save(&id, Some(version)).await.unwrap();
@@ -711,42 +684,38 @@ fn invalid_disk_content_keeps_the_committed_cursor_and_live_text() {
 }
 
 #[test]
-fn short_unicode_observation_sequences_restore_with_consistent_cursors() {
+fn unicode_disk_sequences_survive_restore_including_empty_noop_and_aba() {
     block_on(async {
-        let texts = ["", "a", "😀", "甲😀", "e\u{301}"];
-        for initial in texts {
-            for first in texts {
-                for second in texts {
-                    let backend = HostBackend::new(initial.as_bytes());
-                    let mut core = open_host(backend.clone()).await.unwrap();
-                    let id = core.open_file("a.md").await.unwrap();
-                    edit(&mut core, &id, 0, 0, "local ").await;
-                    for disk in [first, second] {
-                        backend.external(disk.as_bytes());
-                        core.refresh(&id).await.unwrap();
-                        let before = core.read(&id).unwrap();
-                        assert_eq!(before.saved_content, disk);
-                        let mut peer =
-                            Buffer::from_snapshot(&core.snapshot(&id).unwrap(), None).unwrap();
-                        assert_eq!(peer.snapshot().text, before.snapshot.text);
-                        let version = peer.version();
-                        let _ = peer
-                            .apply(BufferCommand::Import(Import::new(
-                                (core.updates(&id, &version).unwrap()).clone(),
-                                "duplicate",
-                            )))
-                            .unwrap();
-                        assert_eq!(peer.version(), version);
-                        drop(core);
-                        core = open_host(backend.clone()).await.unwrap();
-                        core.refresh(&id).await.unwrap();
-                        assert_eq!(
-                            core.read(&id).unwrap().snapshot.version,
-                            before.snapshot.version
-                        );
-                        assert_eq!(core.read(&id).unwrap().snapshot.text, before.snapshot.text);
-                    }
-                }
+        // Scalar diff combinations belong to buffer::filesystem's exhaustive
+        // round-trip test; this layer checks the persisted cursor and journal.
+        for (scenario, initial, observations) in [
+            ("empty and ABA", "", ["😀", ""]),
+            ("combining and CJK", "e\u{301}", ["甲😀", "e\u{301}"]),
+            ("no-op and deletion", "😀", ["😀", ""]),
+        ] {
+            let backend = HostBackend::new(initial.as_bytes());
+            let mut core = open_host(backend.clone()).await.unwrap();
+            let id = core.open_file("a.md").await.unwrap();
+            edit(&mut core, &id, 0, 0, "local ").await;
+            for disk in observations {
+                backend.external(disk.as_bytes());
+                core.refresh(&id).await.unwrap();
+                let before = core.read(&id).unwrap();
+                assert_eq!(before.saved_content, disk, "{scenario}");
+                assert_eq!(
+                    backend.header(&id).disk_cursor.unwrap().bytes,
+                    disk.as_bytes(),
+                    "{scenario}"
+                );
+                drop(core);
+                core = open_host(backend.clone()).await.unwrap();
+                core.refresh(&id).await.unwrap();
+                let restored = core.read(&id).unwrap().snapshot;
+                assert_eq!(
+                    (restored.version, restored.text),
+                    (before.snapshot.version, before.snapshot.text),
+                    "{scenario}"
+                );
             }
         }
     });

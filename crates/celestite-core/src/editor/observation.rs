@@ -1,8 +1,13 @@
 //! Filesystem observation coordination. The platform executes detached work;
 //! this module alone validates its baseline and commits it into current history.
-use super::*;
-use crate::buffer::filesystem::{DIFF_BUDGET, FilesystemChange};
+use super::{EditorCore, MAX_TEXT_BYTES, Record, decode};
+use crate::backend::{Backend, EditorError, EditorResult, FileSnapshot, JournalEntry};
+use celestite_buffer::change::TextChangeTask;
+use celestite_buffer::types::{DocumentIdentity, HistoryPacket, Version};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+const DIFF_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -78,14 +83,14 @@ impl ObservationCoordinator {
 pub struct FileObservationTask {
     token: ObservationToken,
     disk: FileSnapshot,
-    change: FilesystemChange,
+    change: TextChangeTask,
     decoded: (String, bool, String),
 }
 pub struct FileObservationResult {
     token: ObservationToken,
     disk: FileSnapshot,
     decoded: (String, bool, String),
-    result: EditorResult<(Option<SyncPacket>, Version)>,
+    result: EditorResult<(Option<HistoryPacket>, Version)>,
 }
 impl FileObservationTask {
     pub fn path(&self) -> &str {
@@ -187,7 +192,7 @@ impl<B: Backend> EditorCore<B> {
         };
         let change = match record
             .buffer
-            .prepare_filesystem_change(base, &record.header.saved_text)
+            .prepare_text_change(base, &record.header.saved_text)
         {
             Ok(change) => change,
             Err(error) => {
@@ -411,13 +416,13 @@ impl<B: Backend> EditorCore<B> {
         id: &str,
         disk: FileSnapshot,
         decoded: (String, bool, String),
-        packet: Option<SyncPacket>,
+        packet: Option<HistoryPacket>,
         disk_version: Version,
     ) -> EditorResult<()> {
         let record = self.record(id)?;
         let mut header = record.header.clone();
         let prepared = packet
-            .map(|packet| self.prepare_import(id, Import::new(packet, "filesystem")))
+            .map(|packet| self.prepare_import(id, packet))
             .transpose()?;
         let entry = if let Some(prepared) = prepared.as_ref().filter(|p| p.accepts_operations()) {
             header.sequence = header

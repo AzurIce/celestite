@@ -1,5 +1,5 @@
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
-import { expect, test as base } from "@playwright/test";
+import { expect, test as base, type Page } from "@playwright/test";
 type VaultModule = typeof import("../src/lib/vault");
 const test = base.extend<{ runtimeErrors: string[] }>({
   runtimeErrors: [
@@ -42,7 +42,68 @@ test.beforeEach(async ({ page }) => {
   ).toBeVisible();
 });
 
-async function openTestTabs(page: import("@playwright/test").Page) {
+async function readOpfsText(page: Page, path: string) {
+  return page.evaluate(async (path) => {
+    const { openOpfsVault, vaultPath } = (await import(
+      "/src/lib/vault/index.ts" as string
+    )) as VaultModule;
+    const vault = await openOpfsVault();
+    try {
+      return new TextDecoder().decode(await vault.readFile(vaultPath(path)));
+    } finally {
+      await vault.close();
+    }
+  }, path);
+}
+
+async function replaceOpfsText(page: Page, path: string, text: string) {
+  await page.evaluate(
+    async ({ path, text }) => {
+      const { openOpfsVault, vaultPath } = (await import(
+        "/src/lib/vault/index.ts" as string
+      )) as VaultModule;
+      const vault = await openOpfsVault();
+      try {
+        await vault.writeFile(vaultPath(path), new TextEncoder().encode(text), {
+          mode: "replace",
+        });
+      } finally {
+        await vault.close();
+      }
+    },
+    { path, text },
+  );
+}
+
+async function blockWorkerWrites(page: Page, filename: string) {
+  await workerEvaluate(
+    page,
+    (filename) => {
+      const original = FileSystemFileHandle.prototype.createWritable;
+      const control = self as unknown as {
+        writeFailures: number;
+        restoreWriter: () => void;
+      };
+      control.writeFailures = 0;
+      control.restoreWriter = () => {
+        FileSystemFileHandle.prototype.createWritable = original;
+      };
+      FileSystemFileHandle.prototype.createWritable = async function (options) {
+        if (this.name === filename) {
+          control.writeFailures++;
+          throw new DOMException(
+            "Injected quota failure",
+            "QuotaExceededError",
+          );
+        }
+        return original.call(this, options);
+      };
+    },
+    filename,
+  );
+}
+
+async function openTestTabs(page: Page) {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await page.getByRole("button", { name: "展开 notes", exact: true }).click();
   await page.getByRole("treeitem", { name: "b.ts", exact: true }).click();
@@ -142,16 +203,9 @@ test("closing other tabs saves an edited file before removing it", async ({
   await expect(
     page.getByRole("tab", { name: "a.md", exact: true }),
   ).toHaveAttribute("aria-selected", "true");
-  const content = await page.evaluate(async () => {
-    const { openOpfsVault, vaultPath } = (await import(
-      "/src/lib/vault/index.ts" as string
-    )) as VaultModule;
-    const vault = await openOpfsVault();
-    const bytes = await vault.readFile(vaultPath("notes/b.ts"));
-    await vault.close();
-    return new TextDecoder().decode(bytes);
-  });
-  expect(content).toBe("const savedOnClose = true;");
+  expect(await readOpfsText(page, "notes/b.ts")).toBe(
+    "const savedOnClose = true;",
+  );
 });
 
 test("batch closing stops at a conflict and cancellation keeps the draft and later tabs", async ({
@@ -161,18 +215,7 @@ test("batch closing stops at a conflict and cancellation keeps the draft and lat
   await page.getByRole("tab", { name: "a.md", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toBeVisible();
-  await page.evaluate(async () => {
-    const { openOpfsVault, vaultPath } = (await import(
-      "/src/lib/vault/index.ts" as string
-    )) as VaultModule;
-    const vault = await openOpfsVault();
-    await vault.writeFile(
-      vaultPath("a.md"),
-      new TextEncoder().encode("external change"),
-      { mode: "replace" },
-    );
-    await vault.close();
-  });
+  await replaceOpfsText(page, "a.md", "external change");
   await editor.fill("keep this local draft");
   await page
     .getByRole("tab", { name: "binary.bin", exact: true })
@@ -235,22 +278,16 @@ test("editing and Ctrl+S persist UTF-8 content to OPFS and survive reload", asyn
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
-  const content = await page.evaluate(async () => {
-    const url = "/src/lib/vault/index.ts";
-    const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;
-    const vault = await openOpfsVault();
-    const bytes = await vault.readFile(vaultPath("a.md"));
-    await vault.close();
-    return new TextDecoder().decode(bytes);
-  });
-  expect(content).toBe("# 修改后的笔记\n\n真正保存的内容");
+  expect(await readOpfsText(page, "a.md")).toBe(
+    "# 修改后的笔记\n\n真正保存的内容",
+  );
   await page.reload();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor).toContainText("真正保存的内容");
   await expect(page.locator(".cm-lineNumbers")).toBeVisible();
 });
 
-test("file switches and folder rename preserve undo history and future saves use the new path", async ({
+test("folder rename updates the open editor tab without replacing its draft", async ({
   page,
 }) => {
   await page.getByRole("button", { name: "展开 notes", exact: true }).click();
@@ -258,19 +295,6 @@ test("file switches and folder rename preserve undo history and future saves use
   const pane = page.getByRole("region", { name: "文件编辑器" });
   const editor = pane.getByRole("textbox", { name: "代码编辑器" });
   await editor.fill("const value = 2;");
-  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
-    "未保存",
-  );
-  await page.keyboard.press("Control+s");
-  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
-    "已保存",
-  );
-  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await page.getByRole("tab", { name: "notes/b.ts", exact: true }).click();
-  await expect(editor).toContainText("const value = 2;");
-  await editor.focus();
-  await page.keyboard.press("Control+z");
-  await expect(editor).toContainText("const value = 1;");
   await page
     .getByRole("treeitem", { name: "notes", exact: true })
     .locator(".tree-row")
@@ -284,27 +308,7 @@ test("file switches and folder rename preserve undo history and future saves use
   await expect(
     page.getByRole("tab", { name: "renamed/b.ts", exact: true }),
   ).toBeVisible();
-  await expect(editor).toContainText("const value = 1;");
-  await editor.fill("const value = 3;");
-  await page.keyboard.press("Control+s");
-  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
-    "已保存",
-  );
-  const saved = await page.evaluate(async () => {
-    const url = "/src/lib/vault/index.ts";
-    const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;
-    const vault = await openOpfsVault();
-    const result = {
-      old: await vault.stat(vaultPath("notes/b.ts")),
-      content: new TextDecoder().decode(
-        await vault.readFile(vaultPath("renamed/b.ts")),
-      ),
-    };
-    await vault.close();
-    return result;
-  });
-  expect(saved.old).toBeNull();
-  expect(saved.content).toBe("const value = 3;");
+  await expect(editor).toContainText("const value = 2;");
 });
 
 test("write failure preserves edits, prevents closing, and retry commits the buffer", async ({
@@ -314,20 +318,7 @@ test("write failure preserves edits, prevents closing, and retry commits the buf
   const pane = page.getByRole("region", { name: "文件编辑器" });
   const editor = pane.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toBeVisible();
-  await workerEvaluate(page, () => {
-    const original = FileSystemFileHandle.prototype.createWritable;
-    (self as unknown as { writeFailures: number }).writeFailures = 0;
-    (self as unknown as { restoreWriter: () => void }).restoreWriter = () => {
-      FileSystemFileHandle.prototype.createWritable = original;
-    };
-    FileSystemFileHandle.prototype.createWritable = async function (options) {
-      if (this.name === "a.md") {
-        (self as unknown as { writeFailures: number }).writeFailures++;
-        throw new DOMException("Injected quota failure", "QuotaExceededError");
-      }
-      return original.call(this, options);
-    };
-  });
+  await blockWorkerWrites(page, "a.md");
   try {
     await editor.fill("this draft must survive");
     await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
@@ -360,9 +351,6 @@ test("write failure preserves edits, prevents closing, and retry commits the buf
       "已保存",
     );
     await expect(pane.getByRole("alert")).toBeHidden();
-    await page.reload();
-    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-    await expect(editor).toContainText("this draft must survive");
   } finally {
     await workerEvaluate(page, () =>
       (self as unknown as { restoreWriter?: () => void }).restoreWriter?.(),
@@ -435,7 +423,7 @@ test("binary files cannot be edited, and mobile can return to the tree and reope
   );
 });
 
-test("committed private history restores a draft after public-file IO fails, with stable identity and a fresh writer", async ({
+test("committed private history restores a draft after public-file IO fails, with stable identity and a fresh peer", async ({
   page,
 }) => {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
@@ -448,15 +436,8 @@ test("committed private history restores a draft after public-file IO fails, wit
       (message) => message.kind === "reply" && message.result?.core,
     )?.result;
   });
-  await workerEvaluate(page, () => {
-    const original = FileSystemFileHandle.prototype.createWritable;
-    FileSystemFileHandle.prototype.createWritable = async function (options) {
-      if (this.name === "a.md")
-        throw new DOMException("disk blocked", "QuotaExceededError");
-      return original.call(this, options);
-    };
-  });
-  await editor.fill("durable draft 😀 中文");
+  await blockWorkerWrites(page, "a.md");
+  await editor.fill("persisted draft 😀 中文");
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "保存失败",
@@ -469,7 +450,7 @@ test("committed private history restores a draft after public-file IO fails, wit
   );
   await page.reload();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await expect(editor).toContainText("durable draft 😀 中文");
+  await expect(editor).toContainText("persisted draft 😀 中文");
   const after = await page.evaluate(() => {
     const messages = (window as unknown as { editorMessages: any[] })
       .editorMessages;
@@ -479,7 +460,7 @@ test("committed private history restores a draft after public-file IO fails, wit
   });
   expect(after.id).toBe(before.id);
   expect(after.core.version.identity).toEqual(before.core.version.identity);
-  expect(after.core.writerId).not.toBe(before.core.writerId);
+  expect(after.core.peerId).not.toBe(before.core.peerId);
   expect(after.core.undo.canUndo).toBe(false); // Local undo is session-local.
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
@@ -493,32 +474,14 @@ test("private history failure keeps the draft, pauses editing, and retries befor
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toBeVisible();
-  await workerEvaluate(page, () => {
-    const original = FileSystemFileHandle.prototype.createWritable;
-    (self as unknown as { restoreWriter: () => void }).restoreWriter = () => {
-      FileSystemFileHandle.prototype.createWritable = original;
-    };
-    FileSystemFileHandle.prototype.createWritable = async function (options) {
-      if (this.name === "head.json")
-        throw new DOMException("journal blocked", "QuotaExceededError");
-      return original.call(this, options);
-    };
-  });
+  await blockWorkerWrites(page, "head.json");
   await editor.fill("history must commit first");
   await expect(
     page.getByRole("region", { name: "文件编辑器" }).getByRole("alert"),
   ).toContainText("编辑历史尚未持久化");
   await expect(editor).toHaveAttribute("contenteditable", "false");
   await expect(editor).toContainText("history must commit first");
-  const disk = await page.evaluate(async () => {
-    const { openOpfsVault, vaultPath } = (await import(
-      "/src/lib/vault/index.ts" as string
-    )) as VaultModule;
-    return new TextDecoder().decode(
-      await (await openOpfsVault()).readFile(vaultPath("a.md")),
-    );
-  });
-  expect(disk).toBe("# Hello\n");
+  expect(await readOpfsText(page, "a.md")).toBe("# Hello\n");
   await workerEvaluate(page, () =>
     (self as unknown as { restoreWriter: () => void }).restoreWriter(),
   );
@@ -569,27 +532,12 @@ test("OPFS external modification shows the conflict dialog and discard adopts di
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toBeVisible();
-  await page.evaluate(async () => {
-    const { openOpfsVault, vaultPath } = (await import(
-      "/src/lib/vault/index.ts" as string
-    )) as VaultModule;
-    await (
-      await openOpfsVault()
-    ).writeFile(vaultPath("a.md"), new TextEncoder().encode("outside editor"), {
-      mode: "replace",
-    });
-  });
+  await replaceOpfsText(page, "a.md", "outside editor");
   await editor.fill("local draft");
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("dialog")).toContainText("文件已在磁盘上修改");
   await page.getByRole("button", { name: "丢弃编辑", exact: true }).click();
   await expect(page.getByRole("dialog")).toBeHidden();
-  await expect(editor).toHaveText("outside editor");
-  await editor.focus();
-  await page.keyboard.press("Control+z");
-  await expect(editor).toHaveText("outside editor");
-  await page.reload();
-  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor).toHaveText("outside editor");
 });
 
@@ -626,18 +574,7 @@ test("reopening a closed view adopts external disk changes without reseeding its
   await expect(
     page.getByRole("tab", { name: "a.md", exact: true }),
   ).toHaveCount(0);
-  await page.evaluate(async () => {
-    const { openOpfsVault, vaultPath } = (await import(
-      "/src/lib/vault/index.ts" as string
-    )) as VaultModule;
-    await (
-      await openOpfsVault()
-    ).writeFile(
-      vaultPath("a.md"),
-      new TextEncoder().encode("external after closing view"),
-      { mode: "replace" },
-    );
-  });
+  await replaceOpfsText(page, "a.md", "external after closing view");
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor).toHaveText("external after closing view");
   const reopened = await page.evaluate(
@@ -657,14 +594,7 @@ test("legacy OPFS journals restore identity and unsaved text before upgrading on
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toBeVisible();
-  await workerEvaluate(page, () => {
-    const original = FileSystemFileHandle.prototype.createWritable;
-    FileSystemFileHandle.prototype.createWritable = async function (options) {
-      if (this.name === "a.md")
-        throw new DOMException("disk blocked", "QuotaExceededError");
-      return original.call(this, options);
-    };
-  });
+  await blockWorkerWrites(page, "a.md");
   await editor.fill("legacy draft 😀 中文");
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(

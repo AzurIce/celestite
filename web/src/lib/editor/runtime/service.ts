@@ -1,11 +1,15 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath } from "../../vault/path";
 import { encodeError } from "../rpc";
-import { PreviewHost } from "../preview/host";
+import { PreviewHost } from "../../preview/host";
+import type { PreviewResources } from "../../preview/resources";
+import type { PreviewBinding } from "../generated/celestite_core";
+import { fileMutation } from "../files";
+import { TaskQueue } from "../queue";
 import type { EditorHost } from "./host";
 import type {
   InstanceIdentity,
-  BufferCommand,
+  ServiceMethods,
   WorkerMessage,
   WorkerRequest,
   ServiceEvent,
@@ -19,7 +23,7 @@ export type EditorWorkerHost = Pick<
   | "resolveAnchors"
   | "releaseDocument"
   | "composition"
-  | "executePreview"
+  | "withSource"
   | "open"
   | "read"
   | "apply"
@@ -30,12 +34,8 @@ export type EditorWorkerHost = Pick<
   | "flush"
   | "fileOperation"
   | "close"
-  | "previewResources"
 > & {
   reconnect?: () => Promise<ServiceDocument[]>;
-  setResourceScope?: (
-    scope: import("../../vault/file-system-access").LocalDirectoryHandle,
-  ) => Promise<void>;
 };
 export interface EditorServicePort {
   postMessage(message: WorkerMessage): void;
@@ -44,6 +44,11 @@ export interface EditorServicePort {
     listener: (event: MessageEvent<WorkerRequest>) => void,
   ): void;
 }
+type Handlers = {
+  [M in keyof ServiceMethods]: (
+    params: ServiceMethods[M]["params"],
+  ) => ServiceMethods[M]["result"] | Promise<ServiceMethods[M]["result"]>;
+};
 /** The same serialized service can be carried by a Worker, IPC or an in-process port. */
 export async function serveEditor(
   port: EditorServicePort,
@@ -53,129 +58,104 @@ export async function serveEditor(
   ) => Promise<{
     identity: InstanceIdentity;
     host: EditorWorkerHost;
+    previewBinding: PreviewBinding;
+    previewResources: PreviewResources;
+    invalidateResourcesOnTree?: boolean;
+    setResourceScope?: (
+      scope: import("../../vault/file-system-access").LocalDirectoryHandle,
+    ) => Promise<void>;
     dispose: () => void;
   }>,
 ) {
   const sessionId = crypto.randomUUID();
   let host: EditorWorkerHost;
   let previews: PreviewHost;
-  let queue: Promise<unknown> = Promise.resolve();
+  let invalidateResourcesOnTree = false;
+  const queue = new TaskQueue();
   let closing = false;
   let release!: () => void;
   function enqueue<T>(task: () => Promise<T>) {
-    const result = queue.then(async () => {
+    return queue.run(async () => {
       try {
         return await task();
       } finally {
-        if (previews && !closing) await previews.refresh();
+        if (previews && !closing) await previews.refresh().catch(() => {});
       }
     });
-    queue = result.catch(() => {});
-    return result;
   }
+  function fatal(error: unknown) {
+    port.postMessage({ kind: "fatal", error: encodeError(error) });
+  }
+  const handlers: Handlers = {
+    collaboration: () => host.collaboration(),
+    release_document: ({ id }) => host.releaseDocument(id),
+    set_view: ({ viewId, documentId, focused, selection }) =>
+      host.setView(viewId, documentId, focused, selection),
+    anchors_at: ({ id, version, positions }) =>
+      host.anchorsAt(id, version, positions),
+    resolve_anchors: ({ id, checkpoint, anchors }) =>
+      host.resolveAnchors(id, checkpoint, anchors),
+    set_resource_scope: async ({ scope }) => {
+      if (!runtime.setResourceScope)
+        throw new VaultError("Unsupported", "此 Vault 不支持目录资源授权。");
+      // The DOM declaration omits the browser's permission methods.
+      await runtime.setResourceScope(
+        scope as import("../../vault/file-system-access").LocalDirectoryHandle,
+      );
+      return previews.invalidateProject();
+    },
+    reconnect: () => {
+      if (!host.reconnect)
+        throw new VaultError("Unsupported", "连接不支持重新连接。");
+      return host.reconnect();
+    },
+    preview_subscribe: ({ id }) => previews.subscribe(id, sessionId),
+    preview_unsubscribe: ({ subscriptionId }) =>
+      previews.unsubscribe(subscriptionId, sessionId),
+    preview_retry: ({ id }) => previews.retry(id),
+    preview_link: ({ id, taskId, target }) => previews.link(id, taskId, target),
+    preview_assets: ({ id, taskId }) => previews.assets(id, taskId),
+    composition: ({ id, active }) => host.composition(id, active),
+    open: ({ path }) => host.open(vaultPath(path)),
+    read: ({ id }) => host.read(id),
+    apply: ({ id, command }) => host.apply(id, command),
+    retry_history: ({ id }) => host.retryHistory(id),
+    retry_observation: ({ id }) => host.retryObservation(id),
+    save: ({ id }) => host.save(id),
+    resolve: ({ id, action }) => host.resolve(id, action),
+    flush: () => host.flush(),
+    file: async (params) => {
+      try {
+        return await host.fileOperation(params.method, params);
+      } finally {
+        if (fileMutation(params.method))
+          await previews.invalidateProject().catch(() => {});
+      }
+    },
+    close: async () => {
+      closing = true;
+      try {
+        await host.close();
+        previews.close();
+      } catch (error) {
+        closing = false;
+        throw error;
+      }
+      release();
+    },
+  };
   port.addEventListener("message", (event) => {
     const request = event.data;
     if (!request || request.kind !== "request") return;
     const dispatch = async () => {
       if (!host || closing || request.sessionId !== sessionId)
         throw new VaultError("Closed", "编辑服务会话无效或正在关闭。");
-      const p = request.params;
-      switch (request.method) {
-        case "collaboration":
-          return host.collaboration();
-        case "release_document":
-          return host.releaseDocument(String(p.id));
-        case "set_view":
-          return host.setView(
-            String(p.viewId),
-            p.documentId === null ? null : String(p.documentId),
-            Boolean(p.focused),
-            (p.selection ?? null) as
-              import("../contract").VersionedSelection | null,
-          );
-        case "anchors_at":
-          return host.anchorsAt(
-            String(p.id),
-            p.version as import("../contract").Version,
-            p.positions as [number, import("../contract").Affinity][],
-          );
-        case "resolve_anchors":
-          return host.resolveAnchors(
-            String(p.id),
-            p.checkpoint as import("../contract").Version,
-            p.anchors as import("../contract").Anchor[],
-          );
-        case "set_resource_scope":
-          if (!host.setResourceScope)
-            throw new VaultError(
-              "Unsupported",
-              "此 Vault 不支持目录资源授权。",
-            );
-          await host.setResourceScope(
-            p.scope as import("../../vault/file-system-access").LocalDirectoryHandle,
-          );
-          return previews.invalidateProject();
-        case "reconnect":
-          if (!host.reconnect)
-            throw new VaultError("Unsupported", "连接不支持重新连接。");
-          return host.reconnect();
-        case "preview_subscribe":
-          return host.executePreview("preview_subscribe", {
-            id: String(p.id),
-            clientSession: sessionId,
-          });
-        case "preview_unsubscribe":
-          return host.executePreview("preview_unsubscribe", {
-            subscriptionId: String(p.subscriptionId),
-            clientSession: sessionId,
-          });
-        case "preview_retry":
-          return previews.retry(String(p.id));
-        case "preview_link":
-          return host.executePreview("preview_link", {
-            id: String(p.id),
-            taskId: String(p.taskId),
-            target: String(p.target),
-          });
-        case "preview_assets":
-          return previews.assets(String(p.id), String(p.taskId));
-        case "composition":
-          return host.composition(String(p.id), Boolean(p.active));
-        case "open":
-          return host.open(vaultPath(String(p.path)));
-        case "read":
-          return host.read(String(p.id));
-        case "apply":
-          return host.apply(String(p.id), p.command as BufferCommand);
-        case "retry_history":
-          return host.retryHistory(String(p.id));
-        case "retry_observation":
-          return host.retryObservation(String(p.id));
-        case "save":
-          return host.save(String(p.id));
-        case "resolve":
-          return host.resolve(
-            String(p.id),
-            p.action as "overwrite" | "discard" | "retry",
-          );
-        case "flush":
-          return host.flush();
-        case "file":
-          return host.fileOperation(String(p.method), p);
-        case "close":
-          closing = true;
-          try {
-            await host.close();
-            previews.close();
-          } catch (error) {
-            closing = false;
-            throw error;
-          }
-          release();
-          return;
-        default:
-          throw new VaultError("Unsupported", "未知编辑服务命令。");
-      }
+      if (!Object.prototype.hasOwnProperty.call(handlers, request.method))
+        throw new VaultError("Unsupported", "未知编辑服务命令。");
+      // The transport is the only type-erased boundary. Each registered method
+      // is checked against the shared request/result contract above.
+      const handler = handlers[request.method as keyof Handlers];
+      return handler(request.params as never);
     };
     // Network waits yield the host queue; all actual core calls are serialized
     // by EditorHost. Slow IO cannot hold incoming imports or accepted editing.
@@ -189,50 +169,54 @@ export async function serveEditor(
       "file",
       "retry_observation",
     ].includes(request.method);
-    const result = detached
-      ? enqueue(async () => {
-          const pending = dispatch();
-          void pending.catch(() => {});
-          return { pending };
-        })
-          .then(({ pending }) => pending)
-          .finally(() => {
-            if (previews && !closing)
-              void enqueue(() => previews.refresh()).catch(() => {});
-          })
-      : enqueue(dispatch);
-    void result.then(
-      (result) =>
-        port.postMessage({
-          kind: "reply",
-          requestId: request.requestId,
-          result,
-        }),
-      (error) =>
-        port.postMessage({
-          kind: "reply",
-          requestId: request.requestId,
-          error: encodeError(error),
-        }),
-    );
+    const result = detached ? queue.start(dispatch) : queue.run(dispatch);
+    void result
+      .then(
+        (result) =>
+          port.postMessage({
+            kind: "reply",
+            requestId: request.requestId,
+            result,
+          }),
+        (error) =>
+          port.postMessage({
+            kind: "reply",
+            requestId: request.requestId,
+            error: encodeError(error),
+          }),
+      )
+      .then(() => {
+        // Deliver the command's own outcome first. Preview scheduling is derived
+        // work: it must neither replace that outcome nor run before detached IO.
+        if (previews && !closing)
+          void queue.run(() => previews.refresh()).catch(() => {});
+      });
   });
   const runtime = await create(
-    (event) => port.postMessage(event),
+    (event) => {
+      port.postMessage(event);
+      if (
+        event.kind === "tree" &&
+        invalidateResourcesOnTree &&
+        previews &&
+        !closing
+      )
+        void queue.run(() => previews.invalidateProject()).catch(() => {});
+    },
     (task) => {
-      if (!closing)
-        void enqueue(task).catch((error) =>
-          port.postMessage({ kind: "fatal", error: encodeError(error) }),
-        );
+      if (!closing) void enqueue(task).catch(fatal);
     },
   );
   host = runtime.host;
+  invalidateResourcesOnTree = runtime.invalidateResourcesOnTree ?? false;
   previews = new PreviewHost(
-    (method, params) => host.executePreview(method, params),
+    (ids, consume) => host.withSource(ids, consume),
+    runtime.previewBinding,
     (event) => port.postMessage({ kind: "preview", event }),
     (task) => {
       if (!closing) void enqueue(task).catch(() => {});
     },
-    host.previewResources,
+    runtime.previewResources,
   );
   const lifetime = new Promise<void>((resolve) => {
     release = resolve;

@@ -1,7 +1,8 @@
 //! Invalidation feed, serialized by the same lock as the host core.
 //! It carries committed causal versions, never text or operation acknowledgements.
 use super::{fs::Result, VaultIdentity};
-use celestite_core::{DocumentStatus, ExternalChangeStatus, Version};
+use celestite_buffer::types::Version;
+use celestite_core::editor::{observation::ExternalChangeStatus, types::DocumentStatus};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
@@ -13,7 +14,8 @@ pub(crate) struct DocumentNotice {
     path: String,
     version: Option<Version>,
     saved_version: Option<Version>,
-    backend_revision: String,
+    #[serde(rename = "backendRevision")]
+    file_revision: String,
     dirty: bool,
     deleted: bool,
     conflict: bool,
@@ -24,7 +26,7 @@ pub(crate) struct DocumentNotice {
 }
 pub(crate) fn exportable(state: &DocumentStatus, persistent: bool) -> bool {
     state.persistence_error.is_none()
-        && (!persistent || state.durable_version.as_ref() == Some(&state.version))
+        && (!persistent || state.persisted_version.as_ref() == Some(&state.version))
 }
 impl DocumentNotice {
     fn from_state(state: DocumentStatus, persistent: bool) -> Self {
@@ -33,14 +35,14 @@ impl DocumentNotice {
             id: state.id,
             path: state.path,
             version: if persistent {
-                state.durable_version
+                state.persisted_version
             } else if available {
                 Some(state.version)
             } else {
                 None
             },
             saved_version: state.saved_version,
-            backend_revision: state.backend_revision,
+            file_revision: state.file_revision,
             dirty: state.dirty,
             deleted: state.deleted,
             conflict: state.conflict,
@@ -130,9 +132,11 @@ impl DocumentFeed {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{exportable, DocumentFeed};
     use crate::vault::documents::Documents;
+    use celestite_core::editor::types::DocumentStatus;
     use serde_json::Value;
+    use tokio::sync::broadcast;
 
     fn state(documents: &Documents) -> DocumentStatus {
         documents
@@ -159,7 +163,7 @@ mod tests {
         let mut old = feed.subscribe();
         for revision in 0..140 {
             let mut state = state(&documents);
-            state.backend_revision = format!("disk-{revision}");
+            state.file_revision = format!("disk-{revision}");
             feed.publish(vec![state]).unwrap();
         }
         assert!(matches!(
@@ -171,7 +175,7 @@ mod tests {
         let value = serde_json::to_value(&new.initial).unwrap();
         assert_eq!(value["documents"][0]["backendRevision"], "disk-139");
         let mut next = state(&documents);
-        next.backend_revision = "next".into();
+        next.file_revision = "next".into();
         feed.publish(vec![next]).unwrap();
         assert_eq!(
             new.receiver.try_recv().unwrap().sequence,
@@ -179,11 +183,11 @@ mod tests {
         );
     }
     #[test]
-    fn volatile_history_is_available_without_a_durable_version() {
+    fn volatile_history_is_available_without_a_persisted_version() {
         let (_root, documents) = fixture();
         let mut feed = DocumentFeed::new(documents.identity.clone(), false);
         let initial = state(&documents);
-        assert!(initial.durable_version.is_none());
+        assert!(initial.persisted_version.is_none());
         assert!(exportable(&initial, false));
         let version = initial.version.clone();
         feed.publish(vec![initial]).unwrap();

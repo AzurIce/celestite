@@ -361,7 +361,7 @@ impl FsVault {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::FsVault;
     #[test]
     fn paths_and_root_are_protected() {
         let tmp = tempfile::tempdir().unwrap();

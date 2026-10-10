@@ -14,34 +14,8 @@ import {
   Prec,
   Transaction,
 } from "@codemirror/state";
-import {
-  EditorView,
-  keymap,
-  lineNumbers,
-  highlightActiveLineGutter,
-  highlightSpecialChars,
-  drawSelection,
-  dropCursor,
-  rectangularSelection,
-  highlightActiveLine,
-} from "@codemirror/view";
-import { defaultKeymap, indentWithTab } from "@codemirror/commands";
-import {
-  bracketMatching,
-  foldGutter,
-  foldKeymap,
-  indentOnInput,
-  HighlightStyle,
-  syntaxHighlighting,
-} from "@codemirror/language";
-import {
-  autocompletion,
-  completionKeymap,
-  closeBrackets,
-  closeBracketsKeymap,
-} from "@codemirror/autocomplete";
-import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
-import { tags } from "@lezer/highlight";
+import { EditorView, keymap } from "@codemirror/view";
+import { sourceExtensions } from "./source-extensions";
 import type {
   EditorDocument,
   ViewEdit,
@@ -49,12 +23,11 @@ import type {
   ViewSelection,
 } from "@/lib/editor/contract";
 import { languageSupport } from "./languages";
-import { syntaxFolds } from "./tree-sitter";
 import { vimExtension, vimNormalMode, vimUserEvent, type VimMode } from "./vim";
 import "./editor.css";
 import { collaboratorField, setCollaborators } from "./collaborators";
 
-import type { EditorBuffer } from "@/lib/editor/buffer";
+import type { EditorBuffer } from "./buffer";
 import type { PreviewSync } from "./preview-sync";
 interface CodeEditorProps {
   previewSync?: PreviewSync;
@@ -84,25 +57,6 @@ const selectionContext = (state: EditorState): SelectionContext => ({
   ranges: state.selection.ranges.map(({ anchor, head }) => ({ anchor, head })),
   mainIndex: state.selection.mainIndex,
 });
-const highlight = HighlightStyle.define([
-  {
-    tag: [tags.keyword, tags.modifier, tags.operatorKeyword],
-    class: "cm-token-keyword",
-  },
-  {
-    tag: [tags.string, tags.regexp, tags.special(tags.string)],
-    class: "cm-token-string",
-  },
-  { tag: [tags.number, tags.bool, tags.null], class: "cm-token-number" },
-  { tag: [tags.comment, tags.meta], class: "cm-token-comment" },
-  {
-    tag: [tags.typeName, tags.className, tags.tagName],
-    class: "cm-token-type",
-  },
-  { tag: [tags.heading, tags.strong], class: "cm-token-heading" },
-  { tag: tags.emphasis, class: "cm-token-emphasis" },
-  { tag: [tags.link, tags.url], class: "cm-token-link" },
-]);
 
 export default function CodeEditor(props: CodeEditorProps) {
   const previewSync = untrack(() => props.previewSync);
@@ -333,50 +287,7 @@ export default function CodeEditor(props: CodeEditorProps) {
           doc: props.document.content,
           extensions: [
             buffer.vim.of(vimBindings()),
-            lineNumbers(),
-            highlightActiveLineGutter(),
-            highlightSpecialChars(),
-            drawSelection(),
-            dropCursor(),
-            rectangularSelection(),
-            EditorState.allowMultipleSelections.of(true),
-            EditorState.tabSize.of(2),
-            EditorState.phrases.of({
-              Find: "查找",
-              Replace: "替换",
-              next: "下一个",
-              previous: "上一个",
-              all: "全部",
-              "match case": "区分大小写",
-              regexp: "正则表达式",
-              "by word": "全词匹配",
-              replace: "替换",
-              "replace all": "全部替换",
-              close: "关闭",
-              "Go to line": "跳转到行",
-              go: "跳转",
-            }),
-            indentOnInput(),
-            bracketMatching(),
-            closeBrackets(),
-            autocompletion(),
-            highlightActiveLine(),
-            highlightSelectionMatches(),
-            foldGutter({
-              foldingChanged: (update) =>
-                update.transactions.some((transaction) =>
-                  transaction.effects.some((effect) => effect.is(syntaxFolds)),
-                ),
-            }),
-            syntaxHighlighting(highlight),
-            keymap.of([
-              ...closeBracketsKeymap,
-              ...defaultKeymap,
-              ...searchKeymap,
-              ...foldKeymap,
-              ...completionKeymap,
-              indentWithTab,
-            ]),
+            sourceExtensions,
             buffer.language.of([]),
             buffer.theme.of(darkTheme()),
             buffer.bindings.of(bindings()),
