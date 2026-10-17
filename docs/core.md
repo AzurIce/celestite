@@ -15,7 +15,7 @@
 | `persisted_version` / `persistedVersion` | 本机持久后端已提交历史的版本，不承诺 fsync；不等于普通文件的 `savedVersion` 或 host acknowledged。                                                                   |
 | `file_revision` / `fileRevision`         | 普通文件字节基线的不透明版本标记，不是 CRDT 历史进度；`FileSnapshot.revision` 和存储中的 `disk_revision` 保留现有 IO / 历史字段拼写。                                |
 
-Rust / core / WASM 与应用内部统一使用这些名称。协议仍为 v3；server 边界保留 legacy-wire `writerId`、`durableVersion`、`backendRevision`、`snapshot.revision`。WebSocket transport 将 peer 与 host 元数据规范化为 `peerId`、`persistedVersion`、`fileRevision`；正文来自 history packet，不携带文本 snapshot。core 的 `TextSnapshot` 入站仍接受旧 `revision`，出站使用 `stateRevision`。这些旧拼写仅用于兼容，不是双模型；JSON history packet、Version 的 identity / clocks 与 Loro bytes 不变。
+Rust / core / WASM、Web 与 v4 远端协议统一使用这些名称。文档读取模型的顶层 `version` 是唯一定位版本的字段，`snapshot` 只含 `text` 与 `stateRevision`；`TextSnapshot` 继续用于独立历史快照和预览输入。JSON history packet、Version 的 identity / clocks 与 Loro bytes 不变。
 
 ## 模块与所有者
 
@@ -31,6 +31,7 @@ Rust / core / WASM 与应用内部统一使用这些名称。协议仍为 v3；s
 | [`editor/types.rs`](../crates/celestite-core/src/editor/types.rs)                                                     | 原生状态与回执类型                                                   |
 | [`codec`](../crates/celestite-buffer/src/codec/mod.rs)                                                                | 文本版本与 peer 的规范编码；历史与网络共用表示                       |
 | [`protocol`](../crates/celestite-core/src/protocol/mod.rs)                                                            | 外部 JSON 分发、UTF-16 转换与撤销 metadata                           |
+| [`text`](../crates/celestite-core/src/text.rs)                                                                        | 行尾枚举与解码后的物理文本格式；编辑历史只保存 LF                     |
 | [`preview`](../crates/celestite-core/src/preview.rs) / [`sessions`](../crates/celestite-core/src/preview/sessions.rs) | 独立预览控制器、任务、调度、缓存与 feature-gated 纯计算              |
 | [`backend`](../crates/celestite-core/src/backend/mod.rs) / [`wasm`](../crates/celestite-core/src/wasm.rs)             | 平台 IO trait 与存储类型 / 绑定与命令批次封装                        |
 
@@ -358,10 +359,10 @@ server 的 `NativeBackend` 只提供普通文件 IO，历史不落盘；`load` �
 
 - **`DocumentStatus` / `HostDocument`**：轻量状态与 host 元数据，不携带当前正文、个人撤销或本机 peer；保存正文按基线变化发送。
 - **锚点**：原生 `anchors_at(id, positions)` / `resolve_anchors(id, anchors)` 使用字节位置；消息适配层校验 version / checkpoint，返回 `[Version, number[]]` UTF-16 位置。
-- **`EditorDocument`**（视图契约）：`id`、`path`、`snapshot`（正文 + 版本）、`saved_content`、`dirty`、`deleted`、`conflict`、`error`、`persistence_error`、`external_change`、`undo`、`peer_id`、`persisted_version`、`saved_version`、`file_revision`、`bom`、`line_ending`、`autosave_delay`。
+- **`EditorDocument`**（视图契约）：展平的 `DocumentStatus`（`id`、`path`、`version`、`saved_version`、`persisted_version`、`file_revision`、`dirty`、`deleted`、`conflict`、`error`、`external_change`、`persistence_error`）、`snapshot`（`text` + `stateRevision`，不含版本）、`undo`、`peer_id`、`saved_content`、`bom`、`line_ending`、`autosave_delay`。
 - **`autosave_delay`**：core 只给建议值（脏、有文件投影或托管、无冲突 / 观察失败 / 只读），由 host 决定是否定时保存；远端 host 显式置空，文件保存保持显式命令。
 - **版本与身份**：`Version` 为限定到 `DocumentIdentity` 的共享、不透明 Loro version vector；原生 peer 为 u64，集中 JSON 编码保持字符串和既有 clock map 格式，直接 WASM peer getter 为 bigint。Buffer 校验文档与历史身份；Vault / 会话握手由宿主负责，core 不认证分享凭证。
-- **`EditorError`**：`code` / `message` / `path`，可选 `write_not_started` 与 `rename` 阶段信息；code 集与 Web 侧 `VaultError` 对齐（如 `Conflict`、`StaleVersion`、`FilesystemReconciliationPending`）。
+- **`EditorError`**：`code: ErrorCode` / `message` / `path`，可选 `write_not_started` 与 `rename` 阶段信息；`ErrorCode` 枚举与 Web 侧 `VaultError` 对齐（如 `Conflict`、`StaleVersion`、`FilesystemReconciliationPending`），wire 仍编码为字符串。
 - **事件模型**：正文变更统一经原生 mutation 批次交付，修改方法同时返回该回执；适配器编码协议批次。独立预览控制器持有自己的派生状态事件，Buffer 不持有通知队列，也不在 CRDT 提交中回调宿主。
 
 ## 测试职责

@@ -4,8 +4,8 @@ use super::{
     EditorCore, ExternalChangePolicy, MAX_TEXT_BYTES, decode, encode, validate_editor_path, within,
 };
 use crate::backend::{
-    Backend, DirectoryIntent, EditorError, EditorResult, FileEntry, FileSnapshot, PendingWrite,
-    WritePhase,
+    Backend, DirectoryIntent, DirectoryOperation, EditorError, EditorResult, ErrorCode, FileEntry,
+    FileSnapshot, PendingWrite, RenamePhase, WritePhase,
 };
 use celestite_buffer::types::{BufferError, Version};
 
@@ -16,12 +16,12 @@ impl<B: Backend> EditorCore<B> {
             && let Some(record) = self.records.get_mut(id)
         {
             record.error = Some(error.message.clone());
-            record.conflict = error.code == "Conflict";
+            record.conflict = error.code == ErrorCode::Conflict;
         }
         result
     }
     async fn save_inner(&mut self, id: &str, expected: Option<Version>) -> EditorResult<()> {
-        if self.failure.is_some() {
+        if !self.health.is_ok() {
             self.retry_history().await?;
         }
         self.live(id)?;
@@ -42,7 +42,7 @@ impl<B: Backend> EditorCore<B> {
             .await?;
         if !self.recover_completed_write(id, &disk).await? {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Uncertain file write requires recovery",
                 &path,
             ));
@@ -55,7 +55,7 @@ impl<B: Backend> EditorCore<B> {
         if disk.revision != record.header.disk_revision {
             self.records.get_mut(id).unwrap().conflict = true;
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "文件已被其他客户端或程序修改。",
                 &path,
             ));
@@ -128,7 +128,7 @@ impl<B: Backend> EditorCore<B> {
                 }
                 let record = self.records.get_mut(id).unwrap();
                 record.error = Some(error.message.clone());
-                record.conflict = error.code == "Conflict";
+                record.conflict = error.code == ErrorCode::Conflict;
                 return Err(error);
             }
         };
@@ -141,7 +141,7 @@ impl<B: Backend> EditorCore<B> {
         self.stage_observation(id, header, None, None).await
     }
     pub async fn resolve(&mut self, id: &str, action: &str) -> EditorResult<()> {
-        if self.failure.is_some() {
+        if !self.health.is_ok() {
             self.retry_history().await?;
         }
         self.live(id)?;
@@ -154,15 +154,15 @@ impl<B: Backend> EditorCore<B> {
             && !self.recover_completed_write(id, &disk).await?
         {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Uncertain file write requires evidence-aware recovery",
                 &path,
             ));
         }
         match action {
             "discard" => {
-                let (text, bom, ending) = decode(&disk.data, &path)?;
-                self.adopt_disk(id, (text, bom, ending), disk, true).await
+                let decoded = decode(&disk.data, &path)?;
+                self.adopt_disk(id, decoded, disk, true).await
             }
             "overwrite" => {
                 if matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
@@ -176,7 +176,7 @@ impl<B: Backend> EditorCore<B> {
                 self.save(id, None).await
             }
             _ => Err(EditorError::new(
-                "InvalidEdit",
+                ErrorCode::InvalidEdit,
                 "Unknown conflict action",
                 &path,
             )),
@@ -190,7 +190,7 @@ impl<B: Backend> EditorCore<B> {
                 && !r.buffer.content_matches(&r.header.saved_text)
         }) {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "File has unsaved CRDT edits; use the document API",
                 path,
             ));
@@ -207,7 +207,7 @@ impl<B: Backend> EditorCore<B> {
     async fn finish_directory(&mut self, intent: &DirectoryIntent) -> EditorResult<()> {
         for (id, path) in &intent.entries {
             if let Some(record) = self.records.get_mut(id) {
-                if intent.operation == "rename" {
+                if intent.operation == DirectoryOperation::Rename {
                     record.header.path = format!(
                         "{}{}",
                         intent.to.as_ref().unwrap(),
@@ -231,18 +231,18 @@ impl<B: Backend> EditorCore<B> {
             validate_editor_path(path)?;
             if !within(path, &intent.from) {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Invalid directory recovery intent",
                     path,
                 ));
             }
         }
-        if intent.operation == "remove" {
+        if intent.operation == DirectoryOperation::Remove {
             return self.finish_directory(&intent).await;
         }
-        if intent.operation != "rename" || intent.to.is_none() {
+        if intent.operation != DirectoryOperation::Rename || intent.to.is_none() {
             return Err(EditorError::new(
-                "IO",
+                ErrorCode::Io,
                 "Unknown directory recovery intent",
                 &intent.from,
             ));
@@ -255,7 +255,7 @@ impl<B: Backend> EditorCore<B> {
             (None, Some(_)) => self.finish_directory(&intent).await,
             (Some(_), None) => self.backend.set_directory_intent(None).await,
             _ => Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "上次移动未完成，源与目标状态存在歧义；文件与历史已保留。",
                 &intent.from,
             )),
@@ -271,13 +271,13 @@ impl<B: Backend> EditorCore<B> {
         }
         if from.is_empty() || to.is_empty() || within(to, from) {
             return Err(EditorError::new(
-                "InvalidPath",
+                ErrorCode::InvalidPath,
                 "Cannot move root or a directory into itself",
                 from,
             ));
         }
         let intent = DirectoryIntent {
-            operation: "rename".into(),
+            operation: DirectoryOperation::Rename,
             from: from.into(),
             to: Some(to.into()),
             entries: self
@@ -292,7 +292,7 @@ impl<B: Backend> EditorCore<B> {
             if error
                 .rename
                 .as_ref()
-                .is_some_and(|r| r.phase == "remove-source")
+                .is_some_and(|r| r.phase == RenamePhase::RemoveSource)
             {
                 // Keep the complete target and its identity; retain the intent for
                 // an explicit resolution of remaining source files on recovery.
@@ -319,13 +319,13 @@ impl<B: Backend> EditorCore<B> {
         self.recover_directory().await?;
         if path.is_empty() {
             return Err(EditorError::new(
-                "InvalidPath",
+                ErrorCode::InvalidPath,
                 "Cannot remove Vault root",
                 path,
             ));
         }
         let intent = DirectoryIntent {
-            operation: "remove".into(),
+            operation: DirectoryOperation::Remove,
             from: path.into(),
             to: None,
             entries: self

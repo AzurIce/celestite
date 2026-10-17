@@ -36,7 +36,7 @@ impl Fixture {
     }
 }
 fn uri(key: &str, tail: &str) -> String {
-    format!("/{key}/api/v1{tail}")
+    format!("/{key}/api/v4{tail}")
 }
 async fn response(
     router: &Router,
@@ -73,7 +73,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     assert!(!editor.starts_with("ro-"));
     let ro = read(response(&server.router, &reader, "GET", "", Value::Null).await).await;
     let rw = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
-    assert_eq!(ro["vaultIdentity"], rw["vaultIdentity"]);
+    assert_eq!(ro["vault"], rw["vault"]);
     assert_ne!(ro["shareId"], rw["shareId"]);
     assert_eq!(ro["readOnly"], true);
     assert_eq!(rw["readOnly"], false);
@@ -103,7 +103,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
     .await;
     let id = document["id"].as_str().unwrap();
     assert_eq!(document["snapshot"]["text"], "original");
-    let version = &document["snapshot"]["version"];
+    let version = &document["version"];
     let updates = response(
         &server.router,
         &reader,
@@ -148,7 +148,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
         axum::serve(listener, router).await.unwrap();
     });
     let mut client =
-        support::ClientReplica::connect(&format!("http://{address}/{editor}/api/v1")).await;
+        support::ClientReplica::connect(&format!("http://{address}/{editor}/api/v4")).await;
     assert_eq!(client.open("a.md").await, id);
     let edited = client.edit(id, 0, 0, "edited ").await;
     assert_eq!(edited.snapshot.text.as_ref(), "edited original");
@@ -170,7 +170,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
         fs::read_to_string(f.dir.path().join("notes/a.md")).unwrap(),
         "original"
     );
-    for path in ["/api/v1/vaults/notes", "/vaults/notes/shares"] {
+    for path in ["/api/v4/vaults/notes", "/vaults/notes/shares"] {
         assert_eq!(
             server
                 .router
@@ -198,11 +198,8 @@ async fn restart_and_display_rename_preserve_links_and_key_rotation_invalidates_
     assert_eq!(server.links.key(Permission::Readonly), reader.as_str());
     assert_eq!(server.links.key(Permission::Edit), editor.as_str());
     let after = read(response(&server.router, &editor, "GET", "", Value::Null).await).await;
-    assert_eq!(before["vaultIdentity"]["id"], after["vaultIdentity"]["id"]);
-    assert_ne!(
-        before["vaultIdentity"]["historyId"],
-        after["vaultIdentity"]["historyId"]
-    );
+    assert_eq!(before["vault"]["vaultId"], after["vault"]["vaultId"]);
+    assert_ne!(before["vault"]["historyId"], after["vault"]["historyId"]);
     assert_eq!(before["shareId"], after["shareId"]);
     drop(server);
     let mut config = f.config();
@@ -218,7 +215,7 @@ async fn restart_and_display_rename_preserve_links_and_key_rotation_invalidates_
     }
     let rotated = server.links.key(Permission::Edit).to_owned();
     let after = read(response(&server.router, &rotated, "GET", "", Value::Null).await).await;
-    assert_ne!(before["vaultIdentity"], after["vaultIdentity"]);
+    assert_ne!(before["vault"], after["vault"]);
     drop(server);
     let mut config = f.config();
     config.vault.share_key = Some("new randomly chosen secret value 1234567890".into());
@@ -330,7 +327,7 @@ async fn websocket_url_authenticates_before_upgrade_and_shutdown_closes_the_sess
         client
             .request(
                 "save",
-                json!({"id":id,"version":client.core.read(&id).unwrap().snapshot.version})
+                json!({"id":id,"version":client.core.read(&id).unwrap().status.version})
             )
             .await["error"]["code"],
         "PermissionDenied"

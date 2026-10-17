@@ -18,24 +18,20 @@ use tokio_stream::StreamExt;
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/{id}/api/v1/documents", get(list))
-        .route("/{id}/api/v1/documents/events", get(events))
-        .route("/{id}/api/v1/documents/open", post(open))
-        .route("/{id}/api/v1/documents/{document}", get(state))
-        .route("/{id}/api/v1/documents/{document}/snapshot", get(snapshot))
-        .route("/{id}/api/v1/documents/{document}/updates", post(updates))
+        .route("/{id}/api/v4/documents", get(list))
+        .route("/{id}/api/v4/documents/events", get(events))
+        .route("/{id}/api/v4/documents/open", post(open))
+        .route("/{id}/api/v4/documents/{document}", get(state))
+        .route("/{id}/api/v4/documents/{document}/snapshot", get(snapshot))
+        .route("/{id}/api/v4/documents/{document}/updates", post(updates))
         .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
 }
 
 async fn list(
     Extension(access): Extension<RemoteAccess>,
-) -> std::result::Result<Json<Vec<serde_json::Value>>, ApiError> {
+) -> std::result::Result<Json<Vec<celestite_core::editor::types::EditorDocument>>, ApiError> {
     Ok(Json(
-        execute(access.grant.vault.clone(), false, |_, docs| docs.list())
-            .await?
-            .iter()
-            .map(crate::wire::editor_document)
-            .collect(),
+        execute(access.grant.vault.clone(), false, |_, docs| docs.list()).await?,
     ))
 }
 
@@ -46,25 +42,25 @@ struct Open {
 async fn open(
     Extension(access): Extension<RemoteAccess>,
     Json(body): Json<Open>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+) -> std::result::Result<Json<celestite_core::editor::types::EditorDocument>, ApiError> {
     let document = execute(access.grant.vault.clone(), false, move |_, docs| {
         let id = docs.open_file(&body.path)?;
         docs.state(&id)
     })
     .await?;
-    Ok(Json(crate::wire::editor_document(&document)))
+    Ok(Json(document))
 }
 
 async fn state(
     Extension(access): Extension<RemoteAccess>,
     Path((_key, document)): Path<(String, String)>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+) -> std::result::Result<Json<celestite_core::editor::types::EditorDocument>, ApiError> {
     let document = execute(access.grant.vault.clone(), false, move |_, docs| {
         docs.refresh(&document)?;
         docs.state(&document)
     })
     .await?;
-    Ok(Json(crate::wire::editor_document(&document)))
+    Ok(Json(document))
 }
 
 async fn snapshot(

@@ -176,7 +176,7 @@ mod tests {
         let (events, _) = broadcast::channel(128);
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
         let vault = Arc::new(HostedVault {
-            id: documents.identity.id.clone(),
+            id: documents.identity.vault_id.clone(),
             name: "Notes".into(),
             read_only: false,
             files: Mutex::new(documents.files.clone()),
@@ -221,12 +221,12 @@ mod tests {
                 .try_lock()
                 .expect("diff must not hold the document lock");
             let states = docs.resident().unwrap();
-            let a = states.iter().find(|s| s.path == "a.md").unwrap();
-            docs.edit(&a.id, [(2..8, "MIDDLE")]).unwrap();
-            let b = states.iter().find(|s| s.path == "b.md").unwrap();
-            docs.edit(&b.id, [(5..5, " saved")]).unwrap();
-            let version = docs.state(&b.id).unwrap().snapshot.version;
-            docs.save(&b.id, version).unwrap();
+            let a = states.iter().find(|s| s.status.path == "a.md").unwrap();
+            docs.edit(&a.status.id, [(2..8, "MIDDLE")]).unwrap();
+            let b = states.iter().find(|s| s.status.path == "b.md").unwrap();
+            docs.edit(&b.status.id, [(5..5, " saved")]).unwrap();
+            let version = docs.state(&b.status.id).unwrap().status.version;
+            docs.save(&b.status.id, version).unwrap();
         }
         resume.send(()).unwrap();
         worker.join().unwrap();
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(
             states
                 .iter()
-                .find(|s| s.path == "a.md")
+                .find(|s| s.status.path == "a.md")
                 .unwrap()
                 .snapshot
                 .text
@@ -275,7 +275,7 @@ mod tests {
             docs.resident()
                 .unwrap()
                 .iter()
-                .find(|s| s.id == id)
+                .find(|s| s.status.id == id)
                 .unwrap()
                 .snapshot
                 .text
@@ -294,10 +294,10 @@ mod tests {
             .resident()
             .unwrap()
             .into_iter()
-            .find(|s| s.id == id)
+            .find(|s| s.status.id == id)
             .unwrap();
         assert_eq!(state.snapshot.text.as_ref(), "A1 middle B1");
-        assert!(state.external_change.is_none());
+        assert!(state.status.external_change.is_none());
     }
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
             .resident()
             .unwrap()
             .into_iter()
-            .find(|s| s.path == "a.md")
+            .find(|s| s.status.path == "a.md")
             .unwrap();
         {
             let _files = vault.files.lock().unwrap();
@@ -340,10 +340,10 @@ mod tests {
             .resident()
             .unwrap()
             .into_iter()
-            .find(|s| s.id == old.id)
+            .find(|s| s.status.id == old.status.id)
             .unwrap();
         assert_eq!(interim.snapshot, old.snapshot);
-        assert_eq!(interim.path, "renamed.md");
+        assert_eq!(interim.status.path, "renamed.md");
         observe(&vault, &AtomicBool::new(false)).unwrap();
         let state = vault
             .documents
@@ -352,7 +352,7 @@ mod tests {
             .resident()
             .unwrap()
             .into_iter()
-            .find(|s| s.id == old.id)
+            .find(|s| s.status.id == old.status.id)
             .unwrap();
         assert_eq!(state.snapshot.text.as_ref(), "A1 middle B1");
     }
@@ -369,7 +369,7 @@ mod tests {
         let watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
         let events = broadcast::channel(128).0;
         let vault = Arc::new(HostedVault {
-            id: documents.identity.id.clone(),
+            id: documents.identity.vault_id.clone(),
             name: "Notes".into(),
             read_only: false,
             packages: crate::package_resources::PackageResources::new(
@@ -419,8 +419,11 @@ mod tests {
         let mut reopened = Documents::open(root.path(), &[0; 32]).unwrap();
         assert!(reopened.resident().unwrap().is_empty());
         reopened.open_file("a.md").unwrap();
-        let next = reopened.resident().unwrap().pop().unwrap().snapshot;
-        assert_eq!(next.text.as_ref(), state.snapshot.text.as_ref());
-        assert_ne!(next.version.identity(), state.snapshot.version.identity());
+        let next = reopened.resident().unwrap().pop().unwrap();
+        assert_eq!(next.snapshot.text.as_ref(), state.snapshot.text.as_ref());
+        assert_ne!(
+            next.status.version.identity(),
+            state.status.version.identity()
+        );
     }
 }

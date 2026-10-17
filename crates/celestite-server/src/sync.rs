@@ -1,11 +1,13 @@
 //! One online session per connection. Opening a buffer subscribes that session
 //! to its history. A receipt acknowledges in-memory CRDT acceptance; saving the
 //! ordinary file is a separate command.
+use celestite_core::backend::{EditorError, ErrorCode};
+use celestite_core::instance::Vault;
 #[cfg(test)]
 mod tests;
 use crate::{
+    vault::changes::Subscription,
     vault::runtime::{execute, execute_with_tree},
-    vault::{changes::Subscription, fs::VaultError, VaultIdentity},
     ApiError, HostedVault, RemoteAccess, ServerState,
 };
 use axum::{
@@ -32,7 +34,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
-    Router::new().route("/{id}/api/v1/sync", get(upgrade))
+    Router::new().route("/{id}/api/v4/sync", get(upgrade))
 }
 async fn upgrade(
     State(state): State<Arc<ServerState>>,
@@ -50,7 +52,7 @@ async fn upgrade(
 #[serde(rename_all = "camelCase")]
 struct Hello {
     protocol_version: u32,
-    vault_identity: VaultIdentity,
+    vault: Vault,
 }
 #[derive(Clone, Deserialize)]
 #[serde(
@@ -165,7 +167,7 @@ impl SessionState {
         document.saved = Some(state.status.file_revision.clone());
         self.sequence += 1;
         Ok(
-            json!({"kind":"document","sequence":self.sequence,"document":crate::wire::host_document(&state),"packet":packet,"writerId":document.peer_id.to_string()}),
+            json!({"kind":"document","sequence":self.sequence,"document":state,"packet":packet,"peerId":document.peer_id.to_string()}),
         )
     }
     fn reset_receipt(&mut self, id: &str) {
@@ -192,7 +194,7 @@ async fn collect(
     execute(vault, false, move |_, docs| {
         let mut session = session
             .lock()
-            .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
+            .map_err(|_| EditorError::new(ErrorCode::Io, "Session lock failed", ""))?;
         let ids = session.subscriptions();
         let frames = ids
             .into_iter()
@@ -229,19 +231,19 @@ async fn command(
         ..
     } = &request.command
     {
-        let id = document_id
-            .as_ref()
-            .ok_or_else(|| VaultError::new("InvalidEdit", "Selection requires a document", ""))?;
+        let id = document_id.as_ref().ok_or_else(|| {
+            EditorError::new(ErrorCode::InvalidEdit, "Selection requires a document", "")
+        })?;
         {
             let state = session
                 .lock()
-                .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
+                .map_err(|_| EditorError::new(ErrorCode::Io, "Session lock failed", ""))?;
             if request.session_id != state.id
                 || !state.alive.load(Ordering::Acquire)
                 || !state.subscribed(id)
             {
-                return Err(VaultError::new(
-                    "InvalidEdit",
+                return Err(EditorError::new(
+                    ErrorCode::InvalidEdit,
                     "Selection requires a live document subscription",
                     id,
                 )
@@ -253,9 +255,12 @@ async fn command(
             || selection.main_index >= selection.ranges.len()
             || serde_json::to_vec(selection).map_or(true, |data| data.len() > 32 * 1024)
         {
-            return Err(
-                VaultError::new("InvalidEdit", "Selection exceeds presence limits", id).into(),
-            );
+            return Err(EditorError::new(
+                ErrorCode::InvalidEdit,
+                "Selection exceeds presence limits",
+                id,
+            )
+            .into());
         }
         let id = id.clone();
         let selection = selection.clone();
@@ -276,9 +281,9 @@ async fn command(
     ) {
         let mut state = session
             .lock()
-            .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
+            .map_err(|_| EditorError::new(ErrorCode::Io, "Session lock failed", ""))?;
         if !state.alive.load(Ordering::Acquire) || request.session_id != state.id {
-            return Err(VaultError::new("Closed", "Session expired", "").into());
+            return Err(EditorError::new(ErrorCode::Closed, "Session expired", "").into());
         }
         match request.command {
             Command::Ping => return Ok(json!({"pong":true})),
@@ -303,8 +308,8 @@ async fn command(
                     || view_id.len() > 128
                     || document_id.as_ref().is_some_and(|id| !state.subscribed(id))
                 {
-                    return Err(VaultError::new(
-                        "InvalidEdit",
+                    return Err(EditorError::new(
+                        ErrorCode::InvalidEdit,
                         "View requires a subscribed document and a bounded view ID",
                         "",
                     )
@@ -317,7 +322,12 @@ async fn command(
                     selection,
                 });
                 if !vault.collaboration.view(&state.id, &view_id, view) {
-                    return Err(VaultError::new("InvalidEdit", "Too many member views", "").into());
+                    return Err(EditorError::new(
+                        ErrorCode::InvalidEdit,
+                        "Too many member views",
+                        "",
+                    )
+                    .into());
                 }
                 return Ok(json!({"updated":true}));
             }
@@ -333,15 +343,15 @@ async fn command(
         notify_tree,
         move |_files, docs| {
             let mut session = session.lock()
-                .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
+                .map_err(|_| EditorError::new(ErrorCode::Io, "Session lock failed", ""))?;
             if !session.alive.load(Ordering::Acquire) || request.session_id != session.id {
-                return Err(VaultError::new("Closed", "Session expired", ""));
+                return Err(EditorError::new(ErrorCode::Closed, "Session expired", ""));
             }
             match &request.command {
                 Command::Updates { id, .. } | Command::Save { id, .. }
                 | Command::Probe { id, .. } | Command::RetryObservation { id } => {
                     if !session.subscribed(id) {
-                        return Err(VaultError::new("InvalidEdit", "Buffer is not open in this session", id));
+                        return Err(EditorError::new(ErrorCode::InvalidEdit, "Buffer is not open in this session", id));
                     }
                 }
                 _ => {}
@@ -355,7 +365,7 @@ async fn command(
                             docs.refresh(&id)?;
                             id
                         }
-                        _ => return Err(VaultError::new("InvalidEdit", "Open requires a path or a buffer ID", "")),
+                        _ => return Err(EditorError::new(ErrorCode::InvalidEdit, "Open requires a path or a buffer ID", "")),
                     };
                     session.reset_receipt(&id);
                     session.receipt(docs, &id)
@@ -380,17 +390,17 @@ async fn command(
                     if operation < session.next_operation {
                         let old = session.receipts.iter()
                             .find(|(number, _, _)| *number == operation)
-                            .ok_or_else(|| VaultError::new("InvalidEdit", "Receipt expired; probe the causal checkpoint", &id))?;
+                            .ok_or_else(|| EditorError::new(ErrorCode::InvalidEdit, "Receipt expired; probe the causal checkpoint", &id))?;
                         if digest != old.1 {
-                            return Err(VaultError::new("InvalidEdit", "Operation replay payload differs", &id));
+                            return Err(EditorError::new(ErrorCode::InvalidEdit, "Operation replay payload differs", &id));
                         }
                         return Ok(old.2.clone());
                     }
                     if operation != session.next_operation {
-                        return Err(VaultError::new("InvalidEdit", "Operation sequence is discontinuous", &id));
+                        return Err(EditorError::new(ErrorCode::InvalidEdit, "Operation sequence is discontinuous", &id));
                     }
                     let peer_id = session.documents.get(&id)
-                        .ok_or_else(|| VaultError::new("InvalidEdit", "Document not subscribed in this session", &id))?.peer_id;
+                        .ok_or_else(|| EditorError::new(ErrorCode::InvalidEdit, "Document not subscribed in this session", &id))?.peer_id;
                     docs.import_session(&id, packet, peer_id, &version)?;
                     let version = docs.committed_version(&id)?;
                     let ack = json!({"operation": operation, "version": version});
@@ -408,7 +418,7 @@ async fn command(
     if result.is_ok() {
         let state = registry_session
             .lock()
-            .map_err(|_| VaultError::new("IO", "Session lock failed", ""))?;
+            .map_err(|_| EditorError::new(ErrorCode::Io, "Session lock failed", ""))?;
         registry_vault
             .collaboration
             .documents(&state.id, state.subscriptions());
@@ -439,17 +449,22 @@ async fn serve(
         _ => None,
     };
     let Some(hello) = parsed else { return };
-    if hello.protocol_version != 3 {
-        let _=socket.send(Message::Text(json!({"kind":"fatal","code":"PermissionDenied","message":"Invalid handshake or authentication"}).to_string().into())).await;
+    if hello.protocol_version != crate::PROTOCOL_VERSION {
+        let message = format!("Protocol version {} required", crate::PROTOCOL_VERSION);
+        let _ = socket
+            .send(Message::Text(
+                json!({"kind":"fatal","code":"Unsupported","message":message})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
         return;
     }
     let identity = match execute(vault.clone(), false, |_, docs| Ok(docs.identity.clone())).await {
         Ok(identity) => identity,
         Err(_) => return,
     };
-    if hello.vault_identity.id != identity.id
-        || hello.vault_identity.history_id != identity.history_id
-    {
+    if hello.vault.vault_id != identity.vault_id || hello.vault.history_id != identity.history_id {
         let _ = socket
             .send(Message::Text(
                 json!({"kind":"fatal","code":"Conflict","message":"Vault history changed"})
@@ -497,7 +512,7 @@ async fn serve(
     let outcome = async {
         send(
             &mut sink,
-            json!({"kind":"hello","sessionId":session_id,"vaultIdentity":identity}),
+            json!({"kind":"hello","sessionId":session_id,"vault":identity}),
         )
         .await?;
         let subscription = execute(vault.clone(), false, |_, docs| docs.subscribe())
@@ -538,10 +553,10 @@ async fn serve(
                     // later snapshot. On lag, rebuild the subscription barrier.
                     match event {
                         Ok(event)=>{
-                            let ids:Vec<_>=event.documents.into_iter().map(|notice|notice.id).collect();
+                            let ids:Vec<_>=event.documents.into_iter().map(|notice|notice.status.id).collect();
                             let next=session.clone();
                             let result=execute(vault.clone(),false,move |_,docs|{
-                                let mut next=next.lock().map_err(|_|VaultError::new("IO","Session lock failed",""))?;
+                                let mut next=next.lock().map_err(|_|EditorError::new(ErrorCode::Io,"Session lock failed",""))?;
                                 let mut frames=vec![];
                                 for id in ids {
                                     if next.subscribed(&id) {

@@ -1,7 +1,7 @@
 //! The single Buffer mutation pipeline: admission, history commitment and delivery.
 use super::types::{EditorMutation, HistoryCommit};
 use super::{EditorCore, MAX_TEXT_BYTES, validate_text};
-use crate::backend::{Backend, EditorError, EditorResult, JournalEntry};
+use crate::backend::{Backend, EditorError, EditorResult, ErrorCode, JournalEntry};
 use celestite_buffer::history::PreparedImport;
 use celestite_buffer::positions::ToOffset;
 use celestite_buffer::types::{
@@ -50,12 +50,16 @@ impl<B: Backend> EditorCore<B> {
             size = size
                 .checked_sub(to - from)
                 .and_then(|n| n.checked_add(insert.len()))
-                .ok_or_else(|| EditorError::new("InvalidEdit", "Invalid edit size", id))?;
+                .ok_or_else(|| EditorError::new(ErrorCode::InvalidEdit, "Invalid edit size", id))?;
             previous = Some((from, to));
             resolved.push((from..to, insert));
         }
         if size > MAX_TEXT_BYTES {
-            return Err(EditorError::new("Unsupported", "Text exceeds 5 MiB", id));
+            return Err(EditorError::new(
+                ErrorCode::Unsupported,
+                "Text exceeds 5 MiB",
+                id,
+            ));
         }
         let update = self
             .records
@@ -167,7 +171,7 @@ impl<B: Backend> EditorCore<B> {
     ) -> EditorResult<PreparedImport> {
         if packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "CRDT packet exceeds 16 MiB",
                 id,
             ));
@@ -261,7 +265,7 @@ impl<B: Backend> EditorCore<B> {
 
     fn buffer_changed(&mut self, id: &str) {
         let record = self.records.get_mut(id).unwrap();
-        record.dirty = !record.buffer.content_matches(&record.header.saved_text);
+        record.refresh_dirty();
         if record.dirty && record.first_dirty.is_none() {
             record.first_dirty = Some(self.backend.now_ms());
         }
@@ -271,8 +275,8 @@ impl<B: Backend> EditorCore<B> {
         let record = self
             .records
             .get_mut(id)
-            .ok_or_else(|| EditorError::new("NotFound", "Document not loaded", id))?;
-        record.dirty = !record.buffer.content_matches(&record.header.saved_text);
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Document not loaded", id))?;
+        record.refresh_dirty();
         loop {
             let record = self.record(id)?;
             let entry = record.uncommitted.first().cloned();
@@ -282,15 +286,12 @@ impl<B: Backend> EditorCore<B> {
                 header.applied = entry.applied.clone();
             }
             if let Err(error) = self.backend.commit(&header, entry.as_ref()).await {
-                self.failure = Some(format!("编辑历史尚未持久化：{}", error.message));
+                self.health =
+                    super::HistoryHealth::Failed(format!("编辑历史尚未持久化：{}", error.message));
                 return Err(error);
             }
             let record = self.records.get_mut(id).unwrap();
             record.header = header;
-            record.persisted_version = self
-                .backend
-                .persistent()
-                .then(|| record.header.applied.clone());
             if entry.is_some() {
                 record.uncommitted.remove(0);
             }
@@ -307,9 +308,9 @@ impl<B: Backend> EditorCore<B> {
     }
 
     pub async fn retry_history(&mut self) -> EditorResult<()> {
-        if self.requires_reopen {
+        if matches!(self.health, super::HistoryHealth::ReopenRequired(_)) {
             return Err(EditorError::new(
-                "IO",
+                ErrorCode::Io,
                 "Committed history requires reopening the core",
                 "",
             ));
@@ -319,7 +320,7 @@ impl<B: Backend> EditorCore<B> {
             self.finish_observation(&id).await?;
             self.persist(&id).await?;
         }
-        self.failure = None;
+        self.health = super::HistoryHealth::Ok;
         Ok(())
     }
 }

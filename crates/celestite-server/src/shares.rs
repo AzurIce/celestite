@@ -1,6 +1,7 @@
 //! Two host-derived capability keys per Vault, rotated through configuration.
 use crate::{failure, ApiError, HostedVault};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use celestite_core::backend::ErrorCode;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +36,10 @@ pub(crate) struct Grant {
 impl Grant {
     pub fn check(&self, operation: Operation) -> Result<(), ApiError> {
         if operation == Operation::Edit && self.read_only() {
-            return Err(failure("PermissionDenied", "This link is read-only"));
+            return Err(failure(
+                ErrorCode::PermissionDenied,
+                "This link is read-only",
+            ));
         }
         Ok(())
     }
@@ -138,14 +142,14 @@ impl Registry {
     }
     pub fn resolve(&self, key: &str) -> Result<Arc<Grant>, ApiError> {
         let permission =
-            key_permission(key).ok_or_else(|| failure("NotFound", "Link not found"))?;
+            key_permission(key).ok_or_else(|| failure(ErrorCode::NotFound, "Link not found"))?;
         let grant = self
             .grants
             .get(&digest(key))
             .cloned()
-            .ok_or_else(|| failure("NotFound", "Link not found"))?;
+            .ok_or_else(|| failure(ErrorCode::NotFound, "Link not found"))?;
         if grant.permission != permission {
-            return Err(failure("NotFound", "Link not found"));
+            return Err(failure(ErrorCode::NotFound, "Link not found"));
         }
         Ok(grant)
     }

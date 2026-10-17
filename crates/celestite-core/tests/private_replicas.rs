@@ -1,5 +1,6 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{DocumentIdentity, HistoryPacket, Version};
+use celestite_core::backend::ErrorCode;
 use celestite_core::backend::memory::MemoryBackend;
 use celestite_core::editor::EditorCore;
 use celestite_core::editor::replica::ReplicaDocument;
@@ -43,7 +44,7 @@ fn hosted(packet: HistoryPacket, path: &str, deleted: bool) -> ReplicaDocument {
             saved_content: snapshot.text.to_string(),
             file_revision: "disk".into(),
             bom: false,
-            line_ending: "\n".into(),
+            line_ending: celestite_core::text::LineEnding::Lf,
             deleted,
             read_only: false,
             conflict: false,
@@ -90,7 +91,15 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
         assert_eq!(captured.snapshots.len(), 1);
         assert_eq!(captured.snapshots[0].id, "file");
         assert_eq!(captured.snapshots[0].path, "a.md");
-        assert_eq!(captured.snapshots[0].snapshot, before.snapshot);
+        assert_eq!(captured.snapshots[0].snapshot.text, before.snapshot.text);
+        assert_eq!(
+            captured.snapshots[0].snapshot.state_revision,
+            before.snapshot.state_revision
+        );
+        assert_eq!(
+            captured.snapshots[0].snapshot.version,
+            before.status.version
+        );
         assert_eq!(captured.snapshots[0].snapshot.text.as_ref(), "A😀!");
 
         let mut preview = PreviewController::default();
@@ -106,7 +115,7 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
         // Catalogue and history export reads neither consume accepted receipts nor
         // modify personal undo or the derived consumer's running task.
         let history = core.snapshot("file").unwrap();
-        let _ = core.updates("file", &before.snapshot.version).unwrap();
+        let _ = core.updates("file", &before.status.version).unwrap();
         preview.synchronize(&core.document_source(&[]), 1000);
         assert_eq!(core.read("file").unwrap().undo, before.undo);
         assert_eq!(
@@ -135,7 +144,7 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
         assert_ne!(replaced.epoch, metadata.epoch);
         assert_eq!(
             replaced.snapshots[0].snapshot.version,
-            before.snapshot.version
+            before.status.version
         );
         preview.synchronize(&replaced, 1000);
         assert!(!preview.complete(PreviewCompletion {
@@ -150,7 +159,15 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
             },
         }));
         core.replace_text("file", "changed").await.unwrap();
-        assert_eq!(captured.snapshots[0].snapshot, before.snapshot);
+        assert_eq!(captured.snapshots[0].snapshot.text, before.snapshot.text);
+        assert_eq!(
+            captured.snapshots[0].snapshot.state_revision,
+            before.snapshot.state_revision
+        );
+        assert_eq!(
+            captured.snapshots[0].snapshot.version,
+            before.status.version
+        );
         assert_eq!(captured.snapshots[0].snapshot.text.as_ref(), "A😀!");
     });
 }
@@ -229,9 +246,9 @@ fn deleted_and_recreated_paths_join_in_either_order() {
                 inputs.reverse();
             }
             core.replace_replica_session(inputs).await.unwrap();
-            assert!(core.read("old").unwrap().deleted);
+            assert!(core.read("old").unwrap().status.deleted);
             assert_eq!(core.read("new").unwrap().snapshot.text.as_ref(), "new");
-            assert_eq!(core.read("base").unwrap_err().code, "NotFound");
+            assert_eq!(core.read("base").unwrap_err().code, ErrorCode::NotFound);
         }
         let mut core = replica("client", seed("base", "base")).await;
         core.join_replica_document(hosted(seed("new", "new"), "same.md", false))
@@ -240,7 +257,7 @@ fn deleted_and_recreated_paths_join_in_either_order() {
         core.join_replica_document(hosted(seed("old", "old"), "same.md", true))
             .await
             .unwrap();
-        assert!(core.read("old").unwrap().deleted);
+        assert!(core.read("old").unwrap().status.deleted);
     });
 }
 
@@ -264,16 +281,16 @@ fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
                 .is_err()
         );
         let retained = core.read("A").unwrap();
-        assert_eq!(original.snapshot.version, retained.snapshot.version);
+        assert_eq!(original.status.version, retained.status.version);
         assert_eq!(original.peer_id, retained.peer_id);
         assert!(retained.undo.can_undo);
-        assert_eq!(retained.path, "a.md");
+        assert_eq!(retained.status.path, "a.md");
         // B precedes A, while B's new path was owned by A in the old session.
         core.replace_replica_session(vec![hosted(b, "a.md", false), hosted(a, "c.md", false)])
             .await
             .unwrap();
-        assert_eq!(core.read("A").unwrap().path, "c.md");
-        assert_eq!(core.read("B").unwrap().path, "a.md");
+        assert_eq!(core.read("A").unwrap().status.path, "c.md");
+        assert_eq!(core.read("B").unwrap().status.path, "a.md");
         assert!(!core.read("A").unwrap().undo.can_undo);
         preview.synchronize(&core.document_source(&[]), 1000);
         preview.subscribe("A", "view", 1000).unwrap();
@@ -319,7 +336,7 @@ fn session_imports_catch_up_packets_and_close_does_not_require_write_permission(
         );
         assert_eq!(
             core.replace_text("file", "blocked").await.unwrap_err().code,
-            "PermissionDenied"
+            ErrorCode::PermissionDenied
         );
         core.close().await.unwrap();
     });
@@ -348,7 +365,7 @@ fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
         let mut a = replica("a", seed.clone()).await;
         let mut b = replica("b", seed.clone()).await;
         let mut c = replica("c", seed).await;
-        let base = a.read("file").unwrap().snapshot.version;
+        let base = a.read("file").unwrap().status.version;
         assert_ne!(
             a.read("file").unwrap().peer_id,
             b.read("file").unwrap().peer_id
@@ -363,14 +380,17 @@ fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
         c.import("file", b_packet.clone()).await.unwrap();
         c.import("file", a_packet).await.unwrap();
         c.import("file", b_packet).await.unwrap();
-        let merged = a.read("file").unwrap().snapshot;
-        assert_eq!(merged.text, b.read("file").unwrap().snapshot.text);
-        assert_eq!(merged.version, c.read("file").unwrap().snapshot.version);
-        assert!(merged.text.contains('a') && merged.text.contains('b'));
+        let merged = a.read("file").unwrap();
+        assert_eq!(merged.snapshot.text, b.read("file").unwrap().snapshot.text);
+        assert_eq!(
+            merged.status.version,
+            c.read("file").unwrap().status.version
+        );
+        assert!(merged.snapshot.text.contains('a') && merged.snapshot.text.contains('b'));
         for core in [&a, &b, &c] {
             let state = core.read("file").unwrap();
-            assert!(state.persisted_version.is_none());
-            assert!(state.saved_version.is_none());
+            assert!(state.status.persisted_version.is_none());
+            assert!(state.status.saved_version.is_none());
             assert!(state.autosave_delay.is_none());
         }
         assert!(a.read("file").unwrap().undo.can_undo);
@@ -391,7 +411,10 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
         assert!(core.join("b.md", packet.clone()).await.is_err());
         let mut other = packet.clone();
         other.identity.history_id = "different".into();
-        assert_eq!(core.join("a.md", other).await.unwrap_err().code, "Conflict");
+        assert_eq!(
+            core.join("a.md", other).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
         // Stale caller checkpoints belong to the JSON protocol, not native ownership.
         assert_eq!(core.read("file").unwrap().snapshot.text.as_ref(), "draft");
     });
@@ -408,15 +431,21 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
             core.replace_text(id, text).await.unwrap();
         }
         let mut state = hosted(packet.clone(), "a.md", false).state;
-        state.version = core.read("file").unwrap().snapshot.version;
+        state.version = core.read("file").unwrap().status.version;
         state.file_revision = "remote-1".into();
         core.apply_host_state("file", state.clone()).await.unwrap();
         assert!(core.read("file").unwrap().autosave_delay.is_some());
-        assert!(core.read("file").unwrap().persisted_version.is_none());
+        assert!(
+            core.read("file")
+                .unwrap()
+                .status
+                .persisted_version
+                .is_none()
+        );
         let mut unseen = state.clone();
         unseen.version = with_unseen_clock(&unseen.version);
         assert!(core.apply_host_state("file", unseen).await.is_err());
-        assert_eq!(core.read("file").unwrap().file_revision, "remote-1");
+        assert_eq!(core.read("file").unwrap().status.file_revision, "remote-1");
         let collision = hosted(packet.clone(), "other.md", false);
         let other_packet = core.snapshot("other").unwrap();
         assert_eq!(
@@ -427,7 +456,7 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
             .await
             .unwrap_err()
             .code,
-            "Conflict"
+            ErrorCode::Conflict
         );
         assert_eq!(core.read("file").unwrap().snapshot.text.as_ref(), "draft");
         core.replace_replica_session(vec![
@@ -444,12 +473,12 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
         );
         assert!(!core.read("other").unwrap().undo.can_undo);
         let mut read_only = state;
-        read_only.version = core.read("file").unwrap().snapshot.version;
+        read_only.version = core.read("file").unwrap().status.version;
         read_only.read_only = true;
         core.apply_host_state("file", read_only).await.unwrap();
         assert_eq!(
             core.replace_text("file", "blocked").await.unwrap_err().code,
-            "PermissionDenied"
+            ErrorCode::PermissionDenied
         );
         let mut preview = PreviewController::default();
         preview.synchronize(&core.document_source(&[]), 1000);
@@ -480,7 +509,7 @@ fn a_closed_cache_can_rejoin_after_replacing_the_active_session_catalogue() {
         core.replace_replica_session(vec![hosted(active, "b.md", false)])
             .await
             .unwrap();
-        assert_eq!(core.read("closed").unwrap_err().code, "NotFound");
+        assert_eq!(core.read("closed").unwrap_err().code, ErrorCode::NotFound);
         preview.synchronize(&core.document_source(&[]), 1000);
         assert!(preview.state("closed").is_err());
         core.join_replica_document(hosted(closed, "a.md", false))
@@ -506,9 +535,9 @@ fn released_replica_caches_keep_undo_without_reserving_a_live_path() {
         core.replace_text("old", "draft").await.unwrap();
         let state = core.read("old").unwrap();
         core.release_replica_document("old").unwrap();
-        assert!(!core.read("old").unwrap().deleted);
+        assert!(!core.read("old").unwrap().status.deleted);
         assert!(core.read("old").unwrap().undo.can_undo);
-        assert_eq!(core.undo("old").await.unwrap_err().code, "Closed");
+        assert_eq!(core.undo("old").await.unwrap_err().code, ErrorCode::Closed);
         let mut preview = PreviewController::default();
         preview.synchronize(&core.document_source(&[]), 1000);
         assert!(preview.subscribe("old", "view", 1000).is_err());
@@ -519,7 +548,7 @@ fn released_replica_caches_keep_undo_without_reserving_a_live_path() {
             "old",
             ReplicaHostState {
                 path: "renamed.md".into(),
-                version: state.snapshot.version,
+                version: state.status.version,
                 ..hosted(packet, "a.md", false).state
             },
         )

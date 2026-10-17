@@ -3,7 +3,7 @@ use super::{
     buffer::{Command, Contexts, Input, edits, encode_update, validate_base},
     byte_to_utf16,
 };
-use crate::backend::{Backend, EditorError, EditorResult};
+use crate::backend::{Backend, EditorError, EditorResult, ErrorCode};
 use crate::editor::EditorCore;
 use crate::editor::replica::ReplicaDocument;
 use crate::editor::types::{EditorMutation, ReplicaHostState};
@@ -32,7 +32,7 @@ pub struct EditorAdapter {
 #[serde(rename_all = "camelCase")]
 struct WireReplicaDocument {
     packets: Vec<HistoryPacket>,
-    #[serde(default, alias = "writerId")]
+    #[serde(default)]
     peer_id: Option<String>,
     state: ReplicaHostState,
 }
@@ -44,7 +44,7 @@ impl WireReplicaDocument {
             .map(|peer_id| peer_id::parse(&peer_id))
             .transpose()
             .map_err(|error| {
-                EditorError::new("InvalidEdit", error.to_string(), &self.state.path)
+                EditorError::new(ErrorCode::InvalidEdit, error.to_string(), &self.state.path)
             })?;
         Ok(ReplicaDocument {
             packets: self.packets,
@@ -56,34 +56,23 @@ impl WireReplicaDocument {
 
 fn decode<T: DeserializeOwned>(value: Value, path: &str) -> EditorResult<T> {
     serde_json::from_value(value)
-        .map_err(|error| EditorError::new("InvalidEdit", error.to_string(), path))
+        .map_err(|error| EditorError::new(ErrorCode::InvalidEdit, error.to_string(), path))
 }
 
 /// Canonical IDs are strings at the wire boundary; legacy spelling is input-only.
 fn decode_peer_id(params: &Value, path: &str) -> EditorResult<Option<u64>> {
-    let parse = |value: &Value| {
-        if value.is_null() {
-            return Ok(None);
-        }
-        let value = value
-            .as_str()
-            .ok_or_else(|| EditorError::new("InvalidEdit", "Expected a decimal peer ID", path))?;
-        peer_id::parse(value)
-            .map(Some)
-            .map_err(|error| EditorError::new("InvalidEdit", error, path))
+    let Some(value) = params.get("peerId") else {
+        return Ok(None);
     };
-    let canonical = params.get("peerId").map(parse).transpose()?;
-    let legacy = params.get("writerId").map(parse).transpose()?;
-    if let (Some(canonical), Some(legacy)) = (canonical, legacy)
-        && canonical != legacy
-    {
-        return Err(EditorError::new(
-            "InvalidEdit",
-            "Conflicting peerId/writerId",
-            path,
-        ));
+    if value.is_null() {
+        return Ok(None);
     }
-    Ok(canonical.or(legacy).flatten())
+    let value = value.as_str().ok_or_else(|| {
+        EditorError::new(ErrorCode::InvalidEdit, "Expected a decimal peer ID", path)
+    })?;
+    peer_id::parse(value)
+        .map(Some)
+        .map_err(|error| EditorError::new(ErrorCode::InvalidEdit, error, path))
 }
 
 impl EditorAdapter {
@@ -102,8 +91,9 @@ impl EditorAdapter {
             }
             "anchors_at" => {
                 let version: Version = decode(params["version"].clone(), id)?;
-                let snapshot = core.read(id)?.snapshot;
-                validate_base(&snapshot.version, &version)?;
+                let document = core.read(id)?;
+                validate_base(&document.status.version, &version)?;
+                let snapshot = document.snapshot;
                 let positions: Vec<(usize, Affinity)> = decode(params["positions"].clone(), id)?;
                 let positions = positions
                     .into_iter()
@@ -115,22 +105,22 @@ impl EditorAdapter {
             }
             "resolve_anchors" => {
                 let checkpoint: Version = decode(params["checkpoint"].clone(), id)?;
-                let snapshot = core.read(id)?.snapshot;
-                if !snapshot.version.contains(&checkpoint) {
+                let document = core.read(id)?;
+                if !document.status.version.contains(&checkpoint) {
                     return Err(BufferError::StaleVersion.into());
                 }
                 let anchors: Vec<Anchor> = decode(params["anchors"].clone(), id)?;
                 let offsets = core
                     .resolve_anchors(id, &anchors)?
                     .into_iter()
-                    .map(|offset| byte_to_utf16(&snapshot.text, offset))
+                    .map(|offset| byte_to_utf16(&document.snapshot.text, offset))
                     .collect::<Result<Vec<_>, _>>()?;
-                to_value((snapshot.version, offsets))
+                to_value((document.status.version, offsets))
             }
             "join" => {
-                let path = params["path"]
-                    .as_str()
-                    .ok_or_else(|| EditorError::new("InvalidPath", "Missing file path", ""))?;
+                let path = params["path"].as_str().ok_or_else(|| {
+                    EditorError::new(ErrorCode::InvalidPath, "Missing file path", "")
+                })?;
                 let packet = decode(params["packet"].clone(), path)?;
                 let peer_id = decode_peer_id(&params, path)?;
                 let id = core.join_with_peer_id(path, packet, peer_id).await?;
@@ -167,9 +157,9 @@ impl EditorAdapter {
                 to_value(core.updates(id, &decode(params["version"].clone(), id)?)?)
             }
             "open" => {
-                let path = params["path"]
-                    .as_str()
-                    .ok_or_else(|| EditorError::new("InvalidPath", "Missing file path", ""))?;
+                let path = params["path"].as_str().ok_or_else(|| {
+                    EditorError::new(ErrorCode::InvalidPath, "Missing file path", "")
+                })?;
                 let id = core.open_file(path).await?;
                 to_value(core.read(&id)?)
             }
@@ -215,13 +205,13 @@ impl EditorAdapter {
             "file" => return self.file(core, &params).await,
             _ => {
                 return Err(EditorError::new(
-                    "Unsupported",
+                    ErrorCode::Unsupported,
                     "Unknown editor service operation",
                     "",
                 ));
             }
         };
-        value.map_err(|error| EditorError::new("IO", error.to_string(), ""))
+        value.map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), ""))
     }
 
     async fn apply<B: Backend>(
@@ -231,7 +221,9 @@ impl EditorAdapter {
         command: Command,
     ) -> EditorResult<()> {
         let redo = matches!(&command, Command::Redo { .. });
-        let before = core.read(id)?.snapshot;
+        let document = core.read(id)?;
+        let before_version = document.status.version;
+        let before = document.snapshot;
         let mut reserved = Vec::new();
         for document in core.resident_status()? {
             reserved.extend(core.undo_tags(&document.id)?);
@@ -245,7 +237,7 @@ impl EditorAdapter {
                 group,
                 undo,
             } => {
-                validate_base(&before.version, &base)?;
+                validate_base(&before_version, &base)?;
                 let input = match input {
                     Input::Edits { edits: script } => Ok(edits(&before.text, script)?),
                     Input::Text { text } => Err(text),
@@ -259,7 +251,7 @@ impl EditorAdapter {
                 }
             }
             Command::Undo { base, context } | Command::Redo { base, context } => {
-                validate_base(&before.version, &base)?;
+                validate_base(&before_version, &base)?;
                 let (context, tag) = self.contexts.context(&before.text, context)?;
                 allocated = tag;
                 if redo {
@@ -279,7 +271,7 @@ impl EditorAdapter {
         } else {
             // The wire input already needed this immutable snapshot. Reuse it
             // for output conversion rather than forking history after editing.
-            self.before.push((before.version, before.text));
+            self.before.push((before_version, before.text));
         }
         result.map(|_| ())
     }
@@ -301,18 +293,19 @@ impl EditorAdapter {
             } else if let Some(previous) = self
                 .pending
                 .iter()
-                .find(|previous| previous.document.snapshot.version == mutation.update.before)
+                .find(|previous| previous.document.status.version == mutation.update.before)
             {
                 previous.document.snapshot.text.clone()
             } else {
-                core.snapshot_at(&mutation.document.id, &mutation.update.before)?
+                core.snapshot_at(&mutation.document.status.id, &mutation.update.before)?
                     .text
             };
             let update = encode_update(
                 &self.contexts,
                 &mutation.update,
                 &before,
-                &mutation.document.snapshot,
+                &mutation.document.snapshot.text,
+                mutation.document.snapshot.state_revision,
                 &mutation.document.undo,
                 mutation.pending,
             )?;
@@ -377,9 +370,9 @@ impl EditorAdapter {
                 )
             }
             "rename" => {
-                let to = params["to"]
-                    .as_str()
-                    .ok_or_else(|| EditorError::new("InvalidPath", "Missing destination", path))?;
+                let to = params["to"].as_str().ok_or_else(|| {
+                    EditorError::new(ErrorCode::InvalidPath, "Missing destination", path)
+                })?;
                 core.file_rename(path, to).await?;
                 Ok(Value::Null)
             }
@@ -393,48 +386,49 @@ impl EditorAdapter {
             }
             _ => {
                 return Err(EditorError::new(
-                    "Unsupported",
+                    ErrorCode::Unsupported,
                     "Unknown file operation",
                     path,
                 ));
             }
         };
-        value.map_err(|error| EditorError::new("IO", error.to_string(), path))
+        value.map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), path))
     }
 }
 
 #[cfg(test)]
 mod peer_id_tests {
-    use super::decode_peer_id;
+    use super::{ErrorCode, decode_peer_id};
     use serde_json::json;
 
     #[test]
-    fn legacy_and_canonical_ids_have_one_precision_safe_meaning() {
-        for params in [
-            json!({"peerId":"9007199254740993"}),
-            json!({"writerId":"9007199254740993"}),
-            json!({"peerId":"9007199254740993","writerId":"9007199254740993"}),
-        ] {
-            assert_eq!(
-                decode_peer_id(&params, "doc").unwrap(),
-                Some(9_007_199_254_740_993)
-            );
-        }
+    fn peer_ids_use_canonical_decimal_strings() {
+        assert_eq!(
+            decode_peer_id(&json!({"peerId":"9007199254740993"}), "doc").unwrap(),
+            Some(9_007_199_254_740_993)
+        );
         assert_eq!(decode_peer_id(&json!({}), "doc").unwrap(), None);
+        assert_eq!(
+            decode_peer_id(&json!({"peerId":null}), "doc").unwrap(),
+            None
+        );
+        // The retired v3 spelling is ignored, never reinterpreted as a peer ID.
+        assert_eq!(
+            decode_peer_id(&json!({"writerId":"1"}), "doc").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn ambiguous_or_invalid_identity_is_not_silently_reallocated() {
         for params in [
-            json!({"peerId":"1","writerId":"2"}),
-            json!({"peerId":null,"writerId":"1"}),
             json!({"peerId":1}),
             json!({"peerId":"01"}),
             json!({"peerId":"18446744073709551616"}),
         ] {
             assert_eq!(
                 decode_peer_id(&params, "doc").unwrap_err().code,
-                "InvalidEdit"
+                ErrorCode::InvalidEdit
             );
         }
     }

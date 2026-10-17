@@ -1,56 +1,28 @@
 //! Invalidation feed, serialized by the same lock as the host core.
 //! It carries committed causal versions, never text or operation acknowledgements.
-use super::{fs::Result, VaultIdentity};
-use celestite_buffer::types::Version;
-use celestite_core::editor::{observation::ExternalChangeStatus, types::DocumentStatus};
+use super::fs::Result;
+use celestite_core::backend::{EditorError, ErrorCode};
+use celestite_core::editor::types::DocumentStatus;
+use celestite_core::instance::Vault;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct DocumentNotice {
-    pub id: String,
-    path: String,
-    version: Option<Version>,
-    saved_version: Option<Version>,
-    #[serde(rename = "backendRevision")]
-    file_revision: String,
-    dirty: bool,
-    deleted: bool,
-    conflict: bool,
+    #[serde(flatten)]
+    pub(crate) status: DocumentStatus,
+    /// Whether this document can currently be exported to a session.
     available: bool,
-    error: Option<String>,
-    external_change: Option<ExternalChangeStatus>,
-    persistence_error: Option<String>,
 }
 pub(crate) fn exportable(state: &DocumentStatus, persistent: bool) -> bool {
     state.persistence_error.is_none()
         && (!persistent || state.persisted_version.as_ref() == Some(&state.version))
 }
 impl DocumentNotice {
-    fn from_state(state: DocumentStatus, persistent: bool) -> Self {
-        let available = exportable(&state, persistent);
-        Self {
-            id: state.id,
-            path: state.path,
-            version: if persistent {
-                state.persisted_version
-            } else if available {
-                Some(state.version)
-            } else {
-                None
-            },
-            saved_version: state.saved_version,
-            file_revision: state.file_revision,
-            dirty: state.dirty,
-            deleted: state.deleted,
-            conflict: state.conflict,
-            available,
-            error: state.error,
-            external_change: state.external_change,
-            persistence_error: state.persistence_error,
-        }
+    fn from_state(status: DocumentStatus, persistent: bool) -> Self {
+        let available = exportable(&status, persistent);
+        Self { status, available }
     }
 }
 
@@ -60,7 +32,7 @@ pub(crate) struct DocumentEvent {
     pub kind: &'static str,
     pub stream_id: String,
     pub sequence: u64,
-    pub vault_identity: VaultIdentity,
+    pub vault: Vault,
     pub persistent_history: bool,
     pub documents: Vec<DocumentNotice>,
 }
@@ -70,14 +42,14 @@ pub(crate) struct Subscription {
 }
 pub(crate) struct DocumentFeed {
     stream_id: String,
-    identity: VaultIdentity,
+    identity: Vault,
     persistent: bool,
     sequence: u64,
     states: BTreeMap<String, DocumentNotice>,
     sender: broadcast::Sender<DocumentEvent>,
 }
 impl DocumentFeed {
-    pub fn new(identity: VaultIdentity, persistent: bool) -> Self {
+    pub fn new(identity: Vault, persistent: bool) -> Self {
         Self {
             stream_id: uuid::Uuid::new_v4().to_string(),
             identity,
@@ -92,7 +64,7 @@ impl DocumentFeed {
             .into_iter()
             .map(|state| {
                 let notice = DocumentNotice::from_state(state, self.persistent);
-                (notice.id.clone(), notice)
+                (notice.status.id.clone(), notice)
             })
             .collect();
         let changed: Vec<_> = states
@@ -104,7 +76,7 @@ impl DocumentFeed {
             return Ok(false);
         }
         self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
-            super::fs::VaultError::new("IO", "Document feed counter exhausted", "")
+            EditorError::new(ErrorCode::Io, "Document feed counter exhausted", "")
         })?;
         self.states = states;
         let _ = self.sender.send(self.event("changed", changed));
@@ -115,7 +87,7 @@ impl DocumentFeed {
             kind,
             stream_id: self.stream_id.clone(),
             sequence: self.sequence,
-            vault_identity: self.identity.clone(),
+            vault: self.identity.clone(),
             persistent_history: self.persistent,
             documents,
         }
@@ -143,7 +115,12 @@ mod tests {
             .resident()
             .unwrap()
             .into_iter()
-            .map(|state| documents.host_document(&state.id, None).unwrap().status)
+            .map(|state| {
+                documents
+                    .host_document(&state.status.id, None)
+                    .unwrap()
+                    .status
+            })
             .next()
             .unwrap()
     }
@@ -173,7 +150,7 @@ mod tests {
         let mut new = feed.subscribe();
         assert_eq!(new.initial.sequence, feed.sequence);
         let value = serde_json::to_value(&new.initial).unwrap();
-        assert_eq!(value["documents"][0]["backendRevision"], "disk-139");
+        assert_eq!(value["documents"][0]["fileRevision"], "disk-139");
         let mut next = state(&documents);
         next.file_revision = "next".into();
         feed.publish(vec![next]).unwrap();

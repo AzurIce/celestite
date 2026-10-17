@@ -1,6 +1,6 @@
 //! Volatile private history for headless replicas and the sync debugger.
 use super::{
-    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, JournalEntry,
+    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, ErrorCode, JournalEntry,
     StoredDocument,
 };
 use crate::instance::InstanceIdentity;
@@ -59,14 +59,14 @@ impl Backend for MemoryBackend {
                 .is_none_or(|stored| serde_json::to_value(stored).unwrap() != expected)
             {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Retried journal content mismatch",
                     &header.path,
                 ));
             }
         } else if header.sequence != sequence + u64::from(entry.is_some()) {
             return Err(EditorError::new(
-                "IO",
+                ErrorCode::Io,
                 "Journal sequence mismatch",
                 &header.path,
             ));

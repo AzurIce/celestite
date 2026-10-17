@@ -1,8 +1,8 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{EditOptions, UndoContext};
 use celestite_core::backend::{
-    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileEntry, FileSnapshot,
-    JournalEntry, StoredDocument,
+    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, ErrorCode, FileEntry,
+    FileSnapshot, JournalEntry, StoredDocument,
 };
 use celestite_core::editor::EditorCore;
 use celestite_core::editor::types::HistoryCommit;
@@ -50,7 +50,7 @@ impl MemoryBackend {
     }
 }
 fn io() -> EditorError {
-    EditorError::new("IO", "injected commit failure", "")
+    EditorError::new(ErrorCode::Io, "injected commit failure", "")
 }
 
 fn preview_task<B: Backend>(
@@ -101,11 +101,11 @@ fn import_admission_uses_the_buffers_pending_history_even_after_recovery() {
             let before = core.read(&id).unwrap();
             assert_eq!(
                 core.prepare_import(&id, first.clone()).unwrap_err().code,
-                "InvalidEdit"
+                ErrorCode::InvalidEdit
             );
             assert_eq!(
                 core.import(&id, first.clone()).await.unwrap_err().code,
-                "InvalidEdit"
+                ErrorCode::InvalidEdit
             );
             let after = core.read(&id).unwrap();
             assert_eq!(after.snapshot, before.snapshot);
@@ -139,7 +139,7 @@ fn preview_rename_and_deletion_revoke_tasks_even_without_a_text_change() {
         preview.synchronize(&core.document_source(&[]), 1000);
         assert!(!preview.complete(preview_result(&moved)));
         assert!(preview.state(&id).is_err());
-        assert!(core.read(&id).unwrap().deleted);
+        assert!(core.read(&id).unwrap().status.deleted);
         assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "body");
         backend
             .storage
@@ -215,7 +215,7 @@ impl Backend for MemoryBackend {
     async fn stat(&self, path: &str) -> EditorResult<Option<FileEntry>> {
         Ok(self.storage.borrow().files.get(path).map(|data| FileEntry {
             path: path.into(),
-            kind: "file".into(),
+            kind: celestite_core::backend::EntryKind::File,
             size: Some(data.len() as u64),
             modified_at: None,
         }))
@@ -229,7 +229,7 @@ impl Backend for MemoryBackend {
         let data = state
             .files
             .get(path)
-            .ok_or_else(|| EditorError::new("NotFound", "missing file", path))?;
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "missing file", path))?;
         Ok(FileSnapshot {
             data: data.clone(),
             revision: revision(data),
@@ -246,9 +246,13 @@ impl Backend for MemoryBackend {
         let previous = state
             .files
             .get(path)
-            .ok_or_else(|| EditorError::new("NotFound", "missing file", path))?;
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "missing file", path))?;
         if expected.is_some_and(|value| value != revision(previous)) {
-            return Err(EditorError::new("Conflict", "changed on disk", path));
+            return Err(EditorError::new(
+                ErrorCode::Conflict,
+                "changed on disk",
+                path,
+            ));
         }
         state.files.insert(path.into(), data.into());
         Ok(revision(data))
@@ -259,16 +263,20 @@ impl Backend for MemoryBackend {
             return if state.files.contains_key(from) {
                 Ok(())
             } else {
-                Err(EditorError::new("NotFound", "missing", from))
+                Err(EditorError::new(ErrorCode::NotFound, "missing", from))
             };
         }
         if state.files.contains_key(to) {
-            return Err(EditorError::new("AlreadyExists", "target exists", to));
+            return Err(EditorError::new(
+                ErrorCode::AlreadyExists,
+                "target exists",
+                to,
+            ));
         }
         let data = state
             .files
             .remove(from)
-            .ok_or_else(|| EditorError::new("NotFound", "missing", from))?;
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "missing", from))?;
         state.files.insert(to.into(), data);
         if state.fail_rename_receipt {
             state.fail_commit = true;
@@ -280,7 +288,7 @@ impl Backend for MemoryBackend {
             .borrow_mut()
             .files
             .remove(path)
-            .ok_or_else(|| EditorError::new("NotFound", "missing", path))?;
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "missing", path))?;
         Ok(())
     }
 }
@@ -294,7 +302,7 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
         let backend = MemoryBackend::new(b"old");
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
-        let persisted = core.read(&id).unwrap().persisted_version;
+        let persisted = core.read(&id).unwrap().status.persisted_version;
         backend.storage.borrow_mut().fail_commit = true;
         let receipt = core.replace_text(&id, "draft").await.unwrap();
         assert!(matches!(receipt.history, HistoryCommit::Failed { .. }));
@@ -304,9 +312,10 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
         assert!(std::sync::Arc::ptr_eq(&delivery[0], &receipt));
         let state = core.read(&id).unwrap();
         assert_eq!(state.snapshot.text.as_ref(), "draft");
-        assert_eq!(state.persisted_version, persisted);
+        assert_eq!(state.status.persisted_version, persisted);
         assert!(
             state
+                .status
                 .persistence_error
                 .unwrap()
                 .contains("编辑历史尚未持久化")
@@ -333,8 +342,8 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
             receipt.update.operation.as_ref().unwrap().data
         );
         assert_eq!(
-            core.read(&id).unwrap().persisted_version,
-            Some(core.read(&id).unwrap().snapshot.version)
+            core.read(&id).unwrap().status.persisted_version,
+            Some(core.read(&id).unwrap().status.version)
         );
         core.undo(&id).await.unwrap();
         assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "old");
@@ -343,7 +352,7 @@ fn history_failure_keeps_accepted_draft_blocks_more_edits_and_can_retry() {
         drop(core);
         let restored = EditorCore::open(backend).await.unwrap();
         assert_eq!(restored.read(&id).unwrap().snapshot.text.as_ref(), "draft");
-        assert!(!restored.read(&id).unwrap().dirty);
+        assert!(!restored.read(&id).unwrap().status.dirty);
     });
 }
 #[test]
@@ -353,7 +362,7 @@ fn write_completed_before_receipt_recovers_without_a_false_conflict() {
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
         replace(&mut core, &id, "new").await;
-        let version = core.read(&id).unwrap().snapshot.version;
+        let version = core.read(&id).unwrap().status.version;
         backend.storage.borrow_mut().fail_receipt = true;
         assert!(core.save(&id, None).await.is_err());
         assert_eq!(backend.storage.borrow().files["a.md"], b"new");
@@ -368,9 +377,9 @@ fn write_completed_before_receipt_recovers_without_a_false_conflict() {
         let mut core = EditorCore::open(backend.clone()).await.unwrap();
         core.save(&id, None).await.unwrap();
         let state = core.read(&id).unwrap();
-        assert!(!state.dirty && !state.conflict);
-        assert_eq!(state.saved_version, Some(version.clone()));
-        assert_eq!(state.persisted_version, Some(version));
+        assert!(!state.status.dirty && !state.status.conflict);
+        assert_eq!(state.status.saved_version, Some(version.clone()));
+        assert_eq!(state.status.persisted_version, Some(version));
         assert!(
             backend.storage.borrow().documents[&id]
                 .0
@@ -384,6 +393,7 @@ fn write_completed_before_receipt_recovers_without_a_false_conflict() {
                 .unwrap()
                 .read(&id)
                 .unwrap()
+                .status
                 .dirty
         );
     });
@@ -400,7 +410,10 @@ fn external_conflict_discard_and_overwrite_preserve_text_encoding() {
             .borrow_mut()
             .files
             .insert("a.md".into(), b"external\n".to_vec());
-        assert_eq!(core.save(&id, None).await.unwrap_err().code, "Conflict");
+        assert_eq!(
+            core.save(&id, None).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
         assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "draft\n");
         core.resolve(&id, "overwrite").await.unwrap();
         assert_eq!(
@@ -416,7 +429,7 @@ fn external_conflict_discard_and_overwrite_preserve_text_encoding() {
         core.resolve(&id, "discard").await.unwrap();
         let state = core.read(&id).unwrap();
         assert_eq!(state.snapshot.text.as_ref(), "external again");
-        assert!(!state.undo.can_undo && !state.dirty && !state.conflict);
+        assert!(!state.undo.can_undo && !state.status.dirty && !state.status.conflict);
     });
 }
 #[test]
@@ -432,14 +445,14 @@ fn completed_move_recovers_identity_after_header_commit_failure() {
         drop(core);
         backend.storage.borrow_mut().fail_commit = false;
         let mut restored = EditorCore::open(backend.clone()).await.unwrap();
-        assert_eq!(restored.read(&id).unwrap().path, "b.md");
+        assert_eq!(restored.read(&id).unwrap().status.path, "b.md");
         restored.save(&id, None).await.unwrap();
         assert_eq!(backend.storage.borrow().files["b.md"], b"draft");
         assert!(!backend.storage.borrow().files.contains_key("a.md"));
         assert!(backend.storage.borrow().intent.is_none());
         restored.rename("b.md", "b.md").await.unwrap();
         restored.remove("b.md", false).await.unwrap();
-        assert!(restored.read(&id).unwrap().deleted);
+        assert!(restored.read(&id).unwrap().status.deleted);
         assert!(restored.save(&id, None).await.is_err());
     });
 }
@@ -457,9 +470,9 @@ fn private_history_does_not_require_an_ordinary_directory() {
         private.save(&id, None).await.unwrap();
         let state = private.read(&id).unwrap();
         assert_eq!(state.snapshot.text.as_ref(), "draft");
-        assert!(state.dirty);
+        assert!(state.status.dirty);
         assert!(state.autosave_delay.is_none());
-        assert!(state.persisted_version.is_some());
+        assert!(state.status.persisted_version.is_some());
         let mut preview = PreviewController::default();
         let source = private.document_source(&[]);
         assert_eq!(source.documents.len(), 1);
@@ -523,13 +536,13 @@ fn documents_keep_separate_histories_and_reopen_without_reseeding() {
         let second = core.open_file("b.md").await.unwrap();
         assert_ne!(first, second);
         assert_ne!(
-            core.read(&first).unwrap().snapshot.version.identity(),
-            core.read(&second).unwrap().snapshot.version.identity()
+            core.read(&first).unwrap().status.version.identity(),
+            core.read(&second).unwrap().status.version.identity()
         );
         core.edit(&first, [(5..5, "!")]).await.unwrap();
         let mutations = core.take_mutations();
         assert_eq!(mutations.len(), 1);
-        assert_eq!(mutations[0].document.id, first);
+        assert_eq!(mutations[0].document.status.id, first);
         assert_eq!(mutations[0].document.snapshot.text.as_ref(), "A😀!");
         assert_eq!(core.read(&second).unwrap().snapshot.text.as_ref(), "B");
         assert_eq!(core.open_file("a.md").await.unwrap(), first);
@@ -552,7 +565,7 @@ fn adapter_delivers_accepted_history_failure_once() {
                 &mut core,
                 "apply",
                 json!({"id":id,"command":{
-                    "kind":"edit","base":before.snapshot.version,
+                    "kind":"edit","base":before.status.version,
                     "input":{"kind":"text","text":"draft"}
                 }}),
             )
@@ -567,7 +580,7 @@ fn adapter_delivers_accepted_history_failure_once() {
         assert!(receipt["document"]["persistenceError"].is_string());
         assert_eq!(
             receipt["document"]["persistedVersion"],
-            serde_json::to_value(before.persisted_version).unwrap()
+            serde_json::to_value(before.status.persisted_version).unwrap()
         );
         assert!(receipt["update"]["operation"].is_object());
         assert!(core.take_mutations().is_empty());
@@ -579,10 +592,7 @@ fn adapter_delivers_accepted_history_failure_once() {
             .unwrap();
         assert_eq!(recovered["snapshot"], receipt["document"]["snapshot"]);
         assert_eq!(recovered["persistenceError"], json!(null));
-        assert_eq!(
-            recovered["persistedVersion"],
-            recovered["snapshot"]["version"]
-        );
+        assert_eq!(recovered["persistedVersion"], recovered["version"]);
         assert!(core.take_mutations().is_empty());
         assert_eq!(backend.storage.borrow().files["a.md"], b"old");
     });
@@ -613,14 +623,14 @@ fn reopening_history_preserves_identity_but_not_peer_undo_or_preview_session() {
         assert_eq!(external.source, "external 😀");
         replace(&mut core, &id, "external 😀!").await;
         assert!(core.read(&id).unwrap().undo.can_undo);
-        let version = core.read(&id).unwrap().snapshot.version;
+        let version = core.read(&id).unwrap().status.version;
         drop(core);
         let restored = EditorCore::open(backend).await.unwrap();
         let after = restored.read(&id).unwrap();
-        assert_eq!(after.snapshot.version, version);
+        assert_eq!(after.status.version, version);
         assert_eq!(
-            before.snapshot.version.identity(),
-            after.snapshot.version.identity()
+            before.status.version.identity(),
+            after.status.version.identity()
         );
         assert_ne!(before.peer_id, after.peer_id);
         assert!(!after.undo.can_undo);
@@ -650,7 +660,7 @@ fn lightweight_status_tracks_baselines_without_exposing_personal_state_or_text()
                 status.dirty,
                 document.snapshot.text.as_ref() != document.saved_content
             );
-            assert_eq!(status.version, document.snapshot.version);
+            assert_eq!(status.version, document.status.version);
             let host = serde_json::to_value(core.host_document(&id, true).unwrap()).unwrap();
             for field in ["snapshot", "undo", "peerId", "autosaveDelay"] {
                 assert!(host.get(field).is_none(), "host must not expose {field}");

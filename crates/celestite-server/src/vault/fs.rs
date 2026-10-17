@@ -3,6 +3,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
+use celestite_core::backend::{EditorError, EntryKind, ErrorCode, FileEntry};
 use serde::Serialize;
 use std::{
     io::{self, Read, Write},
@@ -10,54 +11,34 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultError {
-    pub code: &'static str,
-    pub message: String,
-    pub path: String,
-}
-pub type Result<T> = std::result::Result<T, VaultError>;
-impl VaultError {
-    pub fn new(code: &'static str, message: impl Into<String>, path: &str) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            path: path.into(),
-        }
+pub type Result<T> = celestite_core::backend::EditorResult<T>;
+fn entry_kind(symlink: bool, directory: bool, file: bool) -> EntryKind {
+    if symlink {
+        EntryKind::Symlink
+    } else if directory {
+        EntryKind::Directory
+    } else if file {
+        EntryKind::File
+    } else {
+        EntryKind::Other
     }
-}
-impl std::fmt::Display for VaultError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
-    }
-}
-impl std::error::Error for VaultError {}
-fn io_error(error: io::Error, path: &str) -> VaultError {
-    let code = match error.kind() {
-        io::ErrorKind::NotFound => "NotFound",
-        io::ErrorKind::AlreadyExists => "AlreadyExists",
-        io::ErrorKind::PermissionDenied => "PermissionDenied",
-        io::ErrorKind::NotADirectory => "NotDirectory",
-        io::ErrorKind::IsADirectory => "NotFile",
-        io::ErrorKind::DirectoryNotEmpty => "DirectoryNotEmpty",
-        io::ErrorKind::StorageFull => "QuotaExceeded",
-        io::ErrorKind::CrossesDevices | io::ErrorKind::Unsupported => "Unsupported",
-        _ => "IO",
-    };
-    VaultError::new(code, error.to_string(), path)
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Entry {
-    pub path: String,
-    pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modified_at: Option<u64>,
+fn io_error(error: io::Error, path: &str) -> EditorError {
+    let code = match error.kind() {
+        io::ErrorKind::NotFound => ErrorCode::NotFound,
+        io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+        io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
+        io::ErrorKind::NotADirectory => ErrorCode::NotDirectory,
+        io::ErrorKind::IsADirectory => ErrorCode::NotFile,
+        io::ErrorKind::DirectoryNotEmpty => ErrorCode::DirectoryNotEmpty,
+        io::ErrorKind::StorageFull => ErrorCode::QuotaExceeded,
+        io::ErrorKind::CrossesDevices | io::ErrorKind::Unsupported => ErrorCode::Unsupported,
+        _ => ErrorCode::Io,
+    };
+    EditorError::new(code, error.to_string(), path)
 }
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ChangeHint {
     pub paths: Vec<String>,
@@ -73,27 +54,14 @@ impl ChangeHint {
 }
 
 pub fn validate_path(path: &str) -> Result<()> {
-    if path.contains(['\\', '\0'])
-        || path.starts_with('/')
-        || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
-        || (!path.is_empty()
-            && path
-                .split('/')
-                .any(|p| p.is_empty() || p == "." || p == ".."))
-    {
-        return Err(VaultError::new(
-            "InvalidPath",
-            "Expected a Vault-relative path",
-            path,
-        ));
-    }
-    Ok(())
+    celestite_core::editor::validate_editor_path(path)
+        .map_err(|error| EditorError::new(ErrorCode::InvalidPath, error.message, path))
 }
 fn split(path: &str) -> Result<(&str, &str)> {
     validate_path(path)?;
     if path.is_empty() {
-        return Err(VaultError::new(
-            "InvalidPath",
+        return Err(EditorError::new(
+            ErrorCode::InvalidPath,
             "Cannot modify the Vault root",
             path,
         ));
@@ -123,8 +91,8 @@ impl FsVault {
                     .symlink_metadata(part)
                     .map_err(|e| io_error(e, path))?;
                 if metadata.is_symlink() {
-                    return Err(VaultError::new(
-                        "Unsupported",
+                    return Err(EditorError::new(
+                        ErrorCode::Unsupported,
                         "Following symbolic links is disabled",
                         path,
                     ));
@@ -138,29 +106,21 @@ impl FsVault {
         let (parent, name) = split(path)?;
         Ok((self.directory(parent)?, name.into()))
     }
-    pub fn stat(&self, path: &str) -> Result<Option<Entry>> {
+    pub fn stat(&self, path: &str) -> Result<Option<FileEntry>> {
         validate_path(path)?;
         let result = if path.is_empty() {
             self.root.dir_metadata()
         } else {
             let (parent, name) = match self.parent(path) {
-                Err(error) if error.code == "NotFound" => return Ok(None),
+                Err(error) if error.code == ErrorCode::NotFound => return Ok(None),
                 result => result?,
             };
             parent.symlink_metadata(name)
         };
         match result {
-            Ok(metadata) => Ok(Some(Entry {
+            Ok(metadata) => Ok(Some(FileEntry {
                 path: path.into(),
-                kind: if metadata.is_symlink() {
-                    "symlink"
-                } else if metadata.is_dir() {
-                    "directory"
-                } else if metadata.is_file() {
-                    "file"
-                } else {
-                    "other"
-                },
+                kind: entry_kind(metadata.is_symlink(), metadata.is_dir(), metadata.is_file()),
                 size: metadata.is_file().then_some(metadata.len()),
                 modified_at: metadata
                     .modified()
@@ -172,14 +132,14 @@ impl FsVault {
             Err(error) => Err(io_error(error, path)),
         }
     }
-    pub fn read_dir(&self, path: &str) -> Result<Vec<Entry>> {
+    pub fn read_dir(&self, path: &str) -> Result<Vec<FileEntry>> {
         let directory = self.directory(path)?;
         let mut entries = Vec::new();
         for entry in directory.entries().map_err(|e| io_error(e, path))? {
             let entry = entry.map_err(|e| io_error(e, path))?;
             let name = entry.file_name().into_string().map_err(|_| {
-                VaultError::new(
-                    "Unsupported",
+                EditorError::new(
+                    ErrorCode::Unsupported,
                     "Non-UTF-8 file names are not supported",
                     path,
                 )
@@ -191,17 +151,9 @@ impl FsVault {
             };
             // Enumeration promises entry kinds, not a consistent metadata snapshot.
             let kind = entry.file_type().map_err(|e| io_error(e, &child))?;
-            entries.push(Entry {
+            entries.push(FileEntry {
                 path: child,
-                kind: if kind.is_symlink() {
-                    "symlink"
-                } else if kind.is_dir() {
-                    "directory"
-                } else if kind.is_file() {
-                    "file"
-                } else {
-                    "other"
-                },
+                kind: entry_kind(kind.is_symlink(), kind.is_dir(), kind.is_file()),
                 size: None,
                 modified_at: None,
             });
@@ -210,9 +162,17 @@ impl FsVault {
     }
     fn require_file(&self, path: &str) -> Result<()> {
         match self.stat(path)? {
-            None => Err(VaultError::new("NotFound", "File does not exist", path)),
-            Some(entry) if entry.kind == "file" => Ok(()),
-            _ => Err(VaultError::new("NotFile", "Expected a regular file", path)),
+            None => Err(EditorError::new(
+                ErrorCode::NotFound,
+                "File does not exist",
+                path,
+            )),
+            Some(entry) if entry.kind == EntryKind::File => Ok(()),
+            _ => Err(EditorError::new(
+                ErrorCode::NotFile,
+                "Expected a regular file",
+                path,
+            )),
         }
     }
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
@@ -227,8 +187,8 @@ impl FsVault {
             .read_to_end(&mut bytes)
             .map_err(|e| io_error(e, path))?;
         if bytes.len() as u64 > limit {
-            return Err(VaultError::new(
-                "Unsupported",
+            return Err(EditorError::new(
+                ErrorCode::Unsupported,
                 "File exceeds the supported size",
                 path,
             ));
@@ -263,8 +223,8 @@ impl FsVault {
                 self.require_file(path)?;
                 if let Some(expected) = expected {
                     if self.file_revision(path)? != expected {
-                        return Err(VaultError::new(
-                            "Conflict",
+                        return Err(EditorError::new(
+                            ErrorCode::Conflict,
                             "File changed since it was read",
                             path,
                         ));
@@ -273,8 +233,8 @@ impl FsVault {
                 options.truncate(true);
             }
             _ => {
-                return Err(VaultError::new(
-                    "InvalidPath",
+                return Err(EditorError::new(
+                    ErrorCode::InvalidPath,
                     "Expected create or replace write mode",
                     path,
                 ))
@@ -304,8 +264,8 @@ impl FsVault {
                 .symlink_metadata(name)
                 .map_err(|e| io_error(e, path))?;
             if kind.is_symlink() {
-                return Err(VaultError::new(
-                    "Unsupported",
+                return Err(EditorError::new(
+                    ErrorCode::Unsupported,
                     "Following symbolic links is disabled",
                     path,
                 ));
@@ -334,21 +294,21 @@ impl FsVault {
         let (source, source_name) = self.parent(from)?;
         let entry = self
             .stat(from)?
-            .ok_or_else(|| VaultError::new("NotFound", "Source does not exist", from))?;
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Source does not exist", from))?;
         let (target, target_name) = self.parent(to)?;
         if from == to {
             return Ok(());
         }
-        if entry.kind == "directory" && to.starts_with(&format!("{from}/")) {
-            return Err(VaultError::new(
-                "InvalidPath",
+        if entry.kind == EntryKind::Directory && to.starts_with(&format!("{from}/")) {
+            return Err(EditorError::new(
+                ErrorCode::InvalidPath,
                 "Cannot move a directory into itself",
                 to,
             ));
         }
         if self.stat(to)?.is_some() {
-            return Err(VaultError::new(
-                "AlreadyExists",
+            return Err(EditorError::new(
+                ErrorCode::AlreadyExists,
                 "Target already exists",
                 to,
             ));
@@ -361,16 +321,22 @@ impl FsVault {
 
 #[cfg(test)]
 mod tests {
-    use super::FsVault;
+    use super::{EntryKind, ErrorCode, FsVault};
     #[test]
     fn paths_and_root_are_protected() {
         let tmp = tempfile::tempdir().unwrap();
         let vault = FsVault::open(tmp.path()).unwrap();
         for path in ["/etc/passwd", "../x", "a//b", "a/./b", "C:/x", "a\\b"] {
-            assert_eq!(vault.stat(path).unwrap_err().code, "InvalidPath");
+            assert_eq!(vault.stat(path).unwrap_err().code, ErrorCode::InvalidPath);
         }
-        assert_eq!(vault.remove("", true).unwrap_err().code, "InvalidPath");
-        assert_eq!(vault.rename("", "x").unwrap_err().code, "InvalidPath");
+        assert_eq!(
+            vault.remove("", true).unwrap_err().code,
+            ErrorCode::InvalidPath
+        );
+        assert_eq!(
+            vault.rename("", "x").unwrap_err().code,
+            ErrorCode::InvalidPath
+        );
         assert!(vault.stat("missing/file").unwrap().is_none());
     }
     #[test]
@@ -386,7 +352,7 @@ mod tests {
                 .write_file("a/b/x.md", b"bad", "create", None)
                 .unwrap_err()
                 .code,
-            "AlreadyExists"
+            ErrorCode::AlreadyExists
         );
         vault
             .write_file("a/b/x.md", b"new", "replace", Some(&version))
@@ -396,20 +362,23 @@ mod tests {
                 .write_file("a/b/x.md", b"bad", "replace", Some(&version))
                 .unwrap_err()
                 .code,
-            "Conflict"
+            ErrorCode::Conflict
         );
         assert_eq!(vault.read_file("a/b/x.md").unwrap(), b"new");
         vault.mkdir("target", false).unwrap();
         assert_eq!(
             vault.rename("a", "target").unwrap_err().code,
-            "AlreadyExists"
+            ErrorCode::AlreadyExists
         );
-        assert_eq!(vault.rename("a", "a/b/c").unwrap_err().code, "InvalidPath");
+        assert_eq!(
+            vault.rename("a", "a/b/c").unwrap_err().code,
+            ErrorCode::InvalidPath
+        );
         vault.rename("a", "renamed").unwrap();
         assert_eq!(vault.read_file("renamed/b/x.md").unwrap(), b"new");
         assert_eq!(
             vault.remove("renamed", false).unwrap_err().code,
-            "DirectoryNotEmpty"
+            ErrorCode::DirectoryNotEmpty
         );
         vault.remove("renamed", true).unwrap();
         assert!(vault.stat("renamed").unwrap().is_none());
@@ -418,7 +387,7 @@ mod tests {
                 .write_file("absent", b"x", "replace", None)
                 .unwrap_err()
                 .code,
-            "NotFound"
+            ErrorCode::NotFound
         );
     }
 
@@ -431,7 +400,7 @@ mod tests {
 
         assert_eq!(
             vault.rename("source", "target").unwrap_err().code,
-            "AlreadyExists"
+            ErrorCode::AlreadyExists
         );
         assert_eq!(vault.read_file("source").unwrap(), b"new");
         assert_eq!(vault.read_file("target").unwrap(), b"old");
@@ -443,7 +412,7 @@ mod tests {
         let vault = FsVault::open(root.path()).unwrap();
         assert_eq!(
             vault.read_file_limited("a", 4).unwrap_err().code,
-            "Unsupported"
+            ErrorCode::Unsupported
         );
         assert_eq!(vault.read_file_limited("a", 5).unwrap(), b"12345");
     }
@@ -456,14 +425,17 @@ mod tests {
         std::fs::write(outside.path().join("secret"), b"secret").unwrap();
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
         let vault = FsVault::open(tmp.path()).unwrap();
-        assert_eq!(vault.stat("link").unwrap().unwrap().kind, "symlink");
+        assert_eq!(
+            vault.stat("link").unwrap().unwrap().kind,
+            EntryKind::Symlink
+        );
         assert_eq!(
             vault.read_file("link/secret").unwrap_err().code,
-            "Unsupported"
+            ErrorCode::Unsupported
         );
         assert_eq!(
             vault.mkdir("link/new", true).unwrap_err().code,
-            "Unsupported"
+            ErrorCode::Unsupported
         );
         vault.remove("link", true).unwrap();
         assert_eq!(

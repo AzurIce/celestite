@@ -1,13 +1,16 @@
 //! Shared editor business: platform adapters implement IO, never save/recovery policy.
 use self::observation::ObservationCoordinator;
 use self::replica::ReplicaState;
-use self::types::{DocumentStatus, EditorDocument, EditorMutation, HostDocument, ReplicaHostState};
+use self::types::{
+    DocumentStatus, DocumentText, EditorDocument, EditorMutation, HostDocument, ReplicaHostState,
+};
 use crate::backend::{
-    Backend, DiskCursor, DocumentHeader, EditorError, EditorResult, FileSnapshot, JournalEntry,
-    WritePhase,
+    Backend, DiskCursor, DocumentHeader, EditorError, EditorResult, ErrorCode, FileSnapshot,
+    JournalEntry, WritePhase,
 };
 use crate::instance::InstanceIdentity;
 use crate::source::{DocumentSnapshot, DocumentSourceSnapshot, SourceDocument};
+use crate::text::{DecodedText, LineEnding};
 use celestite_buffer::Buffer;
 use celestite_buffer::history::PreparedImport;
 use celestite_buffer::types::{
@@ -15,11 +18,15 @@ use celestite_buffer::types::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
+mod format;
 mod history;
 pub mod observation;
 mod projection;
 pub mod replica;
 pub mod types;
+
+pub use format::validate_editor_path;
+pub(crate) use format::{decode, encode, validate_text, within};
 
 pub const MAX_TEXT_BYTES: usize = 5 * 1024 * 1024;
 
@@ -44,10 +51,47 @@ struct Record {
     dirty: bool,
     pending_observation: Option<ObservationCommit>,
     uncommitted: Vec<JournalEntry>,
-    persisted_version: Option<Version>,
     conflict: bool,
     error: Option<String>,
     first_dirty: Option<u64>,
+}
+
+impl Record {
+    fn new(header: DocumentHeader, buffer: Buffer, replica: ReplicaState) -> Self {
+        let dirty = !buffer.content_matches(&header.saved_text);
+        Self {
+            observation: ObservationCoordinator::default(),
+            replica,
+            header,
+            buffer,
+            dirty,
+            pending_observation: None,
+            uncommitted: vec![],
+            conflict: false,
+            error: None,
+            first_dirty: None,
+        }
+    }
+    fn status(&self, id: &str, persistent: bool, failure: Option<String>) -> DocumentStatus {
+        let header = &self.header;
+        DocumentStatus {
+            id: id.into(),
+            path: header.path.clone(),
+            version: self.buffer.version(),
+            saved_version: header.saved_version.clone(),
+            persisted_version: persistent.then(|| header.applied.clone()),
+            file_revision: header.disk_revision.clone(),
+            dirty: self.dirty,
+            deleted: header.deleted,
+            conflict: self.conflict,
+            error: self.error.clone(),
+            external_change: self.observation.status(),
+            persistence_error: failure,
+        }
+    }
+    fn refresh_dirty(&mut self) {
+        self.dirty = !self.buffer.content_matches(&self.header.saved_text);
+    }
 }
 
 struct ObservationCommit {
@@ -56,93 +100,35 @@ struct ObservationCommit {
     prepared: Option<PreparedImport>,
 }
 
+#[derive(Debug, Default)]
+enum HistoryHealth {
+    #[default]
+    Ok,
+    Failed(String),
+    /// Committed history could not be applied to the live Buffer; reopen the core.
+    ReopenRequired(String),
+}
+
+impl HistoryHealth {
+    fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok)
+    }
+    fn message(&self) -> Option<&str> {
+        match self {
+            Self::Ok => None,
+            Self::Failed(message) | Self::ReopenRequired(message) => Some(message),
+        }
+    }
+}
+
 pub struct EditorCore<B: Backend> {
     file_observation_cursor: Option<String>,
     backend: B,
     records: BTreeMap<String, Record>,
-    failure: Option<String>,
-    requires_reopen: bool,
+    health: HistoryHealth,
     options: EditorOptions,
     source_epoch: u64,
     mutations: Vec<Arc<EditorMutation>>,
-}
-
-pub fn validate_editor_path(path: &str) -> EditorResult<()> {
-    if path.contains(['\\', '\0'])
-        || path.starts_with('/')
-        || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
-        || (!path.is_empty()
-            && path
-                .split('/')
-                .any(|p| p.is_empty() || p == "." || p == ".."))
-    {
-        return Err(EditorError::new(
-            "InvalidPath",
-            "Expected a Vault-relative path",
-            path,
-        ));
-    }
-    Ok(())
-}
-fn within(path: &str, root: &str) -> bool {
-    root.is_empty()
-        || path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|tail| tail.starts_with('/'))
-}
-fn validate_text(text: &str, path: &str) -> EditorResult<()> {
-    if text.chars().any(|c| c < ' ' && !matches!(c, '\n' | '\t')) {
-        return Err(EditorError::new(
-            "InvalidEdit",
-            "Text uses LF; binary control characters are not accepted",
-            path,
-        ));
-    }
-    if text.len() > MAX_TEXT_BYTES {
-        return Err(EditorError::new("Unsupported", "Text exceeds 5 MiB", path));
-    }
-    Ok(())
-}
-fn decode(bytes: &[u8], path: &str) -> EditorResult<(String, bool, String)> {
-    if bytes.len() > MAX_TEXT_BYTES {
-        return Err(EditorError::new("Unsupported", "Text exceeds 5 MiB", path));
-    }
-    let bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
-    let raw = std::str::from_utf8(if bom { &bytes[3..] } else { bytes })
-        .map_err(|_| EditorError::new("Unsupported", "Not a UTF-8 text file", path))?;
-    if raw
-        .chars()
-        .any(|c| c < ' ' && !matches!(c, '\n' | '\r' | '\t'))
-    {
-        return Err(EditorError::new(
-            "Unsupported",
-            "Not an editable text file",
-            path,
-        ));
-    }
-    let ending = raw
-        .find(['\r', '\n'])
-        .map(|i| {
-            if raw[i..].starts_with("\r\n") {
-                "\r\n"
-            } else if raw[i..].starts_with('\r') {
-                "\r"
-            } else {
-                "\n"
-            }
-        })
-        .unwrap_or("\n")
-        .to_string();
-    Ok((raw.replace("\r\n", "\n").replace('\r', "\n"), bom, ending))
-}
-fn encode(header: &DocumentHeader, text: &str) -> Vec<u8> {
-    format!(
-        "{}{}",
-        if header.bom { "\u{feff}" } else { "" },
-        text.replace('\n', &header.line_ending)
-    )
-    .into_bytes()
 }
 
 impl<B: Backend> EditorCore<B> {
@@ -155,7 +141,11 @@ impl<B: Backend> EditorCore<B> {
             || identity.vault.vault_id.is_empty()
             || identity.vault.history_id.is_empty()
         {
-            return Err(EditorError::new("IO", "Invalid instance identity", ""));
+            return Err(EditorError::new(
+                ErrorCode::Io,
+                "Invalid instance identity",
+                "",
+            ));
         }
         let mut records = BTreeMap::new();
         let mut paths = std::collections::BTreeSet::new();
@@ -165,10 +155,9 @@ impl<B: Backend> EditorCore<B> {
                 || records.contains_key(&header.id)
                 || (!header.deleted && !paths.insert(header.path.clone()))
                 || journal.len() as u64 != header.sequence
-                || !matches!(header.line_ending.as_str(), "\n" | "\r" | "\r\n")
             {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Invalid stored document identity or journal",
                     &header.path,
                 ));
@@ -178,7 +167,7 @@ impl<B: Backend> EditorCore<B> {
                 let _ = document.import(entry.packet.clone())?;
                 if document.version() != entry.applied {
                     return Err(EditorError::new(
-                        "IO",
+                        ErrorCode::Io,
                         "Recovered journal version mismatch",
                         &header.path,
                     ));
@@ -187,21 +176,21 @@ impl<B: Backend> EditorCore<B> {
             validate_text(&document.snapshot().text, &header.path)?;
             if document.version() != header.applied {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Recovered document version mismatch",
                     &header.path,
                 ));
             }
             if let Some(cursor) = &header.disk_cursor {
-                let (disk_text, bom, ending) = decode(&cursor.bytes, &header.path)?;
-                if disk_text != header.saved_text
-                    || bom != header.bom
-                    || ending != header.line_ending
+                let decoded = decode(&cursor.bytes, &header.path)?;
+                if decoded.text != header.saved_text
+                    || decoded.bom != header.bom
+                    || decoded.line_ending != header.line_ending
                     || header.saved_version.as_ref() != Some(&cursor.version)
                     || document.historical_text(&cursor.version)? != header.saved_text
                 {
                     return Err(EditorError::new(
-                        "IO",
+                        ErrorCode::Io,
                         "Invalid disk history cursor",
                         &header.path,
                     ));
@@ -209,14 +198,14 @@ impl<B: Backend> EditorCore<B> {
             } else if matches!(options.external_changes, ExternalChangePolicy::Merge) {
                 let version = header.saved_version.as_ref().ok_or_else(|| {
                     EditorError::new(
-                        "Conflict",
+                        ErrorCode::Conflict,
                         "Missing historical disk baseline; explicit recovery required",
                         &header.path,
                     )
                 })?;
                 if document.historical_text(version)? != header.saved_text {
                     return Err(EditorError::new(
-                        "IO",
+                        ErrorCode::Io,
                         "Historical disk baseline text mismatch",
                         &header.path,
                     ));
@@ -227,36 +216,21 @@ impl<B: Backend> EditorCore<B> {
                 && document.historical_text(version)? != pending.text
             {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Invalid pending write version",
                     &header.path,
                 ));
             }
-            let persisted_version = backend.persistent().then(|| header.applied.clone());
             records.insert(
                 header.id.clone(),
-                Record {
-                    observation: ObservationCoordinator::default(),
-                    replica: ReplicaState::default(),
-                    dirty: !document.content_matches(&header.saved_text),
-                    header,
-                    buffer: document,
-                    pending_observation: None,
-                    uncommitted: vec![],
-                    persisted_version,
-                    conflict: false,
-                    error: None,
-
-                    first_dirty: None,
-                },
+                Record::new(header, document, ReplicaState::default()),
             );
         }
         let mut core = Self {
             file_observation_cursor: None,
             backend,
             records,
-            failure: None,
-            requires_reopen: false,
+            health: HistoryHealth::Ok,
             options,
             source_epoch: 0,
             mutations: vec![],
@@ -273,11 +247,11 @@ impl<B: Backend> EditorCore<B> {
     fn record(&self, id: &str) -> EditorResult<&Record> {
         self.records
             .get(id)
-            .ok_or_else(|| EditorError::new("NotFound", "Document not found", id))
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Document not found", id))
     }
     fn writable(&self) -> EditorResult<()> {
-        if let Some(error) = &self.failure {
-            return Err(EditorError::new("IO", error, ""));
+        if let Some(error) = self.health.message() {
+            return Err(EditorError::new(ErrorCode::Io, error, ""));
         }
         Ok(())
     }
@@ -285,21 +259,21 @@ impl<B: Backend> EditorCore<B> {
         self.writable()?;
         if !self.record(id)?.replica.attached {
             return Err(EditorError::new(
-                "Closed",
+                ErrorCode::Closed,
                 "Replica document is not subscribed",
                 id,
             ));
         }
         if self.record(id)?.replica.read_only {
             return Err(EditorError::new(
-                "PermissionDenied",
+                ErrorCode::PermissionDenied,
                 "当前远端文档只读。",
                 id,
             ));
         }
         if self.record(id)?.header.deleted {
             return Err(EditorError::new(
-                "NotFound",
+                ErrorCode::NotFound,
                 "Document was deleted; its history is retained",
                 id,
             ));
@@ -307,22 +281,11 @@ impl<B: Backend> EditorCore<B> {
         Ok(())
     }
     pub fn status(&self, id: &str) -> EditorResult<DocumentStatus> {
-        let record = self.record(id)?;
-        let header = &record.header;
-        Ok(DocumentStatus {
-            id: id.into(),
-            path: header.path.clone(),
-            version: record.buffer.version(),
-            saved_version: header.saved_version.clone(),
-            persisted_version: record.persisted_version.clone(),
-            file_revision: header.disk_revision.clone(),
-            dirty: record.dirty,
-            deleted: header.deleted,
-            conflict: record.conflict,
-            error: record.error.clone(),
-            external_change: record.observation.status(),
-            persistence_error: self.failure.clone(),
-        })
+        Ok(self.record(id)?.status(
+            id,
+            self.backend.persistent(),
+            self.health.message().map(str::to_owned),
+        ))
     }
     pub fn resident_status(&self) -> EditorResult<Vec<DocumentStatus>> {
         self.records.keys().map(|id| self.status(id)).collect()
@@ -337,7 +300,7 @@ impl<B: Backend> EditorCore<B> {
             status: self.status(id)?,
             saved_content: include_saved_content.then(|| record.header.saved_text.clone()),
             bom: record.header.bom,
-            line_ending: record.header.line_ending.clone(),
+            line_ending: record.header.line_ending,
         })
     }
     /// Create stable positions in the currently borrowed document. Offsets are
@@ -419,32 +382,26 @@ impl<B: Backend> EditorCore<B> {
         let record = self.record(id)?;
         let header = &record.header;
         let snapshot = record.buffer.snapshot();
-        let dirty = record.dirty;
+        let status = record.status(
+            id,
+            self.backend.persistent(),
+            self.health.message().map(str::to_owned),
+        );
         Ok(EditorDocument {
-            external_change: record.observation.status(),
-            id: id.into(),
-            path: header.path.clone(),
+            status,
             undo: record.buffer.undo_state(),
             peer_id: record.buffer.peer_id(),
             saved_content: header.saved_text.clone(),
             bom: header.bom,
-            line_ending: header.line_ending.clone(),
-            dirty,
-            deleted: header.deleted,
-            conflict: record.conflict,
-            file_revision: header.disk_revision.clone(),
-            saved_version: header.saved_version.clone(),
-            persisted_version: record.persisted_version.clone(),
-            persistence_error: self.failure.clone(),
-            error: record.error.clone(),
-            autosave_delay: if dirty
+            line_ending: header.line_ending,
+            autosave_delay: if record.dirty
                 && (self.backend.has_projection() || record.replica.host_authoritative)
                 && !record.replica.read_only
                 && !header.deleted
                 && !record.conflict
                 && record.error.is_none()
                 && record.observation.status().is_none()
-                && self.failure.is_none()
+                && self.health.is_ok()
             {
                 Some(
                     800.min(
@@ -458,7 +415,10 @@ impl<B: Backend> EditorCore<B> {
             } else {
                 None
             },
-            snapshot,
+            snapshot: DocumentText {
+                text: snapshot.text,
+                state_revision: snapshot.state_revision,
+            },
         })
     }
     /// Join an existing history in a private replica, without creating a file projection.
@@ -476,14 +436,14 @@ impl<B: Backend> EditorCore<B> {
         validate_editor_path(path)?;
         if self.backend.has_projection() || path.is_empty() {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "Joining requires a private replica and a file path",
                 path,
             ));
         }
         if packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "CRDT snapshot exceeds 16 MiB",
                 path,
             ));
@@ -492,7 +452,7 @@ impl<B: Backend> EditorCore<B> {
         if let Some(record) = self.records.get(&id) {
             if record.header.path != path || record.buffer.identity() != &packet.identity {
                 return Err(EditorError::new(
-                    "Conflict",
+                    ErrorCode::Conflict,
                     "Joined document identity/path mismatch",
                     path,
                 ));
@@ -505,7 +465,7 @@ impl<B: Backend> EditorCore<B> {
             .any(|record| !record.header.deleted && record.header.path == path)
         {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Path belongs to another document history",
                 path,
             ));
@@ -529,24 +489,11 @@ impl<B: Backend> EditorCore<B> {
             disk_cursor: None,
             deleted: false,
             bom: false,
-            line_ending: "\n".into(),
+            line_ending: LineEnding::Lf,
         };
         self.records.insert(
             id.clone(),
-            Record {
-                observation: ObservationCoordinator::default(),
-                replica: ReplicaState::default(),
-                dirty: !document.content_matches(&header.saved_text),
-                header,
-                buffer: document,
-                pending_observation: None,
-                uncommitted: vec![],
-                persisted_version: None,
-                conflict: false,
-                error: None,
-
-                first_dirty: None,
-            },
+            Record::new(header, document, ReplicaState::default()),
         );
         self.persist(&id).await?;
         Ok(id)
@@ -567,19 +514,19 @@ impl<B: Backend> EditorCore<B> {
             .backend
             .read_file(path, Some(MAX_TEXT_BYTES as u64))
             .await?;
-        let (text, bom, line_ending) = decode(&disk.data, path)?;
+        let decoded = decode(&disk.data, path)?;
         let identity = DocumentIdentity {
             document_id: self.backend.new_id()?,
             history_id: self.backend.new_id()?,
         };
-        let document = Buffer::new(identity.clone(), &text)?;
+        let document = Buffer::new(identity.clone(), &decoded.text)?;
         let header = DocumentHeader {
             id: identity.document_id.clone(),
             path: path.into(),
             seed: document.export_snapshot()?,
             sequence: 0,
             applied: document.version(),
-            saved_text: text,
+            saved_text: decoded.text,
             disk_revision: disk.revision,
             saved_version: Some(document.version()),
             pending_write: None,
@@ -591,25 +538,12 @@ impl<B: Backend> EditorCore<B> {
                 },
             ),
             deleted: false,
-            bom,
-            line_ending,
+            bom: decoded.bom,
+            line_ending: decoded.line_ending,
         };
         self.records.insert(
             header.id.clone(),
-            Record {
-                observation: ObservationCoordinator::default(),
-                replica: ReplicaState::default(),
-                dirty: !document.content_matches(&header.saved_text),
-                header,
-                buffer: document,
-                uncommitted: vec![],
-                pending_observation: None,
-                persisted_version: None,
-                conflict: false,
-                error: None,
-
-                first_dirty: None,
-            },
+            Record::new(header, document, ReplicaState::default()),
         );
         self.persist(&identity.document_id).await?;
         Ok(identity.document_id)
@@ -626,8 +560,8 @@ impl<B: Backend> EditorCore<B> {
         if !self.backend.has_projection() {
             return errors;
         }
-        if let Some(error) = &self.failure {
-            errors.push(EditorError::new("IO", error, ""));
+        if let Some(error) = self.health.message() {
+            errors.push(EditorError::new(ErrorCode::Io, error, ""));
             return errors;
         }
         let ids: Vec<_> = self.records.keys().cloned().collect();
@@ -635,7 +569,7 @@ impl<B: Backend> EditorCore<B> {
             if let Err(error) = self.refresh(&id).await {
                 errors.push(error);
             }
-            if self.failure.is_some() {
+            if !self.health.is_ok() {
                 return errors;
             }
         }
@@ -651,7 +585,7 @@ impl<B: Backend> EditorCore<B> {
                 states.push(self.read(&id)?);
             }
         }
-        states.sort_by(|a, b| a.path.cmp(&b.path));
+        states.sort_by(|a, b| a.status.path.cmp(&b.status.path));
         Ok(states)
     }
     pub async fn refresh_path(&mut self, path: &str) -> EditorResult<()> {
@@ -687,7 +621,7 @@ impl<B: Backend> EditorCore<B> {
 
     async fn refresh_disk(&mut self, id: &str) -> EditorResult<()> {
         let record = self.record(id)?;
-        if !self.backend.has_projection() || record.header.deleted || self.failure.is_some() {
+        if !self.backend.has_projection() || record.header.deleted || !self.health.is_ok() {
             return Ok(());
         }
         let disk = match self
@@ -725,8 +659,8 @@ impl<B: Backend> EditorCore<B> {
             record.error = Some("文件已在外部修改，本地编辑仍保留。".into());
             return Ok(());
         }
-        let (text, bom, ending) = decode(&disk.data, &record.header.path)?;
-        self.adopt_disk(id, (text, bom, ending), disk, false).await
+        let decoded = decode(&disk.data, &record.header.path)?;
+        self.adopt_disk(id, decoded, disk, false).await
     }
 
     fn cursor(
@@ -745,7 +679,9 @@ impl<B: Backend> EditorCore<B> {
             .as_ref()
             .map_or(0, |c| c.observation)
             .checked_add(1)
-            .ok_or_else(|| EditorError::new("IO", "Disk observation counter exhausted", id))?;
+            .ok_or_else(|| {
+                EditorError::new(ErrorCode::Io, "Disk observation counter exhausted", id)
+            })?;
         Ok(Some(DiskCursor {
             version,
             observation,
@@ -762,7 +698,7 @@ impl<B: Backend> EditorCore<B> {
         let header = candidate.header.clone();
         let entry = candidate.entry.clone();
         if let Err(error) = self.backend.commit(&header, entry.as_ref()).await {
-            self.failure = Some(format!("文件协调尚未持久化：{}", error.message));
+            self.health = HistoryHealth::Failed(format!("文件协调尚未持久化：{}", error.message));
             return Err(error);
         }
         let candidate = self
@@ -782,10 +718,9 @@ impl<B: Backend> EditorCore<B> {
             match result {
                 Ok(update) if update.after == header.applied => Some(update),
                 _ => {
-                    self.requires_reopen = true;
-                    self.failure =
-                        Some("文件协调已提交，但活动 core 未能应用；必须重新打开。".into());
-                    return Err(EditorError::new("IO", self.failure.clone().unwrap(), id));
+                    let message = "文件协调已提交，但活动 core 未能应用；必须重新打开。";
+                    self.health = HistoryHealth::ReopenRequired(message.into());
+                    return Err(EditorError::new(ErrorCode::Io, message, id));
                 }
             }
         } else {
@@ -793,19 +728,17 @@ impl<B: Backend> EditorCore<B> {
         };
         let record = self.records.get_mut(id).unwrap();
         record.header = header;
-        record.dirty = !record.buffer.content_matches(&record.header.saved_text);
-        record.persisted_version = self
-            .backend
-            .persistent()
-            .then(|| record.header.applied.clone());
+        record.refresh_dirty();
         record.observation.queued = None;
         record.observation.failure = None;
         record.conflict = false;
         record.error = None;
-        if record.buffer.content_matches(&record.header.saved_text) {
+        if record.dirty {
+            if record.first_dirty.is_none() {
+                record.first_dirty = Some(self.backend.now_ms());
+            }
+        } else {
             record.first_dirty = None;
-        } else if record.first_dirty.is_none() {
-            record.first_dirty = Some(self.backend.now_ms());
         }
         if let Some(update) = update {
             self.publish_update(id, update, Ok(()))?;
@@ -824,7 +757,7 @@ impl<B: Backend> EditorCore<B> {
             || self.record(id)?.pending_observation.is_some()
         {
             return Err(EditorError::new(
-                "IO",
+                ErrorCode::Io,
                 "History must be committed before observing disk",
                 id,
             ));
@@ -874,11 +807,15 @@ impl<B: Backend> EditorCore<B> {
     async fn adopt_disk(
         &mut self,
         id: &str,
-        decoded: (String, bool, String),
+        decoded: DecodedText,
         disk: FileSnapshot,
         clear_undo: bool,
     ) -> EditorResult<()> {
-        let (text, bom, ending) = decoded;
+        let DecodedText {
+            text,
+            bom,
+            line_ending,
+        } = decoded;
         let mut external = Buffer::from_snapshot(&self.record(id)?.buffer.export_snapshot()?)?;
         let external_update = external.replace_text(&text)?;
         let cursor = self.cursor(id, external_update.after, disk.data)?;
@@ -907,7 +844,7 @@ impl<B: Backend> EditorCore<B> {
         record.header.saved_version = Some(record.buffer.version());
         record.header.disk_revision = disk.revision;
         record.header.bom = bom;
-        record.header.line_ending = ending;
+        record.header.line_ending = line_ending;
         record.header.pending_write = None;
         record.header.disk_cursor = cursor;
         record.conflict = false;
@@ -934,7 +871,7 @@ impl<B: Backend> EditorCore<B> {
     ) -> EditorResult<()> {
         if self.backend.has_projection() {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "Host receipts require a private replica",
                 id,
             ));
@@ -951,17 +888,15 @@ impl<B: Backend> EditorCore<B> {
                 }))
         {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Host path belongs to another document",
                 &state.path,
             ));
         }
         let version = self.record(id)?.buffer.version();
-        if !version.contains(&state.version)
-            || !matches!(state.line_ending.as_str(), "\n" | "\r" | "\r\n")
-        {
+        if !version.contains(&state.version) {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Host receipt has an unseen or different history",
                 id,
             ));

@@ -62,7 +62,7 @@ async fn listing_does_not_open_buffers_or_create_state_files() {
     let directory = host.ok("GET", "/directory?path=", Value::Null).await;
     assert_eq!(directory.as_array().unwrap().len(), 2);
     let opened = host.open("note.md").await;
-    assert!(opened["durableVersion"].is_null());
+    assert!(opened["persistedVersion"].is_null());
     drop(host);
     let names: Vec<_> = fs::read_dir(f.0.path().join("a"))
         .unwrap()
@@ -80,7 +80,7 @@ async fn directories_with_the_same_share_secret_have_distinct_identities() {
     assert_ne!(a.key, b.key);
     let first = a.ok("GET", "", Value::Null).await;
     let second = b.ok("GET", "", Value::Null).await;
-    assert_ne!(first["vaultIdentity"]["id"], second["vaultIdentity"]["id"]);
+    assert_ne!(first["vault"]["vaultId"], second["vault"]["vaultId"]);
     assert_eq!(b.open("note.md").await["snapshot"]["text"], "second vault");
 }
 

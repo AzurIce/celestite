@@ -1,31 +1,28 @@
 #![recursion_limit = "256"]
+
+pub const PROTOCOL_VERSION: u32 = 4;
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    extract::{DefaultBodyLimit, Path, State},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
-    routing::{get, post},
-    Extension, Json, Router,
+    response::{IntoResponse, Response},
+    Json, Router,
 };
+use celestite_core::backend::{EditorError, ErrorCode};
 mod collaboration;
 mod documents_api;
+mod files_api;
 mod package_resources;
 mod profile;
 mod reconcile;
 mod shares;
 mod sync;
-mod wire;
 pub use shares::{Permission, VaultLinks};
 pub mod vault;
 use notify::Watcher;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -35,17 +32,13 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{broadcast, watch};
-use tokio_stream::{
-    wrappers::{BroadcastStream, WatchStream},
-    StreamExt,
-};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use vault::documents::Documents;
-use vault::fs::{revision, ChangeHint, FsVault, VaultError};
+use vault::fs::{ChangeHint, FsVault};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,38 +133,39 @@ struct RemoteAccess {
 }
 
 #[derive(Debug)]
-pub struct ApiError(VaultError);
-impl From<VaultError> for ApiError {
-    fn from(error: VaultError) -> Self {
+pub struct ApiError(EditorError);
+impl From<EditorError> for ApiError {
+    fn from(error: EditorError) -> Self {
         Self(error)
     }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self.0.code {
-            "InvalidPath" => StatusCode::BAD_REQUEST,
-            "NotFound" => StatusCode::NOT_FOUND,
-            "PermissionDenied" => StatusCode::FORBIDDEN,
-            "AlreadyExists" | "DirectoryNotEmpty" | "Conflict" | "StaleVersion" => {
-                StatusCode::CONFLICT
-            }
-            "InvalidEdit" => StatusCode::BAD_REQUEST,
-            "FilesystemDiffTimeout" | "FilesystemReconciliationPending" => StatusCode::CONFLICT,
-            "NotDirectory" | "NotFile" => StatusCode::UNPROCESSABLE_ENTITY,
-            "Unsupported" => StatusCode::NOT_IMPLEMENTED,
-            "QuotaExceeded" => StatusCode::INSUFFICIENT_STORAGE,
+            ErrorCode::InvalidPath | ErrorCode::InvalidEdit => StatusCode::BAD_REQUEST,
+            ErrorCode::NotFound => StatusCode::NOT_FOUND,
+            ErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
+            ErrorCode::AlreadyExists
+            | ErrorCode::DirectoryNotEmpty
+            | ErrorCode::Conflict
+            | ErrorCode::StaleVersion
+            | ErrorCode::FilesystemDiffTimeout
+            | ErrorCode::FilesystemReconciliationPending => StatusCode::CONFLICT,
+            ErrorCode::NotDirectory | ErrorCode::NotFile => StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
+            ErrorCode::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status.is_server_error() {
-            tracing::error!(code = self.0.code, message = %self.0.message, path = %self.0.path, "Vault operation failed");
+            tracing::error!(code = %self.0.code, message = %self.0.message, path = %self.0.path, "Vault operation failed");
         } else {
-            tracing::debug!(code = self.0.code, message = %self.0.message, path = %self.0.path, "Vault operation rejected");
+            tracing::debug!(code = %self.0.code, message = %self.0.message, path = %self.0.path, "Vault operation rejected");
         }
         (status, Json(self.0)).into_response()
     }
 }
-fn failure(code: &'static str, message: &str) -> ApiError {
-    VaultError::new(code, message, "").into()
+fn failure(code: ErrorCode, message: &str) -> ApiError {
+    EditorError::new(code, message, "").into()
 }
 fn request_operation(method: &Method, tail: &str) -> shares::Operation {
     use shares::Operation;
@@ -194,7 +188,7 @@ async fn access_check(
     next: Next,
 ) -> Response {
     let Some(key) = params.get("id") else {
-        return failure("NotFound", "Share not found").into_response();
+        return failure(ErrorCode::NotFound, "Share not found").into_response();
     };
     let grant = match state.shares.resolve(key) {
         Ok(grant) => grant,
@@ -207,14 +201,17 @@ async fn access_check(
                 .iter()
                 .any(|allowed| origin.as_bytes() == allowed.as_bytes())
         {
-            return failure("PermissionDenied", "This client origin is not allowed")
-                .into_response();
+            return failure(
+                ErrorCode::PermissionDenied,
+                "This client origin is not allowed",
+            )
+            .into_response();
         }
     }
     let tail = request
         .uri()
         .path()
-        .split_once("/api/v1")
+        .split_once("/api/v4")
         .map(|(_, tail)| tail)
         .unwrap_or("");
     let operation = request_operation(request.method(), tail);
@@ -237,8 +234,8 @@ async fn api_headers(request: axum::extract::Request, next: Next) -> Response {
 }
 
 fn log_path(path: &str) -> String {
-    if let Some((_, tail)) = path.split_once("/api/v1") {
-        format!("/<redacted>/api/v1{tail}")
+    if let Some((_, tail)) = path.split_once("/api/v4") {
+        format!("/<redacted>/api/v4{tail}")
     } else if path.split('/').any(|segment| {
         shares::key_permission(segment).is_some() || (segment.contains('%') && segment.len() >= 43)
     }) {
@@ -305,7 +302,7 @@ pub fn build_server(
     let seed = shares::seed(vault.share_key.as_deref())?;
     let documents = Documents::open(&root, &seed)?;
     let files = documents.files.clone();
-    let identity = documents.identity.id.clone();
+    let identity = documents.identity.vault_id.clone();
     let (trigger, observations) = reconcile::channel();
     let reconcile_signal = trigger.clone();
     let (file_events, _) = broadcast::channel(128);
@@ -351,13 +348,7 @@ pub fn build_server(
         .merge(package_resources::routes())
         .merge(documents_api::routes())
         .merge(sync::routes())
-        .route("/{id}/api/v1", get(describe))
-        .route("/{id}/api/v1/stat", get(stat))
-        .route("/{id}/api/v1/directory", get(read_dir).post(mkdir))
-        .route("/{id}/api/v1/file", get(read_file).put(write_file))
-        .route("/{id}/api/v1/entry", axum::routing::delete(remove))
-        .route("/{id}/api/v1/rename", post(rename))
-        .route("/{id}/api/v1/events", get(events))
+        .merge(files_api::routes())
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), access_check))
         .layer(
@@ -423,164 +414,6 @@ pub fn build_server(
     })
 }
 
-#[derive(Deserialize)]
-struct FileQuery {
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    recursive: bool,
-    mode: Option<String>,
-}
-async fn describe(
-    Extension(access): Extension<RemoteAccess>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let grant = access.grant.clone();
-    let vault = grant.vault.clone();
-    let documents = vault
-        .documents
-        .lock()
-        .map_err(|_| failure("IO", "Document lock failed"))?;
-    Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "version": 1, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.root, "vaultIdentity": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
-    ))
-}
-async fn stat(
-    Extension(access): Extension<RemoteAccess>,
-    Query(query): Query<FileQuery>,
-) -> Result<Json<Option<vault::fs::Entry>>, ApiError> {
-    Ok(Json(
-        vault::runtime::execute_files(access.grant.vault.clone(), false, move |v| {
-            v.stat(&query.path)
-        })
-        .await?,
-    ))
-}
-async fn read_dir(
-    Extension(access): Extension<RemoteAccess>,
-    Query(query): Query<FileQuery>,
-) -> Result<Json<Vec<vault::fs::Entry>>, ApiError> {
-    Ok(Json(
-        vault::runtime::execute_files(access.grant.vault.clone(), false, move |v| {
-            v.read_dir(&query.path)
-        })
-        .await?,
-    ))
-}
-async fn read_file(
-    Extension(access): Extension<RemoteAccess>,
-    Query(query): Query<FileQuery>,
-) -> Result<Response, ApiError> {
-    let bytes = vault::runtime::execute_files(access.grant.vault.clone(), false, move |v| {
-        if v.stat(&query.path)?
-            .and_then(|e| e.size)
-            .is_some_and(|s| s > 64 * 1024 * 1024)
-        {
-            return Err(VaultError::new(
-                "Unsupported",
-                "MVP file limit is 64 MiB",
-                &query.path,
-            ));
-        }
-        v.read_file_limited(&query.path, 64 * 1024 * 1024)
-    })
-    .await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (header::ETAG, revision(&bytes)),
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        bytes,
-    )
-        .into_response())
-}
-async fn write_file(
-    Extension(access): Extension<RemoteAccess>,
-    Query(query): Query<FileQuery>,
-    headers: HeaderMap,
-    bytes: Bytes,
-) -> Result<Response, ApiError> {
-    let expected = headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    if query.mode.as_deref() == Some("replace") && expected.is_none() {
-        return Err(failure(
-            "Conflict",
-            "Replace requires the version returned by reading the file",
-        ));
-    }
-    let version = vault::runtime::execute(access.grant.vault.clone(), true, move |v, documents| {
-        documents.before_replace(&query.path)?;
-        let version = v.write_file(
-            &query.path,
-            &bytes,
-            query.mode.as_deref().unwrap_or(""),
-            expected.as_deref(),
-        )?;
-        documents.refresh_path(&query.path)?;
-        Ok(version)
-    })
-    .await?;
-    Ok((StatusCode::NO_CONTENT, [(header::ETAG, version)]).into_response())
-}
-async fn mkdir(
-    Extension(access): Extension<RemoteAccess>,
-    Query(query): Query<FileQuery>,
-) -> Result<StatusCode, ApiError> {
-    vault::runtime::execute_files(access.grant.vault.clone(), true, move |v| {
-        v.mkdir(&query.path, query.recursive)
-    })
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn remove(
-    Extension(access): Extension<RemoteAccess>,
-    Query(query): Query<FileQuery>,
-) -> Result<StatusCode, ApiError> {
-    vault::runtime::execute(access.grant.vault.clone(), true, move |_, documents| {
-        documents.remove(&query.path, query.recursive)
-    })
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-#[derive(Deserialize)]
-struct Rename {
-    from: String,
-    to: String,
-}
-async fn rename(
-    Extension(access): Extension<RemoteAccess>,
-    Json(args): Json<Rename>,
-) -> Result<StatusCode, ApiError> {
-    vault::runtime::execute(access.grant.vault.clone(), true, move |_, documents| {
-        documents.rename(&args.from, &args.to)
-    })
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn events(
-    State(state): State<Arc<ServerState>>,
-    Extension(access): Extension<RemoteAccess>,
-) -> Result<Response, ApiError> {
-    let receiver = access.grant.vault.clone().events.subscribe();
-    let first = tokio_stream::once(Ok::<_, Infallible>(
-        Event::default().json_data(ChangeHint::all()).unwrap(),
-    ));
-    let hints = BroadcastStream::new(receiver)
-        .map(|event| Some(event.unwrap_or_else(|_| ChangeHint::all())));
-    let stopping = WatchStream::new(state.shutdown.subscribe())
-        .filter(|stopping| *stopping)
-        .map(|_| None::<ChangeHint>);
-    let stream = hints
-        .merge(stopping)
-        .take_while(Option::is_some)
-        .map(|hint| Ok::<_, Infallible>(Event::default().json_data(hint.unwrap()).unwrap()));
-    Ok(Sse::new(first.chain(stream))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response())
-}
-
 #[cfg(test)]
 pub(crate) mod testing {
     #[derive(Clone)]
@@ -597,7 +430,7 @@ pub(crate) mod testing {
             }
         }
         pub fn uri(&self, tail: &str) -> String {
-            format!("/{}/api/v1{tail}", self.key)
+            format!("/{}/api/v4{tail}", self.key)
         }
     }
 }
@@ -609,8 +442,8 @@ mod tests {
         let key = "A".repeat(43);
         assert_eq!(super::log_path(&format!("/{key}")), "/<redacted>");
         assert_eq!(
-            super::log_path(&format!("/ro-{key}/api/v1/documents")),
-            "/<redacted>/api/v1/documents"
+            super::log_path(&format!("/ro-{key}/api/v4/documents")),
+            "/<redacted>/api/v4/documents"
         );
         assert_eq!(
             super::log_path(&format!("/%41{}", "A".repeat(42))),
@@ -975,7 +808,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/invalid/api/v1")
+                    .uri("/invalid/api/v4")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1128,7 +961,7 @@ mod tests {
             debug.into_body().collect().await.unwrap().to_bytes(),
             "<h1>UI</h1>"
         );
-        for uri in ["/private.md", "/../vault/private.md", "/api/v1/unknown"] {
+        for uri in ["/private.md", "/../vault/private.md", "/api/v4/unknown"] {
             let response = router
                 .router
                 .clone()

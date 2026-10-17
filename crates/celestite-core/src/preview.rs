@@ -1,6 +1,6 @@
 //! Derived document previews. Scheduling policy lives here; platforms execute
 //! immutable tasks separately from editing and persistence.
-use crate::backend::{EditorError, EditorResult};
+use crate::backend::{EditorError, EditorResult, ErrorCode};
 #[cfg(feature = "preview")]
 use crate::editor::MAX_TEXT_BYTES;
 use crate::editor::validate_editor_path;
@@ -292,7 +292,7 @@ pub enum PreviewLink {
 pub fn resolve_preview_target(path: &str, target: &str) -> EditorResult<PreviewLink> {
     let invalid = || {
         EditorError::new(
-            "InvalidPath",
+            ErrorCode::InvalidPath,
             "Invalid preview link or path outside Vault",
             path,
         )
@@ -379,14 +379,14 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
     let computed = (|| -> EditorResult<PreviewOutput> {
         if task.source.len() > MAX_TEXT_BYTES || task.source.contains('\r') {
             return Err(EditorError::new(
-                "InvalidPreview",
+                ErrorCode::InvalidPreview,
                 "Preview requires bounded LF source",
                 &task.ticket.path,
             ));
         }
         let extension = preview_extension(&task.ticket.path).ok_or_else(|| {
             EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "Unsupported preview format",
                 &task.ticket.path,
             )
@@ -417,13 +417,21 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
                         })
                         .collect();
                 }
-                EditorError::new("InvalidPreview", error.to_string(), &task.ticket.path)
+                EditorError::new(
+                    ErrorCode::InvalidPreview,
+                    error.to_string(),
+                    &task.ticket.path,
+                )
             })?;
         let analysis = computed.analysis;
         let transformed = computed.transformed;
         let rendered = computed.rendered;
         let environment = vault.environment_for(&path).map_err(|error| {
-            EditorError::new("InvalidPreview", error.to_string(), &task.ticket.path)
+            EditorError::new(
+                ErrorCode::InvalidPreview,
+                error.to_string(),
+                &task.ticket.path,
+            )
         })?;
         let used_components = rendered
             .used_components
@@ -484,7 +492,7 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
             while byte < offset {
                 let Some(character) = chars.next() else {
                     return Err(EditorError::new(
-                        "InvalidPreview",
+                        ErrorCode::InvalidPreview,
                         "Preview mapping exceeds source",
                         &task.ticket.path,
                     ));
@@ -494,7 +502,7 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
             }
             if byte != offset {
                 return Err(EditorError::new(
-                    "InvalidPreview",
+                    ErrorCode::InvalidPreview,
                     "Preview mapping splits a Unicode scalar",
                     &task.ticket.path,
                 ));
@@ -538,7 +546,7 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
         };
         if output.bytes() > MAX_PREVIEW_OUTPUT_BYTES {
             return Err(EditorError::new(
-                "PreviewLimit",
+                ErrorCode::PreviewLimit,
                 "预览内容超过容量，请缩小文档。",
                 &task.ticket.path,
             ));

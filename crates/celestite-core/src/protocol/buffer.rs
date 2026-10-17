@@ -3,8 +3,8 @@ use super::byte_to_utf16;
 use celestite_buffer::Buffer;
 use celestite_buffer::text::utf16_to_byte;
 use celestite_buffer::types::{
-    BufferError, BufferUpdate, ChangeCause, EditOptions, HistoryPacket, ImportOptions,
-    TextSnapshot, UndoContext, UndoState, Version,
+    BufferError, BufferUpdate, ChangeCause, EditOptions, HistoryPacket, ImportOptions, Restoration,
+    UndoContext, UndoState, Version,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -120,7 +120,7 @@ impl Contexts {
         }
     }
 
-    pub(super) fn restored(&self, text: &str, context: &UndoContext) -> Result<Value, BufferError> {
+    pub(super) fn restored(&self, text: &str, context: &Restoration) -> Result<Value, BufferError> {
         let positions = context
             .positions
             .iter()
@@ -162,7 +162,8 @@ pub(super) fn encode_update(
     contexts: &Contexts,
     update: &BufferUpdate,
     before: &str,
-    after: &TextSnapshot,
+    after_text: &str,
+    state_revision: u64,
     undo: &UndoState,
     pending: bool,
 ) -> Result<Value, BufferError> {
@@ -180,7 +181,7 @@ pub(super) fn encode_update(
     let restored = update
         .restored
         .as_ref()
-        .map(|context| contexts.restored(&after.text, context))
+        .map(|context| contexts.restored(after_text, context))
         .transpose()?;
     let kind = match update.cause {
         ChangeCause::Local => "local",
@@ -195,8 +196,8 @@ pub(super) fn encode_update(
         "before": update.before,
         "after": update.after,
         "beforeLen": byte_to_utf16(before, update.before_len)?,
-        "afterLen": byte_to_utf16(&after.text, update.after_len)?,
-        "stateRevision": after.state_revision,
+        "afterLen": byte_to_utf16(after_text, update.after_len)?,
+        "stateRevision": state_revision,
         "edits": edits,
         "undo": undo,
         "restored": restored,
@@ -265,11 +266,13 @@ impl BufferAdapter {
             self.contexts.discard(allocated);
         }
         let update = result?;
+        let after = buffer.snapshot();
         let encoded = encode_update(
             &self.contexts,
             &update,
             &before.text,
-            &buffer.snapshot(),
+            &after.text,
+            after.state_revision,
             &buffer.undo_state(),
             buffer.has_pending_imports(),
         )?;

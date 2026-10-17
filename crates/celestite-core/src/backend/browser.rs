@@ -1,10 +1,11 @@
 //! Browser IO adapter. JS exposes file and private-history primitives; legacy storage is decoded here.
 use super::{
-    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileEntry, FileSnapshot,
-    JournalEntry, PendingWrite, StoredDocument, WritePhase,
+    Backend, DirectoryIntent, DirectoryOperation, DocumentHeader, EditorError, EditorResult,
+    ErrorCode, FileEntry, FileSnapshot, JournalEntry, PendingWrite, StoredDocument, WritePhase,
 };
 use crate::editor::validate_editor_path;
 use crate::instance::InstanceIdentity;
+use crate::text::LineEnding;
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{DocumentIdentity, HistoryPacket, HistoryPacketKind, Version};
 use js_sys::{Function, Promise};
@@ -44,7 +45,7 @@ struct Receipt {
     saved_content: String,
     disk_revision: String,
     bom: bool,
-    line_ending: String,
+    line_ending: LineEnding,
 }
 #[derive(Serialize, Deserialize)]
 struct UpdateMeta {
@@ -65,22 +66,22 @@ impl BrowserBackend {
         let promise = self
             .io
             .call1(&JsValue::NULL, &JsValue::from_str(&request))
-            .map_err(|e| EditorError::new("IO", format!("Browser bridge: {e:?}"), ""))?;
+            .map_err(|e| EditorError::new(ErrorCode::Io, format!("Browser bridge: {e:?}"), ""))?;
         let result = JsFuture::from(Promise::resolve(&promise))
             .await
-            .map_err(|e| EditorError::new("IO", format!("Browser bridge: {e:?}"), ""))?;
+            .map_err(|e| EditorError::new(ErrorCode::Io, format!("Browser bridge: {e:?}"), ""))?;
         let response: Value = serde_json::from_str(
             &result
                 .as_string()
-                .ok_or_else(|| EditorError::new("IO", "Invalid IO reply", ""))?,
+                .ok_or_else(|| EditorError::new(ErrorCode::Io, "Invalid IO reply", ""))?,
         )
-        .map_err(|e| EditorError::new("IO", e.to_string(), ""))?;
+        .map_err(|e| EditorError::new(ErrorCode::Io, e.to_string(), ""))?;
         if let Some(error) = response.get("error") {
             return Err(serde_json::from_value(error.clone())
-                .map_err(|e| EditorError::new("IO", e.to_string(), ""))?);
+                .map_err(|e| EditorError::new(ErrorCode::Io, e.to_string(), ""))?);
         }
         serde_json::from_value(response["result"].clone())
-            .map_err(|e| EditorError::new("IO", e.to_string(), ""))
+            .map_err(|e| EditorError::new(ErrorCode::Io, e.to_string(), ""))
     }
     async fn read_json<T: DeserializeOwned>(&self, path: &str) -> EditorResult<Option<T>> {
         self.call("readJson", json!({"path":path})).await
@@ -117,7 +118,11 @@ impl Backend for BrowserBackend {
             .ok()
             .and_then(|value| value.as_string())
             .ok_or_else(|| {
-                EditorError::new("IO", "Platform could not create a document identity", "")
+                EditorError::new(
+                    ErrorCode::Io,
+                    "Platform could not create a document identity",
+                    "",
+                )
             })
     }
     fn now_ms(&self) -> u64 {
@@ -127,7 +132,11 @@ impl Backend for BrowserBackend {
         let catalog: Option<Catalog> = self.read_json("catalog.json").await?;
         if let Some(catalog) = catalog {
             if catalog.schema != 1 {
-                return Err(EditorError::new("IO", "Unsupported catalog schema", ""));
+                return Err(EditorError::new(
+                    ErrorCode::Io,
+                    "Unsupported catalog schema",
+                    "",
+                ));
             }
             self.entries = catalog.entries;
         }
@@ -136,7 +145,7 @@ impl Backend for BrowserBackend {
         for entry in &self.entries {
             if !valid_id(&entry.id) || !valid_id(&entry.history_id) || !ids.insert(&entry.id) {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Invalid browser catalog identity",
                     &entry.path,
                 ));
@@ -147,12 +156,14 @@ impl Backend for BrowserBackend {
                 .read_json(&format!("{dir}/head.json"))
                 .await?
                 .ok_or_else(|| {
-                    EditorError::new("IO", "Missing committed history head", &entry.path)
+                    EditorError::new(ErrorCode::Io, "Missing committed history head", &entry.path)
                 })?;
             let seed = self
                 .bytes(&format!("{dir}/seed.bin"))
                 .await?
-                .ok_or_else(|| EditorError::new("IO", "Missing document seed", &entry.path))?;
+                .ok_or_else(|| {
+                    EditorError::new(ErrorCode::Io, "Missing document seed", &entry.path)
+                })?;
             let identity = DocumentIdentity {
                 document_id: entry.id.clone(),
                 history_id: entry.history_id.clone(),
@@ -169,7 +180,7 @@ impl Backend for BrowserBackend {
                     .bytes(&format!("{dir}/updates/{sequence}.bin"))
                     .await?
                     .ok_or_else(|| {
-                        EditorError::new("IO", "Missing committed update", &entry.path)
+                        EditorError::new(ErrorCode::Io, "Missing committed update", &entry.path)
                     })?;
                 let meta: Option<UpdateMeta> = self
                     .read_json(&format!("{dir}/updates/{sequence}.meta.json"))
@@ -208,7 +219,9 @@ impl Backend for BrowserBackend {
                 let receipt: Receipt = self
                     .read_json(&format!("{dir}/projection.json"))
                     .await?
-                    .ok_or_else(|| EditorError::new("IO", "Missing file baseline", &entry.path))?;
+                    .ok_or_else(|| {
+                        EditorError::new(ErrorCode::Io, "Missing file baseline", &entry.path)
+                    })?;
                 let intent: Option<Receipt> =
                     self.read_json(&format!("{dir}/save-intent.json")).await?;
                 DocumentHeader {
@@ -242,7 +255,7 @@ impl Backend for BrowserBackend {
                 || header.applied != head.version
             {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Stored browser history identity/version mismatch",
                     &entry.path,
                 ));
@@ -307,23 +320,25 @@ impl Backend for BrowserBackend {
         if let Some(intent) = self.read_json::<Value>("rename-intent.json").await? {
             let entries: Vec<(String, String)> = intent["entries"]
                 .as_array()
-                .ok_or_else(|| EditorError::new("IO", "Invalid legacy move intent", ""))?
+                .ok_or_else(|| EditorError::new(ErrorCode::Io, "Invalid legacy move intent", ""))?
                 .iter()
                 .map(|e| {
                     serde_json::from_value(json!([e["id"], e["path"]]))
-                        .map_err(|e| EditorError::new("IO", e.to_string(), ""))
+                        .map_err(|e| EditorError::new(ErrorCode::Io, e.to_string(), ""))
                 })
                 .collect::<EditorResult<_>>()?;
             return Ok(Some(DirectoryIntent {
-                operation: "rename".into(),
+                operation: DirectoryOperation::Rename,
                 from: intent["from"]
                     .as_str()
-                    .ok_or_else(|| EditorError::new("IO", "Invalid move source", ""))?
+                    .ok_or_else(|| EditorError::new(ErrorCode::Io, "Invalid move source", ""))?
                     .into(),
                 to: Some(
                     intent["to"]
                         .as_str()
-                        .ok_or_else(|| EditorError::new("IO", "Invalid move destination", ""))?
+                        .ok_or_else(|| {
+                            EditorError::new(ErrorCode::Io, "Invalid move destination", "")
+                        })?
                         .into(),
                 ),
                 entries,
@@ -332,15 +347,17 @@ impl Backend for BrowserBackend {
         if let Some(intent) = self.read_json::<Value>("remove-intent.json").await? {
             let entries = intent["paths"]
                 .as_array()
-                .ok_or_else(|| EditorError::new("IO", "Invalid legacy removal intent", ""))?
+                .ok_or_else(|| {
+                    EditorError::new(ErrorCode::Io, "Invalid legacy removal intent", "")
+                })?
                 .iter()
                 .map(|e| {
                     serde_json::from_value(json!([e["id"], e["path"]]))
-                        .map_err(|e| EditorError::new("IO", e.to_string(), ""))
+                        .map_err(|e| EditorError::new(ErrorCode::Io, e.to_string(), ""))
                 })
                 .collect::<EditorResult<Vec<_>>>()?;
             return Ok(Some(DirectoryIntent {
-                operation: "remove".into(),
+                operation: DirectoryOperation::Remove,
                 from: String::new(),
                 to: None,
                 entries,

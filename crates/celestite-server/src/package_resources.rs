@@ -1,9 +1,10 @@
 //! Read-only package IO. Notist discovers dependencies; Vault file/history IO stays separate.
 use crate::{
-    vault::fs::{self, ChangeHint, Entry, FsVault, VaultError},
+    vault::fs::{self, ChangeHint, FsVault},
     ApiError, RemoteAccess, ServerState,
 };
 use axum::{routing::post, Extension, Json, Router};
+use celestite_core::backend::{EditorError, EntryKind, ErrorCode, FileEntry};
 use celestite_core::preview::{PreviewResource, PreviewResourceKind, PreviewResourceRequest};
 use notify::{RecursiveMode, Watcher};
 use notist::{resources::ResourceKind, ResourceError, Resources};
@@ -138,8 +139,8 @@ impl PackageResources {
             let identity = if path.starts_with('/') {
                 let identity = FsPath::new(path);
                 if notist::resources::normalize(identity) != identity {
-                    return Err(VaultError::new(
-                        "InvalidPath",
+                    return Err(EditorError::new(
+                        ErrorCode::InvalidPath,
                         "Expected a normalized package manifest identity",
                         path,
                     ));
@@ -153,16 +154,16 @@ impl PackageResources {
                 .file_name()
                 .is_none_or(|name| name != "Notist.toml")
             {
-                return Err(VaultError::new(
-                    "InvalidPath",
+                return Err(EditorError::new(
+                    ErrorCode::InvalidPath,
                     "Only Notist configuration snapshots are accepted",
                     path,
                 ));
             }
             bytes = bytes.saturating_add(source.len());
             if bytes > 32 * 1024 * 1024 {
-                return Err(VaultError::new(
-                    "Unsupported",
+                return Err(EditorError::new(
+                    ErrorCode::Unsupported,
                     "Configuration overlays exceed 32 MiB",
                     path,
                 ));
@@ -182,7 +183,7 @@ impl PackageResources {
         let mut watches = self
             .watches
             .lock()
-            .map_err(|_| VaultError::new("IO", "Package watcher lock failed", ""))?;
+            .map_err(|_| EditorError::new(ErrorCode::Io, "Package watcher lock failed", ""))?;
         for root in &packages {
             if root.starts_with(&self.root) {
                 continue;
@@ -202,8 +203,8 @@ impl PackageResources {
                     continue;
                 }
                 if watches.paths.len() >= 2048 {
-                    return Err(VaultError::new(
-                        "Unsupported",
+                    return Err(EditorError::new(
+                        ErrorCode::Unsupported,
                         "Too many package resource directories",
                         "",
                     ));
@@ -211,7 +212,7 @@ impl PackageResources {
                 watches
                     .watcher
                     .watch(&path, mode)
-                    .map_err(|error| VaultError::new("IO", error.to_string(), ""))?;
+                    .map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), ""))?;
                 watches.paths.insert(path);
             }
         }
@@ -220,8 +221,8 @@ impl PackageResources {
     fn resolve(&self, context: &Context, path: &str) -> fs::Result<(FsVault, String)> {
         let resource = FsPath::new(path);
         if !resource.is_absolute() || notist::resources::normalize(resource) != resource {
-            return Err(VaultError::new(
-                "InvalidPath",
+            return Err(EditorError::new(
+                ErrorCode::InvalidPath,
                 "Expected an absolute package resource identity",
                 path,
             ));
@@ -236,7 +237,11 @@ impl PackageResources {
                 || relative.starts_with("components")
             {
                 let relative = relative.to_str().ok_or_else(|| {
-                    VaultError::new("InvalidPath", "Package resource path is not UTF-8", path)
+                    EditorError::new(
+                        ErrorCode::InvalidPath,
+                        "Package resource path is not UTF-8",
+                        path,
+                    )
                 })?;
                 fs::validate_path(relative)?;
                 // An explicit package directory may itself be a symlink. Its contents use
@@ -244,28 +249,30 @@ impl PackageResources {
                 let canonical = match root.canonicalize() {
                     Ok(path) => path,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(VaultError::new(
-                            "NotFound",
+                        return Err(EditorError::new(
+                            ErrorCode::NotFound,
                             "Package directory does not exist",
                             path,
                         ))
                     }
-                    Err(error) => return Err(VaultError::new("IO", error.to_string(), path)),
+                    Err(error) => {
+                        return Err(EditorError::new(ErrorCode::Io, error.to_string(), path))
+                    }
                 };
                 return FsVault::open(&canonical)
                     .map(|files| (files, relative.to_owned()))
-                    .map_err(|error| VaultError::new("IO", error.to_string(), path));
+                    .map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), path));
             }
         }
-        Err(VaultError::new(
-            "PermissionDenied",
+        Err(EditorError::new(
+            ErrorCode::PermissionDenied,
             "Resource is not a manifest, declaration or component of a configured package",
             path,
         ))
     }
     fn read(&self, input: ReadRequest) -> fs::Result<PreviewResource> {
         let (files, path) = match self.resolve(&input.context, &input.request.path) {
-            Err(error) if error.code == "NotFound" => {
+            Err(error) if error.code == ErrorCode::NotFound => {
                 return Ok(PreviewResource {
                     kind: None,
                     data: None,
@@ -282,11 +289,11 @@ impl PackageResources {
             });
         };
         let kind = match stat.kind {
-            "file" => PreviewResourceKind::File,
-            "directory" => PreviewResourceKind::Directory,
+            EntryKind::File => PreviewResourceKind::File,
+            EntryKind::Directory => PreviewResourceKind::Directory,
             _ => {
-                return Err(VaultError::new(
-                    "Unsupported",
+                return Err(EditorError::new(
+                    ErrorCode::Unsupported,
                     "Package resource must be a file or directory",
                     &input.request.path,
                 ))
@@ -303,7 +310,7 @@ impl PackageResources {
             error: None,
         })
     }
-    fn directory(&self, input: DirectoryRequest) -> fs::Result<Vec<Entry>> {
+    fn directory(&self, input: DirectoryRequest) -> fs::Result<Vec<FileEntry>> {
         let (files, path) = self.resolve(&input.context, &input.path)?;
         let mut entries = files.read_dir(&path)?;
         for entry in &mut entries {
@@ -321,8 +328,8 @@ impl PackageResources {
 }
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/{id}/api/v1/preview/resources", post(read))
-        .route("/{id}/api/v1/preview/directory", post(directory))
+        .route("/{id}/api/v4/preview/resources", post(read))
+        .route("/{id}/api/v4/preview/directory", post(directory))
 }
 async fn read(
     Extension(access): Extension<RemoteAccess>,
@@ -331,18 +338,18 @@ async fn read(
     let vault = access.grant.vault.clone();
     tokio::task::spawn_blocking(move || vault.packages.read(input))
         .await
-        .map_err(|_| crate::failure("IO", "Package IO failed"))?
+        .map_err(|_| crate::failure(ErrorCode::Io, "Package IO failed"))?
         .map(Json)
         .map_err(Into::into)
 }
 async fn directory(
     Extension(access): Extension<RemoteAccess>,
     Json(input): Json<DirectoryRequest>,
-) -> Result<Json<Vec<Entry>>, ApiError> {
+) -> Result<Json<Vec<FileEntry>>, ApiError> {
     let vault = access.grant.vault.clone();
     tokio::task::spawn_blocking(move || vault.packages.directory(input))
         .await
-        .map_err(|_| crate::failure("IO", "Package IO failed"))?
+        .map_err(|_| crate::failure(ErrorCode::Io, "Package IO failed"))?
         .map(Json)
         .map_err(Into::into)
 }
@@ -490,10 +497,10 @@ mod tests {
             .contains(&package));
         let mut documents = crate::vault::documents::Documents::open(&root, &[0; 32]).unwrap();
         documents.open_file("a.not").unwrap();
-        assert!(documents
-            .resident()
-            .unwrap()
-            .iter()
-            .all(|doc| !doc.path.contains("lib.notc") && !doc.path.contains("components")));
+        assert!(documents.resident().unwrap().iter().all(|doc| !doc
+            .status
+            .path
+            .contains("lib.notc")
+            && !doc.status.path.contains("components")));
     }
 }

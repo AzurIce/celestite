@@ -9,6 +9,7 @@ use celestite_buffer::{
     types::{Affinity, Anchor, HistoryPacket},
     Buffer,
 };
+use celestite_core::backend::ErrorCode;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,7 @@ fn vault(root: &std::path::Path) -> Arc<HostedVault> {
     let (events, _) = tokio::sync::broadcast::channel(128);
     let (trigger, _) = crate::reconcile::channel();
     Arc::new(HostedVault {
-        id: documents.identity.id.clone(),
+        id: documents.identity.vault_id.clone(),
         name: "Notes".into(),
         read_only: false,
         files: Mutex::new(documents.files.clone()),
@@ -53,7 +54,7 @@ async fn request(
 }
 
 #[test]
-fn v3_document_receipt_keeps_peer_precision_and_host_metadata() {
+fn v4_document_receipt_keeps_peer_precision_and_host_metadata() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
     let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
@@ -71,23 +72,20 @@ fn v3_document_receipt_keeps_peer_precision_and_host_metadata() {
     let expected_packet = documents.snapshot(&id).unwrap();
     let expected_host = documents.host_document(&id, None).unwrap();
     let receipt = session.receipt(&mut documents, &id).unwrap();
-    assert_eq!(receipt["writerId"], "18446744073709551614");
-    assert!(receipt.get("peerId").is_none());
+    assert_eq!(receipt["peerId"], "18446744073709551614");
+    assert!(receipt.get("writerId").is_none());
     assert_eq!(receipt["packet"], json!(expected_packet));
-    assert_eq!(
-        receipt["document"],
-        crate::wire::host_document(&expected_host)
-    );
+    assert_eq!(receipt["document"], json!(expected_host));
     let metadata = &receipt["document"];
-    assert!(metadata.get("durableVersion").is_some());
-    assert!(metadata.get("backendRevision").is_some());
-    for key in ["peerId", "persistedVersion", "fileRevision"] {
+    assert!(metadata.get("persistedVersion").is_some());
+    assert!(metadata.get("fileRevision").is_some());
+    for key in ["writerId", "durableVersion", "backendRevision"] {
         assert!(metadata.get(key).is_none());
     }
     assert_eq!(metadata["savedContent"], "A😀B");
     let next = session.receipt(&mut documents, &id).unwrap();
     assert!(next["document"].get("savedContent").is_none());
-    assert_eq!(next["writerId"], receipt["writerId"]);
+    assert_eq!(next["peerId"], receipt["peerId"]);
     assert_eq!(session.documents[&id].peer_id, u64::MAX - 1);
 }
 
@@ -121,7 +119,7 @@ async fn presence_uses_real_anchors_and_causal_admission_without_editing_or_savi
     let id = receipt["document"]["id"].as_str().unwrap();
     let mut replica = Buffer::from_snapshot_with_peer_id(
         &packet,
-        receipt["writerId"].as_str().unwrap().parse().unwrap(),
+        receipt["peerId"].as_str().unwrap().parse().unwrap(),
     )
     .unwrap();
     let selection = json!({"version": replica.version(), "mainIndex": 0, "ranges": [{"anchor": replica.anchor_at(1, Affinity::After).unwrap(), "head": replica.anchor_at(6, Affinity::Before).unwrap()}]});
@@ -164,9 +162,9 @@ async fn presence_uses_real_anchors_and_causal_admission_without_editing_or_savi
     let mut oversized = view.clone();
     oversized["selection"]["ranges"] = json!(vec![selection["ranges"][0].clone(); 17]);
     for (label, payload, code) in [
-        ("main index", invalid, "InvalidEdit"),
-        ("future version", future, "StaleVersion"),
-        ("range limit", oversized, "InvalidEdit"),
+        ("main index", invalid, ErrorCode::InvalidEdit),
+        ("future version", future, ErrorCode::StaleVersion),
+        ("range limit", oversized, ErrorCode::InvalidEdit),
     ] {
         assert_eq!(
             request(&host, &session, &readonly, payload)
@@ -180,7 +178,7 @@ async fn presence_uses_real_anchors_and_causal_admission_without_editing_or_savi
     }
 
     let update = replica.edit([(0..0, "前")]).unwrap();
-    assert_eq!(request(&host, &session, &readonly, json!({"method":"updates","id":id,"packet":update.operation,"version":update.after,"operation":1})).await.unwrap_err().0.code, "PermissionDenied");
+    assert_eq!(request(&host, &session, &readonly, json!({"method":"updates","id":id,"packet":update.operation,"version":update.after,"operation":1})).await.unwrap_err().0.code, ErrorCode::PermissionDenied);
     request(&host, &session, &edit, json!({"method":"updates","id":id,"packet":update.operation,"version":update.after,"operation":1})).await.unwrap();
     // A stored selection survives concurrent insertion through CRDT identity.
     let anchor: Anchor = serde_json::from_value(selection["ranges"][0]["anchor"].clone()).unwrap();

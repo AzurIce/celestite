@@ -5,6 +5,7 @@ pub mod instance;
 pub mod preview;
 pub mod protocol;
 pub mod source;
+pub mod text;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;

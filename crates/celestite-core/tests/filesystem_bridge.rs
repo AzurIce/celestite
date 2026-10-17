@@ -1,5 +1,5 @@
 use celestite_core::backend::{
-    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileSnapshot,
+    Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, ErrorCode, FileSnapshot,
     JournalEntry, StoredDocument, WritePhase,
 };
 use celestite_core::editor::observation::ExternalChangeStatus;
@@ -50,7 +50,7 @@ impl HostBackend {
     }
 }
 fn error() -> EditorError {
-    EditorError::new("IO", "injected failure", "a.md")
+    EditorError::new(ErrorCode::Io, "injected failure", "a.md")
 }
 fn revision(bytes: &[u8]) -> String {
     format!("{bytes:?}")
@@ -199,11 +199,11 @@ fn detached_observation_merges_into_newer_live_edits_and_keeps_personal_undo() {
         let task = core.take_file_observation().unwrap().unwrap();
         assert!(core.take_file_observation().unwrap().is_none());
         assert_eq!(
-            core.read(&id).unwrap().external_change,
+            core.read(&id).unwrap().status.external_change,
             Some(ExternalChangeStatus::Pending)
         );
         let error = core.save(&id, None).await.unwrap_err();
-        assert_eq!(error.code, "FilesystemReconciliationPending");
+        assert_eq!(error.code, ErrorCode::FilesystemReconciliationPending);
         assert_eq!(backend.state.borrow().writes, 0);
         edit(&mut core, &id, 2, 8, "MIDDLE").await;
         assert!(
@@ -215,7 +215,7 @@ fn detached_observation_merges_into_newer_live_edits_and_keeps_personal_undo() {
         assert_eq!(state.snapshot.text.as_ref(), "A1 MIDDLE B1");
         assert_eq!(state.saved_content, "A1 middle B1");
         assert_eq!(state.peer_id, peer_id);
-        assert!(state.external_change.is_none());
+        assert!(state.status.external_change.is_none());
         core.undo(&id).await.unwrap();
         assert_eq!(
             core.read(&id).unwrap().snapshot.text.as_ref(),
@@ -303,14 +303,14 @@ fn timeout_backoff_preserves_history_and_retries_only_after_an_explicit_trigger(
             .complete_file_observation(task.compute_with_budget(std::time::Duration::ZERO))
             .await
             .unwrap_err();
-        assert_eq!(error.code, "FilesystemDiffTimeout");
+        assert_eq!(error.code, ErrorCode::FilesystemDiffTimeout);
         assert_eq!(error.path, "a.md");
         assert_eq!(core.read(&id).unwrap().snapshot, before);
         assert_eq!(backend.header(&id).sequence, 0);
         assert_eq!(
-            core.read(&id).unwrap().external_change,
+            core.read(&id).unwrap().status.external_change,
             Some(ExternalChangeStatus::Failed {
-                code: error.code.clone(),
+                code: error.code,
                 message: error.message.clone(),
                 retry_at: 31_000,
             })
@@ -321,7 +321,7 @@ fn timeout_backoff_preserves_history_and_retries_only_after_an_explicit_trigger(
         assert!(!core.has_file_observations());
         assert_eq!(
             core.save(&id, None).await.unwrap_err().code,
-            "FilesystemDiffTimeout"
+            ErrorCode::FilesystemDiffTimeout
         );
         assert_eq!(backend.state.borrow().writes, 0);
         backend.state.borrow_mut().now = 31_000;
@@ -331,7 +331,7 @@ fn timeout_backoff_preserves_history_and_retries_only_after_an_explicit_trigger(
             .await
             .unwrap_err();
         assert!(matches!(
-            core.read(&id).unwrap().external_change,
+            core.read(&id).unwrap().status.external_change,
             Some(ExternalChangeStatus::Failed {
                 retry_at: 91_000,
                 ..
@@ -345,7 +345,7 @@ fn timeout_backoff_preserves_history_and_retries_only_after_an_explicit_trigger(
             .await
             .unwrap_err();
         assert!(matches!(
-            core.read(&id).unwrap().external_change,
+            core.read(&id).unwrap().status.external_change,
             Some(ExternalChangeStatus::Failed {
                 retry_at: 61_000,
                 ..
@@ -357,7 +357,7 @@ fn timeout_backoff_preserves_history_and_retries_only_after_an_explicit_trigger(
         core.complete_file_observation(retry.compute())
             .await
             .unwrap();
-        assert!(core.read(&id).unwrap().external_change.is_none());
+        assert!(core.read(&id).unwrap().status.external_change.is_none());
         assert_eq!(core.read(&id).unwrap().snapshot.text.as_ref(), "changed");
     });
 }
@@ -383,7 +383,10 @@ fn fine_diff_and_continuous_disk_branch_preserve_live_peer_and_personal_undo() {
             let state = core.read(&id).unwrap();
             assert_eq!(state.snapshot.text.as_ref(), expected);
             assert_eq!(state.saved_content, disk);
-            assert_ne!(state.saved_version.as_ref(), Some(&state.snapshot.version));
+            assert_ne!(
+                state.status.saved_version.as_ref(),
+                Some(&state.status.version)
+            );
             assert_eq!(state.peer_id, peer_id);
             let sequence = backend.header(&id).sequence;
             core.refresh(&id).await.unwrap();
@@ -421,7 +424,10 @@ fn observed_aba_and_restart_keep_disk_version_separate_from_merged_version() {
         assert_eq!(core.read(&id).unwrap().snapshot.text, merged);
         core.save(&id, None).await.unwrap();
         let saved = core.read(&id).unwrap();
-        assert_eq!(saved.saved_version.as_ref(), Some(&saved.snapshot.version));
+        assert_eq!(
+            saved.status.saved_version.as_ref(),
+            Some(&saved.status.version)
+        );
         assert_eq!(
             backend.header(&id).disk_cursor.unwrap().bytes,
             merged.as_bytes()
@@ -448,8 +454,8 @@ fn failed_or_lost_commit_receipts_do_not_publish_and_retry_the_same_operation() 
             let failed = core.read(&id).unwrap();
             assert_eq!(failed.snapshot, before.snapshot);
             assert_eq!(failed.saved_content, before.saved_content);
-            assert_eq!(failed.saved_version, before.saved_version);
-            assert!(failed.persistence_error.is_some());
+            assert_eq!(failed.status.saved_version, before.status.saved_version);
+            assert!(failed.status.persistence_error.is_some());
             backend.state.borrow_mut().fail_commit = false;
             core.retry_history().await.unwrap();
             {
@@ -502,12 +508,12 @@ fn format_only_changes_preserve_text_history_and_exact_mixed_line_endings() {
         backend.external(raw);
         core.refresh(&id).await.unwrap();
         let after = core.read(&id).unwrap();
-        assert_eq!(before.snapshot.version, after.snapshot.version);
+        assert_eq!(before.status.version, after.status.version);
         assert!(!after.undo.can_undo);
         assert_eq!(backend.header(&id).sequence, 0);
         assert_eq!(backend.header(&id).disk_cursor.unwrap().bytes, raw);
         assert!(after.bom);
-        assert_eq!(after.line_ending, "\r\n");
+        assert_eq!(after.line_ending, celestite_core::text::LineEnding::CrLf);
         drop(core);
         assert!(open_host(backend).await.is_ok());
     });
@@ -528,7 +534,7 @@ fn prepared_write_proves_no_io_but_started_old_bytes_and_aba_remain_uncertain() 
             let mut core = open_host(backend.clone()).await.unwrap();
             core.refresh(&id).await.unwrap();
             let state = core.read(&id).unwrap();
-            assert!(state.conflict);
+            assert!(state.status.conflict);
             assert!(state.autosave_delay.is_none());
             assert!(core.save(&id, None).await.is_err());
             assert_eq!(backend.state.borrow().writes, 1);
@@ -553,7 +559,7 @@ fn prepared_write_proves_no_io_but_started_old_bytes_and_aba_remain_uncertain() 
         backend.state.borrow_mut().fail_started = false;
         let mut core = open_host(backend.clone()).await.unwrap();
         core.refresh(&id).await.unwrap();
-        assert!(!core.read(&id).unwrap().conflict);
+        assert!(!core.read(&id).unwrap().status.conflict);
         assert!(backend.header(&id).pending_write.is_none());
         core.save(&id, None).await.unwrap();
         assert_eq!(backend.state.borrow().bytes, b"new");
@@ -604,7 +610,7 @@ fn completed_write_recovers_receipt_but_a_third_disk_state_is_not_merged() {
             core.refresh(&id).await.unwrap();
             let state = core.read(&id).unwrap();
             assert_eq!(state.snapshot.text.as_ref(), "new");
-            assert_eq!(state.conflict, third);
+            assert_eq!(state.status.conflict, third);
             assert_eq!(backend.header(&id).pending_write.is_some(), third);
             assert_eq!(backend.state.borrow().writes, 1);
         }
@@ -618,18 +624,18 @@ fn save_reconciles_disk_then_rejects_a_now_stale_requested_version() {
         let mut core = open_host(backend.clone()).await.unwrap();
         let id = core.open_file("a.md").await.unwrap();
         edit(&mut core, &id, 4, 4, " local").await;
-        let version = core.read(&id).unwrap().snapshot.version;
+        let version = core.read(&id).unwrap().status.version;
         backend.external(b"external base");
         assert_eq!(
             core.save(&id, Some(version)).await.unwrap_err().code,
-            "StaleVersion"
+            ErrorCode::StaleVersion
         );
         assert_eq!(
             core.read(&id).unwrap().snapshot.text.as_ref(),
             "external base local"
         );
         assert_eq!(backend.state.borrow().writes, 0);
-        let version = core.read(&id).unwrap().snapshot.version;
+        let version = core.read(&id).unwrap().status.version;
         core.save(&id, Some(version)).await.unwrap();
         assert_eq!(backend.state.borrow().bytes, b"external base local");
     });
@@ -710,10 +716,10 @@ fn unicode_disk_sequences_survive_restore_including_empty_noop_and_aba() {
                 drop(core);
                 core = open_host(backend.clone()).await.unwrap();
                 core.refresh(&id).await.unwrap();
-                let restored = core.read(&id).unwrap().snapshot;
+                let restored = core.read(&id).unwrap();
                 assert_eq!(
-                    (restored.version, restored.text),
-                    (before.snapshot.version, before.snapshot.text),
+                    (restored.status.version, restored.snapshot.text),
+                    (before.status.version, before.snapshot.text),
                     "{scenario}"
                 );
             }

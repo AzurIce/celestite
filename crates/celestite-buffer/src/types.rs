@@ -125,6 +125,16 @@ pub struct UndoState {
     pub can_redo: bool,
 }
 
+/// Caller context restored by undo/redo. The private frame keeps its tag alive
+/// while an external receipt still needs to encode the caller's metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restoration {
+    pub tag: Option<u64>,
+    /// UTF-8 byte positions in AFTER text.
+    pub positions: Vec<usize>,
+    pub(crate) frame: Option<Arc<Vec<u8>>>,
+}
+
 /// One accepted command's complete effects. An error means no command was
 /// accepted; an unchanged result is a successful no-op. No hidden event queue
 /// or second export step is required. Display edits are never CRDT operations.
@@ -138,14 +148,12 @@ pub struct BufferUpdate {
     pub before_len: usize,
     pub after_len: usize,
     pub edits: Vec<TextEdit>,
-    /// UTF-8 byte positions in AFTER text and tag restored by undo/redo.
-    pub restored: Option<UndoContext>,
+    /// Positions and caller tag restored by undo/redo.
+    pub restored: Option<Restoration>,
     /// Exact accepted bytes for journaling. For local changes these contain
     /// only this peer's new operations; imports retain the original packet.
     /// None for a no-op or a change to personal undo only.
     pub operation: Option<HistoryPacket>,
-    /// Keep restored caller context live while a receipt awaits external encoding.
-    pub(super) _restored_frame: Option<Arc<Vec<u8>>>,
 }
 
 impl BufferUpdate {

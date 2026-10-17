@@ -46,11 +46,11 @@ impl Host {
         )
         .unwrap();
         let url = format!(
-            "http://{address}/{}/api/v1",
+            "http://{address}/{}/api/v4",
             server.links.key(Permission::Edit)
         );
         let readonly_url = format!(
-            "http://{address}/{}/api/v1",
+            "http://{address}/{}/api/v4",
             server.links.key(Permission::Readonly)
         );
         let stopping = server.shutdown;
@@ -102,7 +102,7 @@ impl Host {
         ClientReplica::connect(&self.url).await
     }
     pub async fn identity(&self) -> Value {
-        self.json("GET", "", Value::Null).await["vaultIdentity"].clone()
+        self.json("GET", "", Value::Null).await["vault"].clone()
     }
     pub async fn socket(&self) -> Socket {
         connect_async(self.url.replace("http:", "ws:") + "/sync")
@@ -148,14 +148,14 @@ impl ClientReplica {
             .json::<Value>()
             .await
             .unwrap();
-        let identity = descriptor["vaultIdentity"].clone();
+        let identity = descriptor["vault"].clone();
         let mut socket = connect_async(url.replace("http:", "ws:") + "/sync")
             .await
             .unwrap()
             .0;
         socket
             .send(Message::Text(
-                json!({"protocolVersion":3,"vaultIdentity":identity})
+                json!({"protocolVersion":4,"vault":identity})
                     .to_string()
                     .into(),
             ))
@@ -174,7 +174,7 @@ impl ClientReplica {
             InstanceIdentity {
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 vault: Vault {
-                    vault_id: identity["id"].as_str().unwrap().into(),
+                    vault_id: identity["vaultId"].as_str().unwrap().into(),
                     history_id: identity["historyId"].as_str().unwrap().into(),
                 },
             },
@@ -249,9 +249,9 @@ impl ClientReplica {
             path: host["path"].as_str().unwrap().into(),
             version: serde_json::from_value(host["version"].clone()).unwrap(),
             saved_content: self.saved.get(&id).expect("initial saved content").clone(),
-            file_revision: host["backendRevision"].as_str().unwrap().into(),
+            file_revision: host["fileRevision"].as_str().unwrap().into(),
             bom: host["bom"].as_bool().unwrap(),
-            line_ending: host["lineEnding"].as_str().unwrap().into(),
+            line_ending: serde_json::from_value(host["lineEnding"].clone()).unwrap(),
             deleted: host["deleted"].as_bool().unwrap(),
             conflict: host["conflict"].as_bool().unwrap(),
             error: host["error"].as_str().map(str::to_owned),
@@ -261,7 +261,7 @@ impl ClientReplica {
         if self.core.read(&id).is_ok() {
             assert_eq!(
                 self.core.peer_id(&id).unwrap(),
-                frame["writerId"].as_str().unwrap().parse::<u64>().unwrap()
+                frame["peerId"].as_str().unwrap().parse::<u64>().unwrap()
             );
             self.core.import(&id, packet).await.unwrap();
             self.core.apply_host_state(&id, state).await.unwrap();
@@ -269,7 +269,7 @@ impl ClientReplica {
             self.core
                 .join_replica_document(ReplicaDocument {
                     packets: vec![packet],
-                    peer_id: Some(frame["writerId"].as_str().unwrap().parse().unwrap()),
+                    peer_id: Some(frame["peerId"].as_str().unwrap().parse().unwrap()),
                     state,
                 })
                 .await

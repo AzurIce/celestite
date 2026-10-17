@@ -32,7 +32,7 @@ async fn sessions_subscribe_only_when_they_open_a_buffer() {
         observer
             .request(
                 "probe",
-                json!({"id":id,"version":editor.core.read(&id).unwrap().snapshot.version})
+                json!({"id":id,"version":editor.core.read(&id).unwrap().status.version})
             )
             .await["error"]["code"],
         "InvalidEdit"
@@ -60,7 +60,7 @@ async fn reconnect_can_reopen_a_moved_buffer_by_identity() {
         .await;
     let mut new = host.client_replica().await;
     new.sync(&id).await;
-    assert_eq!(new.core.read(&id).unwrap().path, "renamed.md");
+    assert_eq!(new.core.read(&id).unwrap().status.path, "renamed.md");
     assert_ne!(new.core.peer_id(&id).unwrap(), peer_id);
     assert_eq!(new.core.read(&id).unwrap().snapshot.text, text);
     new.close().await;
@@ -163,12 +163,12 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
     for (label, handshake, code) in [
         (
             "protocol",
-            json!({"protocolVersion":0,"vaultIdentity":identity}),
-            "PermissionDenied",
+            json!({"protocolVersion":0,"vault":identity}),
+            "Unsupported",
         ),
         (
             "history",
-            json!({"protocolVersion":3,"vaultIdentity":{"id":"wrong","historyId":"wrong"}}),
+            json!({"protocolVersion":4,"vault":{"vaultId":"wrong","historyId":"wrong"}}),
             "Conflict",
         ),
     ] {
@@ -235,7 +235,7 @@ async fn restart_discards_unsaved_history_and_invalidates_old_sessions() {
     let identity = host.identity().await;
     let mut old = host.client_replica().await;
     let id = old.open("a.md").await;
-    let version = old.edit(&id, 0, 0, "unsaved").await.snapshot.version;
+    let version = old.edit(&id, 0, 0, "unsaved").await.status.version;
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.md")).unwrap(),
         "ab🦀cd\nsecond\n"
@@ -245,7 +245,7 @@ async fn restart_discards_unsaved_history_and_invalidates_old_sessions() {
     let saved = old.replace(&saved_id, "saved text").await;
     old.ok(
         "save",
-        json!({"id":saved_id,"version":saved.snapshot.version}),
+        json!({"id":saved_id,"version":saved.status.version}),
     )
     .await;
     let session = old.session.clone();
@@ -254,7 +254,7 @@ async fn restart_discards_unsaved_history_and_invalidates_old_sessions() {
     host.stop().await;
     let host = Host::start(root.path(), false).await;
     let fresh = host.identity().await;
-    assert_eq!(fresh["id"], identity["id"]);
+    assert_eq!(fresh["vaultId"], identity["vaultId"]);
     assert_ne!(fresh["historyId"], identity["historyId"]);
     assert_eq!(host.json("GET", "/documents", Value::Null).await, json!([]));
     assert_eq!(

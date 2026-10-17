@@ -27,7 +27,7 @@ Celestite 使用统一的 Rust EditorCore。每个 VaultInstance 构造自己的
 
 每个 server 进程只服务一个 Vault，以 `[vault]` 配置目录和权限；客户端可以连接多个独立 server。server 协作状态只驻留内存，普通文件通过保存写回托管目录。集中托管多个 Vault 留待 SaaS 场景再设计。
 
-远端连接使用 `https://host/<key>` 作为基址，接口追加 `/api/v1/...`。每个 Vault 固定提供 readonly / edit 两条链接，由秘密值、Vault 身份和独立权限域派生；readonly 使用 `ro-` 前缀，完整 key 参与凭证查找，URL 不含 Vault 名称或磁盘路径。server 的 Vault 身份由秘密值和规范根目录确定，协作历史身份每次启动重新生成。
+远端连接使用 `https://host/<key>` 作为基址，接口追加 `/api/v4/...`。每个 Vault 固定提供 readonly / edit 两条链接，由秘密值、Vault 身份和独立权限域派生；readonly 使用 `ro-` 前缀，完整 key 参与凭证查找，URL 不含 Vault 名称或磁盘路径。server 的 Vault 身份由秘密值和规范根目录确定，协作历史身份每次启动重新生成。
 
 配置文件和 CLI 均可省略 `share_key`，由宿主生成仅供本次进程使用的随机秘密值。复用显式秘密值与同一根目录可保留链接；修改秘密值或根目录并重启轮换两种链接。固定链接不提供历史恢复。`public_url` 决定公开基址。宿主启动日志输出完整链接，普通请求与诊断脱敏 key。没有动态分享管理或分享初始化流程。
 

@@ -150,14 +150,14 @@ async fn observation_updates_open_buffers_without_discovering_unopened_files() {
     assert_eq!(initial["documents"], json!([]));
     let opened = host.open("nested/a.md").await;
     let id = opened["id"].as_str().unwrap().to_owned();
-    let old = opened["snapshot"]["version"].clone();
+    let old = opened["version"].clone();
     std::fs::write(root.path().join("nested/a.md"), "external base 😀").unwrap();
     let changed = feed.until(&id, |notice| notice["version"] != old).await;
     assert_eq!(changed["available"], true);
     assert_eq!(changed["version"], changed["savedVersion"]);
     let state = host.state(&id).await;
     assert_eq!(state["snapshot"]["text"], "external base 😀");
-    assert!(state["durableVersion"].is_null());
+    assert!(state["persistedVersion"].is_null());
     // A new file has never been opened or fetched by a client.
     std::fs::write(root.path().join("nested/new.md"), "new").unwrap();
     assert_eq!(
@@ -183,28 +183,26 @@ async fn consecutive_disk_edits_merge_with_dirty_history_and_saved_echo_does_not
     let initial = feed.next().await;
     let id = notice(&initial, "a.md")["id"].as_str().unwrap().to_owned();
     let state = host.mutate(&id, Some((2..8, "MIDDLE"))).await;
-    feed.until(&id, |notice| {
-        notice["version"] == state["snapshot"]["version"]
-    })
-    .await;
-    let peer_id = host.state(&id).await["writerId"].clone();
-    let mut prior = state["snapshot"]["version"].clone();
+    feed.until(&id, |notice| notice["version"] == state["version"])
+        .await;
+    let peer_id = host.state(&id).await["peerId"].clone();
+    let mut prior = state["version"].clone();
     for text in ["A1 middle B1", "A2 middle B2", "A middle B"] {
         std::fs::write(root.path().join("a.md"), text).unwrap();
         let event = feed.until(&id, |notice| notice["version"] != prior).await;
         prior = event["version"].clone();
         let state = host.state(&id).await;
         assert_eq!(state["snapshot"]["text"], text.replace("middle", "MIDDLE"));
-        assert_eq!(state["writerId"], peer_id);
+        assert_eq!(state["peerId"], peer_id);
         assert_eq!(state["conflict"], false);
     }
     let saved = host.save(&id, prior.clone()).await;
     feed.until(&id, |notice| notice["dirty"] == false).await;
-    assert_eq!(saved["snapshot"]["version"], prior);
+    assert_eq!(saved["version"], prior);
     // Rewriting the exact bytes generates OS events but no further CRDT operation.
     std::fs::write(root.path().join("a.md"), "A MIDDLE B").unwrap();
     tokio::time::sleep(Duration::from_millis(160)).await;
-    assert_eq!(host.state(&id).await["snapshot"]["version"], prior);
+    assert_eq!(host.state(&id).await["version"], prior);
     let undone = host.mutate(&id, None).await;
     assert_eq!(undone["snapshot"]["text"], "A middle B");
     drop(feed);

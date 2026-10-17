@@ -66,7 +66,9 @@ fn main() -> Result<(), BufferError> {
     })?;
     show_update(&undo);
     assert_eq!(alice.text(), current.text.as_ref());
-    assert_eq!(undo.restored, Some(selection));
+    let restored = undo.restored.as_ref().unwrap();
+    assert_eq!(restored.tag, selection.tag);
+    assert_eq!(restored.positions, selection.positions);
     assert!(!alice.undo_state().can_undo);
     assert!(alice.undo_state().can_redo);
     let redo = alice.redo()?;

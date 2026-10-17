@@ -1,32 +1,33 @@
 //! Observable documents and receipts, shared by native and serialized callers.
 use super::observation::ExternalChangeStatus;
 use crate::backend::{EditorError, EditorResult};
-use celestite_buffer::types::{BufferUpdate, TextSnapshot, UndoState, Version};
+use crate::text::LineEnding;
+use celestite_buffer::types::{BufferUpdate, UndoState, Version};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorDocument {
-    pub external_change: Option<ExternalChangeStatus>,
-    pub id: String,
-    pub path: String,
-    pub snapshot: TextSnapshot,
+    #[serde(flatten)]
+    pub status: DocumentStatus,
+    pub snapshot: DocumentText,
     pub undo: UndoState,
     #[serde(with = "celestite_buffer::codec::peer_id")]
     pub peer_id: u64,
     pub saved_content: String,
     pub bom: bool,
-    pub line_ending: String,
-    pub dirty: bool,
-    pub deleted: bool,
-    pub conflict: bool,
-    pub file_revision: String,
-    pub saved_version: Option<Version>,
-    pub persisted_version: Option<Version>,
-    pub persistence_error: Option<String>,
-    pub error: Option<String>,
+    pub line_ending: LineEnding,
     pub autosave_delay: Option<u64>,
 }
+/// Text of one read view. The document version lives in `DocumentStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentText {
+    pub text: Arc<str>,
+    pub state_revision: u64,
+}
+
 /// Lightweight observable state. Reading it never materializes the full text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,7 +56,7 @@ pub struct HostDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved_content: Option<String>,
     pub bom: bool,
-    pub line_ending: String,
+    pub line_ending: LineEnding,
 }
 
 /// Acceptance of text and commitment of history are different facts. A failed
@@ -97,10 +98,9 @@ pub struct ReplicaHostState {
     pub path: String,
     pub version: Version,
     pub saved_content: String,
-    #[serde(alias = "backendRevision")]
     pub file_revision: String,
     pub bom: bool,
-    pub line_ending: String,
+    pub line_ending: LineEnding,
     pub deleted: bool,
     pub conflict: bool,
     pub error: Option<String>,

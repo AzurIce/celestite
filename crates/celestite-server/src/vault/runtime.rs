@@ -1,9 +1,10 @@
 //! Serial execution and publication shared by every host adapter.
 use super::{
     documents::Documents,
-    fs::{ChangeHint, FsVault, Result, VaultError},
+    fs::{ChangeHint, FsVault, Result},
 };
 use crate::{failure, ApiError, HostedVault};
+use celestite_core::backend::{EditorError, ErrorCode};
 use std::sync::Arc;
 
 pub(crate) async fn execute<T: Send + 'static>(
@@ -20,7 +21,7 @@ pub(crate) async fn execute_with_tree<T: Send + 'static>(
     action: impl FnOnce(&FsVault, &mut Documents) -> Result<T> + Send + 'static,
 ) -> std::result::Result<T, ApiError> {
     if mutation && vault.read_only {
-        return Err(failure("PermissionDenied", "Vault is read-only"));
+        return Err(failure(ErrorCode::PermissionDenied, "Vault is read-only"));
     }
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
@@ -29,7 +30,7 @@ pub(crate) async fn execute_with_tree<T: Send + 'static>(
         execute_locked(&vault, mutation, notify_tree, action)
     })
     .await
-    .map_err(|_| failure("IO", "Document operation failed"))?
+    .map_err(|_| failure(ErrorCode::Io, "Document operation failed"))?
     .map_err(Into::into)
 }
 
@@ -45,11 +46,11 @@ pub(crate) fn execute_locked<T>(
     let files = vault
         .files
         .lock()
-        .map_err(|_| VaultError::new("IO", "Vault lock failed", ""))?;
+        .map_err(|_| EditorError::new(ErrorCode::Io, "Vault lock failed", ""))?;
     let mut documents = vault
         .documents
         .lock()
-        .map_err(|_| VaultError::new("IO", "Document lock failed", ""))?;
+        .map_err(|_| EditorError::new(ErrorCode::Io, "Document lock failed", ""))?;
     let result = action(&files, &mut documents);
     let published = documents.publish_changes();
     if documents.has_file_observations() {
@@ -67,7 +68,7 @@ pub(crate) async fn execute_files<T: Send + 'static>(
     action: impl FnOnce(&FsVault) -> Result<T> + Send + 'static,
 ) -> std::result::Result<T, ApiError> {
     if mutation && vault.read_only {
-        return Err(failure("PermissionDenied", "Vault is read-only"));
+        return Err(failure(ErrorCode::PermissionDenied, "Vault is read-only"));
     }
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
@@ -79,14 +80,14 @@ pub(crate) async fn execute_files<T: Send + 'static>(
             let files = vault
                 .files
                 .lock()
-                .map_err(|_| VaultError::new("IO", "Vault operation lock failed", ""))?
+                .map_err(|_| EditorError::new(ErrorCode::Io, "Vault operation lock failed", ""))?
                 .clone();
             return action(&files);
         }
         let files = vault
             .files
             .lock()
-            .map_err(|_| VaultError::new("IO", "Vault operation lock failed", ""))?;
+            .map_err(|_| EditorError::new(ErrorCode::Io, "Vault operation lock failed", ""))?;
         let result = action(&files);
         // Failed recursive operations can partially complete, so invalidate on failure too.
         if mutation {
@@ -96,6 +97,6 @@ pub(crate) async fn execute_files<T: Send + 'static>(
         result
     })
     .await
-    .map_err(|_| failure("IO", "Vault operation failed"))?
+    .map_err(|_| failure(ErrorCode::Io, "Vault operation failed"))?
     .map_err(Into::into)
 }

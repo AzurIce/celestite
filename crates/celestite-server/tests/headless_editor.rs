@@ -22,10 +22,16 @@ async fn independent_cores_merge_and_undo_only_their_own_operations() {
     b.edit(&id, 5, 5, "乙").await;
     a.sync(&id).await;
     b.sync(&id).await;
-    let merged = a.core.read(&id).unwrap().snapshot;
-    assert_eq!(merged.text, b.core.read(&id).unwrap().snapshot.text);
-    assert_eq!(merged.version, b.core.read(&id).unwrap().snapshot.version);
-    assert!(merged.text.contains('甲') && merged.text.contains('乙'));
+    let merged = a.core.read(&id).unwrap();
+    assert_eq!(
+        merged.snapshot.text,
+        b.core.read(&id).unwrap().snapshot.text
+    );
+    assert_eq!(
+        merged.status.version,
+        b.core.read(&id).unwrap().status.version
+    );
+    assert!(merged.snapshot.text.contains('甲') && merged.snapshot.text.contains('乙'));
     a.undo(&id, false).await;
     b.sync(&id).await;
     assert_eq!(b.core.read(&id).unwrap().snapshot.text.as_ref(), "A😀乙B");
@@ -51,7 +57,7 @@ async fn session_admission_rejects_foreign_peers_histories_and_missing_dependenc
     let seed = client.core.snapshot(&id).unwrap();
     let mut foreign = Buffer::from_snapshot(&seed).unwrap();
     let _ = foreign.replace_text("foreign").unwrap();
-    let rejected = client.request("updates", json!({"id":id,"packet":foreign.export_updates_since(&client.core.read(&id).unwrap().snapshot.version).unwrap(),"version":foreign.version(),"operation":1})).await;
+    let rejected = client.request("updates", json!({"id":id,"packet":foreign.export_updates_since(&client.core.read(&id).unwrap().status.version).unwrap(),"version":foreign.version(),"operation":1})).await;
     assert_eq!(rejected["error"]["code"], "InvalidEdit");
     let mut wrong = seed.clone();
     wrong.identity.history_id = "other history".into();
@@ -84,10 +90,10 @@ async fn file_save_uses_a_causal_checkpoint_and_preserves_encoding() {
     let initial = client.core.read(&id).unwrap();
     client.edit(&id, 5, 5, "中文").await;
     let stale = client
-        .request("save", json!({"id":id,"version":initial.snapshot.version}))
+        .request("save", json!({"id":id,"version":initial.status.version}))
         .await;
     assert_eq!(stale["error"]["code"], "StaleVersion");
-    let version = client.core.read(&id).unwrap().snapshot.version;
+    let version = client.core.read(&id).unwrap().status.version;
     let saved = client.ok("save", json!({"id":id,"version":version})).await;
     client.accept(saved).await;
     assert_eq!(
@@ -107,13 +113,13 @@ async fn moves_preserve_identity_and_deleted_documents_reject_late_updates_and_s
     host.json("POST", "/rename", json!({"from":"a.md","to":"b.md"}))
         .await;
     client.sync(&id).await;
-    assert_eq!(client.core.read(&id).unwrap().path, "b.md");
+    assert_eq!(client.core.read(&id).unwrap().status.path, "b.md");
     let late = client.core.edit(&id, [(0..0, "late")]).await.unwrap();
     host.json("DELETE", "/entry?path=b.md", Value::Null).await;
     assert_eq!(client.request("updates", json!({"id":id,"packet":late.update.operation,"version":late.update.after,"operation":1})).await["error"]["code"], "NotFound");
     client.sync(&id).await;
-    assert!(client.core.read(&id).unwrap().deleted);
-    let version = client.core.read(&id).unwrap().snapshot.version;
+    assert!(client.core.read(&id).unwrap().status.deleted);
+    let version = client.core.read(&id).unwrap().status.version;
     let save = client
         .request("save", json!({"id":id,"version":version}))
         .await;
@@ -137,12 +143,12 @@ async fn readonly_sessions_receive_updates_but_cannot_submit_operations() {
         reader.core.read(&id).unwrap().snapshot.text.as_ref(),
         "base changed"
     );
-    let denied = reader.request("updates", json!({"id":id,"packet":reader.core.snapshot(&id).unwrap(),"version":reader.core.read(&id).unwrap().snapshot.version,"operation":1})).await;
+    let denied = reader.request("updates", json!({"id":id,"packet":reader.core.snapshot(&id).unwrap(),"version":reader.core.read(&id).unwrap().status.version,"operation":1})).await;
     assert_eq!(denied["error"]["code"], "PermissionDenied");
     let denied = reader
         .request(
             "save",
-            json!({"id":id,"version":reader.core.read(&id).unwrap().snapshot.version}),
+            json!({"id":id,"version":reader.core.read(&id).unwrap().status.version}),
         )
         .await;
     assert_eq!(denied["error"]["code"], "PermissionDenied");

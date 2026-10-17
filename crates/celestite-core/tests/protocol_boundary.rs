@@ -1,5 +1,6 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{DocumentIdentity, EditOptions, UndoContext, Version};
+use celestite_core::backend::ErrorCode;
 use celestite_core::backend::memory::MemoryBackend;
 use celestite_core::editor::EditorCore;
 use celestite_core::instance::{InstanceIdentity, Vault};
@@ -42,7 +43,7 @@ fn stale_wire_base_is_rejected_without_text_history_undo_or_preview_effects() {
     block_on(async {
         let mut core = replica("A😀甲").await;
         let mut adapter = EditorAdapter::default();
-        let base = core.read("doc").unwrap().snapshot.version;
+        let base = core.read("doc").unwrap().status.version;
         core.replace_text("doc", "A😀甲!").await.unwrap();
         core.take_mutations();
         let mut controller = PreviewController::default();
@@ -75,12 +76,15 @@ fn stale_wire_base_is_rejected_without_text_history_undo_or_preview_effects() {
                 .call(&mut core, "apply", json!({"id":"doc","command":command}))
                 .await
                 .unwrap_err();
-            assert_eq!(error.code, "StaleVersion");
+            assert_eq!(error.code, ErrorCode::StaleVersion);
             let after = core.read("doc").unwrap();
             assert_eq!(after.snapshot, before.snapshot);
             assert_eq!(after.undo, before.undo);
             assert_eq!(after.peer_id, before.peer_id);
-            assert_eq!(after.persisted_version, before.persisted_version);
+            assert_eq!(
+                after.status.persisted_version,
+                before.status.persisted_version
+            );
             assert_eq!(core.snapshot("doc").unwrap().data, packet.data);
             assert!(adapter.take_mutations(&mut core).unwrap().is_empty());
             controller.synchronize(&core.document_source(&[]), 1000);
@@ -111,7 +115,7 @@ fn wire_edit_and_undo_map_utf16_edits_lengths_and_metadata() {
         // UTF-8 boundaries:  A=0..1, 😀=1..5, 甲=5..8, é=8..10.
         let mut core = replica("A😀甲é").await;
         let mut adapter = EditorAdapter::default();
-        let base = core.read("doc").unwrap().snapshot.version;
+        let base = core.read("doc").unwrap().status.version;
         let metadata = json!({"mainIndex":1,"selection":"甲é"});
         adapter
             .call(
@@ -138,7 +142,7 @@ fn wire_edit_and_undo_map_utf16_edits_lengths_and_metadata() {
                 &mut core,
                 "apply",
                 json!({"id":"doc","command":{
-                    "kind":"undo","base":edited.snapshot.version,
+                    "kind":"undo","base":edited.status.version,
                     "context":{"metadata":{"redo":true},"positions":[4,6]}
                 }}),
             )
@@ -198,7 +202,7 @@ fn wire_anchor_resolution_is_a_utf16_number_array_without_refreshed_objects() {
     block_on(async {
         let mut core = replica("A😀甲é").await;
         let mut adapter = EditorAdapter::default();
-        let version = core.read("doc").unwrap().snapshot.version;
+        let version = core.read("doc").unwrap().status.version;
         let anchors = adapter
             .call(
                 &mut core,
@@ -213,7 +217,7 @@ fn wire_anchor_resolution_is_a_utf16_number_array_without_refreshed_objects() {
         let roundtrip: Value =
             serde_json::from_str(&serde_json::to_string(&anchors).unwrap()).unwrap();
         core.edit("doc", [(5..5, "🚀")]).await.unwrap();
-        let checkpoint = core.read("doc").unwrap().snapshot.version;
+        let checkpoint = core.read("doc").unwrap().status.version;
         let offsets = adapter
             .call(
                 &mut core,
@@ -281,4 +285,56 @@ fn wire_metadata_does_not_alias_a_native_callers_undo_tag() {
         }
         assert_eq!(core.read("doc").unwrap().snapshot.text.as_ref(), "A");
     });
+}
+
+#[test]
+fn shared_wire_values_keep_their_spelling() {
+    use celestite_core::backend::{EntryKind, ErrorCode, RenamePhase};
+    use celestite_core::text::LineEnding;
+
+    for (code, wire) in [
+        (ErrorCode::Io, "IO"),
+        (ErrorCode::InvalidEdit, "InvalidEdit"),
+        (ErrorCode::InvalidPath, "InvalidPath"),
+        (ErrorCode::NotFound, "NotFound"),
+        (ErrorCode::AlreadyExists, "AlreadyExists"),
+        (ErrorCode::NotDirectory, "NotDirectory"),
+        (ErrorCode::NotFile, "NotFile"),
+        (ErrorCode::DirectoryNotEmpty, "DirectoryNotEmpty"),
+        (ErrorCode::PermissionDenied, "PermissionDenied"),
+        (ErrorCode::QuotaExceeded, "QuotaExceeded"),
+        (ErrorCode::Busy, "Busy"),
+        (ErrorCode::Closed, "Closed"),
+        (ErrorCode::Conflict, "Conflict"),
+        (ErrorCode::StaleVersion, "StaleVersion"),
+        (ErrorCode::FilesystemDiffTimeout, "FilesystemDiffTimeout"),
+        (
+            ErrorCode::FilesystemReconciliationPending,
+            "FilesystemReconciliationPending",
+        ),
+        (ErrorCode::InvalidPreview, "InvalidPreview"),
+        (ErrorCode::PreviewLimit, "PreviewLimit"),
+        (ErrorCode::Unsupported, "Unsupported"),
+    ] {
+        assert_eq!(serde_json::to_value(code).unwrap(), json!(wire));
+    }
+    for (ending, wire) in [
+        (LineEnding::Lf, "\n"),
+        (LineEnding::CrLf, "\r\n"),
+        (LineEnding::Cr, "\r"),
+    ] {
+        assert_eq!(serde_json::to_value(ending).unwrap(), json!(wire));
+    }
+    for (kind, wire) in [
+        (EntryKind::File, "file"),
+        (EntryKind::Directory, "directory"),
+        (EntryKind::Symlink, "symlink"),
+        (EntryKind::Other, "other"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(wire));
+    }
+    assert_eq!(
+        serde_json::to_value(RenamePhase::RemoveSource).unwrap(),
+        json!("remove-source")
+    );
 }

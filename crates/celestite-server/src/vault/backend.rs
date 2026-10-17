@@ -1,14 +1,13 @@
 //! Native platform IO for the shared EditorCore. The caller runs it on a blocking worker.
-use super::{
-    fs::{self, FsVault},
-    VaultIdentity,
-};
+use super::fs::{self, FsVault};
+use celestite_core::backend::ErrorCode;
+use celestite_core::instance::Vault;
 use celestite_core::{
     backend::{
         Backend, DirectoryIntent, DocumentHeader, EditorError, EditorResult, FileEntry,
         FileSnapshot, JournalEntry, StoredDocument,
     },
-    instance::{InstanceIdentity, Vault},
+    instance::InstanceIdentity,
 };
 use std::{
     path::Path,
@@ -16,47 +15,22 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) fn editor_error(error: fs::VaultError) -> EditorError {
-    EditorError::new(error.code, error.message, &error.path)
-}
-pub(crate) fn vault_error(error: EditorError) -> fs::VaultError {
-    let code = match error.code.as_str() {
-        "InvalidPath" => "InvalidPath",
-        "NotFound" => "NotFound",
-        "AlreadyExists" => "AlreadyExists",
-        "NotDirectory" => "NotDirectory",
-        "NotFile" => "NotFile",
-        "DirectoryNotEmpty" => "DirectoryNotEmpty",
-        "PermissionDenied" => "PermissionDenied",
-        "QuotaExceeded" => "QuotaExceeded",
-        "Busy" => "Busy",
-        "Unsupported" => "Unsupported",
-        "Closed" => "Closed",
-        "Conflict" => "Conflict",
-        "StaleVersion" => "StaleVersion",
-        "InvalidEdit" => "InvalidEdit",
-        "FilesystemDiffTimeout" => "FilesystemDiffTimeout",
-        "FilesystemReconciliationPending" => "FilesystemReconciliationPending",
-        _ => "IO",
-    };
-    fs::VaultError::new(code, error.message, &error.path)
-}
-
 pub(crate) struct NativeBackend {
     pub(crate) files: Arc<FsVault>,
     identity: InstanceIdentity,
     intent: Option<DirectoryIntent>,
 }
 impl NativeBackend {
-    pub fn open(root: &Path, vault: VaultIdentity) -> fs::Result<Self> {
+    pub fn open(root: &Path, vault: Vault) -> fs::Result<Self> {
         Ok(Self {
             files: Arc::new(
-                FsVault::open(root).map_err(|e| fs::VaultError::new("IO", e.to_string(), ""))?,
+                FsVault::open(root)
+                    .map_err(|e| EditorError::new(ErrorCode::Io, e.to_string(), ""))?,
             ),
             identity: InstanceIdentity {
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 vault: Vault {
-                    vault_id: vault.id,
+                    vault_id: vault.vault_id,
                     history_id: vault.history_id,
                 },
             },
@@ -101,22 +75,15 @@ impl Backend for NativeBackend {
         Ok(())
     }
     async fn stat(&self, path: &str) -> EditorResult<Option<FileEntry>> {
-        Ok(self.files.stat(path).map_err(editor_error)?.map(entry))
+        self.files.stat(path)
     }
     async fn read_dir(&self, path: &str) -> EditorResult<Vec<FileEntry>> {
-        Ok(self
-            .files
-            .read_dir(path)
-            .map_err(editor_error)?
-            .into_iter()
-            .map(entry)
-            .collect())
+        self.files.read_dir(path)
     }
     async fn read_file(&self, path: &str, limit: Option<u64>) -> EditorResult<FileSnapshot> {
         let data = self
             .files
-            .read_file_limited(path, limit.unwrap_or(u64::MAX))
-            .map_err(editor_error)?;
+            .read_file_limited(path, limit.unwrap_or(u64::MAX))?;
         let revision = fs::revision(&data);
         Ok(FileSnapshot { data, revision })
     }
@@ -127,25 +94,15 @@ impl Backend for NativeBackend {
         mode: &str,
         expected: Option<&str>,
     ) -> EditorResult<String> {
-        self.files
-            .write_file(path, data, mode, expected)
-            .map_err(editor_error)
+        self.files.write_file(path, data, mode, expected)
     }
     async fn mkdir(&self, path: &str, recursive: bool) -> EditorResult<()> {
-        self.files.mkdir(path, recursive).map_err(editor_error)
+        self.files.mkdir(path, recursive)
     }
     async fn rename(&self, from: &str, to: &str) -> EditorResult<()> {
-        self.files.rename(from, to).map_err(editor_error)
+        self.files.rename(from, to)
     }
     async fn remove(&self, path: &str, recursive: bool) -> EditorResult<()> {
-        self.files.remove(path, recursive).map_err(editor_error)
-    }
-}
-fn entry(entry: fs::Entry) -> FileEntry {
-    FileEntry {
-        path: entry.path,
-        kind: entry.kind.into(),
-        size: entry.size,
-        modified_at: entry.modified_at,
+        self.files.remove(path, recursive)
     }
 }

@@ -1,8 +1,7 @@
 //! Host snapshots and metadata are validated together before replacing a session.
-use super::observation::ObservationCoordinator;
 use super::types::ReplicaHostState;
 use super::{EditorCore, Record, validate_editor_path, validate_text};
-use crate::backend::{Backend, DocumentHeader, EditorError, EditorResult};
+use crate::backend::{Backend, DocumentHeader, EditorError, EditorResult, ErrorCode};
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{HistoryPacket, HistoryPacketKind};
 use std::collections::BTreeMap;
@@ -35,20 +34,24 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
     let state = input.state;
     validate_editor_path(&state.path)?;
     validate_text(&state.saved_content, &state.path)?;
-    if state.path.is_empty() || !matches!(state.line_ending.as_str(), "\n" | "\r" | "\r\n") {
+    if state.path.is_empty() {
         return Err(EditorError::new(
-            "InvalidEdit",
+            ErrorCode::InvalidEdit,
             "Invalid host metadata",
             &state.path,
         ));
     }
     let mut packets = input.packets.into_iter();
-    let seed = packets
-        .next()
-        .ok_or_else(|| EditorError::new("InvalidEdit", "Missing session snapshot", &state.path))?;
+    let seed = packets.next().ok_or_else(|| {
+        EditorError::new(
+            ErrorCode::InvalidEdit,
+            "Missing session snapshot",
+            &state.path,
+        )
+    })?;
     if seed.data.len() > 16 * 1024 * 1024 {
         return Err(EditorError::new(
-            "Unsupported",
+            ErrorCode::Unsupported,
             "CRDT snapshot exceeds 16 MiB",
             &state.path,
         ));
@@ -60,7 +63,7 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
     for packet in packets {
         if packet.kind != HistoryPacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
-                "InvalidEdit",
+                ErrorCode::InvalidEdit,
                 "Invalid session update",
                 &state.path,
             ));
@@ -68,7 +71,7 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
         let _ = document.import(packet)?;
         if document.has_pending_imports() {
             return Err(EditorError::new(
-                "InvalidEdit",
+                ErrorCode::InvalidEdit,
                 "Session history has missing dependencies",
                 &state.path,
             ));
@@ -78,7 +81,7 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
     validate_text(&snapshot.text, &state.path)?;
     if snapshot.version != state.version {
         return Err(EditorError::new(
-            "Conflict",
+            ErrorCode::Conflict,
             "Session snapshot and host version differ",
             &state.path,
         ));
@@ -98,26 +101,19 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
         bom: state.bom,
         line_ending: state.line_ending,
     };
-    let mut observation = ObservationCoordinator::default();
-    observation.remote = state.external_change;
-    Ok(Record {
-        observation,
-        replica: ReplicaState {
+    let mut record = Record::new(
+        header,
+        document,
+        ReplicaState {
             host_authoritative: true,
             attached: true,
             read_only: state.read_only,
         },
-        dirty: !document.content_matches(&header.saved_text),
-        header,
-        buffer: document,
-        pending_observation: None,
-        uncommitted: vec![],
-        persisted_version: None,
-        conflict: state.conflict,
-        error: state.error,
-
-        first_dirty: None,
-    })
+    );
+    record.observation.remote = state.external_change;
+    record.conflict = state.conflict;
+    record.error = state.error;
+    Ok(record)
 }
 
 impl<B: Backend> EditorCore<B> {
@@ -129,7 +125,7 @@ impl<B: Backend> EditorCore<B> {
             || !self.record(id)?.replica.host_authoritative
         {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "Only volatile hosted replicas can release a subscription",
                 id,
             ));
@@ -142,7 +138,7 @@ impl<B: Backend> EditorCore<B> {
         self.writable()?;
         if self.backend.has_projection() {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "Host snapshots require a private replica",
                 "",
             ));
@@ -158,7 +154,7 @@ impl<B: Backend> EditorCore<B> {
                 }))
         {
             return Err(EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Host document identity/path already exists",
                 &next.header.path,
             ));
@@ -175,7 +171,7 @@ impl<B: Backend> EditorCore<B> {
     ) -> EditorResult<()> {
         if self.backend.has_projection() || self.backend.persistent() {
             return Err(EditorError::new(
-                "Unsupported",
+                ErrorCode::Unsupported,
                 "Only volatile private sessions can be replaced",
                 "",
             ));
@@ -189,7 +185,7 @@ impl<B: Backend> EditorCore<B> {
                 || (!record.header.deleted && !paths.insert(record.header.path.clone()))
             {
                 return Err(EditorError::new(
-                    "Conflict",
+                    ErrorCode::Conflict,
                     "Duplicate session document or live path",
                     &record.header.path,
                 ));
@@ -200,7 +196,7 @@ impl<B: Backend> EditorCore<B> {
                 .is_some_and(|old| old.buffer.identity() != record.buffer.identity())
             {
                 return Err(EditorError::new(
-                    "Conflict",
+                    ErrorCode::Conflict,
                     "Replica history changed",
                     &record.header.path,
                 ));
@@ -218,8 +214,7 @@ impl<B: Backend> EditorCore<B> {
             .expect("source epoch exhausted");
         // Accepted effects are owned receipts, not borrowed session state.
         // Replacement must not erase an undrained native owner's batch.
-        self.failure = None;
-        self.requires_reopen = false;
+        self.health = super::HistoryHealth::Ok;
         Ok(())
     }
 }

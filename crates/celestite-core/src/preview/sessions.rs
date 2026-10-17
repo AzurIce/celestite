@@ -6,7 +6,7 @@ use super::{
     PreviewStatus, PreviewSubscription, PreviewTask, PreviewTicket, default_resource_root,
     diagnostic_bytes, resolve_preview_target, supports_preview,
 };
-use crate::backend::{EditorError, EditorResult};
+use crate::backend::{EditorError, EditorResult, ErrorCode};
 use crate::source::{DocumentSourceSnapshot, SourceDocument};
 use celestite_buffer::new_peer_id;
 use celestite_buffer::types::{TextSnapshot, Version};
@@ -44,7 +44,7 @@ impl Default for PreviewSessions {
 }
 
 impl PreviewSessions {
-    pub fn invalidate_project(&mut self, now: u64) {
+    fn invalidate_project(&mut self, now: u64) {
         self.generation = self
             .generation
             .checked_add(1)
@@ -75,7 +75,7 @@ impl PreviewSessions {
         format!("{}:{}", self.scope, self.next_id)
     }
 
-    pub fn contains(&self, id: &str) -> bool {
+    fn contains(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
     }
 
@@ -131,7 +131,7 @@ impl PreviewSessions {
         }
     }
 
-    pub fn unsubscribe(&mut self, subscription: &str, client: &str) -> bool {
+    fn unsubscribe(&mut self, subscription: &str, client: &str) -> bool {
         let id = self.sessions.iter().find_map(|(id, session)| {
             (session
                 .subscribers
@@ -150,7 +150,7 @@ impl PreviewSessions {
         true
     }
 
-    pub fn release_client(&mut self, client: &str) {
+    fn release_client(&mut self, client: &str) {
         let mut closed = Vec::new();
         for (id, session) in &mut self.sessions {
             session.subscribers.retain(|_, owner| owner != client);
@@ -163,13 +163,24 @@ impl PreviewSessions {
         }
     }
 
-    pub fn close(&mut self, id: &str) {
+    fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        let closed: Vec<_> = self
+            .sessions
+            .keys()
+            .filter(|id| !keep(id))
+            .cloned()
+            .collect();
+        for id in closed {
+            self.close(&id);
+        }
+    }
+    fn close(&mut self, id: &str) {
         if self.sessions.remove(id).is_some() {
             self.changed.insert(id.into());
         }
     }
 
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.changed.extend(self.sessions.keys().cloned());
         self.sessions.clear();
     }
@@ -187,7 +198,7 @@ impl PreviewSessions {
         }
     }
 
-    pub fn reconcile(&mut self, id: &str, version: &Version, path: &str, now: u64) {
+    fn reconcile(&mut self, id: &str, version: &Version, path: &str, now: u64) {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
@@ -217,14 +228,14 @@ impl PreviewSessions {
         self.changed.insert(id.into());
     }
 
-    pub fn state(&self, id: &str) -> EditorResult<PreviewState> {
+    fn state(&self, id: &str) -> EditorResult<PreviewState> {
         self.sessions
             .get(id)
             .map(|s| s.state.clone())
-            .ok_or_else(|| EditorError::new("NotFound", "Preview session not found", id))
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Preview session not found", id))
     }
 
-    pub fn take_task(&mut self, id: &str, snapshot: TextSnapshot, now: u64) -> Option<PreviewTask> {
+    fn take_task(&mut self, id: &str, snapshot: TextSnapshot, now: u64) -> Option<PreviewTask> {
         let session = self.sessions.get_mut(id)?;
         if session.running.is_some()
             || session.state.status != PreviewStatus::Pending
@@ -249,7 +260,7 @@ impl PreviewSessions {
     }
 
     /// Wrong, duplicate or revoked task IDs never mutate the current session.
-    pub fn complete(&mut self, completion: PreviewCompletion) -> bool {
+    fn complete(&mut self, completion: PreviewCompletion) -> bool {
         let id = self.sessions.iter().find_map(|(id, session)| {
             session
                 .running
@@ -337,7 +348,7 @@ impl PreviewSessions {
         true
     }
 
-    pub fn retry(&mut self, id: &str, now: u64) -> EditorResult<()> {
+    fn retry(&mut self, id: &str, now: u64) -> EditorResult<()> {
         self.state(id)?;
         let task_id = self.token();
         let session_id = self.token();
@@ -361,7 +372,7 @@ impl PreviewSessions {
 
     /// Coalesce undelivered states; assign sequence numbers on delivery so a
     /// slow consumer sees continuous events without retaining every HTML copy.
-    pub fn take_events(&mut self) -> Vec<PreviewEvent> {
+    fn take_events(&mut self) -> Vec<PreviewEvent> {
         std::mem::take(&mut self.changed)
             .into_iter()
             .map(|id| {
@@ -402,16 +413,7 @@ impl PreviewController {
             .filter(|document| !supports_preview(&document.path))
             .map(|document| (document.path.clone(), document.version.clone()))
             .collect();
-        let closed: Vec<_> = self
-            .sessions
-            .sessions
-            .keys()
-            .filter(|id| !documents.contains_key(*id))
-            .cloned()
-            .collect();
-        for id in closed {
-            self.sessions.close(&id);
-        }
+        self.sessions.retain(|id| documents.contains_key(id));
         for document in documents.values() {
             self.sessions
                 .reconcile(&document.id, &document.version, &document.path, now);
@@ -430,7 +432,7 @@ impl PreviewController {
     fn document(&self, id: &str) -> EditorResult<&SourceDocument> {
         self.documents
             .get(id)
-            .ok_or_else(|| EditorError::new("NotFound", "Source document not found", id))
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Source document not found", id))
     }
 
     pub fn subscribe(
@@ -441,7 +443,7 @@ impl PreviewController {
     ) -> EditorResult<PreviewSubscription> {
         if client.is_empty() {
             return Err(EditorError::new(
-                "InvalidPreview",
+                ErrorCode::InvalidPreview,
                 "Missing client session",
                 id,
             ));
@@ -497,7 +499,7 @@ impl PreviewController {
                 .filter(|body| body.id == required_id);
             let body = matches.next().ok_or_else(|| {
                 EditorError::new(
-                    "StaleVersion",
+                    ErrorCode::StaleVersion,
                     "Required preview snapshot missing",
                     &required_id,
                 )
@@ -507,7 +509,7 @@ impl PreviewController {
                 || body.snapshot.version != document.version
             {
                 return Err(EditorError::new(
-                    "StaleVersion",
+                    ErrorCode::StaleVersion,
                     "Preview snapshot does not match source catalogue",
                     &required_id,
                 ));
@@ -578,7 +580,7 @@ impl PreviewController {
                 .is_none_or(|result| result.ticket != state.target)
         {
             return Err(EditorError::new(
-                "StaleVersion",
+                ErrorCode::StaleVersion,
                 "预览正在更新，请稍后再打开链接。",
                 id,
             ));

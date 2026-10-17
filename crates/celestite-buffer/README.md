@@ -38,6 +38,8 @@ Run the complete walkthrough with
 - `history::PreparedImport`: read-only admission tied to one unchanged Buffer.
 - `positions::ToOffset`: UTF-8 byte positions and stable anchor resolution.
 - `text::{difference, utf16_to_byte}`: display deltas and coordinate conversion.
+- `types::Restoration`: caller tag and AFTER-text byte positions returned by undo/redo;
+  it owns the metadata frame for as long as a receipt still needs it.
 - `codec::peer_id`: canonical decimal peer parsing and serde field encoding.
 - `change::TextChangeTask`: an isolated historical text rewrite, constructed only
   through `Buffer::prepare_text_change`. Callers provide the time budget.

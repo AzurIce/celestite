@@ -1,7 +1,8 @@
 //! Filesystem observation coordination. The platform executes detached work;
 //! this module alone validates its baseline and commits it into current history.
 use super::{EditorCore, MAX_TEXT_BYTES, Record, decode};
-use crate::backend::{Backend, EditorError, EditorResult, FileSnapshot, JournalEntry};
+use crate::backend::{Backend, EditorError, EditorResult, ErrorCode, FileSnapshot, JournalEntry};
+use crate::text::DecodedText;
 use celestite_buffer::change::TextChangeTask;
 use celestite_buffer::types::{DocumentIdentity, HistoryPacket, Version};
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ const DIFF_BUDGET: Duration = Duration::from_secs(5);
 pub enum ExternalChangeStatus {
     Pending,
     Failed {
-        code: String,
+        code: ErrorCode,
         message: String,
         retry_at: u64,
     },
@@ -68,7 +69,7 @@ impl ObservationCoordinator {
             Some(ExternalChangeStatus::Pending)
         } else if let Some(failure) = &self.failure {
             Some(ExternalChangeStatus::Failed {
-                code: failure.error.code.clone(),
+                code: failure.error.code,
                 message: failure.error.message.clone(),
                 retry_at: failure.retry_at,
             })
@@ -84,12 +85,12 @@ pub struct FileObservationTask {
     token: ObservationToken,
     disk: FileSnapshot,
     change: TextChangeTask,
-    decoded: (String, bool, String),
+    decoded: DecodedText,
 }
 pub struct FileObservationResult {
     token: ObservationToken,
     disk: FileSnapshot,
-    decoded: (String, bool, String),
+    decoded: DecodedText,
     result: EditorResult<(Option<HistoryPacket>, Version)>,
 }
 impl FileObservationTask {
@@ -103,7 +104,7 @@ impl FileObservationTask {
     pub fn compute_with_budget(self, budget: Duration) -> FileObservationResult {
         let result = self
             .change
-            .compute(&self.decoded.0, budget)
+            .compute(&self.decoded.text, budget)
             .map_err(|error| {
                 let mut error = EditorError::from(error);
                 error.path = self.token.path.clone();
@@ -129,7 +130,7 @@ fn baseline(record: &Record) -> Option<&Version> {
 
 impl<B: Backend> EditorCore<B> {
     pub fn has_file_observations(&self) -> bool {
-        self.failure.is_none()
+        self.health.is_ok()
             && self.records.values().any(|r| {
                 !r.header.deleted
                     && r.observation.active.is_none()
@@ -139,7 +140,7 @@ impl<B: Backend> EditorCore<B> {
 
     /// Take at most one task for each document. New disk hints coalesce while it runs.
     pub fn take_file_observation(&mut self) -> EditorResult<Option<FileObservationTask>> {
-        if self.failure.is_some() {
+        if !self.health.is_ok() {
             return Ok(None);
         }
         let ready = |record: &Record| {
@@ -175,7 +176,7 @@ impl<B: Backend> EditorCore<B> {
         };
         let base = baseline(record).ok_or_else(|| {
             EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Missing historical disk baseline",
                 &record.header.path,
             )
@@ -227,11 +228,11 @@ impl<B: Backend> EditorCore<B> {
         if record.observation.active.as_ref() != Some(&result.token) {
             return Ok(false);
         }
-        let applicable = result.token.applies_to(record) && self.failure.is_none();
+        let applicable = result.token.applies_to(record) && self.health.is_ok();
         self.records.get_mut(id).unwrap().observation.active = None;
         if !applicable {
             self.records.get_mut(id).unwrap().observation.queued = None;
-            if self.failure.is_none() && !self.record(id)?.header.deleted {
+            if self.health.is_ok() && !self.record(id)?.header.deleted {
                 // A new cursor/path may already have newer disk hints. Re-read
                 // at that baseline rather than waiting for another watcher event.
                 self.refresh_disk(id).await?;
@@ -269,7 +270,7 @@ impl<B: Backend> EditorCore<B> {
             if error.path.is_empty() {
                 error.path = result.token.path.clone();
             }
-            if self.failure.is_none() {
+            if self.health.is_ok() {
                 self.fail_observation(result.token, error.clone());
             }
             return Err(error);
@@ -305,7 +306,7 @@ impl<B: Backend> EditorCore<B> {
         if let Some(failure) = &mut self
             .records
             .get_mut(id)
-            .ok_or_else(|| EditorError::new("NotFound", "Document not found", id))?
+            .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Document not found", id))?
             .observation
             .failure
         {
@@ -318,7 +319,7 @@ impl<B: Backend> EditorCore<B> {
         let record = self.record(id)?;
         if record.observation.active.is_some() || record.observation.queued.is_some() {
             return Err(EditorError::new(
-                "FilesystemReconciliationPending",
+                ErrorCode::FilesystemReconciliationPending,
                 "外部修改尚未同步，完成后再保存。",
                 &record.header.path,
             ));
@@ -336,12 +337,11 @@ impl<B: Backend> EditorCore<B> {
 
     pub(super) async fn compute_inline_observation(&mut self, id: &str) -> EditorResult<()> {
         if !self.options.defer_filesystem_diff
-            && self.failure.is_none()
+            && self.health.is_ok()
             && !self.record(id)?.header.deleted
+            && let Some(task) = self.take_observation(id)?
         {
-            if let Some(task) = self.take_observation(id)? {
-                self.complete_file_observation(task.compute()).await?;
-            }
+            self.complete_file_observation(task.compute()).await?;
         }
         Ok(())
     }
@@ -374,15 +374,15 @@ impl<B: Backend> EditorCore<B> {
         let record = self.record(id)?;
         let base = baseline(record).ok_or_else(|| {
             EditorError::new(
-                "Conflict",
+                ErrorCode::Conflict,
                 "Missing historical disk baseline",
                 &record.header.path,
             )
         })?;
-        if decoded.0 == record.header.saved_text {
-            if record.buffer.historical_text(base)? != decoded.0 {
+        if decoded.text == record.header.saved_text {
+            if record.buffer.historical_text(base)? != decoded.text {
                 return Err(EditorError::new(
-                    "IO",
+                    ErrorCode::Io,
                     "Historical disk baseline text mismatch",
                     &record.header.path,
                 ));
@@ -415,7 +415,7 @@ impl<B: Backend> EditorCore<B> {
         &mut self,
         id: &str,
         disk: FileSnapshot,
-        decoded: (String, bool, String),
+        decoded: DecodedText,
         packet: Option<HistoryPacket>,
         disk_version: Version,
     ) -> EditorResult<()> {
@@ -425,10 +425,9 @@ impl<B: Backend> EditorCore<B> {
             .map(|packet| self.prepare_import(id, packet))
             .transpose()?;
         let entry = if let Some(prepared) = prepared.as_ref().filter(|p| p.accepts_operations()) {
-            header.sequence = header
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| EditorError::new("IO", "Journal counter exhausted", &header.path))?;
+            header.sequence = header.sequence.checked_add(1).ok_or_else(|| {
+                EditorError::new(ErrorCode::Io, "Journal counter exhausted", &header.path)
+            })?;
             header.applied = prepared.preview().version.clone();
             Some(JournalEntry {
                 packet: prepared.packet().clone(),
@@ -437,9 +436,9 @@ impl<B: Backend> EditorCore<B> {
         } else {
             None
         };
-        header.saved_text = decoded.0;
-        header.bom = decoded.1;
-        header.line_ending = decoded.2;
+        header.saved_text = decoded.text;
+        header.bom = decoded.bom;
+        header.line_ending = decoded.line_ending;
         header.saved_version = Some(disk_version.clone());
         header.disk_revision = disk.revision;
         header.disk_cursor = self.cursor(id, disk_version, disk.data)?;

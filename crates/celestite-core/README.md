@@ -64,7 +64,7 @@ Web 使用同一处理层消费 Buffer 结果、维护版本化视图映射并�
 
 host 的更新准入绑定连接分配的 peer 和因果依赖，文件保存等待显式的正文版本。`release_replica_document` 保留客户端 Buffer 与撤销并释放活动路径；重新加入通过 host 元数据恢复活动状态。完整会话替换以活动订阅为目录，失败保留旧会话。
 
-网络协议仍为 v3：server 边界保留 legacy-wire `writerId`、`durableVersion`、`backendRevision` 和 `snapshot.revision`；Web transport 将它们规范化为内部新名。这只是兼容拼写，不是双模型；JSON history packet、Version 的 identity / clocks 与 Loro bytes 均不变。
+网络协议为 v4，字段统一使用 `peerId`、`persistedVersion`、`fileRevision`、`stateRevision`；文档读取模型在顶层只有一个 `version`，`snapshot` 只包含 `{ text, stateRevision }`。JSON history packet、Version 的 identity / clocks 与 Loro bytes 均不变。
 
 `tests/editor_backend.rs` 验证统一业务的故障恢复与服务契约；server 的 `headless_editor` 测试验证真实 HTTP、内存历史和普通文件保存；Web 的编辑器回归验证 WASM / OPFS，包括旧日志兼容。后续阶段见项目路线图。
 

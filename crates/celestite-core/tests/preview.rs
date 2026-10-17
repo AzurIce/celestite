@@ -1,6 +1,7 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::DocumentIdentity;
 use celestite_core::backend::EditorResult;
+use celestite_core::backend::ErrorCode;
 use celestite_core::backend::memory::MemoryBackend;
 use celestite_core::editor::EditorCore;
 use celestite_core::instance::{InstanceIdentity, Vault};
@@ -323,7 +324,7 @@ fn edits_coalesce_and_stale_or_unknown_completions_cannot_overwrite_current_stat
         assert_eq!(state.status, PreviewStatus::Pending);
         assert_eq!(
             state.target.version,
-            core.read("doc").unwrap().snapshot.version
+            core.read("doc").unwrap().status.version
         );
         time(2000);
         assert!(core.take_preview_task("doc").unwrap().is_none());
@@ -359,9 +360,9 @@ fn returning_to_same_text_by_undo_still_revokes_old_causal_version() {
         let old = core.take_preview_task("doc").unwrap().unwrap();
         replace(&mut core, "changed").await;
         core.undo("doc").await.unwrap();
-        let snapshot = core.read("doc").unwrap().snapshot;
-        assert_eq!(snapshot.text.as_ref(), old.source);
-        assert_ne!(snapshot.version, old.ticket.version);
+        let document = core.read("doc").unwrap();
+        assert_eq!(document.snapshot.text.as_ref(), old.source);
+        assert_ne!(document.status.version, old.ticket.version);
         assert!(!core.complete_preview(output(&old, "obsolete")));
         time(2000);
         let task = core.take_preview_task("doc").unwrap().unwrap();
@@ -659,7 +660,7 @@ fn links_resolve_from_the_document_directory_and_cannot_escape_vault() {
             core.preview_link("doc", &task.ticket.task_id, "../b.md")
                 .unwrap_err()
                 .code,
-            "StaleVersion"
+            ErrorCode::StaleVersion
         );
     });
 }

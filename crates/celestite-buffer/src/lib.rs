@@ -24,9 +24,10 @@ use std::{ops::Range, sync::Arc};
 use text::difference;
 use types::{
     BufferError, BufferUpdate, ChangeCause, DocumentIdentity, EditOptions, HistoryPacket,
-    HistoryPacketKind, TextEdit, TextSnapshot, UndoContext, UndoState, Version, crdt_error,
+    HistoryPacketKind, Restoration, TextEdit, TextSnapshot, UndoContext, UndoState, Version,
+    crdt_error,
 };
-use undo::{Restoration, UndoSession};
+use undo::{Restoration as UndoRestoration, UndoSession};
 
 const SOURCE: &str = "source";
 
@@ -352,7 +353,7 @@ impl Buffer {
         cause: ChangeCause,
         edits: Vec<TextEdit>,
         operation: Option<HistoryPacket>,
-        restored: Option<Restoration>,
+        restored: Option<UndoRestoration>,
         changed: bool,
     ) -> BufferUpdate {
         let known = self.doc.oplog_vv();
@@ -373,16 +374,14 @@ impl Buffer {
                     .expect("valid integrated causal version");
             }
         }
-        let restored_frame = restored
-            .as_ref()
-            .and_then(|restored| restored.frame.clone());
-        let restored = restored.map(|restored| UndoContext {
+        let restored = restored.map(|restored| Restoration {
             tag: restored.tag,
             positions: restored
                 .positions
                 .iter()
                 .map(|index| self.byte_index((*index).min(self.text.len_unicode())))
                 .collect(),
+            frame: restored.frame,
         });
         BufferUpdate {
             before_len,
@@ -394,7 +393,6 @@ impl Buffer {
             edits,
             restored,
             operation,
-            _restored_frame: restored_frame,
         }
     }
 

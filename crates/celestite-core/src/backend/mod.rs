@@ -1,5 +1,6 @@
 //! Platform IO contract. Futures need not be Send: browser IO stays in its Worker.
 use crate::instance::InstanceIdentity;
+use crate::text::LineEnding;
 use celestite_buffer::types::{BufferError, HistoryPacket, Version};
 use serde::{Deserialize, Serialize};
 
@@ -9,11 +10,68 @@ pub mod memory;
 
 pub type EditorResult<T> = Result<T, EditorError>;
 
+/// Stable error identity across native, wire and platform boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ErrorCode {
+    #[serde(rename = "IO")]
+    Io,
+    InvalidEdit,
+    InvalidPath,
+    NotFound,
+    AlreadyExists,
+    NotDirectory,
+    NotFile,
+    DirectoryNotEmpty,
+    PermissionDenied,
+    QuotaExceeded,
+    Busy,
+    Closed,
+    Conflict,
+    StaleVersion,
+    FilesystemDiffTimeout,
+    FilesystemReconciliationPending,
+    InvalidPreview,
+    PreviewLimit,
+    Unsupported,
+}
+
+impl ErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "IO",
+            Self::InvalidEdit => "InvalidEdit",
+            Self::InvalidPath => "InvalidPath",
+            Self::NotFound => "NotFound",
+            Self::AlreadyExists => "AlreadyExists",
+            Self::NotDirectory => "NotDirectory",
+            Self::NotFile => "NotFile",
+            Self::DirectoryNotEmpty => "DirectoryNotEmpty",
+            Self::PermissionDenied => "PermissionDenied",
+            Self::QuotaExceeded => "QuotaExceeded",
+            Self::Busy => "Busy",
+            Self::Closed => "Closed",
+            Self::Conflict => "Conflict",
+            Self::StaleVersion => "StaleVersion",
+            Self::FilesystemDiffTimeout => "FilesystemDiffTimeout",
+            Self::FilesystemReconciliationPending => "FilesystemReconciliationPending",
+            Self::InvalidPreview => "InvalidPreview",
+            Self::PreviewLimit => "PreviewLimit",
+            Self::Unsupported => "Unsupported",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 #[error("{message}")]
 #[serde(rename_all = "camelCase")]
 pub struct EditorError {
-    pub code: String,
+    pub code: ErrorCode,
     pub message: String,
     #[serde(default)]
     pub path: String,
@@ -23,18 +81,24 @@ pub struct EditorError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rename: Option<Box<RenameFailure>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RenamePhase {
+    Copy,
+    RemoveSource,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameFailure {
     pub from: String,
     pub to: String,
-    pub phase: String,
+    pub phase: RenamePhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<Box<EditorError>>,
 }
 impl EditorError {
-    pub fn new(code: &str, message: impl Into<String>, path: &str) -> Self {
+    pub fn new(code: ErrorCode, message: impl Into<String>, path: &str) -> Self {
         Self {
-            code: code.into(),
+            code,
             message: message.into(),
             path: path.into(),
             rename: None,
@@ -45,12 +109,12 @@ impl EditorError {
 impl From<BufferError> for EditorError {
     fn from(error: BufferError) -> Self {
         let code = match error {
-            BufferError::DiffTimeout => "FilesystemDiffTimeout",
-            BufferError::StaleVersion | BufferError::StalePreparation => "StaleVersion",
+            BufferError::DiffTimeout => ErrorCode::FilesystemDiffTimeout,
+            BufferError::StaleVersion | BufferError::StalePreparation => ErrorCode::StaleVersion,
             BufferError::IdentityMismatch
             | BufferError::PeerIdCollision
-            | BufferError::PeerIdAlreadyUsed { .. } => "Conflict",
-            _ => "InvalidEdit",
+            | BufferError::PeerIdAlreadyUsed { .. } => ErrorCode::Conflict,
+            _ => ErrorCode::InvalidEdit,
         };
         Self::new(code, error.to_string(), "")
     }
@@ -104,16 +168,27 @@ pub struct DocumentHeader {
     pub disk_cursor: Option<DiskCursor>,
     pub deleted: bool,
     pub bom: bool,
-    pub line_ending: String,
+    pub line_ending: LineEnding,
 }
 pub type StoredDocument = (DocumentHeader, Vec<JournalEntry>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     pub path: String,
-    pub kind: String,
+    pub kind: EntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -121,9 +196,16 @@ pub struct FileSnapshot {
     pub data: Vec<u8>,
     pub revision: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectoryOperation {
+    Rename,
+    Remove,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryIntent {
-    pub operation: String,
+    pub operation: DirectoryOperation,
     pub from: String,
     pub to: Option<String>,
     pub entries: Vec<(String, String)>,
@@ -157,7 +239,7 @@ pub trait Backend {
         _headers: &[DocumentHeader],
     ) -> EditorResult<()> {
         Err(EditorError::new(
-            "Unsupported",
+            ErrorCode::Unsupported,
             "Replica session replacement is unavailable",
             "",
         ))
@@ -195,8 +277,52 @@ pub trait Backend {
 
 fn no_projection(path: &str) -> EditorError {
     EditorError::new(
-        "Unsupported",
+        ErrorCode::Unsupported,
         "This instance has no ordinary file projection",
         path,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DocumentHeader, WritePhase};
+    use crate::text::LineEnding;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_opfs_header_json_remains_readable() {
+        let header: DocumentHeader = serde_json::from_value(json!({
+            "id": "doc",
+            "path": "a.md",
+            "seed": {
+                "identity": { "document_id": "doc", "history_id": "history" },
+                "kind": "snapshot",
+                "data": [1, 2, 3]
+            },
+            "sequence": 0,
+            "applied": {
+                "identity": { "document_id": "doc", "history_id": "history" },
+                "clocks": {}
+            },
+            "saved_text": "a\n",
+            "disk_revision": "disk",
+            "saved_version": null,
+            "pending_write": {
+                "text": "a\n",
+                "version": null,
+                "phase": "legacy",
+                "id": null,
+                "expected_revision": null
+            },
+            "deleted": false,
+            "bom": false,
+            "line_ending": "\r\n"
+        }))
+        .unwrap();
+        assert_eq!(header.line_ending, LineEnding::CrLf);
+        assert!(matches!(
+            header.pending_write.unwrap().phase,
+            WritePhase::Legacy
+        ));
+    }
 }
