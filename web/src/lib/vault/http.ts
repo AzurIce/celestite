@@ -11,12 +11,12 @@ import type {
 
 export interface RemoteVaultDescriptor {
   protocol: "celestite-vault";
-  version: 1;
+  protocolVersion: number;
   shareId: string;
   name: string;
   readOnly: boolean;
   previewResourceRoot?: string;
-  vaultIdentity?: { id: string; historyId: string };
+  vault?: { vaultId: string; historyId: string };
   capabilities: {
     watch: boolean;
     conditionalWrite: boolean;
@@ -154,7 +154,7 @@ export class HttpVaultBackend implements VaultBackend {
     query: Record<string, string> = {},
     init: RequestInit = {},
   ) {
-    const url = new URL(this.url + "/api/v1" + route);
+    const url = new URL(this.url + "/api/v4" + route);
     url.search = new URLSearchParams(query).toString();
     const headers = new Headers(init.headers);
     try {
@@ -211,11 +211,11 @@ export class HttpVaultBackend implements VaultBackend {
       const raw = await (await this.request("")).json();
       if (
         raw.protocol !== "celestite-vault" ||
-        raw.version !== 1 ||
+        raw.protocolVersion !== 4 ||
         typeof raw.shareId !== "string" ||
         !raw.shareId ||
-        typeof raw.vaultIdentity?.id !== "string" ||
-        typeof raw.vaultIdentity?.historyId !== "string" ||
+        typeof raw.vault?.vaultId !== "string" ||
+        typeof raw.vault?.historyId !== "string" ||
         typeof raw.name !== "string" ||
         !raw.name.trim() ||
         typeof raw.readOnly !== "boolean" ||
@@ -396,7 +396,7 @@ export class HttpVaultBackend implements VaultBackend {
   private async watchLoop(controller: AbortController) {
     while (!controller.signal.aborted) {
       try {
-        const response = await fetch(this.url + "/api/v1/events", {
+        const response = await fetch(this.url + "/api/v4/events", {
           credentials: "omit",
           referrerPolicy: "no-referrer",
           cache: "no-store",

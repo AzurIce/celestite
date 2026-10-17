@@ -1,13 +1,6 @@
 import { ChangeSet } from "@codemirror/state";
-import type { SelectionContext, TextEdit, Version, ViewEdit } from "./contract";
-export function sameVersion(a: Version, b: Version) {
-  return (
-    a.identity.document_id === b.identity.document_id &&
-    a.identity.history_id === b.identity.history_id &&
-    Object.keys(a.clocks).length === Object.keys(b.clocks).length &&
-    Object.entries(a.clocks).every(([peer, clock]) => b.clocks[peer] === clock)
-  );
-}
+import type { SelectionContext, TextEdit, ViewEdit } from "./contract";
+export { sameVersion } from "./protocol";
 export function editsOf(changes: ChangeSet): TextEdit[] {
   const edits: TextEdit[] = [];
   changes.iterChanges((from, to, _fromB, _toB, insert) =>

@@ -99,10 +99,7 @@ export class EditorHost {
     );
   }
   private rebase(command: BufferCommand, current: CoreDocument): BufferCommand {
-    if (
-      !("base" in command) ||
-      sameVersion(command.base, current.snapshot.version)
-    )
+    if (!("base" in command) || sameVersion(command.base, current.version))
       return command;
     if (command.kind === "edit" && command.input.kind === "text")
       throw new VaultError(
@@ -128,7 +125,7 @@ export class EditorHost {
       };
       version = patch.after;
     }
-    if (!sameVersion(version, current.snapshot.version))
+    if (!sameVersion(version, current.version))
       throw new VaultError(
         "Conflict",
         "输入的历史版本已过期，输入仍保留。",
@@ -216,7 +213,7 @@ export class EditorHost {
       externalChange: raw.externalChange,
       conflict: raw.conflict,
       core: {
-        version: raw.snapshot.version,
+        version: raw.version,
         persistedVersion: raw.persistedVersion,
         undo: raw.undo,
         peerId: raw.peerId,

@@ -23,33 +23,37 @@ import type {
 } from "./protocol";
 export type * from "./protocol";
 
-/** Visible projection; accepted history remains in Rust and provisional input in its session. */
-export interface EditorDocument {
-  collaborators?: RemoteSelection[];
+/** Fields shared by the worker transport and the UI projection. */
+export interface DocumentBase {
   deleted?: boolean;
   conflictResolution?: "local" | "shared";
-  inputFailure?: {
-    outcome: "rejected" | "unknown" | "projection";
-    message: string;
-  };
   externalChange?: ExternalChangeStatus | null;
   core?: EditorProjection;
-  pending?: number;
-  restoredSelection?: SelectionContext & { revision: number };
-  remoteChange?: { before: string; edits: TextEdit[] };
   id: string;
   path: VaultPath;
-  content: string;
-  dirty: boolean;
-  saving: boolean;
-  locked: boolean;
   error: string | null;
   conflict: boolean;
-  reloadVersion: number;
   readOnlyReason: string | null;
   canPreview: boolean;
   lineEnding: LineEnding;
   bom: boolean;
+}
+
+/** Visible projection; accepted history remains in Rust and provisional input in its session. */
+export interface EditorDocument extends DocumentBase {
+  collaborators?: RemoteSelection[];
+  inputFailure?: {
+    outcome: "rejected" | "unknown" | "projection";
+    message: string;
+  };
+  pending?: number;
+  restoredSelection?: SelectionContext & { revision: number };
+  remoteChange?: { before: string; edits: TextEdit[] };
+  content: string;
+  dirty: boolean;
+  saving: boolean;
+  locked: boolean;
+  reloadVersion: number;
 }
 export interface DocumentsSnapshot {
   connection?: ConnectionState;
@@ -182,22 +186,10 @@ export interface EditorDocuments {
   hasUnsaved(): boolean;
   close(): Promise<void>;
 }
-export interface ServiceDocument {
-  deleted?: boolean;
-  conflictResolution?: "local" | "shared";
-  externalChange?: ExternalChangeStatus | null;
+export interface ServiceDocument extends DocumentBase {
   change?: { before: Version; edits: TextEdit[] };
-  id: string;
-  path: VaultPath;
   content?: string;
   savedContent?: string;
-  bom: boolean;
-  lineEnding: LineEnding;
-  readOnlyReason: string | null;
-  canPreview: boolean;
-  error: string | null;
-  conflict: boolean;
-  core?: EditorProjection;
 }
 export interface MutationResult {
   rejection?: RpcError;

@@ -53,7 +53,7 @@ UI 的正文是 core 已接受正文与待确认输入的投影；已接受正�
 
 本机目录在前台定期、恢复焦点及页面可见时核对已登记文档，core 从磁盘历史合入外部修改。未打开文件不主动加载正文，文件树按缓存范围刷新；IME 期间延后后台核对。保存前再次核对，失败保留正文；暂存写入在提交前复查内容 revision。Web Locks 无法协调本机程序，检查与最终写入／删除之间仍存在竞争窗口。
 
-一个 server 进程只托管一个 Vault，Web 可连接多个独立 server。远端连接以 `https://host/<key>` 为基址，接口追加 `/api/v1/...`。不同分享即使指向同一 Vault，也保留独立实例和权限。宿主启动时固定提供 readonly / edit 两条链接；修改 `share_key` 并重启同时轮换这对链接。宿主退出终止 WebSocket 与 SSE，客户端冻结工作区并保留待确认正文。管理列表显示服务器与有效权限，完整链接通过明确的复制操作取得。
+一个 server 进程只托管一个 Vault，Web 可连接多个独立 server。远端连接以 `https://host/<key>` 为基址，接口追加 `/api/v4/...`。不同分享即使指向同一 Vault，也保留独立实例和权限。宿主启动时固定提供 readonly / edit 两条链接；修改 `share_key` 并重启同时轮换这对链接。宿主退出终止 WebSocket 与 SSE，客户端冻结工作区并保留待确认正文。管理列表显示服务器与有效权限，完整链接通过明确的复制操作取得。
 
 host 不使用私有状态库，描述响应的 `persistentHistory` 为 false。历史确认与普通文件保存分别完成：已确认但尚未写回的正文只保留到 host 进程结束。每次启动生成新的 `historyId`；配置固定 `share_key` 和相同根目录可保留链接，但不能恢复旧历史。
 
@@ -114,9 +114,9 @@ flowchart LR
 
 UI 调用统一的文档和文件接口，经 Worker RPC 到编辑 Worker。远端 Worker 再选择 HTTP 或 WebSocket；本地 Worker 则由 core 调用 OPFS 后端，不访问 host。
 
-下表 HTTP 路径相对于 `/<key>/api/v1`，WebSocket 命令共用该 Vault 的 `/sync` 连接。
+下表 HTTP 路径相对于 `/<key>/api/v4`，WebSocket 命令共用该 Vault 的 `/sync` 连接。
 
-协议仍为 v3。server 对外保留 legacy-wire `writerId`、`durableVersion`、`backendRevision` 与 `snapshot.revision`，Web transport 规范化为内部 `peerId`、`persistedVersion`、`fileRevision` 与 `snapshot.stateRevision`；旧拼写仅是兼容边界，不是双模型。JSON history packet、Version 的 identity / clocks 与 Loro bytes 不变。peer 是 Loro 操作来源，不等于 Member、Session 或 User；`stateRevision` 是 Buffer 本地状态计数，不能作为因果版本或文件 revision。`persistedVersion` 不承诺 fsync，也不表示普通文件已保存或 host 已确认。
+协议为 v4：HTTP、SSE 与 WebSocket 统一使用 `peerId`、`persistedVersion`、`fileRevision`、`stateRevision`；文档读取模型在顶层只有一个 `version`，`snapshot` 只包含 `{ text, stateRevision }`。JSON history packet、Version 的 identity / clocks 与 Loro bytes 不变。peer 是 Loro 操作来源，不等于 Member、Session 或 User；`stateRevision` 是 Buffer 本地状态计数，不能作为因果版本或文件 revision。`persistedVersion` 不承诺 fsync，也不表示普通文件已保存或 host 已确认。
 
 | 行为               | 网络请求                                             | 返回与后续处理                                                         |
 | ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------- |

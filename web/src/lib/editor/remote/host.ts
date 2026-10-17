@@ -57,7 +57,7 @@ export class RemoteEditorHost extends EditorHost {
     super(core, http, emit, scheduleRemote);
   }
   async connect() {
-    const identity = this.descriptor.vaultIdentity!;
+    const identity = this.descriptor.vault!;
     this.inbox.stop();
     const inbox = (this.inbox = new RemoteInbox());
     const current = () => {
@@ -448,7 +448,7 @@ export class RemoteEditorHost extends EditorHost {
       const transport = this.requireOnline();
       const sync = this.sync!;
       const current = await this.execute<CoreDocument>("read", { id });
-      await sync.wait(id, current.snapshot.version);
+      await sync.wait(id, current.version);
       this.requireTransport(transport);
       await transport.request("unsubscribe", { id });
       this.requireTransport(transport);
@@ -558,12 +558,12 @@ export class RemoteEditorHost extends EditorHost {
     // overwrite a version the client has not seen.
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await this.execute<CoreDocument>("read", { id });
-      await sync.wait(id, current.snapshot.version);
+      await sync.wait(id, current.version);
       this.requireTransport(transport);
       try {
         const receipt = await transport.request<RemoteReceipt>("save", {
           id,
-          version: current.snapshot.version,
+          version: current.version,
         });
         this.requireTransport(transport);
         return await this.receive(receipt);
@@ -619,9 +619,8 @@ export class RemoteEditorHost extends EditorHost {
       throw error;
     }
     if (
-      descriptor.vaultIdentity?.id !== this.descriptor.vaultIdentity?.id ||
-      descriptor.vaultIdentity?.historyId !==
-        this.descriptor.vaultIdentity?.historyId
+      descriptor.vault?.vaultId !== this.descriptor.vault?.vaultId ||
+      descriptor.vault?.historyId !== this.descriptor.vault?.historyId
     ) {
       const error = new VaultError(
         "Conflict",

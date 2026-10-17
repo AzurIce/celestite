@@ -18,9 +18,9 @@ self.addEventListener("message", (event) => {
     async (emit, schedule) => {
       const { backend, descriptor } = await openHttpVault(url);
       try {
-        const vault = descriptor.vaultIdentity;
+        const vault = descriptor.vault;
         if (
-          !vault?.id ||
+          !vault?.vaultId ||
           !vault.historyId ||
           !descriptor.capabilities.websocketSync
         )
@@ -30,7 +30,7 @@ self.addEventListener("message", (event) => {
           );
         const identity = {
           instanceId: crypto.randomUUID(),
-          vault: { vaultId: vault.id, historyId: vault.historyId },
+          vault,
         };
         await init();
         const binding = await MemoryEditorBinding.open(

@@ -3,6 +3,8 @@
 import type { DocumentIdentity, Version } from "./generated/celestite_core";
 export type { DocumentIdentity, Version } from "./generated/celestite_core";
 
+export const PROTOCOL_VERSION = 4;
+
 export interface Vault {
   vaultId: string;
   historyId: string;
@@ -82,4 +84,13 @@ export interface RpcError {
     phase: "copy" | "remove-source";
     cleanup?: RpcError;
   };
+}
+
+export function sameVersion(a: Version, b: Version): boolean {
+  return (
+    a.identity.document_id === b.identity.document_id &&
+    a.identity.history_id === b.identity.history_id &&
+    Object.keys(a.clocks).length === Object.keys(b.clocks).length &&
+    Object.entries(a.clocks).every(([peer, clock]) => b.clocks[peer] === clock)
+  );
 }

@@ -30,7 +30,8 @@ const version = (clock: number): Version => ({
 const before: CoreDocument = {
   id: "doc",
   path: "a.md",
-  snapshot: { text: "base", version: version(4), stateRevision: 0 },
+  version: version(4),
+  snapshot: { text: "base", stateRevision: 0 },
   undo: { canUndo: false, canRedo: false },
   peerId: "1",
   savedContent: "base",
@@ -49,7 +50,8 @@ const before: CoreDocument = {
 const mutation: CoreMutation = {
   document: {
     ...before,
-    snapshot: { text: "baseX", version: version(5), stateRevision: 1 },
+    version: version(5),
+    snapshot: { text: "baseX", stateRevision: 1 },
     undo: { canUndo: true, canRedo: false },
     dirty: true,
   },
@@ -89,7 +91,7 @@ test("readonly source captures use the core queue and request only explicit bodi
   });
   const source = {
     epoch: 1,
-    documents: [{ id: "doc", path: "a.md", version: before.snapshot.version }],
+    documents: [{ id: "doc", path: "a.md", version: before.version }],
     snapshots: [],
   };
   const host = new EditorHost(
@@ -268,7 +270,7 @@ test("concurrent open replies join a replica once and accept metadata in receipt
         value: state
           ? {
               ...before,
-              snapshot: { ...before.snapshot, version: state.version },
+              version: state.version,
             }
           : null,
         mutations: [],

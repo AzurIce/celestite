@@ -3,7 +3,6 @@ import type {
   BufferUpdate,
   ExternalChangeStatus,
   RpcError,
-  TextSnapshot,
   UndoState,
   Version,
 } from "./protocol";
@@ -11,11 +10,16 @@ import type {
 export interface CorePort {
   call(method: string, params: string): Promise<string>;
 }
+export interface CoreTextSnapshot {
+  text: string;
+  stateRevision: number;
+}
 export interface CoreDocument {
   externalChange?: ExternalChangeStatus | null;
   id: string;
   path: string;
-  snapshot: TextSnapshot;
+  version: Version;
+  snapshot: CoreTextSnapshot;
   undo: UndoState;
   peerId: string;
   savedContent: string;

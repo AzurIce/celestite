@@ -130,7 +130,7 @@ test("connect imports pushes only after every open and the new replica session i
   const host = Object.assign(Object.create(RemoteEditorHost.prototype), {
     inbox: new RemoteInbox(),
     http: { url: "http://localhost" },
-    descriptor: { vaultIdentity: { id: "vault", historyId: "history" } },
+    descriptor: { vault: { vaultId: "vault", historyId: "history" } },
     subscriptions: new Set(["a", "b"]),
     views: new Map(),
     offline: true,

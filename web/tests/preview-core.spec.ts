@@ -120,7 +120,7 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
         first: first.result?.output,
         last: last.result?.output,
         previewVersion: last.result?.ticket.version,
-        documentVersion: document.snapshot.version,
+        documentVersion: document.version,
         savedVersion: document.savedVersion,
         initialVersion: task.ticket.version,
       };

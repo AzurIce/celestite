@@ -2,7 +2,8 @@ import { VaultError } from "../../vault/errors";
 import { decodeError } from "../rpc";
 import type { RpcError } from "../contract";
 import type { HostDocument, CollaborationSnapshot } from "../contract";
-import type { HistoryPacket, Version } from "../contract";
+import type { HistoryPacket } from "../contract";
+import { PROTOCOL_VERSION } from "../protocol";
 
 export interface RemoteReceipt {
   kind: "document";
@@ -12,53 +13,10 @@ export interface RemoteReceipt {
   peerId: string;
 }
 
-/** v3 spelling compatibility exists only at this network boundary. */
-function canonicalField(
-  object: Record<string, unknown>,
-  canonical: string,
-  legacy: string,
-  equal: (a: unknown, b: unknown) => boolean = Object.is,
-) {
-  if (
-    Object.prototype.hasOwnProperty.call(object, canonical) &&
-    Object.prototype.hasOwnProperty.call(object, legacy) &&
-    !equal(object[canonical], object[legacy])
-  )
-    throw new VaultError(
-      "IO",
-      `Protocol error: conflicting ${canonical}/${legacy}`,
-    );
-  const value = Object.prototype.hasOwnProperty.call(object, canonical)
-    ? object[canonical]
-    : object[legacy];
-  delete object[legacy];
-  object[canonical] = value;
-}
-
-function equalVersion(a: unknown, b: unknown): boolean {
-  if (a === null || b === null) return a === b;
-  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
-  const left = a as Version;
-  const right = b as Version;
-  return (
-    left.identity?.document_id === right.identity?.document_id &&
-    left.identity?.history_id === right.identity?.history_id &&
-    !!left.clocks &&
-    !!right.clocks &&
-    Object.keys(left.clocks).length === Object.keys(right.clocks).length &&
-    Object.entries(left.clocks).every(
-      ([peer, clock]) =>
-        Object.prototype.hasOwnProperty.call(right.clocks, peer) &&
-        right.clocks[peer] === clock,
-    )
-  );
-}
-
 export function normalizeRemoteReceipt(value: unknown): RemoteReceipt {
   if (!value || typeof value !== "object")
     throw new VaultError("IO", "Protocol error: invalid document receipt");
-  const receipt = { ...value } as Record<string, unknown>;
-  canonicalField(receipt, "peerId", "writerId");
+  const receipt = value as Record<string, unknown>;
   if (
     typeof receipt.peerId !== "string" ||
     receipt.peerId.length > 20 ||
@@ -68,10 +26,6 @@ export function normalizeRemoteReceipt(value: unknown): RemoteReceipt {
     throw new VaultError("IO", "Protocol error: invalid peerId");
   if (!receipt.document || typeof receipt.document !== "object")
     throw new VaultError("IO", "Protocol error: invalid document metadata");
-  const document = { ...receipt.document } as Record<string, unknown>;
-  canonicalField(document, "persistedVersion", "durableVersion", equalVersion);
-  canonicalField(document, "fileRevision", "backendRevision");
-  receipt.document = document;
   return receipt as unknown as RemoteReceipt;
 }
 
@@ -114,7 +68,7 @@ export class RemoteTransport {
   private lastMessage = Date.now();
   constructor(
     url: string,
-    identity: { id: string; historyId: string },
+    identity: { vaultId: string; historyId: string },
     private receive: (
       receipt:
         | RemoteReceipt
@@ -123,12 +77,12 @@ export class RemoteTransport {
     ) => void,
     private disconnected: (error: unknown) => void,
   ) {
-    const address = new URL(url + "/api/v1/sync");
+    const address = new URL(url + "/api/v4/sync");
     address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
     this.socket = new WebSocket(address);
     this.socket.onopen = () =>
       this.socket.send(
-        JSON.stringify({ protocolVersion: 3, vaultIdentity: identity }),
+        JSON.stringify({ protocolVersion: PROTOCOL_VERSION, vault: identity }),
       );
     this.socket.onmessage = (event) => {
       if (this.closed) return;
