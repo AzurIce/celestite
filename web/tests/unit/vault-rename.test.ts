@@ -1,4 +1,5 @@
 import { afterEach, test } from "node:test";
+import { OpfsInstanceStore } from "../../src/lib/editor/local/store";
 import assert from "node:assert/strict";
 import {
   openOpfsVault,
@@ -546,4 +547,94 @@ test("competing renames cannot overwrite the same target and preserve the losing
   );
   assert.equal((await backend.stat(ROOT_PATH))?.kind, "directory");
   await Promise.all([backend.close(), other.close()]);
+});
+
+test("private OPFS profiles retain stable IDs and start a fresh CRDT history on every open", async () => {
+  const { fs } = await setup();
+  const first = await OpfsInstanceStore.open();
+  await first.files.mkdir(vaultPath("recovery"));
+  await first.files.writeFile(
+    vaultPath("recovery/draft.json"),
+    new TextEncoder().encode('{"text":"draft"}'),
+    { mode: "upsert" },
+  );
+  await first.files.close();
+  const second = await OpfsInstanceStore.open();
+  assert.equal(second.identity.instanceId, first.identity.instanceId);
+  assert.equal(second.identity.vault.vaultId, first.identity.vault.vaultId);
+  assert.notEqual(
+    second.identity.vault.historyId,
+    first.identity.vault.historyId,
+  );
+  assert.equal(
+    new TextDecoder().decode(
+      await second.files.readFile(vaultPath("recovery/draft.json")),
+    ),
+    '{"text":"draft"}',
+  );
+  const profile = await second.files.readFile(vaultPath("profile.json"));
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(profile)), {
+    schema: 2,
+    instanceId: first.identity.instanceId,
+    vaultId: first.identity.vault.vaultId,
+  });
+  assert.ok(fs.root.children.has("editor-instances"));
+});
+
+test("legacy OPFS profiles migrate stable identity without retaining the old history ID", async () => {
+  const { fs } = await setup();
+  const root = await (
+    await fs.root.getDirectoryHandle("editor-instances", { create: true })
+  ).getDirectoryHandle("default", { create: true });
+  const file = await root.getFileHandle("profile.json", { create: true });
+  file.bytes = new TextEncoder().encode(
+    JSON.stringify({
+      schema: 1,
+      identity: {
+        instanceId: "instance",
+        vault: { vaultId: "vault", historyId: "retired-history" },
+      },
+    }),
+  );
+  const store = await OpfsInstanceStore.open();
+  assert.equal(store.identity.instanceId, "instance");
+  assert.equal(store.identity.vault.vaultId, "vault");
+  assert.notEqual(store.identity.vault.historyId, "retired-history");
+  const migrated = JSON.parse(new TextDecoder().decode(file.bytes));
+  assert.deepEqual(migrated, {
+    schema: 2,
+    instanceId: "instance",
+    vaultId: "vault",
+  });
+});
+
+test("upsert atomically replaces private records and preserves old bytes when publication fails", async () => {
+  const { fs, backend } = await setup();
+  const file = vaultPath("draft.json");
+  await backend.writeFile(file, new Uint8Array([1]), { mode: "upsert" });
+  fs.onClose = () => {
+    throw new DOMException("disk full", "QuotaExceededError");
+  };
+  await assert.rejects(
+    backend.writeFile(file, new Uint8Array([2]), { mode: "upsert" }),
+    (error: unknown) =>
+      error instanceof VaultError && error.code === "QuotaExceeded",
+  );
+  assert.deepEqual(await backend.readFile(file), new Uint8Array([1]));
+  fs.onClose = undefined;
+  await backend.writeFile(file, new Uint8Array([3]), { mode: "upsert" });
+  assert.deepEqual(await backend.readFile(file), new Uint8Array([3]));
+});
+
+test("private recovery without a profile is rejected without replacing unknown data", async () => {
+  const { fs } = await setup();
+  const root = await (
+    await fs.root.getDirectoryHandle("editor-instances", { create: true })
+  ).getDirectoryHandle("default", { create: true });
+  const marker = await root.getFileHandle("recovery-format.json", {
+    create: true,
+  });
+  marker.bytes = new TextEncoder().encode("1");
+  await assert.rejects(OpfsInstanceStore.open(), /缺少实例身份/);
+  assert.deepEqual([...root.children.keys()], ["recovery-format.json"]);
 });

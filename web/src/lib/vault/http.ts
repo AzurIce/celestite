@@ -154,7 +154,7 @@ export class HttpVaultBackend implements VaultBackend {
     query: Record<string, string> = {},
     init: RequestInit = {},
   ) {
-    const url = new URL(this.url + "/api/v4" + route);
+    const url = new URL(this.url + "/api/v5" + route);
     url.search = new URLSearchParams(query).toString();
     const headers = new Headers(init.headers);
     try {
@@ -211,7 +211,7 @@ export class HttpVaultBackend implements VaultBackend {
       const raw = await (await this.request("")).json();
       if (
         raw.protocol !== "celestite-vault" ||
-        raw.protocolVersion !== 4 ||
+        raw.protocolVersion !== 5 ||
         typeof raw.shareId !== "string" ||
         !raw.shareId ||
         typeof raw.vault?.vaultId !== "string" ||
@@ -396,7 +396,7 @@ export class HttpVaultBackend implements VaultBackend {
   private async watchLoop(controller: AbortController) {
     while (!controller.signal.aborted) {
       try {
-        const response = await fetch(this.url + "/api/v4/events", {
+        const response = await fetch(this.url + "/api/v5/events", {
           credentials: "omit",
           referrerPolicy: "no-referrer",
           cache: "no-store",

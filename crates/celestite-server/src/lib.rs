@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderValue, Method, StatusCode},
@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router,
 };
-use celestite_core::backend::{EditorError, ErrorCode};
+use celestite_core::error::{EditorError, ErrorCode};
 mod collaboration;
 mod documents_api;
 mod files_api;
@@ -19,6 +19,7 @@ mod shares;
 mod sync;
 pub use shares::{Permission, VaultLinks};
 pub mod vault;
+use celestite_core::fs::native::FsVault;
 use notify::Watcher;
 use serde::Deserialize;
 use std::{
@@ -37,8 +38,8 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use vault::changes::ChangeHint;
 use vault::documents::Documents;
-use vault::fs::{ChangeHint, FsVault};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,7 +212,7 @@ async fn access_check(
     let tail = request
         .uri()
         .path()
-        .split_once("/api/v4")
+        .split_once("/api/v5")
         .map(|(_, tail)| tail)
         .unwrap_or("");
     let operation = request_operation(request.method(), tail);
@@ -234,8 +235,8 @@ async fn api_headers(request: axum::extract::Request, next: Next) -> Response {
 }
 
 fn log_path(path: &str) -> String {
-    if let Some((_, tail)) = path.split_once("/api/v4") {
-        format!("/<redacted>/api/v4{tail}")
+    if let Some((_, tail)) = path.split_once("/api/v5") {
+        format!("/<redacted>/api/v5{tail}")
     } else if path.split('/').any(|segment| {
         shares::key_permission(segment).is_some() || (segment.contains('%') && segment.len() >= 43)
     }) {
@@ -286,8 +287,16 @@ pub fn build_server(
         .iter()
         .map(|o| {
             let header = HeaderValue::from_str(o)?;
-            if !(o.starts_with("http://") || o.starts_with("https://")) || o.ends_with('/') {
-                return Err("Origins must be http(s) origins without trailing slash".into());
+            // Packaged Linux/macOS Tauri WebViews use this exact local app
+            // origin. Keep it opt-in and byte-matched by both CORS and WS auth;
+            // accepting arbitrary custom schemes or `null` would widen access.
+            if o != "tauri://localhost"
+                && (!(o.starts_with("http://") || o.starts_with("https://")) || o.ends_with('/'))
+            {
+                return Err(
+                    "Origins must be HTTP(S) origins without trailing slash, or tauri://localhost"
+                        .into(),
+                );
             }
             Ok(header)
         })
@@ -320,7 +329,7 @@ pub fn build_server(
         }
     })?;
     watcher.watch(&root, notify::RecursiveMode::Recursive)?;
-    tracing::info!(vault_identity = %identity, root = %root.display(), read_only = vault.read_only, persistent_history = documents.persistent(), "Vault initialized");
+    tracing::info!(vault_identity = %identity, root = %root.display(), read_only = vault.read_only, "Vault initialized");
     let hosted = Arc::new(HostedVault {
         id: identity.clone(),
         name: vault.name,
@@ -430,7 +439,7 @@ pub(crate) mod testing {
             }
         }
         pub fn uri(&self, tail: &str) -> String {
-            format!("/{}/api/v4{tail}", self.key)
+            format!("/{}/api/v5{tail}", self.key)
         }
     }
 }
@@ -442,8 +451,8 @@ mod tests {
         let key = "A".repeat(43);
         assert_eq!(super::log_path(&format!("/{key}")), "/<redacted>");
         assert_eq!(
-            super::log_path(&format!("/ro-{key}/api/v4/documents")),
-            "/<redacted>/api/v4/documents"
+            super::log_path(&format!("/ro-{key}/api/v5/documents")),
+            "/<redacted>/api/v5/documents"
         );
         assert_eq!(
             super::log_path(&format!("/%41{}", "A".repeat(42))),
@@ -808,7 +817,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/invalid/api/v4")
+                    .uri("/invalid/api/v5")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -853,6 +862,38 @@ mod tests {
                 .unwrap(),
             "https://client.example"
         );
+    }
+
+    #[test]
+    fn tauri_origin_configuration_accepts_only_the_exact_local_app_origin() {
+        let root = tempfile::tempdir().unwrap();
+        for origin in [
+            "null",
+            "file://localhost",
+            "tauri://other",
+            "tauri://localhost/",
+            "tauri://localhost:80",
+            "tauri://localhost/path",
+            "tauri://user@localhost",
+        ] {
+            let result = build_server(
+                Config {
+                    server: ServerConfig {
+                        allowed_origins: vec![origin.into()],
+                        ..Default::default()
+                    },
+                    vault: VaultConfig {
+                        path: root.path().into(),
+                        ..Default::default()
+                    },
+                },
+                root.path(),
+            );
+            assert!(
+                result.is_err(),
+                "{origin} must not widen the Tauri exception"
+            );
+        }
     }
     #[tokio::test]
     async fn event_stream_invalidates_after_mutation() {
@@ -961,7 +1002,7 @@ mod tests {
             debug.into_body().collect().await.unwrap().to_bytes(),
             "<h1>UI</h1>"
         );
-        for uri in ["/private.md", "/../vault/private.md", "/api/v4/unknown"] {
+        for uri in ["/private.md", "/../vault/private.md", "/api/v5/unknown"] {
             let response = router
                 .router
                 .clone()

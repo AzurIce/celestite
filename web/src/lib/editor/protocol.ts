@@ -3,7 +3,7 @@
 import type { DocumentIdentity, Version } from "./generated/celestite_core";
 export type { DocumentIdentity, Version } from "./generated/celestite_core";
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 export interface Vault {
   vaultId: string;

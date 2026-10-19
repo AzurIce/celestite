@@ -1,9 +1,8 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::DocumentIdentity;
-use celestite_core::backend::EditorResult;
-use celestite_core::backend::ErrorCode;
-use celestite_core::backend::memory::MemoryBackend;
 use celestite_core::editor::EditorCore;
+use celestite_core::error::EditorResult;
+use celestite_core::error::ErrorCode;
 use celestite_core::instance::{InstanceIdentity, Vault};
 use celestite_core::preview::sessions::PreviewController;
 use celestite_core::preview::{
@@ -31,11 +30,11 @@ fn now() -> u64 {
 
 // Explicit consumer composition: the editor supplies immutable source reads.
 struct PreviewFixture {
-    editor: EditorCore<MemoryBackend>,
+    editor: EditorCore,
     preview: PreviewController,
 }
 impl std::ops::Deref for PreviewFixture {
-    type Target = EditorCore<MemoryBackend>;
+    type Target = EditorCore;
     fn deref(&self) -> &Self::Target {
         &self.editor
     }
@@ -94,35 +93,24 @@ impl PreviewFixture {
     }
 }
 
-async fn core(path: &str, source: &str) -> PreviewFixture {
+fn core(path: &str, source: &str) -> PreviewFixture {
     time(1000);
-    let mut core = EditorCore::open(MemoryBackend::new(
-        InstanceIdentity {
-            instance_id: "instance".into(),
-            vault: Vault {
-                vault_id: "vault".into(),
-                history_id: "vault-history".into(),
-            },
+    let mut core = EditorCore::memory(InstanceIdentity {
+        instance_id: "instance".into(),
+        vault: Vault {
+            vault_id: "vault".into(),
+            history_id: "vault-history".into(),
         },
-        now,
-    ))
-    .await
+    })
     .unwrap();
-    join(&mut core, path, "doc", "history", 100, source).await;
+    join(&mut core, path, "doc", "history", 100, source);
     PreviewFixture {
         editor: core,
         preview: PreviewController::default(),
     }
 }
 
-async fn join(
-    core: &mut EditorCore<MemoryBackend>,
-    path: &str,
-    id: &str,
-    history: &str,
-    peer_id: u64,
-    source: &str,
-) {
+fn join(core: &mut EditorCore, path: &str, id: &str, history: &str, peer_id: u64, source: &str) {
     let document = Buffer::with_peer_id(
         DocumentIdentity {
             document_id: id.into(),
@@ -133,12 +121,11 @@ async fn join(
     )
     .unwrap();
     core.join(path, document.export_snapshot().unwrap())
-        .await
         .unwrap();
 }
 
-async fn replace(core: &mut PreviewFixture, text: &str) {
-    core.replace_text("doc", text).await.unwrap();
+fn replace(core: &mut PreviewFixture, text: &str) {
+    core.replace_text("doc", text).unwrap();
     core.synchronize();
 }
 
@@ -225,11 +212,11 @@ fn resource(kind: Option<PreviewResourceKind>, data: Option<&str>) -> PreviewRes
 #[test]
 fn oversized_output_fails_without_discarding_the_previous_preview() {
     block_on(async {
-        let mut core = core("a.md", "old").await;
+        let mut core = core("a.md", "old");
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
         core.complete_preview(output(&old, "previous"));
-        replace(&mut core, "new").await;
+        replace(&mut core, "new");
         time(2000);
         let task = core.take_preview_task("doc").unwrap().unwrap();
         assert!(core.complete_preview(output(&task, "x".repeat(MAX_PREVIEW_OUTPUT_BYTES + 1))));
@@ -243,7 +230,7 @@ fn oversized_output_fails_without_discarding_the_previous_preview() {
 #[test]
 fn cache_capacity_is_released_with_the_last_subscription() {
     block_on(async {
-        let mut core = core("a.md", "small").await;
+        let mut core = core("a.md", "small");
         let count = MAX_PREVIEW_CACHE_BYTES / MAX_PREVIEW_OUTPUT_BYTES;
         let mut first = None;
         for index in 0..=count {
@@ -258,8 +245,7 @@ fn cache_capacity_is_released_with_the_last_subscription() {
                     &format!("history-{index}"),
                     100,
                     "small",
-                )
-                .await;
+                );
                 id
             };
             let subscription = core.subscribe_preview(&id, "client").unwrap();
@@ -289,7 +275,7 @@ fn cache_capacity_is_released_with_the_last_subscription() {
 #[test]
 fn views_share_one_preview_and_client_cleanup_does_not_drop_another_view() {
     block_on(async {
-        let mut core = core("a.md", "# Title").await;
+        let mut core = core("a.md", "# Title");
         let a = core.subscribe_preview("doc", "client-a").unwrap();
         let b = core.subscribe_preview("doc", "client-b").unwrap();
         assert_eq!(a.state.target, b.state.target);
@@ -315,11 +301,11 @@ fn views_share_one_preview_and_client_cleanup_does_not_drop_another_view() {
 #[test]
 fn edits_coalesce_and_stale_or_unknown_completions_cannot_overwrite_current_state() {
     block_on(async {
-        let mut core = core("a.md", "old").await;
+        let mut core = core("a.md", "old");
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
-        replace(&mut core, "middle").await;
-        replace(&mut core, "latest 😀").await;
+        replace(&mut core, "middle");
+        replace(&mut core, "latest 😀");
         let state = core.preview_state("doc").unwrap();
         assert_eq!(state.status, PreviewStatus::Pending);
         assert_eq!(
@@ -355,18 +341,18 @@ fn edits_coalesce_and_stale_or_unknown_completions_cannot_overwrite_current_stat
 #[test]
 fn returning_to_same_text_by_undo_still_revokes_old_causal_version() {
     block_on(async {
-        let mut core = core("a.md", "original").await;
+        let mut core = core("a.md", "original");
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
-        replace(&mut core, "changed").await;
-        core.undo("doc").await.unwrap();
+        replace(&mut core, "changed");
+        core.undo("doc").unwrap();
         let document = core.read("doc").unwrap();
         assert_eq!(document.snapshot.text.as_ref(), old.source);
         assert_ne!(document.status.version, old.ticket.version);
         assert!(!core.complete_preview(output(&old, "obsolete")));
         time(2000);
         let task = core.take_preview_task("doc").unwrap().unwrap();
-        core.redo("doc").await.unwrap();
+        core.redo("doc").unwrap();
         assert!(!core.complete_preview(output(&task, "obsolete after redo")));
         assert_eq!(core.read("doc").unwrap().snapshot.text.as_ref(), "changed");
     });
@@ -375,18 +361,18 @@ fn returning_to_same_text_by_undo_still_revokes_old_causal_version() {
 #[test]
 fn imported_history_invalidates_preview_and_duplicate_import_does_not() {
     block_on(async {
-        let mut core = core("a.md", "local").await;
+        let mut core = core("a.md", "local");
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
         let mut peer =
             Buffer::from_snapshot_with_peer_id(&core.snapshot("doc").unwrap(), 200).unwrap();
         let _ = peer.edit([(5..5, " remote")]).unwrap();
         let packet = peer.export_updates_since(&old.ticket.version).unwrap();
-        core.import("doc", packet.clone()).await.unwrap();
+        core.import("doc", packet.clone()).unwrap();
         assert!(!core.complete_preview(output(&old, "old")));
         time(2000);
         let task = core.take_preview_task("doc").unwrap().unwrap();
-        core.import("doc", packet).await.unwrap();
+        core.import("doc", packet).unwrap();
         assert!(core.complete_preview(output(&task, "current")));
     });
 }
@@ -394,16 +380,16 @@ fn imported_history_invalidates_preview_and_duplicate_import_does_not() {
 #[test]
 fn debounce_has_a_maximum_wait_and_does_not_enqueue_every_keystroke() {
     block_on(async {
-        let mut core = core("a.md", "initial").await;
+        let mut core = core("a.md", "initial");
         core.subscribe_preview("doc", "client").unwrap();
         let initial = core.take_preview_task("doc").unwrap().unwrap();
         core.complete_preview(output(&initial, "initial"));
-        replace(&mut core, "draft").await;
+        replace(&mut core, "draft");
         assert_eq!(core.preview_state("doc").unwrap().due_at, Some(1120));
         assert!(core.take_preview_task("doc").unwrap().is_none());
         for i in 1..=5 {
             time(1000 + i * 100);
-            replace(&mut core, &format!("draft {i}")).await;
+            replace(&mut core, &format!("draft {i}"));
         }
         let state = core.preview_state("doc").unwrap();
         assert_eq!(state.due_at, Some(1500));
@@ -417,11 +403,11 @@ fn debounce_has_a_maximum_wait_and_does_not_enqueue_every_keystroke() {
 #[test]
 fn failure_preserves_last_output_and_explicit_retry_revokes_running_generation() {
     block_on(async {
-        let mut core = core("a.md", "initial").await;
+        let mut core = core("a.md", "initial");
         core.subscribe_preview("doc", "client").unwrap();
         let initial = core.take_preview_task("doc").unwrap().unwrap();
         core.complete_preview(output(&initial, "last good"));
-        replace(&mut core, "next").await;
+        replace(&mut core, "next");
         time(2000);
         let failed = core.take_preview_task("doc").unwrap().unwrap();
         assert!(core.complete_preview(PreviewCompletion {
@@ -452,13 +438,13 @@ fn failure_preserves_last_output_and_explicit_retry_revokes_running_generation()
 #[test]
 fn event_delivery_coalesces_states_without_sequence_gaps_and_close_releases_preview() {
     block_on(async {
-        let mut core = core("a.md", "initial").await;
+        let mut core = core("a.md", "initial");
         core.subscribe_preview("doc", "client").unwrap();
         assert_eq!(core.take_preview_events()[0].sequence, 1);
         assert!(core.take_preview_events().is_empty());
         let task = core.take_preview_task("doc").unwrap().unwrap();
-        replace(&mut core, "a").await;
-        replace(&mut core, "b").await;
+        replace(&mut core, "a");
+        replace(&mut core, "b");
         core.complete_preview(output(&task, "stale"));
         let events = core.take_preview_events();
         assert_eq!(events.len(), 1);
@@ -481,7 +467,7 @@ fn event_delivery_coalesces_states_without_sequence_gaps_and_close_releases_prev
 #[test]
 fn unsupported_documents_do_not_dispatch_and_json_contract_roundtrips() {
     block_on(async {
-        let mut core = core("a.rs", "fn main() {}").await;
+        let mut core = core("a.rs", "fn main() {}");
         let subscription = core.subscribe_preview("doc", "client").unwrap();
         let subscription: PreviewSubscription =
             serde_json::from_value(serde_json::to_value(subscription).unwrap()).unwrap();
@@ -503,8 +489,8 @@ fn unsupported_documents_do_not_dispatch_and_json_contract_roundtrips() {
 #[test]
 fn both_frontends_render_identical_escaped_output_without_mutating_core() {
     block_on(async {
-        let mut not = core("a.not", "= Title\n\n*bold* `a < b`\n").await;
-        let mut md = core("A.MARKDOWN", "# Title\n\n**bold** `a < b`\n").await;
+        let mut not = core("a.not", "= Title\n\n*bold* `a < b`\n");
+        let mut md = core("A.MARKDOWN", "# Title\n\n**bold** `a < b`\n");
         let mut results = Vec::new();
         for core in [&mut not, &mut md] {
             core.subscribe_preview("doc", "client").unwrap();
@@ -524,7 +510,7 @@ fn both_frontends_render_identical_escaped_output_without_mutating_core() {
             let after = core.read("doc").unwrap();
             assert_eq!(before.snapshot, after.snapshot);
             assert_eq!(before.undo, after.undo);
-            assert!(after.saved_version.is_none());
+            assert!(after.status.saved_version.is_none());
             results.push(result);
         }
         assert_eq!(results[0].html, results[1].html);
@@ -545,7 +531,7 @@ fn source_maps_are_utf16_ranges_in_the_original_source_and_share_the_result_tick
                 "= 😀中文\n\nA \\* B *bold*\n\n- item\n\n| X | Y |\n| --- | --- |\n| a | b |\n\n```rust\na < b\n```\n\n#unknown[recovery]",
             ),
         ] {
-            let mut core = core(path, source).await;
+            let mut core = core(path, source);
             core.subscribe_preview("doc", "client").unwrap();
             let task = core.take_preview_task("doc").unwrap().unwrap();
             assert!(core.complete_preview(compute_preview(&task)));
@@ -576,7 +562,7 @@ fn source_maps_are_utf16_ranges_in_the_original_source_and_share_the_result_tick
 #[test]
 fn recovery_and_render_diagnostics_use_utf16_offsets_after_emoji_and_cjk() {
     block_on(async {
-        let mut core = core("a.not", "😀中文 #unknown[ok]").await;
+        let mut core = core("a.not", "😀中文 #unknown[ok]");
         core.subscribe_preview("doc", "client").unwrap();
         let task = core.take_preview_task("doc").unwrap().unwrap();
         assert!(core.complete_preview(compute_preview(&task)));
@@ -647,7 +633,7 @@ fn links_resolve_from_the_document_directory_and_cannot_escape_vault() {
         );
     }
     block_on(async {
-        let mut core = core("notes/a.not", "[go](../b.md)").await;
+        let mut core = core("notes/a.not", "[go](../b.md)");
         core.subscribe_preview("doc", "client").unwrap();
         let task = core.take_preview_task("doc").unwrap().unwrap();
         core.complete_preview(output(&task, "link"));
@@ -655,7 +641,7 @@ fn links_resolve_from_the_document_directory_and_cannot_escape_vault() {
             core.preview_link("doc", &task.ticket.task_id, "../b.md")
                 .is_ok()
         );
-        replace(&mut core, "changed").await;
+        replace(&mut core, "changed");
         assert_eq!(
             core.preview_link("doc", &task.ticket.task_id, "../b.md")
                 .unwrap_err()
@@ -669,7 +655,7 @@ fn links_resolve_from_the_document_directory_and_cannot_escape_vault() {
 #[test]
 fn packages_render_with_project_sources_and_cross_file_diagnostics() {
     block_on(async {
-        let mut core = core("notes/a.not", "#widgets::badge(\"x\")[😀正文]").await;
+        let mut core = core("notes/a.not", "#widgets::badge(\"x\")[😀正文]");
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
         task.overlays.insert(
@@ -736,7 +722,7 @@ fn packages_render_with_project_sources_and_cross_file_diagnostics() {
 #[test]
 fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits() {
     block_on(async {
-        let mut core = core("a.not", "= same body").await;
+        let mut core = core("a.not", "= same body");
         core.subscribe_preview("doc", "client").unwrap();
         let old = core.take_preview_task("doc").unwrap().unwrap();
         join(
@@ -746,8 +732,7 @@ fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits
             "defs-history",
             101,
             "fn leaf() -> Content;",
-        )
-        .await;
+        );
         assert!(!core.complete_preview(output(&old, "stale environment")));
         time(2000);
         let new = core.take_preview_task("doc").unwrap().unwrap();
@@ -767,7 +752,7 @@ fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits
 fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnostics() {
     block_on(async {
         let source = "😀 $x$ #math(false)";
-        let mut core = core("math.not", source).await;
+        let mut core = core("math.not", source);
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
         let config = "future_option = true\n[dependencies]\nkatex = {path = 'packages/katex', future_option = true}\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'katex::math'\nfuture_option = true\n";
@@ -832,61 +817,126 @@ fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnost
 #[test]
 fn resource_snapshots_support_sibling_and_absolute_packages_with_a_stable_document_root() {
     block_on(async {
-        let mut core = core("a.not", "#widgets::badge(\"x\")[正文]").await;
+        let mut core = core("a.not", "#widgets::badge(\"x\")[正文]");
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
-        task.resource_root = "/workspace/docs".into();
-        for dependency in ["../packages/widgets", "/workspace/packages/widgets"] {
-            task.resources.clear();
-            task.resources.insert(
-                "/workspace/packages/widgets/Notist.toml".into(),
-                resource(
-                    Some(PreviewResourceKind::File),
-                    Some("[package]\nname = 'widgets'\n"),
-                ),
-            );
-            task.overlays.insert(
-                "Notist.toml".into(),
-                format!("[dependencies]\nwidgets = {{path = '{dependency}'}}"),
-            );
-            task.resources.insert(
-                "/workspace/packages/widgets/lib.notc".into(),
-                resource(
-                    Some(PreviewResourceKind::File),
-                    Some("fn badge(label: String)[children: InlineContent] -> InlineContent;"),
-                ),
-            );
-            for request in preview_resource_requests(&task) {
-                assert!(
-                    request
-                        .path
-                        .starts_with("/workspace/packages/widgets/components/")
-                );
+        for (root, package_root, relative) in [
+            (
+                "/workspace/docs",
+                "/workspace/packages/widgets",
+                "../packages/widgets",
+            ),
+            (
+                "C:/workspace/docs",
+                "C:/workspace/packages/widgets",
+                "../packages/widgets",
+            ),
+            (
+                r"C:\workspace\docs",
+                "C:/workspace/packages/widgets",
+                r"..\packages\widgets",
+            ),
+            (
+                "//host/share/docs",
+                "//host/share/packages/widgets",
+                "../packages/widgets",
+            ),
+        ] {
+            task.resource_root = root.into();
+            for dependency in [relative, package_root] {
+                task.resources.clear();
+                task.overlays.clear();
                 task.resources.insert(
-                    request.path.clone(),
+                    format!("{package_root}/Notist.toml"),
                     resource(
-                        request
-                            .path
-                            .ends_with("badge.js")
-                            .then_some(PreviewResourceKind::File),
-                        None,
+                        Some(PreviewResourceKind::File),
+                        Some("[package]\nname = 'widgets'\n"),
                     ),
                 );
+                let original_manifest =
+                    format!("[dependencies]\nwidgets = {{path = '{dependency}'}}");
+                task.overlays
+                    .insert("Notist.toml".into(), original_manifest.clone());
+                task.resources.insert(
+                    format!("{package_root}/lib.notc"),
+                    resource(
+                        Some(PreviewResourceKind::File),
+                        Some("fn badge(label: String)[children: InlineContent] -> InlineContent;"),
+                    ),
+                );
+                for request in preview_resource_requests(&task) {
+                    assert!(
+                        request
+                            .path
+                            .starts_with(&format!("{package_root}/components/")),
+                        "unexpected {root}: {}",
+                        request.path
+                    );
+                    task.resources.insert(
+                        request.path.clone(),
+                        resource(
+                            request
+                                .path
+                                .ends_with("badge.js")
+                                .then_some(PreviewResourceKind::File),
+                            None,
+                        ),
+                    );
+                }
+                assert!(preview_resource_requests(&task).is_empty());
+                let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
+                    panic!("external package failed: {root}, {dependency}")
+                };
+                assert!(output.html.contains("<widgets-badge"));
+                assert_eq!(output.used_components[0].package_root, package_root);
+                assert_eq!(
+                    output.used_components[0].path,
+                    format!("{package_root}/components/badge.js")
+                );
+                assert_eq!(task.ticket.path, "a.not");
+                assert_eq!(task.overlays["Notist.toml"], original_manifest);
             }
-            assert!(preview_resource_requests(&task).is_empty());
-            let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
-                panic!("external package failed")
-            };
-            assert!(output.html.contains("<widgets-badge"));
-            assert_eq!(
-                output.used_components[0].package_root,
-                "/workspace/packages/widgets"
-            );
-            assert_eq!(
-                output.used_components[0].path,
-                "/workspace/packages/widgets/components/badge.js"
-            );
-            assert_eq!(task.ticket.path, "a.not");
         }
+    });
+}
+
+#[cfg(feature = "preview")]
+#[test]
+fn foreign_manifests_keep_original_diagnostic_sources_and_offsets_after_path_rewriting() {
+    block_on(async {
+        let mut core = core("a.not", "#widgets::badge(\"x\")[正文]");
+        core.subscribe_preview("doc", "client").unwrap();
+        let mut task = core.take_preview_task("doc").unwrap().unwrap();
+        task.resource_root = "C:/workspace/docs".into();
+        let source = "# 配置 😀\n[dependencies]\nwidgets = {path = 'D:\\packages\\widgets'}\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'widgets::missing'\n";
+        task.overlays.insert("Notist.toml".into(), source.into());
+        task.overlays.insert(
+            "D:/packages/widgets/Notist.toml".into(),
+            "[package]\nname = 'widgets'\n".into(),
+        );
+        task.overlays.insert(
+            "D:/packages/widgets/lib.notc".into(),
+            "fn badge(label: String)[children: InlineContent] -> InlineContent;".into(),
+        );
+        assert!(preview_resource_requests(&task).is_empty());
+        let PreviewOutcome::Failure {
+            diagnostics,
+            message,
+        } = compute_preview(&task).outcome
+        else {
+            panic!("invalid transform accepted")
+        };
+        assert!(!message.contains("__celestite_preview__"));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.path == "Notist.toml")
+            .unwrap();
+        assert_eq!(diagnostic.source.as_deref(), Some(source));
+        let utf16 = source.encode_utf16().collect::<Vec<_>>();
+        let selected = String::from_utf16(&utf16[diagnostic.from..diagnostic.to]).unwrap();
+        assert!(
+            selected.contains("widgets::missing"),
+            "wrong original span: {selected}"
+        );
     });
 }

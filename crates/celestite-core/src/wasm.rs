@@ -1,8 +1,8 @@
 //! Thin WASM bindings for the shared kernel.
 //! JSON keeps 64-bit peer IDs as strings.
-use crate::backend::memory::MemoryBackend;
-use crate::backend::{Backend, EditorError};
 use crate::editor::{EditorCore, EditorOptions, ExternalChangePolicy};
+use crate::error::EditorError;
+use crate::fs::{FileSystem, browser::BrowserFileSystem};
 use crate::preview::sessions::PreviewController;
 use crate::preview::{
     PreviewCompletion, PreviewEvent, PreviewLink, PreviewState, PreviewSubscription, PreviewTask,
@@ -162,10 +162,10 @@ impl PreviewBinding {
     }
 }
 
-/// Worker-owned shared editor with its browser IO Backend.
+/// Worker-owned editor with independent file and recovery capabilities.
 #[wasm_bindgen]
 pub struct EditorBinding {
-    core: EditorCore<crate::backend::browser::BrowserBackend>,
+    core: EditorCore<BrowserFileSystem>,
     adapter: EditorAdapter,
 }
 #[wasm_bindgen]
@@ -173,13 +173,17 @@ impl EditorBinding {
     pub async fn open(
         identity: String,
         io: js_sys::Function,
+        recovery_io: js_sys::Function,
         merge_external: bool,
     ) -> Result<EditorBinding, JsValue> {
-        let backend = crate::backend::browser::BrowserBackend::new(io, decode(&identity)?);
+        let files = BrowserFileSystem::new(io);
+        let recovery = BrowserFileSystem::new(recovery_io);
         Ok(Self {
             adapter: EditorAdapter::default(),
             core: EditorCore::open_with_options(
-                backend,
+                decode(&identity)?,
+                Some(files),
+                Some(recovery),
                 EditorOptions {
                     external_changes: if merge_external {
                         ExternalChangePolicy::Merge
@@ -187,6 +191,7 @@ impl EditorBinding {
                         ExternalChangePolicy::Conflict
                     },
                     defer_filesystem_diff: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -196,27 +201,15 @@ impl EditorBinding {
     pub async fn call(&mut self, method: String, params: String) -> Result<String, JsValue> {
         call_editor(&mut self.adapter, &mut self.core, method, params).await
     }
-}
 
-/// A real EditorCore with volatile private history for independent debug replicas.
-#[wasm_bindgen]
-pub struct MemoryEditorBinding {
-    core: EditorCore<MemoryBackend>,
-    adapter: EditorAdapter,
-}
-#[wasm_bindgen]
-impl MemoryEditorBinding {
-    pub async fn open(identity: String) -> Result<MemoryEditorBinding, JsValue> {
-        let backend = MemoryBackend::new(decode(&identity)?, || js_sys::Date::now() as u64);
+    /// An online or debug replica, with no file or recovery capabilities.
+    pub async fn memory(identity: String) -> Result<EditorBinding, JsValue> {
         Ok(Self {
             adapter: EditorAdapter::default(),
-            core: EditorCore::open(backend)
+            core: EditorCore::open(decode(&identity)?, None, None)
                 .await
                 .map_err(|e| JsValue::from_str(&encode(e)))?,
         })
-    }
-    pub async fn call(&mut self, method: String, params: String) -> Result<String, JsValue> {
-        call_editor(&mut self.adapter, &mut self.core, method, params).await
     }
 }
 
@@ -337,9 +330,9 @@ struct CallReply {
     mutations: Vec<serde_json::Value>,
 }
 
-async fn call_editor<B: Backend>(
+async fn call_editor<F: FileSystem, R: FileSystem>(
     adapter: &mut EditorAdapter,
-    core: &mut EditorCore<B>,
+    core: &mut EditorCore<F, R>,
     method: String,
     params: String,
 ) -> Result<String, JsValue> {

@@ -1,6 +1,6 @@
 # Celestite server MVP
 
-独立 Rust 可执行程序。每个 server 进程服务一个 Vault，由配置文件或命令行指定。Web 客户端通过分享 URL 连接，可以连接多个独立 server，没有创建或删除远端 Vault 的接口。Tauri 尚未接入。目录操作位于 server 的 `vault/fs.rs`；`celestite_core::editor::EditorCore<Backend>` 提供统一 Rust / WASM 编辑内核，server 使用 native 后端，默认 Web Vault 使用 OPFS 后端。
+独立 Rust 可执行程序。每个 server 进程服务一个 Vault，由配置文件或命令行指定。Web 与 Tauri 客户端通过分享 URL 连接，可以连接多个独立 server，没有创建或删除远端 Vault 的接口。目录操作复用 `celestite_core::fs::native::FsVault`；`celestite_core::editor::EditorCore` 显式接收实例身份、普通文件空间与可选恢复空间。server 不建立恢复区，Buffer 和 CRDT 历史只驻留内存；本地 Web 与桌面另用私有文件空间保存明文草稿、磁盘基线和操作意图，重启建立新的 CRDT 历史。
 
 ## 启动
 
@@ -19,7 +19,7 @@ cp crates/celestite-server/config.example.toml /tmp/celestite-demo/config.toml
 Vault share links readonly_url=http://127.0.0.1:7437/ro-<key> edit_url=http://127.0.0.1:7437/<other-key>
 ```
 
-打开 Web 客户端，在底部“管理 Vault”中粘贴其中一条完整 URL。链接到 key 为止，客户端自动追加 `/api/v4/...`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；不设置 `allowed_origins` 时允许所有来源，链接 key 是唯一凭证，设置后仅名单内（含 `public_url` 与监听地址）的来源可访问。没有分享初始化或分享管理命令。
+打开 Web 客户端，在底部“管理 Vault”中粘贴其中一条完整 URL。链接到 key 为止，客户端自动追加 `/api/v5/...`。例子允许默认 Vite 客户端 `http://localhost:1420` 与 `http://127.0.0.1:1420`；不设置 `allowed_origins` 时允许所有来源，链接 key 是唯一凭证，设置后仅名单内（含 `public_url` 与监听地址）的来源可访问。没有分享初始化或分享管理命令。桌面打包版在 Linux / macOS 使用 `tauri://localhost`，Windows 使用 `http://tauri.localhost`；设置来源名单时需按实际客户端平台加入对应 Origin，开发模式仍加入 Vite 的 HTTP Origin。
 
 配置内目录必须已经存在；相对路径以配置文件目录为基准。`[vault]` 指定唯一的 Vault，无配置 ID。配置启动时读取，修改后重启生效。Ctrl+C / SIGTERM 会结束事件订阅并等待正在处理的请求，避免事件长连接阻止退出。server 不读写私有状态库，CRDT 历史只在进程内存中保留；普通文件保存仍写入 Vault 目录。多 Vault 的集中托管留待 SaaS 场景再设计。
 
@@ -135,9 +135,9 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist "$share_key"
 
 启动日志打印完整连接链接；普通请求日志脱敏 key 且不包含查询串、请求头或正文；同步日志只记录包大小和状态。作为 library 使用时，由调用者初始化 subscriber。
 
-## API v1
+## API v5
 
-下面路径均相对于 `/<key>/api/v4`，文件路径通过查询参数传递，使用 Vault 内相对路径与 `/` 分隔。空路径表示根目录。
+下面路径均相对于 `/<key>/api/v5`，文件路径通过查询参数传递，使用 Vault 内相对路径与 `/` 分隔。空路径表示根目录。
 
 | 方法   | 路径                               | 功能                                                    |
 | ------ | ---------------------------------- | ------------------------------------------------------- |
@@ -154,7 +154,7 @@ RUST_LOG=celestite_server=debug,tower_http=debug just serve-notist "$share_key"
 
 错误采用 JSON `{ code, message, path }`，前端恢复为 `VaultError`。多步操作不保证事务。每个 Vault 内操作串行，磁盘操作在线程池执行；服务内多个客户端的版本比较与提交在同一锁内完成。外部程序不参与该锁，内容核对与提交之间仍有竞争窗口；没有跨程序的原子 CAS 承诺。
 
-所有平台使用同一套目录句柄接口直接读写文件和重命名。创建使用排他创建，已有目标返回 AlreadyExists；替换在版本核对后截断原文件，直接写入并同步数据，不更换原文件身份。写入不是原子替换，其他读取者可能看到中间内容，失败可能留下空文件或部分正文，也不承诺断电后目录项已持久化。
+本机文件访问使用受限目录句柄。创建使用排他创建，已有目标返回 AlreadyExists；替换先检查预期 revision、完整暂存新字节，再次核对 revision 后通过重命名发布。替换失败时按实际阶段保留错误证据；只有平台能证明目标未变时才报告 `writeNotStarted`。创建过程失败仍可能留下不完整的新文件；外部程序不参与宿主锁，条件检查不是跨程序原子 CAS。
 
 移动前检查目标是否存在，已有目标返回 AlreadyExists；目标检查与平台重命名之间不保证跨程序的原子排他性。跨挂载点移动返回 Unsupported，不自动复制/删除。符号链接可列出、删除或移动链接本身，正常操作不跟随链接；访问通过受限目录句柄，防止链接逃逸 Vault。对 Vault 内目录的并发替换仍以平台能力和实际错误为准。
 
@@ -175,15 +175,15 @@ REST 文档接口用于检查 host 已加载的历史，供无头客户端与集
 | POST | `/documents/{document}/updates`  | 请求体为起始 `Version`；返回导出的增量，不是上传操作  |
 | GET  | `/documents/events`              | SSE 文档状态提示；不提供协作 peer 或正文订阅屏障      |
 
-这些入口不接受正文编辑或文件保存命令。打开与读取可加载 Buffer 或触发外部文件核对，但不显式写回文件。需要实时编辑、peer 准入、幂等确认或保存时使用 WebSocket；core 的 Rust / JSON 契约见 [API 文档](../../docs/core.md)，网络契约见 [远端协议 v4](../../docs/protocol.md)。
+这些入口不接受正文编辑或文件保存命令。打开与读取可加载 Buffer 或触发外部文件核对，但不显式写回文件。需要实时编辑、peer 准入、幂等确认或保存时使用 WebSocket；core 的 Rust / JSON 契约见 [API 文档](../../docs/core.md)，网络契约见 [远端协议 v5](../../docs/protocol.md)。
 
 ## 在线协作 WebSocket
 
-描述接口报告 `websocketSync: true`。每个客户端 VaultInstance 建立一条 `/<key>/api/v4/sync` 连接；HTTPS 使用 WSS，反向代理需转发 WebSocket upgrade。分享鉴权与来源检查发生在升级前；首个 JSON 消息只校验协议和预期 Vault / 历史身份：
+描述接口报告 `websocketSync: true`。每个客户端 VaultInstance 建立一条 `/<key>/api/v5/sync` 连接；HTTPS 使用 WSS，反向代理需转发 WebSocket upgrade。分享鉴权与来源检查发生在升级前；首个 JSON 消息只校验协议和预期 Vault / 历史身份：
 
 ```json
 {
-  "protocolVersion": 4,
+  "protocolVersion": 5,
   "vault": {
     "vaultId": "描述接口的 vaultId",
     "historyId": "描述接口的 historyId"
@@ -216,7 +216,7 @@ host 同时发送 `members {state}` 全量成员快照，包含成员会话 ID�
 
 ## 文档检查 API
 
-下面路径仍相对于 `/<key>/api/v4`。正文与文档业务由 `celestite_core::editor::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
+下面路径仍相对于 `/<key>/api/v5`。正文与文档业务由 `celestite_core::editor::EditorCore` 管理，不需要标签页、CodeMirror 或浏览器。所有返回值禁止缓存，沿用 Vault 的认证、来源检查与只读约束。
 
 | 方法 | 路径                             | 请求 / 行为                                            |
 | ---- | -------------------------------- | ------------------------------------------------------ |
@@ -228,7 +228,7 @@ host 同时发送 `members {state}` 全量成员快照，包含成员会话 ID�
 
 回执的多词字段采用 `camelCase`，历史身份保留 `document_id` / `history_id`。文档读取模型在顶层只有一个 `version`；`snapshot` 只包含 `{ text, stateRevision }`。`Version = { identity: { document_id, history_id }, clocks: { "十进制 peer ID": counter } }`。peer ID 用字符串，避免 JS 64 位整数精度丢失。`HistoryPacket = { identity, kind: "snapshot" | "updates", data: [byte, ...] }`。JSON 字节数组用于当前测试传输，未来可加入二进制 framing。
 
-协议为 v4：HTTP 单 / 批文档与 WebSocket host 元数据统一使用 `peerId`、`persistedVersion`、`fileRevision`、`snapshot.stateRevision`。v3 的 `writerId`、`durableVersion`、`backendRevision`、`snapshot.revision` 与 `/api/v1` 不再提供；旧客户端会收到握手失败或 404。历史身份、clocks 与包 data 不变。
+协议为 v5，文档状态使用 `fileRevision` 与 `recoveryError`，不提供 CRDT 持久化状态或能力声明。HTTP 文档读取模型使用 `peerId` 和 `snapshot.stateRevision`，WebSocket 文档帧在顶层携带会话分配的 `peerId`。旧客户端会收到握手失败或 404；不提供旧 API 路由或字段转换。历史身份、clocks 与包 data 不变。
 
 HTTP 文档接口用于只读检查；编辑、撤销、增量准入、保存与观察重试均经过 WebSocket 会话。宿主 `vault/runtime.rs` 统一串行执行与通知发布，后台观察复用同一边界。只读普通文件传输不持有投影修改锁。
 
@@ -249,13 +249,13 @@ cargo run -p celestite-server -- --no-config \
 just serve-notist "$share_key"
 ```
 
-描述接口始终报告 `persistentHistory: false`，文档的 `persistedVersion` 为 null。`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）。file revision 标识文件字节基线，不是 CRDT 历史进度。内存历史确认不等于写回 `.md`，WebSocket `save` 是独立动作。没有可见文本变化的导入也可能推进因果版本；等待依赖的包不会被虚报为已应用版本。
+server 不建立明文恢复区，文档的 `recoveryError` 为 null。`dirty` 表示正文与最后已保存文本不同；`savedVersion` 是当前磁盘基线对应的因果版本（含已接受的外部保存）。file revision 标识文件字节基线，不是 CRDT 历史进度。内存历史确认不等于写回 `.md`，WebSocket `save` 是独立动作。没有可见文本变化的导入也可能推进因果版本；等待依赖的包不会被虚报为已应用版本。
 
 server 重启丢弃未写回正文和历史，并生成新的 `historyId` 与实例身份；打开文件时从当前磁盘字节建立新文档 ID 和历史。旧客户端保留内存正文并拒绝重连到新历史，需要保留正文后重新打开连接。同一进程内重连可以恢复 host 已接受的编辑，包括回执丢失的操作。
 
-保存通过哈希条件检查后直接覆盖文件，core 在进程内保留保存阶段和回执。结果不确定时暂停自动处理并保留正文；这些意图不跨重启恢复。普通文件 IO 不提供外部写入来源证明或跨程序 CAS，也不重放崩溃前的目录操作。
+保存通过哈希条件检查后完整暂存并发布替换文件，core 在进程内保留保存阶段和回执。结果不确定时暂停自动处理并保留正文；这些意图不跨重启恢复。普通文件 IO 不提供外部写入来源证明或跨程序 CAS，也不重放崩溃前的目录操作。
 
-host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改合并，Backend 只负责 IO。core 保留磁盘的精确字节和历史版本；外部变化从该版本 fork，以独立 peer 生成有时间预算的 Unicode 细粒度 diff，再合入当前正文。连续观察沿磁盘分支推进，保留活动 Buffer 的 peer ID、个人撤销和订阅。重复提示及自身写回不生成额外文本操作，格式变化仅更新基线；超时、非法正文与不确定写回不会退化为整篇替换。启动注册递归监听；运行时由有界合并的监听唤醒后台核对，每 30 秒核对已加载 Buffer 以兜底漏报，不加载未打开文件。目录变化仍向全部客户端提示。单个无效 / 不可读文件不会阻止其他文件。外部删除保留原文档、未保存正文和历史并报告缺失；外部移动不按相同内容推断身份，稳定移动通过 host API 完成。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持已加载文档 ID；删除保留进程内历史，延迟保存不能重建旧路径。
+host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改合并，FileSystem 只负责 IO。core 保留磁盘的精确字节和历史版本；外部变化从该版本 fork，以独立 peer 生成有时间预算的 Unicode 细粒度 diff，再合入当前正文。连续观察沿磁盘分支推进，保留活动 Buffer 的 peer ID、个人撤销和订阅。重复提示及自身写回不生成额外文本操作，格式变化仅更新基线；超时、非法正文与不确定写回不会退化为整篇替换。启动注册递归监听；运行时由有界合并的监听唤醒后台核对，每 30 秒核对已加载 Buffer 以兜底漏报，不加载未打开文件。目录变化仍向全部客户端提示。单个无效 / 不可读文件不会阻止其他文件。外部删除保留原文档、未保存正文和历史并报告缺失；外部移动不按相同内容推断身份，稳定移动通过 host API 完成。原文件 API 也不能绕过未保存 CRDT 正文直接覆盖文件。通过 server 移动文件 / 目录保持已加载文档 ID；删除保留进程内历史，延迟保存不能重建旧路径。
 
 ### 文档变化通知
 
@@ -263,7 +263,7 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 待协调时保存返回 `409 FilesystemReconciliationPending`，计算超时返回 `409 FilesystemDiffTimeout`，两者都携带文件路径并保留历史和磁盘内容。相同失败输入从 30 秒退避至最多 5 分钟；新内容绕过退避。WebSocket `retry_observation`（参数 `id`）立即重新排队，返回当前文档状态；重试只协调，不写回物理文件，也允许只读 Vault 使用。
 
-`GET /<key>/api/v4/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全部已加载 Buffer 元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence`、`vault` 和 `persistentHistory`。各条目包含文档 ID、路径、已接受 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文，也不加载其他文件。
+`GET /<key>/api/v5/documents/events` 提供需要相同认证的 SSE（`event: documents`，`Cache-Control: no-store`）。连接首先收到 `kind: "resync"` 的全部已加载 Buffer 元数据，之后收到 `kind: "changed"` 的变化条目；通知包含 `streamId`、递增 `sequence` 和 `vault`。各条目包含文档 ID、路径、已接受 `version`、`savedVersion`、磁盘 revision、dirty / conflict / deleted / available 与错误状态，不传正文，也不加载其他文件。
 
 初始元数据与 receiver 在同一 core 锁下建立，订阅后出现的变化进入 receiver；消费者落后超过广播缓冲时重新原子取得全部驻留状态和新 receiver。重连始终重新核对，`Last-Event-ID` 不表示持久化操作回执；server 重启改变 `streamId` 和历史身份。客户端收到通知后通过 `/snapshot` 或 `/updates` 获取 CRDT 内容。
 
@@ -271,7 +271,7 @@ host 通过 core 的 `EditorOptions.external_changes = Merge` 启用外部修改
 
 ### 当前范围
 
-已实现独立文本 CRDT 与单个 server 的文件协调。打开文本时才建立 Buffer，排除符号链接、非 UTF-8 / 二进制内容及超过 5 MiB 的文件；内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一。关闭标签取消文本订阅并清除视图，已加载的 host Buffer 保留到进程结束，以保留已接受但未保存的编辑。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、历史压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
+已实现独立文本 CRDT 与单个 server 的文件协调。打开文本时才建立 Buffer，排除符号链接、非 UTF-8 / 二进制内容及规范 LF 正文超过 5 MiB 的文件；物理文本另容纳 CRLF 与 BOM，最多 10 MiB 加 3 字节。内存正文为 LF，保存恢复文件原有 BOM 与首个换行样式，混合换行会统一；读取、恢复与外部合并使用同一容量规则。关闭标签取消文本订阅并清除视图，已加载的 host Buffer 保留到进程结束，以保留已接受但未保存的编辑。尚未实现目录 Catalog CRDT、整个 Vault 的离线结构合并、附件同步、工作集淘汰、历史压缩或 P2P 同步。描述接口明确报告 `vaultCrdt: false`。
 
 移动 / 删除的物理结果保留在文件系统中，内存元数据与目录操作不构成跨资源原子事务。外部程序 rename 的稳定身份识别暂未实现。HTTP 文档接口用于只读检查，SSE 保留为变化提示；远端 Web 使用自己的 Rust WASM core 和实时 WebSocket 会话。
 
@@ -303,6 +303,6 @@ bun run --cwd web test:ui tests/multi-vault.spec.ts
 
 Vault 根目录只确定文档范围。`Notist.toml` 中的 package 路径相对于该配置解析，可使用 `../packages/grammar` 或绝对路径；无需扩大 Vault 根或迁移文档历史。
 
-描述接口的 `previewResourceRoot` 提供编译资源解析根。`POST /<key>/api/v4/preview/resources` 接收 `{context: {documentPath, overlays}, request: {path, read}}`，返回文件种类、可选字节或不存在状态；`POST /<key>/api/v4/preview/directory` 接收相同 `context` 和绝对 `path`，返回直接子项。`overlays` 包含 Vault 内的 `Notist.toml` 未保存正文及已读取的外部清单源码快照，不写入磁盘；外部身份使用规范绝对路径，仅在 Notist 依赖图实际读取时生效。资源发现由 Notist 执行，这两条接口只读取直接或递归依赖的 `Notist.toml`、`lib.notc` 与 `components/`，沿用 Vault 的认证与来源检查；单文件上限 16 MiB，目录内部符号链接不跟随。
+描述接口的 `previewResourceRoot` 提供编译资源解析根。`POST /<key>/api/v5/preview/resources` 接收 `{context: {documentPath, overlays}, request: {path, read}}`，返回文件种类、可选字节或不存在状态；`POST /<key>/api/v5/preview/directory` 接收相同 `context` 和绝对 `path`，返回直接子项。`overlays` 包含 Vault 内的 `Notist.toml` 未保存正文及已读取的外部清单源码快照，不写入磁盘；外部身份使用规范绝对路径，仅在 Notist 依赖图实际读取时生效。资源发现由 Notist 执行，这两条接口只读取直接或递归依赖的 `Notist.toml`、`lib.notc` 与 `components/`，沿用 Vault 的认证与来源检查；单文件上限 16 MiB，目录内部符号链接不跟随。
 
 每个 package 的清单声明 `[package].name`，依赖键与名称一致。递归依赖、根配置的开发依赖和各作用域的 transforms 均由 Notist 装配；server 只提供资源。外部清单、声明与组件目录变更触发预览失效通知，不运行文档协调，也不将 package 导入文件树或 CRDT 历史。外部配置和声明诊断由 Web 显示只读源码快照。启用这些接口需要重新构建并重启 server；现有 Vault 路径和状态目录保持原配置。

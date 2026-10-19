@@ -18,12 +18,12 @@ use tokio_stream::StreamExt;
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/{id}/api/v4/documents", get(list))
-        .route("/{id}/api/v4/documents/events", get(events))
-        .route("/{id}/api/v4/documents/open", post(open))
-        .route("/{id}/api/v4/documents/{document}", get(state))
-        .route("/{id}/api/v4/documents/{document}/snapshot", get(snapshot))
-        .route("/{id}/api/v4/documents/{document}/updates", post(updates))
+        .route("/{id}/api/v5/documents", get(list))
+        .route("/{id}/api/v5/documents/events", get(events))
+        .route("/{id}/api/v5/documents/open", post(open))
+        .route("/{id}/api/v5/documents/{document}", get(state))
+        .route("/{id}/api/v5/documents/{document}/snapshot", get(snapshot))
+        .route("/{id}/api/v5/documents/{document}/updates", post(updates))
         .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
 }
 

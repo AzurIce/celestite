@@ -317,7 +317,7 @@ export function VaultEditor(props: VaultEditorProps) {
                     disabled={
                       (!active()?.dirty &&
                         !active()?.pending &&
-                        !active()?.core?.historyError) ||
+                        !active()?.core?.recoveryError) ||
                       active()?.saving ||
                       !!active()?.externalChange ||
                       active()?.locked ||

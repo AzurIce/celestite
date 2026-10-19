@@ -14,12 +14,13 @@ import {
   IndexedDbDirectoryRegistry,
   type DirectoryRegistry,
 } from "./directory-registry";
-import type { LocalEditorSource } from "../editor/local/worker";
+import { isDesktop, desktopInvoke } from "../desktop/platform";
+import { openNativeEditor } from "../desktop/editor";
 
 export const DEFAULT_VAULT_ID = "opfs:default";
 export interface VaultConnection {
   id: string;
-  kind: "opfs" | "directory" | "remote";
+  kind: "opfs" | "native" | "directory" | "remote";
   name: string;
   url?: string;
   directoryPath?: string;
@@ -44,6 +45,10 @@ export interface VaultManagerSnapshot {
   persistenceError: string | null;
 }
 interface ManagerOptions {
+  native?: {
+    openEditor: typeof openNativeEditor;
+    pickDirectory: () => Promise<string | null>;
+  };
   file?: SettingsFile;
   openRemote?: typeof openHttpVault;
   openRemoteEditor?: typeof openRemoteEditor;
@@ -51,15 +56,16 @@ interface ManagerOptions {
   pickDirectory?: typeof pickLocalDirectory;
   openLocalEditor?: typeof openLocalEditor;
 }
-const defaultConnection = (): VaultConnection => ({
-  id: DEFAULT_VAULT_ID,
-  kind: "opfs",
+const defaultConnection = (native: boolean): VaultConnection => ({
+  id: native ? "native:default" : DEFAULT_VAULT_ID,
+  kind: native ? "native" : "opfs",
   name: "我的 Vault",
 });
 
 /** Owns runtime lifetimes. Switching views never closes or shares editing buffers. */
 export class VaultManager {
-  private connections: VaultConnection[] = [defaultConnection()];
+  readonly defaultId: string;
+  private connections: VaultConnection[];
   private runtimes = new Map<string, VaultInstance>();
   private inflight = new Map<string, Promise<VaultInstance>>();
   private connecting = new Map<string, Promise<boolean>>();
@@ -70,7 +76,13 @@ export class VaultManager {
   private listeners = new Set<(state: VaultManagerSnapshot) => void>();
   private selection = 0;
   private disposed = false;
+  private preparing = false;
+  private preparation?: Promise<boolean>;
+  private accepted = new Set<Promise<unknown>>();
+  private closePromise?: Promise<void>;
   private persistence: Promise<unknown> = Promise.resolve();
+  private pendingPersistence = false;
+  private connectionsLoaded = false;
   private removals = new Set<string>();
   private file?: SettingsFile;
   private initialization?: Promise<void>;
@@ -82,11 +94,24 @@ export class VaultManager {
     (scope: FileSystemDirectoryHandle) => Promise<void>
   >();
   private directoryError: string | null = null;
+  private native?: ManagerOptions["native"];
   constructor(private options: ManagerOptions = {}) {
     this.file = options.file;
+    this.native =
+      options.native ??
+      (isDesktop()
+        ? {
+            openEditor: openNativeEditor,
+            pickDirectory: () =>
+              desktopInvoke<string | null>("desktop_pick_directory"),
+          }
+        : undefined);
+    const connection = defaultConnection(!!this.native);
+    this.defaultId = connection.id;
+    this.connections = [connection];
     this.directories =
       options.directories ??
-      (typeof indexedDB === "undefined"
+      (this.native || typeof indexedDB === "undefined"
         ? undefined
         : new IndexedDbDirectoryRegistry());
   }
@@ -95,7 +120,7 @@ export class VaultManager {
       connections: [...this.connections],
       opened: [...this.runtimes.values()],
       active: this.active,
-      opening: this.opening,
+      opening: this.opening || this.preparing,
       error: this.error,
       persistenceError:
         [this.persistenceError, this.directoryError]
@@ -113,39 +138,45 @@ export class VaultManager {
     if (!this.disposed)
       for (const listener of this.listeners) listener(this.snapshot());
   }
+  private accept<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.disposed)
+      return Promise.reject(new VaultError("Closed", "Vault 管理器已关闭。"));
+    if (this.preparing)
+      return Promise.reject(
+        new VaultError("Busy", "工作区正在等待关闭，请稍后重试。"),
+      );
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const pending = new Promise<T>((accepted, failed) => {
+      resolve = accepted;
+      reject = failed;
+    });
+    this.accepted.add(pending);
+    void pending.then(
+      () => this.accepted.delete(pending),
+      () => this.accepted.delete(pending),
+    );
+    try {
+      // Register first for synchronous subscribers, then start immediately to
+      // retain the user gesture required by browser directory pickers.
+      void operation().then(resolve, reject);
+    } catch (error) {
+      reject(error);
+    }
+    return pending;
+  }
   initialize(): Promise<void> {
-    return (this.initialization ??= this.load());
+    if (!this.initialization && (this.disposed || this.preparing))
+      return this.accept(() => this.load());
+    return (this.initialization ??= this.accept(() => this.load()));
   }
   private async load() {
     try {
       this.file ??= await openAppDocument("connections.json");
-      const text = await this.file.read();
-      if (text) {
-        const document = JSON.parse(text);
-        if (document.version !== 2 || !Array.isArray(document.connections))
-          throw new Error("连接记录格式无效。");
-        const seen = new Set<string>();
-        for (const connection of document.connections) {
-          if (
-            typeof connection.id !== "string" ||
-            !/^remote:[0-9a-f-]{36}$/.test(connection.id) ||
-            typeof connection.url !== "string" ||
-            typeof connection.name !== "string"
-          )
-            throw new Error("连接记录格式无效。");
-          const url = normalizeVaultUrl(connection.url);
-          const id = connection.id;
-          if (!seen.has(id)) {
-            seen.add(id);
-            this.connections.push({
-              id,
-              kind: "remote",
-              name: connection.name,
-              url,
-            });
-          }
-        }
-      }
+      this.connections.push(
+        ...readConnections(await this.file.read(), !!this.native),
+      );
+      this.connectionsLoaded = true;
       if (this.file.persistent === false)
         this.persistenceError = "连接记录仅保留在本次会话。";
     } catch (error) {
@@ -171,7 +202,7 @@ export class VaultManager {
     }
     if (this.disposed) return;
     this.notify();
-    await this.activate(DEFAULT_VAULT_ID);
+    await this.activateConnection(this.defaultId);
   }
   private open(connection: VaultConnection): Promise<VaultInstance> {
     const existing = this.runtimes.get(connection.id);
@@ -183,18 +214,29 @@ export class VaultManager {
       let resourceSetter:
         ((scope: FileSystemDirectoryHandle) => Promise<void>) | undefined;
       if (connection.kind !== "remote") {
-        const source: LocalEditorSource =
-          connection.kind === "opfs"
-            ? { kind: "opfs", id: "default" }
-            : {
-                kind: "directory",
-                id: connection.id,
-                handle: this.directoryHandle(connection.id),
-                resourceScope: this.resourceScopes.get(connection.id),
-              };
-        const { identity, backend, documents, setResourceScope } = await (
-          this.options.openLocalEditor ?? openLocalEditor
-        )(source);
+        const local = this.native
+          ? await this.native.openEditor(
+              connection.kind === "opfs" || connection.kind === "native"
+                ? { kind: "default" }
+                : { kind: "directory", path: connection.directoryPath! },
+            )
+          : await (this.options.openLocalEditor ?? openLocalEditor)(
+              connection.kind === "opfs" || connection.kind === "native"
+                ? { kind: "opfs", id: "default" }
+                : {
+                    kind: "directory",
+                    id: connection.id,
+                    handle: this.directoryHandle(connection.id),
+                    resourceScope: this.resourceScopes.get(connection.id),
+                  },
+            );
+        const { identity, backend, documents } = local;
+        const setResourceScope =
+          "setResourceScope" in local
+            ? (local.setResourceScope as
+                | ((scope: FileSystemDirectoryHandle) => Promise<void>)
+                | undefined)
+            : undefined;
         resourceSetter = setResourceScope;
         vault = {
           id: connection.id,
@@ -241,11 +283,15 @@ export class VaultManager {
     );
     return operation;
   }
-  async activate(id: string): Promise<boolean> {
+  activate(id: string): Promise<boolean> {
+    if (this.disposed || this.preparing) return Promise.resolve(false);
+    return this.accept(() => this.activateConnection(id));
+  }
+  private async activateConnection(id: string): Promise<boolean> {
     const connection = this.connections.find((c) => c.id === id);
     if (!connection || this.disposed || this.removals.has(id)) return false;
     const authorization =
-      connection.kind === "directory"
+      connection.kind === "directory" && !this.native
         ? authorizeDirectory(this.directoryHandle(id))
         : undefined;
     // Start both prompts during the click; losing an optional resource grant must not block editing.
@@ -289,7 +335,10 @@ export class VaultManager {
       throw new VaultError("NotFound", "目录记录已不存在，请重新选择目录。");
     return handle;
   }
-  async openDirectory(): Promise<boolean> {
+  openDirectory(): Promise<boolean> {
+    return this.accept(() => this.selectDirectory());
+  }
+  private async selectDirectory(): Promise<boolean> {
     if (this.disposed) throw new VaultError("Closed", "Vault 管理器已关闭。");
     const request = ++this.selection;
     this.opening = true;
@@ -297,6 +346,60 @@ export class VaultManager {
     this.notify();
     try {
       // Picker runs before any storage IO, preserving the click's activation.
+      if (this.native) {
+        const path = await this.native.pickDirectory();
+        if (!path || this.disposed) return false;
+        const existing = this.connections.find(
+          (entry) => entry.kind === "directory" && entry.directoryPath === path,
+        );
+        if (existing) {
+          const vault = await this.open(existing);
+          if (request !== this.selection || this.disposed) return false;
+          this.active = vault;
+          return true;
+        }
+        const editor = await this.native.openEditor({
+          kind: "directory",
+          path,
+        });
+        const current = [...this.runtimes.values()].find(
+          (vault) => vault.identity?.instanceId === editor.identity.instanceId,
+        );
+        if (current) {
+          if (request !== this.selection || this.disposed) return false;
+          this.active = current;
+          return true;
+        }
+        const id = `directory:${editor.identity.instanceId}`;
+        if (this.disposed || this.removals.has(id)) {
+          await editor.documents.close();
+          return false;
+        }
+        let connection = this.connections.find((entry) => entry.id === id);
+        const root = editor.root ?? path;
+        const name =
+          root
+            .replace(/[\\/]+$/, "")
+            .split(/[\\/]/)
+            .pop() || root;
+        if (!connection) {
+          connection = { id, kind: "directory", name, directoryPath: root };
+          this.connections.push(connection);
+        }
+        const vault: VaultInstance = {
+          id,
+          name: connection.name,
+          ...editor,
+          tree: new FileTreeModel(editor.backend),
+          treeView: { scrollTop: 0 },
+          readOnly: false,
+        };
+        this.runtimes.set(id, vault);
+        await this.persist();
+        if (request !== this.selection || this.disposed) return false;
+        this.active = vault;
+        return true;
+      }
       const handle = await (this.options.pickDirectory ?? pickLocalDirectory)();
       if (!handle || this.disposed) return false;
       if (!this.directories)
@@ -330,7 +433,10 @@ export class VaultManager {
       this.notify();
     }
   }
-  async connect(value: string): Promise<boolean> {
+  connect(value: string): Promise<boolean> {
+    return this.accept(() => this.connectValue(value));
+  }
+  private async connectValue(value: string): Promise<boolean> {
     const url = normalizeVaultUrl(value);
     const pending = this.connecting.get(url);
     if (pending) return pending;
@@ -394,7 +500,13 @@ export class VaultManager {
       this.notify();
     }
   }
-  private async authorizeResources(
+  private authorizeResources(
+    id: string,
+    update: (scope: FileSystemDirectoryHandle) => Promise<void>,
+  ) {
+    return this.accept(() => this.authorizeResourceDirectory(id, update));
+  }
+  private async authorizeResourceDirectory(
     id: string,
     update: (scope: FileSystemDirectoryHandle) => Promise<void>,
   ) {
@@ -442,8 +554,11 @@ export class VaultManager {
     };
   }
   /** Removing a connection never calls backend.remove(). The default entry is structural. */
-  async removeConnection(id: string): Promise<void> {
-    if (id === DEFAULT_VAULT_ID)
+  removeConnection(id: string): Promise<void> {
+    return this.accept(() => this.remove(id));
+  }
+  private async remove(id: string): Promise<void> {
+    if (id === this.defaultId)
       throw new VaultError("PermissionDenied", "默认本地 Vault 不可移除。");
     if (this.removals.has(id) || this.disposed) return;
     this.removals.add(id);
@@ -460,7 +575,7 @@ export class VaultManager {
       const fallback =
         this.active?.id === id
           ? await this.open(
-              this.connections.find((c) => c.id === DEFAULT_VAULT_ID)!,
+              this.connections.find((c) => c.id === this.defaultId)!,
             )
           : undefined;
       if (vault) {
@@ -488,19 +603,47 @@ export class VaultManager {
     }
   }
   private persist(): Promise<void> {
-    const document = {
-      version: 2,
-      connections: this.connections
-        .filter((c) => c.kind === "remote")
-        .map((c) => ({ id: c.id, url: c.url, name: c.name })),
-    };
+    this.pendingPersistence = true;
     const operation = this.persistence.then(async () => {
       try {
         if (!this.file) throw new Error("本地存储不可用。");
+        if (!this.connectionsLoaded) {
+          const previous = readConnections(
+            await this.file.read(),
+            !!this.native,
+          );
+          for (const connection of previous) {
+            if (
+              !this.connections.some((current) => current.id === connection.id)
+            )
+              this.connections.push(connection);
+          }
+          this.connectionsLoaded = true;
+        }
+        const document = {
+          version: 2,
+          connections: this.connections
+            .filter(
+              (c) =>
+                c.kind === "remote" || (this.native && c.kind === "directory"),
+            )
+            .map((c) =>
+              c.kind === "directory"
+                ? {
+                    id: c.id,
+                    kind: "directory",
+                    path: c.directoryPath,
+                    name: c.name,
+                  }
+                : { id: c.id, url: c.url, name: c.name },
+            ),
+        };
         await this.file.write(document);
+        this.pendingPersistence = false;
         this.persistenceError =
           this.file.persistent === false ? "连接记录仅保留在本次会话。" : null;
       } catch (error) {
+        this.pendingPersistence = true;
         this.persistenceError = `连接记录未保存：${message(error)}`;
       }
       this.notify();
@@ -508,20 +651,75 @@ export class VaultManager {
     this.persistence = operation;
     return operation;
   }
-  async close() {
-    if (this.disposed) return;
-    this.disposed = true;
-    this.selection++;
-    await Promise.allSettled([...this.inflight.values()]);
-    await Promise.allSettled(
-      [...this.runtimes.values()].map((v) => v.documents.close()),
-    );
+  prepareClose(): Promise<boolean> {
+    if (this.disposed) return Promise.resolve(true);
+    if (this.preparation) return this.preparation;
+    this.preparing = true;
+    this.preparation = this.drainAndPrepare();
+    this.notify();
+    return this.preparation;
+  }
+  private async drainAndPrepare(): Promise<boolean> {
+    await Promise.allSettled([...this.accepted]);
+    let preparing: VaultInstance | undefined;
+    try {
+      for (const vault of this.runtimes.values()) {
+        preparing = vault;
+        await vault.documents.prepareClose();
+      }
+      await this.persistence;
+      if (this.pendingPersistence) await this.persist();
+      if (this.pendingPersistence)
+        throw new Error(this.persistenceError ?? "连接记录未保存。");
+      return true;
+    } catch (error) {
+      this.resumeAfterCloseFailure();
+      if (preparing) this.active = preparing;
+      this.error = `窗口仍保留：${message(error)}`;
+      this.notify();
+      return false;
+    }
+  }
+  resumeAfterCloseFailure() {
+    this.preparing = false;
+    this.preparation = undefined;
+    for (const vault of this.runtimes.values())
+      vault.documents.resumeAfterCloseFailure();
+    this.notify();
+  }
+  /** Native has confirmed every owner; teardown must issue no further core calls. */
+  detach() {
     for (const vault of this.runtimes.values()) {
+      vault.documents.detach();
       vault.tree.dispose();
     }
-    await this.persistence;
-    this.resourceSetters.clear();
+    this.disposed = true;
     this.listeners.clear();
+    this.resourceSetters.clear();
+  }
+  close(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.closePromise) return this.closePromise;
+    this.preparing = true;
+    this.notify();
+    return (this.closePromise = (async () => {
+      this.selection++;
+      await Promise.allSettled([...this.accepted]);
+      await Promise.all(
+        [...this.runtimes.values()].map((v) => v.documents.close()),
+      );
+      for (const vault of this.runtimes.values()) vault.tree.dispose();
+      await this.persistence;
+      this.disposed = true;
+      this.resourceSetters.clear();
+      this.listeners.clear();
+    })().catch((error) => {
+      this.closePromise = undefined;
+      this.resumeAfterCloseFailure();
+      this.error = `无法关闭工作区：${message(error)}`;
+      this.notify();
+      throw error;
+    }));
   }
 }
 function message(error: unknown) {
@@ -538,4 +736,55 @@ async function directoryDisplayPath(
   } catch {
     // Optional resource capabilities must not prevent loading the Vault connection.
   }
+}
+
+/** Validate before publishing any stored entries, so a malformed file stays owned by storage. */
+function readConnections(
+  text: string | null,
+  native: boolean,
+): VaultConnection[] {
+  if (!text) return [];
+  const document = JSON.parse(text);
+  if (document.version !== 2 || !Array.isArray(document.connections))
+    throw new Error("连接记录格式无效。");
+  const connections: VaultConnection[] = [];
+  const seen = new Set<string>();
+  for (const connection of document.connections) {
+    let parsed: VaultConnection;
+    if (native && connection.kind === "directory") {
+      if (
+        typeof connection.id !== "string" ||
+        !connection.id.startsWith("directory:") ||
+        typeof connection.path !== "string" ||
+        !connection.path ||
+        typeof connection.name !== "string"
+      )
+        throw new Error("连接记录格式无效。");
+      parsed = {
+        id: connection.id,
+        kind: "directory",
+        name: connection.name,
+        directoryPath: connection.path,
+      };
+    } else {
+      if (
+        typeof connection.id !== "string" ||
+        !/^remote:[0-9a-f-]{36}$/.test(connection.id) ||
+        typeof connection.url !== "string" ||
+        typeof connection.name !== "string"
+      )
+        throw new Error("连接记录格式无效。");
+      parsed = {
+        id: connection.id,
+        kind: "remote",
+        name: connection.name,
+        url: normalizeVaultUrl(connection.url),
+      };
+    }
+    if (!seen.has(parsed.id)) {
+      seen.add(parsed.id);
+      connections.push(parsed);
+    }
+  }
+  return connections;
 }

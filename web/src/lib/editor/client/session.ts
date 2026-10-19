@@ -176,6 +176,6 @@ export class DocumentSession {
     }
     Object.assign(this, metadata);
     if (savedContent !== undefined) this.savedContent = savedContent;
-    if (document.core?.historyError) this.error = document.core.historyError;
+    if (document.core?.recoveryError) this.error = document.core.recoveryError;
   }
 }

@@ -248,7 +248,7 @@ for (const action of ["overwrite", "discard"] as const) {
 test("another edit between conflict reread and commit cannot be silently overwritten", async () => {
   const { files, backend, documents, external } = await conflictedDraft();
   await documents.requestSave();
-  const read = backend.readFileSnapshot!;
+  const read = backend.readFileSnapshot;
   backend.readFileSnapshot = async (path) => {
     const result = await read(path);
     external("newer external");
@@ -543,7 +543,7 @@ test("unrelated reads cannot advance a document save baseline", async () => {
   external("external");
   assert.equal(
     new TextDecoder().decode(
-      (await backend.readFileSnapshot!(path("a.md"))).data,
+      (await backend.readFileSnapshot(path("a.md"))).data,
     ),
     "external",
   );

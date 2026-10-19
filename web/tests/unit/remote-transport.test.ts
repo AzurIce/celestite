@@ -15,17 +15,20 @@ const canonical = () => ({
   sequence: 1,
   peerId: "18446744073709551615",
   document: {
-    persistedVersion: version,
+    version,
+    recoveryError: null,
     fileRevision: "disk",
   },
   packet: { identity: version.identity, kind: "snapshot", data: [] },
 });
 
-test("v4 receipts are accepted without legacy rewriting", () => {
+test("v5 receipts are accepted without legacy rewriting", () => {
   const wire = canonical();
   const receipt = normalizeRemoteReceipt(wire);
   assert.equal(receipt.peerId, wire.peerId);
-  assert.deepEqual(receipt.document.persistedVersion, version);
+  assert.deepEqual(receipt.document.version, version);
+  assert.equal(receipt.document.recoveryError, null);
+  assert.equal("persistedVersion" in receipt.document, false);
   assert.equal(receipt.document.fileRevision, "disk");
   assert.equal("writerId" in receipt, false);
   assert.equal("durableVersion" in receipt.document, false);
@@ -33,7 +36,7 @@ test("v4 receipts are accepted without legacy rewriting", () => {
   assert.deepEqual(normalizeRemoteReceipt(receipt), receipt);
 });
 
-test("retired v3 spellings do not satisfy v4 fields", () => {
+test("retired v3 spellings do not satisfy v5 fields", () => {
   assert.throws(
     () =>
       normalizeRemoteReceipt({
@@ -84,7 +87,7 @@ test("overlong peer IDs are rejected before BigInt conversion", () => {
   }
 });
 
-test("transport sends the v4 handshake and delivers canonical receipts", async () => {
+test("transport sends the v5 handshake and delivers canonical receipts", async () => {
   const original = globalThis.WebSocket;
   let socket!: Socket;
   class Socket {
@@ -116,7 +119,7 @@ test("transport sends the v4 handshake and delivers canonical receipts", async (
   try {
     socket.onopen?.();
     assert.deepEqual(socket.requests[0], {
-      protocolVersion: 4,
+      protocolVersion: 5,
       vault: { vaultId: "vault", historyId: "history" },
     });
     socket.frame({ kind: "hello", sessionId: "session" });

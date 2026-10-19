@@ -9,6 +9,7 @@ import { EditGroups, undoContext } from "../commands";
 import { DocumentPresence } from "./presence";
 import { DocumentSession, type PendingInput } from "./session";
 import { startEditorWorker } from "./worker";
+import { isDesktop } from "../../desktop/platform";
 export { applyEdits } from "./session";
 import type { DocumentPreviews, PreviewState } from "../../preview/contract";
 import type {
@@ -20,15 +21,18 @@ import type {
   SelectionContext,
   ViewSelection,
   ServiceDocument,
+  ServiceEvent,
   ViewEdit,
   Version,
 } from "../contract";
+
+type DocumentEvent = Extract<ServiceEvent, { kind: "document" }>;
 
 function within(path: VaultPath, parent: VaultPath) {
   return path === parent || parent === "" || path.startsWith(parent + "/");
 }
 /** Main-thread view controller. Accepted history/undo/IO live only in the host. */
-export class WorkerDocuments {
+export class ClientDocuments {
   private presence: DocumentPresence;
   readonly previews: DocumentPreviews = {
     subscribe: (id, listener) => this.subscribePreview(id, listener),
@@ -44,6 +48,11 @@ export class WorkerDocuments {
   private connection?: ConnectionState;
   private members?: CollaborationSnapshot;
   private replacingSession = false;
+  private replacementEvents = new Map<
+    string,
+    { content?: DocumentEvent; latest: DocumentEvent }
+  >();
+  private reconnectConnection?: ConnectionState;
   private generation = 0;
   private records = new Map<string, DocumentSession>();
   private groups = new EditGroups();
@@ -51,6 +60,7 @@ export class WorkerDocuments {
   private listeners = new Set<(state: DocumentsSnapshot) => void>();
   private queue = new TaskQueue();
   private saves = new Map<string, Promise<boolean>>();
+  private operations = new Set<Promise<unknown>>();
   private activeId: string | null = null;
   private activation = 0;
   private loadingPath: VaultPath | null = null;
@@ -61,6 +71,8 @@ export class WorkerDocuments {
   private openRequest = 0;
   private undoRequests = new Map<string, number>();
   private closing = false;
+  private closeLocks = new Set<string>();
+  private suspended = false;
   private closePromise?: Promise<void>;
   private unsubscribe: () => void;
   private unsubscribeFailure: () => void;
@@ -93,6 +105,7 @@ export class WorkerDocuments {
         return;
       }
       if (event.kind === "connection") {
+        if (this.replacingSession) this.reconnectConnection = event.connection;
         if (!this.replacingSession || event.connection.status !== "online")
           this.connection = event.connection;
         this.notify();
@@ -104,7 +117,22 @@ export class WorkerDocuments {
           listener({ paths: [vaultPath("")], recursive: true });
         return;
       }
-      if (!this.replacingSession) this.merge(event.document);
+      // A failed handshake retains the old session, including updates already
+      // accepted by its in-flight imports. Keep projecting them while waiting.
+      // After a successful replacement a new history may temporarily fail this
+      // old projection; inputs are blocked and the successful reply withdraws
+      // it using the baseline and buffered snapshots below.
+      this.merge(event.document);
+      if (this.replacingSession && this.records.has(event.document.id)) {
+        const previous = this.replacementEvents.get(event.document.id);
+        // Only the latest complete text and status are needed while inputs are
+        // blocked. This remains bounded by the number of open documents.
+        this.replacementEvents.set(event.document.id, {
+          content:
+            event.document.content !== undefined ? event : previous?.content,
+          latest: event,
+        });
+      }
       this.notify();
     });
     this.unsubscribeFailure = client.onFailure((error) => {
@@ -143,7 +171,13 @@ export class WorkerDocuments {
     return this.queue.run(task);
   }
   private start<T>(task: () => Promise<T>): Promise<T> {
-    return this.queue.start(task);
+    const operation = this.queue.start(task);
+    this.operations.add(operation);
+    void operation.then(
+      () => this.operations.delete(operation),
+      () => this.operations.delete(operation),
+    );
+    return operation;
   }
   snapshot(): DocumentsSnapshot {
     return {
@@ -232,6 +266,8 @@ export class WorkerDocuments {
   async reconnectSession(discardUnconfirmed = false) {
     if (this.replacingSession) throw new VaultError("Busy", "正在重新连接。");
     this.replacingSession = true;
+    this.replacementEvents.clear();
+    this.reconnectConnection = undefined;
     this.generation++;
     this.openRequest++;
     this.connection = {
@@ -249,14 +285,31 @@ export class WorkerDocuments {
           "Conflict",
           "存在未确认输入。重新连接将采用远端历史，请先导出正文或确认丢弃。",
         );
-      const documents = await this.client.request("reconnect", {});
-      for (const document of documents) {
+      const replacement = await this.client.request("reconnect", {});
+      for (let document of replacement.documents) {
         const record = this.records.get(document.id);
         if (!record) continue;
-        record.withdraw(document, true);
+        const pending = this.replacementEvents.get(document.id);
+        const content = pending?.content;
+        const latest = pending?.latest;
+        if (content && content.sequence > replacement.sequence)
+          document = { ...document, ...content.document };
+        if (
+          latest &&
+          latest.sequence > replacement.sequence &&
+          (!content || latest.sequence > content.sequence)
+        )
+          document = { ...document, ...latest.document };
+        // The buffered text is a full snapshot, not a delta from the reply's
+        // version. Applying only its last change would skip earlier updates.
+        const { change: _change, ...snapshot } = document;
+        record.withdraw(snapshot, true);
       }
       this.openError = null;
-      this.connection = { status: "online", error: null };
+      this.connection = this.reconnectConnection ?? {
+        status: "online",
+        error: null,
+      };
       this.conflictPrompt = null;
       for (const listener of this.treeListeners)
         listener({ paths: [vaultPath("")], recursive: true });
@@ -269,6 +322,8 @@ export class WorkerDocuments {
       throw error;
     } finally {
       this.replacingSession = false;
+      this.replacementEvents.clear();
+      this.reconnectConnection = undefined;
       for (const record of this.records.values()) record.saving = false;
       this.notify();
     }
@@ -283,7 +338,7 @@ export class WorkerDocuments {
         record.inputs.length ||
         record.saving ||
         record.content !== record.savedContent ||
-        record.core?.historyError,
+        record.core?.recoveryError,
     );
   }
   private online() {
@@ -363,7 +418,6 @@ export class WorkerDocuments {
       record.locked ||
       record.readOnlyReason ||
       record.blocked ||
-      record.core.historyError ||
       this.closing ||
       (this.connection && this.connection.status !== "online")
     )
@@ -388,7 +442,6 @@ export class WorkerDocuments {
   ): Promise<boolean> {
     if (!record.inputs.includes(input)) return true;
     if (
-      record.core?.historyError ||
       record.blocked ||
       (this.connection && this.connection.status !== "online")
     )
@@ -412,7 +465,7 @@ export class WorkerDocuments {
     }
     record.accept(input, result.document);
     this.notify();
-    return !record.core?.historyError;
+    return true;
   }
   async discardRejectedInput(id: string): Promise<boolean> {
     const record = this.records.get(id);
@@ -436,13 +489,6 @@ export class WorkerDocuments {
   }
   private async flushInputs(record: DocumentSession) {
     if (record.blocked) return false;
-    if (record.core?.historyError) {
-      const document = await this.client.request("retry_history", {
-        id: record.id,
-      });
-      this.merge(document);
-      if (record.core?.historyError) return false;
-    }
     for (const input of [...record.inputs])
       if (!(await this.performEdit(record, input))) return false;
     return true;
@@ -551,7 +597,7 @@ export class WorkerDocuments {
       if (generation !== this.generation) return false;
       this.merge(result);
       this.notify();
-      return !result.error && !result.core?.historyError;
+      return !result.error && !result.core?.recoveryError;
     } catch (error) {
       if (generation !== this.generation) return false;
       record.error = String(error);
@@ -605,7 +651,6 @@ export class WorkerDocuments {
       record.content !== record.savedContent
     )
       return false;
-    const generation = this.generation;
     record.locked = true;
     this.notify();
     try {
@@ -617,7 +662,9 @@ export class WorkerDocuments {
         )
           return false;
         await this.client.request("release_document", { id });
-        if (generation !== this.generation) return false;
+        // A successful release still closes this view when reconnect ran while
+        // its reply was pending. Only a different view record supersedes it.
+        if (this.records.get(id) !== record) return false;
         this.forget(id);
         return true;
       });
@@ -733,6 +780,71 @@ export class WorkerDocuments {
       this.notify();
     }
   }
+  /** Freeze input and confirm IO while retaining the service and its owner. */
+  async prepareClose(): Promise<void> {
+    this.closing = true;
+    this.openRequest++;
+    for (const record of this.records.values())
+      if (!record.locked) {
+        this.closeLocks.add(record.id);
+        record.locked = true;
+      }
+    this.notify();
+    try {
+      await Promise.allSettled([...this.operations, ...this.saves.values()]);
+      if (this.remote) {
+        await this.enqueue(async () => {
+          for (const record of this.records.values()) {
+            if (
+              record.blocked ||
+              (record.inputs.length &&
+                (!this.online() || !(await this.flushInputs(record))))
+            )
+              throw new VaultError(
+                "IO",
+                "未确认的编辑仍保留，请恢复连接后再关闭。",
+              );
+          }
+        });
+      } else if (!(await this.saveAll()) && this.hasUnsaved()) {
+        throw new VaultError(
+          "IO",
+          "存在未能保存的编辑，请处理保存错误后再关闭。",
+        );
+      }
+      await this.enqueue(() => this.client.request("flush", {}));
+      await this.enqueue(() => this.client.request("suspend", {}));
+      this.suspended = true;
+    } catch (error) {
+      this.resumeAfterCloseFailure();
+      throw error;
+    }
+  }
+  resumeAfterCloseFailure() {
+    if (this.suspended) {
+      this.suspended = false;
+      void this.client
+        .request("resume", {})
+        .catch((error) => this.client.fail(error));
+    }
+    this.closing = false;
+    for (const id of this.closeLocks) {
+      const record = this.records.get(id);
+      if (record && !this.undoRequests.has(id)) record.locked = false;
+    }
+    this.closeLocks.clear();
+    this.notify();
+  }
+  /** After native shutdown succeeds, release views without calling the closed owner. */
+  detach() {
+    this.closing = true;
+    this.unsubscribe();
+    this.presence.close();
+    this.unsubscribeFailure();
+    this.client.dispose();
+    this.terminate();
+    this.listeners.clear();
+  }
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
@@ -754,18 +866,11 @@ export class WorkerDocuments {
         });
       } else if (
         !(await this.saveAll()) &&
-        [...this.records.values()].some(
-          (record) => record.inputs.length || record.core?.historyError,
-        )
+        [...this.records.values()].some((record) => record.inputs.length)
       )
         throw new VaultError("IO", "未提交的编辑仍保留，不能关闭服务。");
       await this.enqueue(() => this.client.request("close", {}));
-      this.unsubscribe();
-      this.presence.close();
-      this.unsubscribeFailure();
-      this.client.dispose();
-      this.terminate();
-      this.listeners.clear();
+      this.detach();
     })().catch((error) => {
       this.closing = false;
       this.closePromise = undefined;
@@ -789,7 +894,7 @@ export async function openLocalEditor(
     kind: "initialize",
     source,
   });
-  const documents = new WorkerDocuments(client, terminate);
+  const documents = new ClientDocuments(client, terminate);
   return {
     identity,
     documents,
@@ -812,6 +917,11 @@ export async function openRemoteEditor(
   documents: import("../contract").EditorDocuments;
   backend: VaultBackend;
 }> {
+  if (isDesktop())
+    return (await import("../../desktop/editor")).openNativeRemoteEditor(
+      url,
+      backend,
+    );
   const worker = new Worker(new URL("../remote/worker.ts", import.meta.url), {
     type: "module",
   });
@@ -820,7 +930,7 @@ export async function openRemoteEditor(
     { kind: "initialize", url },
     backend,
   );
-  const documents = new WorkerDocuments(client, terminate, true);
+  const documents = new ClientDocuments(client, terminate, true);
   documents.reconnect = async (discardUnconfirmed = false) => {
     await documents.reconnectSession(discardUnconfirmed);
   };

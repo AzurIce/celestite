@@ -1,3 +1,4 @@
+import { downloadBytes } from "@/lib/download";
 import {
   For,
   Show,
@@ -229,12 +230,7 @@ export function FileTree(props: FileTreeProps) {
   async function download(path: VaultPath) {
     try {
       const bytes = await props.backend.readFile(path);
-      const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)]));
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = entryName(path);
-      anchor.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      await downloadBytes(entryName(path), bytes);
     } catch (error) {
       setLocalError(describeTreeError(error));
     }

@@ -1,13 +1,12 @@
 //! Shared editor business: platform adapters implement IO, never save/recovery policy.
 use self::observation::ObservationCoordinator;
 use self::replica::ReplicaState;
+use self::state::{DirectoryIntent, DiskCursor, DocumentState, WritePhase};
 use self::types::{
     DocumentStatus, DocumentText, EditorDocument, EditorMutation, HostDocument, ReplicaHostState,
 };
-use crate::backend::{
-    Backend, DiskCursor, DocumentHeader, EditorError, EditorResult, ErrorCode, FileSnapshot,
-    JournalEntry, WritePhase,
-};
+use crate::error::{EditorError, EditorResult, ErrorCode};
+use crate::fs::{FileSnapshot, FileSystem};
 use crate::instance::InstanceIdentity;
 use crate::source::{DocumentSnapshot, DocumentSourceSnapshot, SourceDocument};
 use crate::text::{DecodedText, LineEnding};
@@ -16,19 +15,24 @@ use celestite_buffer::history::PreparedImport;
 use celestite_buffer::types::{
     Affinity, Anchor, DocumentIdentity, HistoryPacket, ImportOptions, TextSnapshot, Version,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 
 mod format;
-mod history;
+mod mutation;
 pub mod observation;
 mod projection;
+mod recovery;
 pub mod replica;
+mod state;
 pub mod types;
 
-pub use format::validate_editor_path;
-pub(crate) use format::{decode, encode, validate_text, within};
+use crate::fs::validate_path;
+use format::encode;
+pub(crate) use format::{decode, validate_text, within};
 
 pub const MAX_TEXT_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum encoded UTF-8 bytes for an accepted LF body, including CRLF and BOM.
+pub const MAX_FILE_BYTES: usize = 2 * MAX_TEXT_BYTES + 3;
 
 #[derive(Clone, Copy, Default)]
 pub enum ExternalChangePolicy {
@@ -36,28 +40,45 @@ pub enum ExternalChangePolicy {
     Conflict,
     Merge,
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone)]
 pub struct EditorOptions {
     pub external_changes: ExternalChangePolicy,
     /// Platforms take detached tasks and compute without holding the live core.
     pub defer_filesystem_diff: bool,
+    /// Epoch milliseconds; tests can control scheduling without replacing storage.
+    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self {
+            external_changes: ExternalChangePolicy::default(),
+            defer_filesystem_diff: false,
+            clock: Arc::new(|| {
+                web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            }),
+        }
+    }
 }
 
 struct Record {
     observation: ObservationCoordinator,
     replica: ReplicaState,
-    header: DocumentHeader,
+    header: DocumentState,
     buffer: Buffer,
     dirty: bool,
-    pending_observation: Option<ObservationCommit>,
-    uncommitted: Vec<JournalEntry>,
+    recovery_file: String,
+    recovery_pending_since: Option<u64>,
     conflict: bool,
     error: Option<String>,
     first_dirty: Option<u64>,
 }
 
 impl Record {
-    fn new(header: DocumentHeader, buffer: Buffer, replica: ReplicaState) -> Self {
+    fn new(header: DocumentState, buffer: Buffer, replica: ReplicaState) -> Self {
         let dirty = !buffer.content_matches(&header.saved_text);
         Self {
             observation: ObservationCoordinator::default(),
@@ -65,28 +86,27 @@ impl Record {
             header,
             buffer,
             dirty,
-            pending_observation: None,
-            uncommitted: vec![],
+            recovery_file: format!("recovery/{}.json", uuid::Uuid::new_v4()),
+            recovery_pending_since: None,
             conflict: false,
             error: None,
             first_dirty: None,
         }
     }
-    fn status(&self, id: &str, persistent: bool, failure: Option<String>) -> DocumentStatus {
+    fn status(&self, id: &str, failure: Option<String>) -> DocumentStatus {
         let header = &self.header;
         DocumentStatus {
             id: id.into(),
             path: header.path.clone(),
             version: self.buffer.version(),
             saved_version: header.saved_version.clone(),
-            persisted_version: persistent.then(|| header.applied.clone()),
             file_revision: header.disk_revision.clone(),
             dirty: self.dirty,
             deleted: header.deleted,
             conflict: self.conflict,
             error: self.error.clone(),
             external_change: self.observation.status(),
-            persistence_error: failure,
+            recovery_error: failure,
         }
     }
     fn refresh_dirty(&mut self) {
@@ -94,49 +114,63 @@ impl Record {
     }
 }
 
-struct ObservationCommit {
-    header: DocumentHeader,
-    entry: Option<JournalEntry>,
-    prepared: Option<PreparedImport>,
-}
-
-#[derive(Debug, Default)]
-enum HistoryHealth {
-    #[default]
-    Ok,
-    Failed(String),
-    /// Committed history could not be applied to the live Buffer; reopen the core.
-    ReopenRequired(String),
-}
-
-impl HistoryHealth {
-    fn is_ok(&self) -> bool {
-        matches!(self, Self::Ok)
-    }
-    fn message(&self) -> Option<&str> {
-        match self {
-            Self::Ok => None,
-            Self::Failed(message) | Self::ReopenRequired(message) => Some(message),
-        }
-    }
-}
-
-pub struct EditorCore<B: Backend> {
+pub struct EditorCore<F: FileSystem = Infallible, R: FileSystem = F> {
+    identity: InstanceIdentity,
     file_observation_cursor: Option<String>,
-    backend: B,
+    files: Option<F>,
+    recovery: Option<R>,
+    directory_intent: Option<DirectoryIntent>,
     records: BTreeMap<String, Record>,
-    health: HistoryHealth,
+    recovery_error: Option<EditorError>,
     options: EditorOptions,
     source_epoch: u64,
     mutations: Vec<Arc<EditorMutation>>,
 }
 
-impl<B: Backend> EditorCore<B> {
-    pub async fn open(backend: B) -> EditorResult<Self> {
-        Self::open_with_options(backend, EditorOptions::default()).await
+impl EditorCore {
+    /// Create an in-memory editing session without file or recovery capabilities.
+    pub fn memory(identity: InstanceIdentity) -> EditorResult<Self> {
+        Self::memory_with_options(identity, EditorOptions::default())
     }
-    pub async fn open_with_options(mut backend: B, options: EditorOptions) -> EditorResult<Self> {
-        let identity = backend.identity();
+
+    pub fn memory_with_options(
+        identity: InstanceIdentity,
+        options: EditorOptions,
+    ) -> EditorResult<Self> {
+        Self::new(identity, None, None, options)
+    }
+}
+
+impl<F: FileSystem, R: FileSystem> EditorCore<F, R> {
+    pub async fn open(
+        identity: InstanceIdentity,
+        files: Option<F>,
+        recovery: Option<R>,
+    ) -> EditorResult<Self> {
+        Self::open_with_options(identity, files, recovery, EditorOptions::default()).await
+    }
+    pub async fn open_with_options(
+        identity: InstanceIdentity,
+        files: Option<F>,
+        recovery: Option<R>,
+        options: EditorOptions,
+    ) -> EditorResult<Self> {
+        let mut core = Self::new(identity, files, recovery, options)?;
+        core.restore().await?;
+        core.recover_directory().await?;
+        let ids: Vec<_> = core.records.keys().cloned().collect();
+        for id in ids {
+            // One missing or inaccessible file must not prevent other drafts opening.
+            let _ = core.refresh(&id).await;
+        }
+        Ok(core)
+    }
+    fn new(
+        identity: InstanceIdentity,
+        files: Option<F>,
+        recovery: Option<R>,
+        options: EditorOptions,
+    ) -> EditorResult<Self> {
         if identity.instance_id.is_empty()
             || identity.vault.vault_id.is_empty()
             || identity.vault.history_id.is_empty()
@@ -147,116 +181,50 @@ impl<B: Backend> EditorCore<B> {
                 "",
             ));
         }
-        let mut records = BTreeMap::new();
-        let mut paths = std::collections::BTreeSet::new();
-        for (header, journal) in backend.load().await? {
-            validate_editor_path(&header.path)?;
-            if header.id != header.seed.identity.document_id
-                || records.contains_key(&header.id)
-                || (!header.deleted && !paths.insert(header.path.clone()))
-                || journal.len() as u64 != header.sequence
-            {
-                return Err(EditorError::new(
-                    ErrorCode::Io,
-                    "Invalid stored document identity or journal",
-                    &header.path,
-                ));
-            }
-            let mut document = Buffer::from_snapshot(&header.seed)?;
-            for entry in journal {
-                let _ = document.import(entry.packet.clone())?;
-                if document.version() != entry.applied {
-                    return Err(EditorError::new(
-                        ErrorCode::Io,
-                        "Recovered journal version mismatch",
-                        &header.path,
-                    ));
-                }
-            }
-            validate_text(&document.snapshot().text, &header.path)?;
-            if document.version() != header.applied {
-                return Err(EditorError::new(
-                    ErrorCode::Io,
-                    "Recovered document version mismatch",
-                    &header.path,
-                ));
-            }
-            if let Some(cursor) = &header.disk_cursor {
-                let decoded = decode(&cursor.bytes, &header.path)?;
-                if decoded.text != header.saved_text
-                    || decoded.bom != header.bom
-                    || decoded.line_ending != header.line_ending
-                    || header.saved_version.as_ref() != Some(&cursor.version)
-                    || document.historical_text(&cursor.version)? != header.saved_text
-                {
-                    return Err(EditorError::new(
-                        ErrorCode::Io,
-                        "Invalid disk history cursor",
-                        &header.path,
-                    ));
-                }
-            } else if matches!(options.external_changes, ExternalChangePolicy::Merge) {
-                let version = header.saved_version.as_ref().ok_or_else(|| {
-                    EditorError::new(
-                        ErrorCode::Conflict,
-                        "Missing historical disk baseline; explicit recovery required",
-                        &header.path,
-                    )
-                })?;
-                if document.historical_text(version)? != header.saved_text {
-                    return Err(EditorError::new(
-                        ErrorCode::Io,
-                        "Historical disk baseline text mismatch",
-                        &header.path,
-                    ));
-                }
-            }
-            if let Some(pending) = &header.pending_write
-                && let Some(version) = &pending.version
-                && document.historical_text(version)? != pending.text
-            {
-                return Err(EditorError::new(
-                    ErrorCode::Io,
-                    "Invalid pending write version",
-                    &header.path,
-                ));
-            }
-            records.insert(
-                header.id.clone(),
-                Record::new(header, document, ReplicaState::default()),
-            );
+        if recovery.is_some() && files.is_none() {
+            return Err(EditorError::new(
+                ErrorCode::InvalidEdit,
+                "Draft recovery requires a file system",
+                "",
+            ));
         }
-        let mut core = Self {
+        Ok(Self {
+            identity,
             file_observation_cursor: None,
-            backend,
-            records,
-            health: HistoryHealth::Ok,
+            files,
+            recovery,
+            directory_intent: None,
+            records: BTreeMap::new(),
+            recovery_error: None,
             options,
             source_epoch: 0,
             mutations: vec![],
-        };
-        core.recover_directory().await?;
-        Ok(core)
+        })
+    }
+    fn files(&self) -> EditorResult<&F> {
+        self.files.as_ref().ok_or_else(|| {
+            EditorError::new(
+                ErrorCode::Unsupported,
+                "This session has no ordinary file system",
+                "",
+            )
+        })
     }
     pub fn identity(&self) -> &InstanceIdentity {
-        self.backend.identity()
+        &self.identity
     }
-    pub fn persistent(&self) -> bool {
-        self.backend.persistent()
+    fn now_ms(&self) -> u64 {
+        (self.options.clock)()
+    }
+    fn new_id() -> String {
+        uuid::Uuid::new_v4().to_string()
     }
     fn record(&self, id: &str) -> EditorResult<&Record> {
         self.records
             .get(id)
             .ok_or_else(|| EditorError::new(ErrorCode::NotFound, "Document not found", id))
     }
-    fn writable(&self) -> EditorResult<()> {
-        if let Some(error) = self.health.message() {
-            return Err(EditorError::new(ErrorCode::Io, error, ""));
-        }
-        Ok(())
-    }
     fn live(&self, id: &str) -> EditorResult<()> {
-        self.writable()?;
         if !self.record(id)?.replica.attached {
             return Err(EditorError::new(
                 ErrorCode::Closed,
@@ -281,11 +249,9 @@ impl<B: Backend> EditorCore<B> {
         Ok(())
     }
     pub fn status(&self, id: &str) -> EditorResult<DocumentStatus> {
-        Ok(self.record(id)?.status(
-            id,
-            self.backend.persistent(),
-            self.health.message().map(str::to_owned),
-        ))
+        Ok(self
+            .record(id)?
+            .status(id, self.recovery_error.as_ref().map(|e| e.message.clone())))
     }
     pub fn resident_status(&self) -> EditorResult<Vec<DocumentStatus>> {
         self.records.keys().map(|id| self.status(id)).collect()
@@ -380,13 +346,10 @@ impl<B: Backend> EditorCore<B> {
 
     pub fn read(&self, id: &str) -> EditorResult<EditorDocument> {
         let record = self.record(id)?;
+        let now = self.now_ms();
         let header = &record.header;
         let snapshot = record.buffer.snapshot();
-        let status = record.status(
-            id,
-            self.backend.persistent(),
-            self.health.message().map(str::to_owned),
-        );
+        let status = record.status(id, self.recovery_error.as_ref().map(|e| e.message.clone()));
         Ok(EditorDocument {
             status,
             undo: record.buffer.undo_state(),
@@ -394,24 +357,20 @@ impl<B: Backend> EditorCore<B> {
             saved_content: header.saved_text.clone(),
             bom: header.bom,
             line_ending: header.line_ending,
+            recovery_delay: record
+                .recovery_pending_since
+                .map(|first| 500_u64.saturating_sub(now.saturating_sub(first))),
             autosave_delay: if record.dirty
-                && (self.backend.has_projection() || record.replica.host_authoritative)
+                && self.files.is_some()
                 && !record.replica.read_only
                 && !header.deleted
                 && !record.conflict
                 && record.error.is_none()
                 && record.observation.status().is_none()
-                && self.health.is_ok()
             {
-                Some(
-                    800.min(
-                        5000_u64.saturating_sub(
-                            self.backend.now_ms().saturating_sub(
-                                record.first_dirty.unwrap_or(self.backend.now_ms()),
-                            ),
-                        ),
-                    ),
-                )
+                Some(800.min(
+                    5000_u64.saturating_sub(now.saturating_sub(record.first_dirty.unwrap_or(now))),
+                ))
             } else {
                 None
             },
@@ -423,18 +382,17 @@ impl<B: Backend> EditorCore<B> {
     }
     /// Join an existing history in a private replica, without creating a file projection.
     /// The host supplies the logical path and full snapshot; never seed from plain text.
-    pub async fn join(&mut self, path: &str, packet: HistoryPacket) -> EditorResult<String> {
-        self.join_with_peer_id(path, packet, None).await
+    pub fn join(&mut self, path: &str, packet: HistoryPacket) -> EditorResult<String> {
+        self.join_with_peer_id(path, packet, None)
     }
-    pub async fn join_with_peer_id(
+    pub fn join_with_peer_id(
         &mut self,
         path: &str,
         packet: HistoryPacket,
         peer_id: Option<u64>,
     ) -> EditorResult<String> {
-        self.writable()?;
-        validate_editor_path(path)?;
-        if self.backend.has_projection() || path.is_empty() {
+        validate_path(path)?;
+        if self.files.is_some() || path.is_empty() {
             return Err(EditorError::new(
                 ErrorCode::Unsupported,
                 "Joining requires a private replica and a file path",
@@ -476,12 +434,9 @@ impl<B: Backend> EditorCore<B> {
         };
         let snapshot = document.snapshot();
         validate_text(&snapshot.text, path)?;
-        let header = DocumentHeader {
+        let header = DocumentState {
             id: id.clone(),
             path: path.into(),
-            seed: packet,
-            sequence: 0,
-            applied: snapshot.version,
             saved_text: snapshot.text.to_string(),
             disk_revision: String::new(),
             saved_version: None,
@@ -495,11 +450,10 @@ impl<B: Backend> EditorCore<B> {
             id.clone(),
             Record::new(header, document, ReplicaState::default()),
         );
-        self.persist(&id).await?;
         Ok(id)
     }
     pub async fn open_file(&mut self, path: &str) -> EditorResult<String> {
-        validate_editor_path(path)?;
+        validate_path(path)?;
         if let Some(id) = self
             .records
             .values()
@@ -509,34 +463,28 @@ impl<B: Backend> EditorCore<B> {
             self.refresh(&id).await?;
             return Ok(id);
         }
-        self.writable()?;
         let disk = self
-            .backend
-            .read_file(path, Some(MAX_TEXT_BYTES as u64))
+            .files()?
+            .read_file(path, Some(MAX_FILE_BYTES as u64))
             .await?;
         let decoded = decode(&disk.data, path)?;
         let identity = DocumentIdentity {
-            document_id: self.backend.new_id()?,
-            history_id: self.backend.new_id()?,
+            document_id: Self::new_id(),
+            history_id: Self::new_id(),
         };
         let document = Buffer::new(identity.clone(), &decoded.text)?;
-        let header = DocumentHeader {
+        let header = DocumentState {
             id: identity.document_id.clone(),
             path: path.into(),
-            seed: document.export_snapshot()?,
-            sequence: 0,
-            applied: document.version(),
             saved_text: decoded.text,
             disk_revision: disk.revision,
             saved_version: Some(document.version()),
             pending_write: None,
-            disk_cursor: matches!(self.options.external_changes, ExternalChangePolicy::Merge).then(
-                || DiskCursor {
-                    version: document.version(),
-                    observation: 0,
-                    bytes: disk.data.clone(),
-                },
-            ),
+            disk_cursor: Some(DiskCursor {
+                version: document.version(),
+                observation: 0,
+                bytes: disk.data.clone(),
+            }),
             deleted: false,
             bom: decoded.bom,
             line_ending: decoded.line_ending,
@@ -545,7 +493,7 @@ impl<B: Backend> EditorCore<B> {
             header.id.clone(),
             Record::new(header, document, ReplicaState::default()),
         );
-        self.persist(&identity.document_id).await?;
+        self.checkpoint_document(&identity.document_id).await?;
         Ok(identity.document_id)
     }
     /// Inspect already loaded documents without filesystem IO or accepting new changes.
@@ -554,23 +502,16 @@ impl<B: Backend> EditorCore<B> {
     }
 
     /// Observe loaded buffers without opening other files. One invalid file must
-    /// not starve unrelated documents; history failures require explicit retry.
+    /// not starve unrelated documents.
     pub async fn reconcile_files(&mut self) -> Vec<EditorError> {
         let mut errors = vec![];
-        if !self.backend.has_projection() {
-            return errors;
-        }
-        if let Some(error) = self.health.message() {
-            errors.push(EditorError::new(ErrorCode::Io, error, ""));
+        if self.files.is_none() {
             return errors;
         }
         let ids: Vec<_> = self.records.keys().cloned().collect();
         for id in ids {
             if let Err(error) = self.refresh(&id).await {
                 errors.push(error);
-            }
-            if !self.health.is_ok() {
-                return errors;
             }
         }
         errors
@@ -621,12 +562,12 @@ impl<B: Backend> EditorCore<B> {
 
     async fn refresh_disk(&mut self, id: &str) -> EditorResult<()> {
         let record = self.record(id)?;
-        if !self.backend.has_projection() || record.header.deleted || !self.health.is_ok() {
+        if self.files.is_none() || record.header.deleted {
             return Ok(());
         }
         let disk = match self
-            .backend
-            .read_file(&record.header.path, Some(MAX_TEXT_BYTES as u64))
+            .files()?
+            .read_file(&record.header.path, Some(MAX_FILE_BYTES as u64))
             .await
         {
             Ok(disk) => disk,
@@ -663,15 +604,7 @@ impl<B: Backend> EditorCore<B> {
         self.adopt_disk(id, decoded, disk, false).await
     }
 
-    fn cursor(
-        &self,
-        id: &str,
-        version: Version,
-        bytes: Vec<u8>,
-    ) -> EditorResult<Option<DiskCursor>> {
-        if !matches!(self.options.external_changes, ExternalChangePolicy::Merge) {
-            return Ok(None);
-        }
+    fn cursor(&self, id: &str, version: Version, bytes: Vec<u8>) -> EditorResult<DiskCursor> {
         let observation = self
             .record(id)?
             .header
@@ -682,50 +615,29 @@ impl<B: Backend> EditorCore<B> {
             .ok_or_else(|| {
                 EditorError::new(ErrorCode::Io, "Disk observation counter exhausted", id)
             })?;
-        Ok(Some(DiskCursor {
+        Ok(DiskCursor {
             version,
             observation,
             bytes,
-        }))
+        })
     }
 
-    /// Commit a previously validated candidate before importing into the live Buffer.
-    /// Retrying uses the exact same header and packet even when the receipt was lost.
-    async fn finish_observation(&mut self, id: &str) -> EditorResult<()> {
-        let Some(candidate) = self.record(id)?.pending_observation.as_ref() else {
-            return Ok(());
-        };
-        let header = candidate.header.clone();
-        let entry = candidate.entry.clone();
-        if let Err(error) = self.backend.commit(&header, entry.as_ref()).await {
-            self.health = HistoryHealth::Failed(format!("文件协调尚未持久化：{}", error.message));
-            return Err(error);
-        }
-        let candidate = self
-            .records
-            .get_mut(id)
-            .unwrap()
-            .pending_observation
-            .take()
-            .unwrap();
-        let update = if let Some(prepared) = candidate.prepared {
-            let result = self
-                .records
-                .get_mut(id)
-                .unwrap()
-                .buffer
-                .commit_import(prepared);
-            match result {
-                Ok(update) if update.after == header.applied => Some(update),
-                _ => {
-                    let message = "文件协调已提交，但活动 core 未能应用；必须重新打开。";
-                    self.health = HistoryHealth::ReopenRequired(message.into());
-                    return Err(EditorError::new(ErrorCode::Io, message, id));
-                }
-            }
-        } else {
-            None
-        };
+    async fn stage_observation(
+        &mut self,
+        id: &str,
+        header: DocumentState,
+        prepared: Option<PreparedImport>,
+    ) -> EditorResult<()> {
+        let update = prepared
+            .map(|value| {
+                self.records
+                    .get_mut(id)
+                    .unwrap()
+                    .buffer
+                    .commit_import(value)
+            })
+            .transpose()?;
+        let now = self.now_ms();
         let record = self.records.get_mut(id).unwrap();
         record.header = header;
         record.refresh_dirty();
@@ -734,40 +646,15 @@ impl<B: Backend> EditorCore<B> {
         record.conflict = false;
         record.error = None;
         if record.dirty {
-            if record.first_dirty.is_none() {
-                record.first_dirty = Some(self.backend.now_ms());
-            }
+            record.first_dirty.get_or_insert(now);
         } else {
             record.first_dirty = None;
         }
+        let checkpoint = self.checkpoint_document(id).await;
         if let Some(update) = update {
-            self.publish_update(id, update, Ok(()))?;
+            self.publish_update(id, update)?;
         }
-        Ok(())
-    }
-
-    async fn stage_observation(
-        &mut self,
-        id: &str,
-        header: DocumentHeader,
-        entry: Option<JournalEntry>,
-        prepared: Option<PreparedImport>,
-    ) -> EditorResult<()> {
-        if !self.record(id)?.uncommitted.is_empty()
-            || self.record(id)?.pending_observation.is_some()
-        {
-            return Err(EditorError::new(
-                ErrorCode::Io,
-                "History must be committed before observing disk",
-                id,
-            ));
-        }
-        self.records.get_mut(id).unwrap().pending_observation = Some(ObservationCommit {
-            header,
-            entry,
-            prepared,
-        });
-        self.finish_observation(id).await
+        checkpoint
     }
 
     async fn recover_completed_write(
@@ -782,19 +669,17 @@ impl<B: Backend> EditorCore<B> {
             // A persisted Prepared record proves that this attempt had not started file IO.
             let mut header = self.record(id)?.header.clone();
             header.pending_write = None;
-            self.stage_observation(id, header, None, None).await?;
+            self.stage_observation(id, header, None).await?;
             return Ok(true);
         }
         if encode(&self.record(id)?.header, &pending.text) == disk.data {
             let mut header = self.record(id)?.header.clone();
             header.saved_text = pending.text;
-            header.saved_version = pending.version.clone();
+            header.saved_version = Some(pending.version.clone());
             header.disk_revision = disk.revision.clone();
             header.pending_write = None;
-            if let Some(version) = pending.version {
-                header.disk_cursor = self.cursor(id, version, disk.data.clone())?;
-            }
-            self.stage_observation(id, header, None, None).await?;
+            header.disk_cursor = Some(self.cursor(id, pending.version, disk.data.clone())?);
+            self.stage_observation(id, header, None).await?;
             return Ok(true);
         }
         // Even seeing the old bytes cannot distinguish no write from write + external ABA.
@@ -846,17 +731,16 @@ impl<B: Backend> EditorCore<B> {
         record.header.bom = bom;
         record.header.line_ending = line_ending;
         record.header.pending_write = None;
-        record.header.disk_cursor = cursor;
+        record.header.disk_cursor = Some(cursor);
+        record.refresh_dirty();
         record.conflict = false;
         record.error = None;
         record.first_dirty = None;
+        let checkpoint = self.checkpoint_document(id).await;
         if let Some(update) = update {
-            self.accept_update(id, update, true)
-                .await?
-                .require_committed()
-        } else {
-            self.persist(id).await
+            self.publish_update(id, update)?;
         }
+        checkpoint
     }
     pub fn snapshot(&self, id: &str) -> EditorResult<HistoryPacket> {
         Ok(self.record(id)?.buffer.export_snapshot()?)
@@ -864,19 +748,15 @@ impl<B: Backend> EditorCore<B> {
     pub fn updates(&self, id: &str, version: &Version) -> EditorResult<HistoryPacket> {
         Ok(self.record(id)?.buffer.export_updates_since(version)?)
     }
-    pub async fn apply_host_state(
-        &mut self,
-        id: &str,
-        state: ReplicaHostState,
-    ) -> EditorResult<()> {
-        if self.backend.has_projection() {
+    pub fn apply_host_state(&mut self, id: &str, state: ReplicaHostState) -> EditorResult<()> {
+        if self.files.is_some() {
             return Err(EditorError::new(
                 ErrorCode::Unsupported,
                 "Host receipts require a private replica",
                 id,
             ));
         }
-        validate_editor_path(&state.path)?;
+        validate_path(&state.path)?;
         validate_text(&state.saved_content, &state.path)?;
         if state.path.is_empty()
             || (!state.deleted
@@ -913,13 +793,13 @@ impl<B: Backend> EditorCore<B> {
         record.header.bom = state.bom;
         record.header.line_ending = state.line_ending;
         record.header.deleted = state.deleted;
+        record.refresh_dirty();
         record.observation.remote = state.external_change;
         record.conflict = state.conflict;
         record.error = state.error;
         if record.buffer.content_matches(&record.header.saved_text) {
             record.first_dirty = None;
         }
-        self.persist(id).await?;
         Ok(())
     }
 }

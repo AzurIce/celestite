@@ -1,6 +1,11 @@
 //! Notist drives resource discovery; platforms answer queries asynchronously.
-use super::{PreviewResourceKind, PreviewResourceRequest, PreviewTask};
-use crate::editor::validate_editor_path;
+use super::{
+    PreviewDiagnostic, PreviewDiagnosticOrigin, PreviewResourceKind, PreviewResourceRequest,
+    PreviewTask,
+    manifests::ManifestSource,
+    paths::{ResourceNamespace, ResourcePath},
+};
+use crate::fs::validate_path;
 use notist::{ResourceError, Resources, resources::ResourceKind};
 use std::{
     cell::RefCell,
@@ -9,20 +14,21 @@ use std::{
 };
 
 pub(super) fn resource_key(root: &str, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    ResourceNamespace::new(root).key(path)
 }
 
 pub(super) struct SnapshotResources<'a> {
     task: &'a PreviewTask,
+    namespace: ResourceNamespace,
+    manifests: RefCell<BTreeMap<PathBuf, ManifestSource>>,
     requests: RefCell<BTreeMap<String, bool>>,
 }
 impl<'a> SnapshotResources<'a> {
     pub(super) fn new(task: &'a PreviewTask) -> Self {
         Self {
             task,
+            namespace: ResourceNamespace::new(&task.resource_root),
+            manifests: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
         }
     }
@@ -41,27 +47,50 @@ impl<'a> SnapshotResources<'a> {
         }
     }
     fn key(&self, path: &Path) -> Result<String, ResourceError> {
-        let resolved = self.resolve(path);
-        let key = resource_key(&self.task.resource_root, &resolved);
-        // WASM paths use the preview's logical Unix namespace.
-        if !resolved.to_string_lossy().starts_with('/') {
+        if ResourcePath::absolute(&self.task.resource_root).is_none() {
             return Err(ResourceError::Access {
-                path: resolved,
-                message: "expected absolute resource identity".into(),
+                path: PathBuf::from(&self.task.resource_root),
+                message: "expected absolute resource root".into(),
             });
         }
-        if !key.starts_with('/') {
-            validate_editor_path(&key).map_err(|error| ResourceError::Access {
-                path: resolved,
+        let key = self.namespace.key(path);
+        if ResourcePath::absolute(&key).is_none() {
+            validate_path(&key).map_err(|error| ResourceError::Access {
+                path: PathBuf::from(&key),
                 message: error.message,
             })?;
         }
         Ok(key)
     }
+
+    pub(super) fn diagnostic(&self, error: &notist::SourceDiagnostic) -> PreviewDiagnostic {
+        let sources = self.manifests.borrow();
+        let prepared = sources
+            .get(&self.resolve(&error.path))
+            .filter(|prepared| prepared.analysis == error.source);
+        let from = usize::from(error.diagnostic.span.start());
+        let to = usize::from(error.diagnostic.span.end());
+        let (source, range) = match prepared {
+            Some(prepared) => (&prepared.original, prepared.range(from, to)),
+            None => (&error.source, from..to),
+        };
+        PreviewDiagnostic {
+            from: source[..range.start].encode_utf16().count(),
+            to: source[..range.end].encode_utf16().count(),
+            origin: PreviewDiagnosticOrigin::Environment,
+            phase: error.diagnostic.phase.to_string(),
+            message: self.namespace.message(&error.diagnostic.message),
+            path: self.namespace.key(&error.path),
+            source: Some(source.clone()),
+        }
+    }
 }
 impl Resources for SnapshotResources<'_> {
     fn root(&self) -> &Path {
-        Path::new(&self.task.resource_root)
+        self.namespace.root()
+    }
+    fn resolve(&self, path: &Path) -> PathBuf {
+        self.namespace.resolve(path)
     }
     fn kind(&self, path: &Path) -> Result<Option<ResourceKind>, ResourceError> {
         let resolved = self.resolve(path);
@@ -92,7 +121,7 @@ impl Resources for SnapshotResources<'_> {
             Some(resource) => {
                 if let Some(message) = &resource.error {
                     return Err(ResourceError::Access {
-                        path: resolved,
+                        path: PathBuf::from(&key),
                         message: message.clone(),
                     });
                 }
@@ -115,7 +144,7 @@ impl Resources for SnapshotResources<'_> {
         if let Some(resource) = self.task.resources.get(&key) {
             if let Some(message) = &resource.error {
                 return Err(ResourceError::Access {
-                    path: self.resolve(path),
+                    path: PathBuf::from(&key),
                     message: message.clone(),
                 });
             }
@@ -123,23 +152,36 @@ impl Resources for SnapshotResources<'_> {
                 return Ok(data.clone());
             }
             if resource.kind.is_none() {
-                return Err(ResourceError::NotFound(self.resolve(path)));
+                return Err(ResourceError::NotFound(PathBuf::from(&key)));
             }
         }
         self.request(&key, true);
         Err(ResourceError::Access {
-            path: self.resolve(path),
+            path: PathBuf::from(&key),
             message: "resource snapshot is not prepared".into(),
         })
     }
     fn source(&self, path: &Path) -> Result<String, ResourceError> {
         let source = String::from_utf8(self.read(path)?)
-            .map_err(|_| ResourceError::InvalidUtf8(self.resolve(path)))?;
-        Ok(source
+            .map_err(|_| ResourceError::InvalidUtf8(PathBuf::from(self.namespace.key(path))))?;
+        let source = source
             .trim_start_matches('\u{feff}')
             .replace("\r\n", "\n")
-            .replace('\r', "\n"))
+            .replace('\r', "\n");
+        let resolved = self.resolve(path);
+        if resolved
+            .file_name()
+            .is_some_and(|name| name == "Notist.toml")
+        {
+            let prepared = ManifestSource::new(&self.namespace.path(&resolved), source);
+            let analysis = prepared.analysis.clone();
+            self.manifests.borrow_mut().insert(resolved, prepared);
+            Ok(analysis)
+        } else {
+            Ok(source)
+        }
     }
+
     fn entries(&self, _path: &Path) -> Result<Vec<PathBuf>, ResourceError> {
         Ok(vec![])
     }

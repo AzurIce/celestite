@@ -1,6 +1,7 @@
 //! Shared, host-independent Celestite editing kernel.
-pub mod backend;
 pub mod editor;
+pub mod error;
+pub mod fs;
 pub mod instance;
 pub mod preview;
 pub mod protocol;

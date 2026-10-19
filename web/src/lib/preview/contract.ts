@@ -6,6 +6,7 @@ import type {
   PreviewResourceRequest,
   PreviewState,
   PreviewTask,
+  PreviewBinding,
 } from "../editor/generated/celestite_core";
 export type {
   PreviewCompletion,
@@ -21,13 +22,14 @@ export type {
   PreviewState,
   PreviewSubscription,
   PreviewTask,
+  PreviewBinding,
   PreviewTicket,
 } from "../editor/generated/celestite_core";
 
-/** A synchronous readonly consumption boundary, independent of Editor and UI. */
+/** An owned readonly capture, independent of Editor and UI. */
 export type DocumentSource = <T>(
   ids: readonly string[],
-  consume: (source: DocumentSourceSnapshot) => T,
+  consume: (source: DocumentSourceSnapshot) => T | Promise<T>,
 ) => Promise<T>;
 
 /** Host-provided package IO, separate from editable Vault file operations. */
@@ -46,13 +48,6 @@ export interface PreviewAssets {
   digest: string;
   files: { path: string; data: Uint8Array }[];
 }
-export type PreviewWorkerMessage =
-  | PreviewCompletion
-  | {
-      kind: "resources";
-      taskId: string;
-      requests: PreviewResourceRequest[];
-    };
 export interface DocumentPreviews {
   subscribe(
     id: string,
@@ -61,4 +56,39 @@ export interface DocumentPreviews {
   retry(id: string): Promise<void>;
   link(id: string, taskId: string, target: string): Promise<PreviewLink>;
   assets(id: string, taskId: string): Promise<PreviewAssets>;
+}
+
+/** The controller may be local WASM or native IPC; both own identical policy. */
+export type PreviewPort = {
+  [
+    K in
+      | "clear"
+      | "complete"
+      | "events"
+      | "invalidate_project"
+      | "link"
+      | "required_snapshots"
+      | "retry"
+      | "state"
+      | "subscribe"
+      | "synchronize"
+      | "take_task"
+      | "unsubscribe"
+      | "free"
+  ]: (
+    ...args: Parameters<PreviewBinding[K]>
+  ) => ReturnType<PreviewBinding[K]> | Promise<ReturnType<PreviewBinding[K]>>;
+};
+export type PreviewResourceReader = (
+  requests: PreviewResourceRequest[],
+) => Promise<Record<string, PreviewResource>>;
+
+/** Executes one captured task; the host owns applicability and cancellation. */
+export interface PreviewExecutor {
+  execute(
+    task: PreviewTask,
+    readResources: PreviewResourceReader,
+    signal: AbortSignal,
+  ): Promise<PreviewCompletion>;
+  dispose?(): void;
 }

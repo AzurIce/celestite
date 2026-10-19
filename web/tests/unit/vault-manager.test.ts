@@ -84,7 +84,7 @@ function setup(registry = new Registry()) {
         backend: remote.backend as HttpVaultBackend,
         descriptor: {
           protocol: "celestite-vault",
-          protocolVersion: 4,
+          protocolVersion: 5,
           shareId: "test-share",
           vault: { vaultId: "test-vault", historyId: "test-history" },
           name: "Remote",
@@ -203,7 +203,7 @@ test("an obsolete open cannot activate after a more recent selection", async () 
         backend: remote.backend as HttpVaultBackend,
         descriptor: {
           protocol: "celestite-vault",
-          protocolVersion: 4,
+          protocolVersion: 5,
           shareId: "test-share",
           vault: { vaultId: "test-vault", historyId: "test-history" },
           name: "Remote",
@@ -399,7 +399,7 @@ test("readonly and edit shares of one Vault keep separate instances and non-secr
       backend: files().backend as HttpVaultBackend,
       descriptor: {
         protocol: "celestite-vault",
-        protocolVersion: 4,
+        protocolVersion: 5,
         shareId: url.includes("/ro-") ? "reader" : "editor",
         name: "Same Vault",
         readOnly: url.includes("/ro-"),

@@ -157,7 +157,8 @@ async fn observation_updates_open_buffers_without_discovering_unopened_files() {
     assert_eq!(changed["version"], changed["savedVersion"]);
     let state = host.state(&id).await;
     assert_eq!(state["snapshot"]["text"], "external base 😀");
-    assert!(state["persistedVersion"].is_null());
+    assert!(state.get("persistedVersion").is_none());
+    assert!(state["recoveryError"].is_null());
     // A new file has never been opened or fetched by a client.
     std::fs::write(root.path().join("nested/new.md"), "new").unwrap();
     assert_eq!(

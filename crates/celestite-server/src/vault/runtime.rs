@@ -1,16 +1,15 @@
 //! Serial execution and publication shared by every host adapter.
-use super::{
-    documents::Documents,
-    fs::{ChangeHint, FsVault, Result},
-};
+use super::changes::ChangeHint;
+use super::documents::Documents;
 use crate::{failure, ApiError, HostedVault};
-use celestite_core::backend::{EditorError, ErrorCode};
+use celestite_core::error::{EditorError, EditorResult, ErrorCode};
+use celestite_core::fs::native::FsVault;
 use std::sync::Arc;
 
 pub(crate) async fn execute<T: Send + 'static>(
     vault: Arc<HostedVault>,
     mutation: bool,
-    action: impl FnOnce(&FsVault, &mut Documents) -> Result<T> + Send + 'static,
+    action: impl FnOnce(&FsVault, &mut Documents) -> EditorResult<T> + Send + 'static,
 ) -> std::result::Result<T, ApiError> {
     execute_with_tree(vault, mutation, true, action).await
 }
@@ -18,7 +17,7 @@ pub(crate) async fn execute_with_tree<T: Send + 'static>(
     vault: Arc<HostedVault>,
     mutation: bool,
     notify_tree: bool,
-    action: impl FnOnce(&FsVault, &mut Documents) -> Result<T> + Send + 'static,
+    action: impl FnOnce(&FsVault, &mut Documents) -> EditorResult<T> + Send + 'static,
 ) -> std::result::Result<T, ApiError> {
     if mutation && vault.read_only {
         return Err(failure(ErrorCode::PermissionDenied, "Vault is read-only"));
@@ -40,8 +39,8 @@ pub(crate) fn execute_locked<T>(
     vault: &HostedVault,
     mutation: bool,
     notify_tree: bool,
-    action: impl FnOnce(&FsVault, &mut Documents) -> Result<T>,
-) -> Result<T> {
+    action: impl FnOnce(&FsVault, &mut Documents) -> EditorResult<T>,
+) -> EditorResult<T> {
     // Same order for every document/file operation.
     let files = vault
         .files
@@ -65,7 +64,7 @@ pub(crate) fn execute_locked<T>(
 pub(crate) async fn execute_files<T: Send + 'static>(
     vault: Arc<HostedVault>,
     mutation: bool,
-    action: impl FnOnce(&FsVault) -> Result<T> + Send + 'static,
+    action: impl FnOnce(&FsVault) -> EditorResult<T> + Send + 'static,
 ) -> std::result::Result<T, ApiError> {
     if mutation && vault.read_only {
         return Err(failure(ErrorCode::PermissionDenied, "Vault is read-only"));

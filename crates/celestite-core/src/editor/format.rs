@@ -1,25 +1,9 @@
 //! Vault-relative path and LF text validation shared by every platform adapter.
-use super::MAX_TEXT_BYTES;
-use crate::backend::{DocumentHeader, EditorError, EditorResult, ErrorCode};
+use super::state::DocumentState;
+use super::{MAX_FILE_BYTES, MAX_TEXT_BYTES};
+use crate::error::{EditorError, EditorResult, ErrorCode};
 use crate::text::{DecodedText, LineEnding};
 
-pub fn validate_editor_path(path: &str) -> EditorResult<()> {
-    if path.contains(['\\', '\0'])
-        || path.starts_with('/')
-        || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic())
-        || (!path.is_empty()
-            && path
-                .split('/')
-                .any(|p| p.is_empty() || p == "." || p == ".."))
-    {
-        return Err(EditorError::new(
-            ErrorCode::InvalidPath,
-            "Expected a Vault-relative path",
-            path,
-        ));
-    }
-    Ok(())
-}
 pub(crate) fn within(path: &str, root: &str) -> bool {
     root.is_empty()
         || path == root
@@ -45,10 +29,10 @@ pub(crate) fn validate_text(text: &str, path: &str) -> EditorResult<()> {
     Ok(())
 }
 pub(crate) fn decode(bytes: &[u8], path: &str) -> EditorResult<DecodedText> {
-    if bytes.len() > MAX_TEXT_BYTES {
+    if bytes.len() > MAX_FILE_BYTES {
         return Err(EditorError::new(
             ErrorCode::Unsupported,
-            "Text exceeds 5 MiB",
+            "Encoded text exceeds the file byte limit",
             path,
         ));
     }
@@ -65,13 +49,15 @@ pub(crate) fn decode(bytes: &[u8], path: &str) -> EditorResult<DecodedText> {
             path,
         ));
     }
+    let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+    validate_text(&text, path)?;
     Ok(DecodedText {
-        text: raw.replace("\r\n", "\n").replace('\r', "\n"),
+        text,
         bom,
         line_ending: LineEnding::detect(raw),
     })
 }
-pub(crate) fn encode(header: &DocumentHeader, text: &str) -> Vec<u8> {
+pub(super) fn encode(header: &DocumentState, text: &str) -> Vec<u8> {
     format!(
         "{}{}",
         if header.bom { "\u{feff}" } else { "" },

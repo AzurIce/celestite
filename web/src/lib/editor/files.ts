@@ -41,7 +41,7 @@ export function fileBackend(
         revision: string;
       }>,
     writeFile: (path, data, options) =>
-      invoke("writeFile", { path, data, options }) as Promise<void | string>,
+      invoke("writeFile", { path, data, options }) as Promise<string>,
     mkdir: (path, options) =>
       invoke("mkdir", { path, options }) as Promise<void>,
     rename: (from, to) => invoke("rename", { from, to }) as Promise<void>,
@@ -70,8 +70,6 @@ export async function executeFile(
     case "readFile":
       return backend.readFile(path);
     case "readFileSnapshot":
-      if (!backend.readFileSnapshot)
-        throw new VaultError("Unsupported", "文件后端不提供版本化读取。", path);
       return backend.readFileSnapshot(path);
     case "writeFile":
       return backend.writeFile(

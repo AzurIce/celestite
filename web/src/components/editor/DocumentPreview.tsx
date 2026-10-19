@@ -1,3 +1,5 @@
+import { isDesktop, nativeExternalUrl } from "@/lib/desktop/platform";
+import { absoluteResourcePath } from "@/lib/preview/path";
 import {
   For,
   Show,
@@ -219,6 +221,9 @@ export function DocumentPreview(props: {
               !disposed
             )
               setError(`无法打开 ${link.path}`);
+          } else if (isDesktop()) {
+            const { openUrl } = await import("@tauri-apps/plugin-opener");
+            await openUrl(nativeExternalUrl(link.url));
           } else {
             window.open(
               new URL(link.url, location.href).href,
@@ -330,7 +335,7 @@ export function DocumentPreview(props: {
                 disabled={diagnostic.source === null && !current()}
                 onClick={() => {
                   if (
-                    diagnostic.path.startsWith("/") &&
+                    absoluteResourcePath(diagnostic.path) &&
                     diagnostic.source !== null
                   ) {
                     setPackageDiagnostic(diagnostic);

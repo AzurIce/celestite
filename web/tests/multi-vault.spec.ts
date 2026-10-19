@@ -233,10 +233,10 @@ async function hostDocuments(
   api: Api,
   vault = "notes",
 ): Promise<{ id: string; path: string; snapshot: { text: string } }[]> {
-  const response = await fetch(api.urls[vault] + "/api/v4/documents");
+  const response = await fetch(api.urls[vault] + "/api/v5/documents");
   return response.json();
 }
-test("collaborative input commits history immediately while disk save stays explicit", async ({
+test("collaborative input is accepted in memory while disk save stays explicit", async ({
   page,
   api,
 }) => {
@@ -792,10 +792,10 @@ test("startup readonly and edit links to one Vault synchronize with separate per
     ).toHaveText("Shared update");
     await expect(editor(page)).toHaveAttribute("contenteditable", "true");
     expect(
-      (await fetch(readerUrl.replace("/ro-", "/") + "/api/v4")).status,
+      (await fetch(readerUrl.replace("/ro-", "/") + "/api/v5")).status,
     ).toBe(404);
     const denied = await fetch(
-      readerUrl + "/api/v4/file?path=" + name + "&mode=replace",
+      readerUrl + "/api/v5/file?path=" + name + "&mode=replace",
       { method: "PUT", body: "forged write" },
     );
     expect(denied.status).toBe(403);
@@ -949,7 +949,7 @@ test("changing share_key and restarting replaces startup links and begins new Va
       configuration("random configuration secret value old 1234567890"),
     );
     const before = await start();
-    const identity = (await (await fetch(before.edit + "/api/v4")).json())
+    const identity = (await (await fetch(before.edit + "/api/v5")).json())
       .vault;
     await page.goto("/");
     await connect(page, before.edit);
@@ -958,7 +958,7 @@ test("changing share_key and restarting replaces startup links and begins new Va
     await expect
       .poll(async () => {
         const documents = await (
-          await fetch(before.edit + "/api/v4/documents")
+          await fetch(before.edit + "/api/v5/documents")
         ).json();
         return documents.find((document: any) => document.path === "a.md")
           .snapshot.text;
@@ -976,8 +976,8 @@ test("changing share_key and restarting replaces startup links and begins new Va
     expect(after.readonly).not.toBe(before.readonly);
     expect(after.edit).not.toBe(before.edit);
     for (const old of [before.readonly, before.edit])
-      expect((await fetch(old + "/api/v4")).status).toBe(404);
-    const rotatedIdentity = (await (await fetch(after.edit + "/api/v4")).json())
+      expect((await fetch(old + "/api/v5")).status).toBe(404);
+    const rotatedIdentity = (await (await fetch(after.edit + "/api/v5")).json())
       .vault;
     expect(rotatedIdentity.vaultId).not.toBe(identity.vaultId);
     expect(rotatedIdentity.historyId).not.toBe(identity.historyId);
@@ -1105,7 +1105,7 @@ test("reauthentication rejects a changed host history and retains the client dra
         (await hostDocuments(api)).find((d) => d.path === name)?.snapshot.text,
     )
     .toBe("# Keep this draft");
-  await page.context().route(api.url + "/api/v4", async (route) => {
+  await page.context().route(api.url + "/api/v5", async (route) => {
     const response = await route.fetch();
     const descriptor = await response.json();
     descriptor.vault.historyId = "another-host-history";
@@ -1122,7 +1122,7 @@ test("reauthentication rejects a changed host history and retains the client dra
   expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
     "# Original",
   );
-  await page.context().unroute(api.url + "/api/v4");
+  await page.context().unroute(api.url + "/api/v5");
 
   await connect(page, api.url);
   await expect(editor(page)).toHaveAttribute("contenteditable", "true");
@@ -2026,7 +2026,7 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       );
       await start();
       expect(await hostDocuments(api)).toEqual([]);
-      const identity = (await (await fetch(api.url + "/api/v4", {})).json())
+      const identity = (await (await fetch(api.url + "/api/v5", {})).json())
         .vault;
       for (const client of [page, other]) {
         await installWorkerHarness(client, true);
@@ -2083,7 +2083,7 @@ for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       );
       await start();
       const recoveredIdentity = (
-        await (await fetch(api.url + "/api/v4", {})).json()
+        await (await fetch(api.url + "/api/v5", {})).json()
       ).vault;
       expect(recoveredIdentity.vaultId).toBe(identity.vaultId);
       expect(recoveredIdentity.historyId).not.toBe(identity.historyId);
@@ -2197,7 +2197,7 @@ test("document leases release presence, keep undo on reopen, and permit path reu
   await page.getByRole("button", { name: `关闭 ${a}`, exact: true }).click();
   await expect.poll(async () => (await mine())?.documents.length).toBe(0);
   const removed = await fetch(
-    `${api.url}/api/v4/entry?path=${encodeURIComponent(a)}`,
+    `${api.url}/api/v5/entry?path=${encodeURIComponent(a)}`,
     { method: "DELETE" },
   );
   expect(removed.ok).toBe(true);

@@ -113,14 +113,13 @@ export interface HostDocument {
   path: string;
   version: Version;
   savedVersion: Version | null;
-  persistedVersion: Version | null;
   fileRevision: string;
   dirty: boolean;
   deleted: boolean;
   conflict: boolean;
   error: string | null;
   externalChange?: ExternalChangeStatus | null;
-  persistenceError: string | null;
+  recoveryError: string | null;
   savedContent: string;
   bom: boolean;
   lineEnding: "\n" | "\r\n" | "\r";
@@ -134,10 +133,9 @@ export interface ViewEdit {
 }
 export interface EditorProjection {
   version: Version;
-  persistedVersion: Version | null;
   undo: UndoState;
   peerId: string;
-  historyError: string | null;
+  recoveryError: string | null;
 }
 /** Connection state for the remote editor session. */
 export interface ConnectionState {
@@ -184,6 +182,9 @@ export interface EditorDocuments {
   discardRejectedInput?(id: string): Promise<boolean>;
   has(id: string): boolean;
   hasUnsaved(): boolean;
+  prepareClose(): Promise<void>;
+  resumeAfterCloseFailure(): void;
+  detach(): void;
   close(): Promise<void>;
 }
 export interface ServiceDocument extends DocumentBase {
@@ -197,18 +198,23 @@ export interface MutationResult {
   edits: TextEdit[];
   restoredSelection?: SelectionContext;
 }
+export interface SessionReplacement {
+  documents: ServiceDocument[];
+  /** Document events after this sequence belong after the replacement snapshots. */
+  sequence: number;
+}
 export type ServiceEvent =
   | { kind: "members"; sequence: number; state: CollaborationSnapshot | null }
   | { kind: "document"; sequence: number; document: ServiceDocument }
   | { kind: "tree"; sequence: number }
   | { kind: "connection"; sequence: number; connection: ConnectionState };
-export type WorkerMessage =
+export type ServiceMessage =
   | { kind: "ready"; identity: InstanceIdentity; sessionId: string }
   | { kind: "reply"; requestId: number; result?: unknown; error?: RpcError }
   | { kind: "fatal"; error: RpcError }
   | { kind: "preview"; event: PreviewEvent }
   | ServiceEvent;
-export interface WorkerRequest {
+export interface ServiceRequest {
   kind: "request";
   requestId: number;
   sessionId: string;
@@ -246,7 +252,7 @@ export interface ServiceMethods {
     result: PreviewAssets;
   };
   composition: { params: { id: string; active: boolean }; result: void };
-  reconnect: { params: Record<string, never>; result: ServiceDocument[] };
+  reconnect: { params: Record<string, never>; result: SessionReplacement };
   preview_subscribe: { params: { id: string }; result: PreviewSubscription };
   preview_unsubscribe: { params: { subscriptionId: string }; result: boolean };
   preview_retry: { params: { id: string }; result: PreviewState };
@@ -260,7 +266,7 @@ export interface ServiceMethods {
     result: MutationResult;
   };
   save: { params: { id: string }; result: ServiceDocument };
-  retry_history: { params: { id: string }; result: ServiceDocument };
+  checkpoint: { params: { id: string }; result: ServiceDocument };
   set_resource_scope: {
     params: { scope: FileSystemDirectoryHandle };
     result: void;
@@ -271,6 +277,8 @@ export interface ServiceMethods {
     result: ServiceDocument;
   };
   flush: { params: Record<string, never>; result: void };
+  suspend: { params: Record<string, never>; result: void };
+  resume: { params: Record<string, never>; result: void };
   file: {
     params: Record<string, unknown> & { method: string };
     result: unknown;

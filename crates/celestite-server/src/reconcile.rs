@@ -2,6 +2,7 @@
 //! periodic observation of loaded buffers repairs missed events outside notify's callback.
 use crate::HostedVault;
 use celestite_core::editor::observation::{FileObservationResult, FileObservationTask};
+use celestite_core::error::EditorResult;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -100,7 +101,7 @@ impl Drop for Reconciler {
     }
 }
 
-fn observe(vault: &HostedVault, stopping: &AtomicBool) -> crate::vault::fs::Result<()> {
+fn observe(vault: &HostedVault, stopping: &AtomicBool) -> EditorResult<()> {
     observe_with(vault, stopping, |task| task.compute())
 }
 
@@ -108,7 +109,7 @@ fn observe_with(
     vault: &HostedVault,
     stopping: &AtomicBool,
     mut execute: impl FnMut(FileObservationTask) -> FileObservationResult,
-) -> crate::vault::fs::Result<()> {
+) -> EditorResult<()> {
     crate::vault::runtime::execute_locked(vault, false, true, |_, docs| docs.reconcile())?;
     let count = crate::vault::runtime::execute_locked(vault, false, true, |_, docs| {
         docs.resident().map(|states| states.len())

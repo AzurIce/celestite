@@ -1,31 +1,22 @@
-//! Read-only package IO. Notist discovers dependencies; Vault file/history IO stays separate.
-use crate::{
-    vault::fs::{self, ChangeHint, FsVault},
-    ApiError, RemoteAccess, ServerState,
-};
+//! HTTP and watch integration for the shared read-only package grant policy.
+use crate::vault::changes::ChangeHint;
+use crate::{ApiError, RemoteAccess, ServerState};
 use axum::{routing::post, Extension, Json, Router};
-use celestite_core::backend::{EditorError, EntryKind, ErrorCode, FileEntry};
-use celestite_core::preview::{PreviewResource, PreviewResourceKind, PreviewResourceRequest};
+use celestite_core::error::{EditorError, EditorResult, ErrorCode};
+use celestite_core::fs::FileEntry;
+use celestite_core::preview::native::{
+    Context, PackageGrant, PackageResources as NativePackageResources,
+};
+use celestite_core::preview::{PreviewResource, PreviewResourceRequest};
 use notify::{RecursiveMode, Watcher};
-use notist::{resources::ResourceKind, ResourceError, Resources};
 use serde::Deserialize;
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-    path::{Path as FsPath, PathBuf},
+    collections::BTreeSet,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
-const LIMIT: u64 = 16 * 1024 * 1024;
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Context {
-    document_path: String,
-    #[serde(default)]
-    overlays: BTreeMap<String, String>,
-}
 #[derive(Deserialize)]
 struct ReadRequest {
     context: Context,
@@ -36,80 +27,12 @@ struct DirectoryRequest {
     context: Context,
     path: String,
 }
-struct Discovery<'a> {
-    root: &'a FsPath,
-    overlays: BTreeMap<PathBuf, &'a str>,
-    packages: RefCell<BTreeSet<PathBuf>>,
-}
-impl Resources for Discovery<'_> {
-    fn root(&self) -> &FsPath {
-        self.root
-    }
-    fn read(&self, path: &FsPath) -> Result<Vec<u8>, ResourceError> {
-        let path = self.resolve(path);
-        if path.file_name().is_some_and(|name| name == "lib.notc")
-            || (!path.starts_with(self.root)
-                && path.file_name().is_some_and(|name| name == "Notist.toml"))
-        {
-            self.packages
-                .borrow_mut()
-                .insert(path.parent().unwrap().to_owned());
-        }
-        if let Some(source) = self.overlays.get(&path) {
-            return Ok(source.as_bytes().to_vec());
-        }
-        let access = |error: std::io::Error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ResourceError::NotFound(path.clone())
-            } else {
-                ResourceError::Access {
-                    path: path.clone(),
-                    message: error.to_string(),
-                }
-            }
-        };
-        let file = std::fs::File::open(&path).map_err(access)?;
-        let mut data = Vec::new();
-        file.take(LIMIT + 1)
-            .read_to_end(&mut data)
-            .map_err(access)?;
-        if data.len() as u64 > LIMIT {
-            return Err(ResourceError::Access {
-                path,
-                message: "package input exceeds 16 MiB".into(),
-            });
-        }
-        Ok(data)
-    }
-    fn kind(&self, path: &FsPath) -> Result<Option<ResourceKind>, ResourceError> {
-        let path = self.resolve(path);
-        // Nearest document configuration remains scoped to the document Vault.
-        if !path.starts_with(self.root) {
-            return Ok(None);
-        }
-        if self.overlays.contains_key(&path) {
-            return Ok(Some(ResourceKind::File));
-        }
-        notist::FsResources::new(self.root).kind(&path)
-    }
-    fn entries(&self, _: &FsPath) -> Result<Vec<PathBuf>, ResourceError> {
-        Ok(vec![])
-    }
-    fn source(&self, path: &FsPath) -> Result<String, ResourceError> {
-        let source = String::from_utf8(self.read(path)?)
-            .map_err(|_| ResourceError::InvalidUtf8(self.resolve(path)))?;
-        Ok(source
-            .trim_start_matches('\u{feff}')
-            .replace("\r\n", "\n")
-            .replace('\r', "\n"))
-    }
-}
 struct Watches {
     watcher: notify::RecommendedWatcher,
     paths: BTreeSet<PathBuf>,
 }
 pub(crate) struct PackageResources {
-    pub root: PathBuf,
+    pub(crate) resources: NativePackageResources,
     watches: Mutex<Watches>,
 }
 impl PackageResources {
@@ -119,73 +42,25 @@ impl PackageResources {
     ) -> Result<Self, notify::Error> {
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if !matches!(event, Ok(ref event) if event.kind.is_access()) {
-                // No reconciliation: package content never joins the document histories.
                 let _ = events.send(ChangeHint::all());
             }
         })?;
         Ok(Self {
-            root,
+            resources: NativePackageResources::new(root),
             watches: Mutex::new(Watches {
                 watcher,
                 paths: BTreeSet::new(),
             }),
         })
     }
-    fn packages(&self, context: &Context) -> fs::Result<BTreeSet<PathBuf>> {
-        fs::validate_path(&context.document_path)?;
-        let mut overlays = BTreeMap::new();
-        let mut bytes = 0usize;
-        for (path, source) in &context.overlays {
-            let identity = if path.starts_with('/') {
-                let identity = FsPath::new(path);
-                if notist::resources::normalize(identity) != identity {
-                    return Err(EditorError::new(
-                        ErrorCode::InvalidPath,
-                        "Expected a normalized package manifest identity",
-                        path,
-                    ));
-                }
-                identity.to_owned()
-            } else {
-                fs::validate_path(path)?;
-                self.root.join(path)
-            };
-            if FsPath::new(path)
-                .file_name()
-                .is_none_or(|name| name != "Notist.toml")
-            {
-                return Err(EditorError::new(
-                    ErrorCode::InvalidPath,
-                    "Only Notist configuration snapshots are accepted",
-                    path,
-                ));
-            }
-            bytes = bytes.saturating_add(source.len());
-            if bytes > 32 * 1024 * 1024 {
-                return Err(EditorError::new(
-                    ErrorCode::Unsupported,
-                    "Configuration overlays exceed 32 MiB",
-                    path,
-                ));
-            }
-            // External snapshots are consulted only when Notist reaches them through
-            // the document's dependency graph. They do not grant arbitrary resource IO.
-            overlays.insert(identity, source.as_str());
-        }
-        let resources = Discovery {
-            root: &self.root,
-            overlays,
-            packages: RefCell::new(BTreeSet::new()),
-        };
-        // Capture Notist's manifest/declaration reads even when assembly is invalid.
-        let _ = notist::Vault::new(&resources).environment_for(&context.document_path);
-        let packages = resources.packages.into_inner();
+    fn grant(&self, context: &Context) -> EditorResult<PackageGrant> {
+        let grant = self.resources.grant(context)?;
         let mut watches = self
             .watches
             .lock()
             .map_err(|_| EditorError::new(ErrorCode::Io, "Package watcher lock failed", ""))?;
-        for root in &packages {
-            if root.starts_with(&self.root) {
+        for root in grant.roots() {
+            if root.starts_with(&self.resources.root) {
                 continue;
             }
             let mut ancestor = root.as_path();
@@ -216,120 +91,23 @@ impl PackageResources {
                 watches.paths.insert(path);
             }
         }
-        Ok(packages)
+        Ok(grant)
     }
-    fn resolve(&self, context: &Context, path: &str) -> fs::Result<(FsVault, String)> {
-        let resource = FsPath::new(path);
-        if !resource.is_absolute() || notist::resources::normalize(resource) != resource {
-            return Err(EditorError::new(
-                ErrorCode::InvalidPath,
-                "Expected an absolute package resource identity",
-                path,
-            ));
-        }
-        for root in self.packages(context)? {
-            let Ok(relative) = resource.strip_prefix(&root) else {
-                continue;
-            };
-            if relative.as_os_str().is_empty()
-                || relative == FsPath::new("lib.notc")
-                || relative == FsPath::new("Notist.toml")
-                || relative.starts_with("components")
-            {
-                let relative = relative.to_str().ok_or_else(|| {
-                    EditorError::new(
-                        ErrorCode::InvalidPath,
-                        "Package resource path is not UTF-8",
-                        path,
-                    )
-                })?;
-                fs::validate_path(relative)?;
-                // An explicit package directory may itself be a symlink. Its contents use
-                // the same capability-based IO as Vaults; internal symlinks are rejected.
-                let canonical = match root.canonicalize() {
-                    Ok(path) => path,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(EditorError::new(
-                            ErrorCode::NotFound,
-                            "Package directory does not exist",
-                            path,
-                        ))
-                    }
-                    Err(error) => {
-                        return Err(EditorError::new(ErrorCode::Io, error.to_string(), path))
-                    }
-                };
-                return FsVault::open(&canonical)
-                    .map(|files| (files, relative.to_owned()))
-                    .map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), path));
-            }
-        }
-        Err(EditorError::new(
-            ErrorCode::PermissionDenied,
-            "Resource is not a manifest, declaration or component of a configured package",
-            path,
-        ))
+    #[cfg(test)]
+    fn packages(&self, context: &Context) -> EditorResult<BTreeSet<PathBuf>> {
+        Ok(self.grant(context)?.roots().clone())
     }
-    fn read(&self, input: ReadRequest) -> fs::Result<PreviewResource> {
-        let (files, path) = match self.resolve(&input.context, &input.request.path) {
-            Err(error) if error.code == ErrorCode::NotFound => {
-                return Ok(PreviewResource {
-                    kind: None,
-                    data: None,
-                    error: None,
-                })
-            }
-            other => other?,
-        };
-        let Some(stat) = files.stat(&path)? else {
-            return Ok(PreviewResource {
-                kind: None,
-                data: None,
-                error: None,
-            });
-        };
-        let kind = match stat.kind {
-            EntryKind::File => PreviewResourceKind::File,
-            EntryKind::Directory => PreviewResourceKind::Directory,
-            _ => {
-                return Err(EditorError::new(
-                    ErrorCode::Unsupported,
-                    "Package resource must be a file or directory",
-                    &input.request.path,
-                ))
-            }
-        };
-        let data = if input.request.read && kind == PreviewResourceKind::File {
-            Some(files.read_file_limited(&path, LIMIT)?)
-        } else {
-            None
-        };
-        Ok(PreviewResource {
-            kind: Some(kind),
-            data,
-            error: None,
-        })
+    fn read(&self, input: ReadRequest) -> EditorResult<PreviewResource> {
+        self.grant(&input.context)?.read(input.request)
     }
-    fn directory(&self, input: DirectoryRequest) -> fs::Result<Vec<FileEntry>> {
-        let (files, path) = self.resolve(&input.context, &input.path)?;
-        let mut entries = files.read_dir(&path)?;
-        for entry in &mut entries {
-            entry.path = format!(
-                "{}/{}",
-                input.path,
-                FsPath::new(&entry.path)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-            );
-        }
-        Ok(entries)
+    fn directory(&self, input: DirectoryRequest) -> EditorResult<Vec<FileEntry>> {
+        self.grant(&input.context)?.directory(&input.path)
     }
 }
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/{id}/api/v4/preview/resources", post(read))
-        .route("/{id}/api/v4/preview/directory", post(directory))
+        .route("/{id}/api/v5/preview/resources", post(read))
+        .route("/{id}/api/v5/preview/directory", post(directory))
 }
 async fn read(
     Extension(access): Extension<RemoteAccess>,

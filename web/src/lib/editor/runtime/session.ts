@@ -1,10 +1,8 @@
 import { ChangeSet } from "@codemirror/state";
 import { VaultError } from "../../vault/errors";
-import { vaultPath, type VaultPath } from "../../vault/path";
-import type { VaultBackend } from "../../vault/types";
+import { vaultPath } from "../../vault/path";
 import { encodeError } from "../rpc";
 import {
-  callCore,
   coreValue,
   type CoreDocument,
   type CoreMutation,
@@ -26,7 +24,6 @@ import type {
   CollaborationSnapshot,
   Affinity,
   Anchor,
-  VersionedSelection,
 } from "../contract";
 
 interface Patch {
@@ -35,17 +32,13 @@ interface Patch {
   changes: ChangeSet;
 }
 
-/** Worker transport, view projections and timers; Rust owns all editor policy. */
-export class EditorHost {
-  private timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private placeholders = new Map<string, ServiceDocument>();
-  private eventSequence = 0;
+/** Shared core execution, view changes and projections for local owners and online replicas. */
+export class EditorSession {
+  protected eventSequence = 0;
   private patches = new Map<string, Patch[]>();
   constructor(
     protected core: CorePort,
-    protected backend: VaultBackend,
     private emit: (event: ServiceEvent) => void,
-    private schedule: (task: () => Promise<unknown>) => void,
   ) {}
   private coreQueue = new TaskQueue();
   private async call(
@@ -53,29 +46,28 @@ export class EditorHost {
     params: Record<string, unknown> = {},
     replyFor?: string,
   ): Promise<CoreReply> {
-    const reply = await callCore(this.core, method, params);
+    const reply = await this.core.call(method, params);
     for (const mutation of reply.mutations)
-      await this.onMutation(mutation, mutation.document.id === replyFor);
+      this.onMutation(mutation, mutation.document.id === replyFor);
     return reply;
-  }
-  private invoke(
-    method: string,
-    params: Record<string, unknown> = {},
-    replyFor?: string,
-  ): Promise<CoreReply> {
-    return this.coreQueue.run(() => this.call(method, params, replyFor));
   }
   protected async execute<T>(
     method: string,
     params: Record<string, unknown> = {},
+    lease?: { before(): void; accept(value: T): void },
   ): Promise<T> {
-    return coreValue<T>(await this.invoke(method, params));
+    return this.coreQueue.run(async () => {
+      lease?.before();
+      const value = coreValue<T>(await this.call(method, params));
+      lease?.accept(value);
+      return value;
+    });
   }
   protected clearPatches() {
     this.patches.clear();
   }
   protected ensureMutationAllowed() {}
-  protected async onMutation(mutation: CoreMutation, inReply = false) {
+  protected onMutation(mutation: CoreMutation, inReply = false) {
     const { document, update } = mutation;
     const textChanged = !sameVersion(update.before, update.after);
     if (textChanged) {
@@ -95,7 +87,6 @@ export class EditorHost {
       document,
       external,
       external ? { before: update.before, edits: update.edits } : undefined,
-      true,
     );
   }
   private rebase(command: BufferCommand, current: CoreDocument): BufferCommand {
@@ -184,11 +175,11 @@ export class EditorHost {
   readSource(ids: readonly string[]): Promise<DocumentSourceSnapshot> {
     return this.withSource(ids, (source) => source);
   }
-  /** Synchronously consume a readonly capture before another core call can run.
-   * Computation and IO must happen after this lease, using the owned snapshot. */
+  /** Consume a readonly capture and synchronize its controller under one core lease.
+   * Rendering and resource IO use the owned snapshot after this lease. */
   withSource<T>(
     ids: readonly string[],
-    consume: (source: DocumentSourceSnapshot) => T,
+    consume: (source: DocumentSourceSnapshot) => T | Promise<T>,
   ): Promise<T> {
     return this.coreQueue.run(async () => {
       const source = coreValue<DocumentSourceSnapshot>(
@@ -214,10 +205,9 @@ export class EditorHost {
       conflict: raw.conflict,
       core: {
         version: raw.version,
-        persistedVersion: raw.persistedVersion,
         undo: raw.undo,
         peerId: raw.peerId,
-        historyError: raw.persistenceError,
+        recoveryError: raw.recoveryError,
       },
     };
   }
@@ -225,20 +215,7 @@ export class EditorHost {
     raw: CoreDocument,
     content = false,
     change?: ServiceDocument["change"],
-    includeDeleted = false,
   ) {
-    clearTimeout(this.timers.get(raw.id));
-    this.timers.delete(raw.id);
-    if (raw.deleted && !includeDeleted) return;
-    if (raw.autosaveDelay !== null) {
-      this.timers.set(
-        raw.id,
-        setTimeout(() => {
-          this.timers.delete(raw.id);
-          this.schedule(() => this.save(raw.id));
-        }, raw.autosaveDelay),
-      );
-    }
     this.emit({
       kind: "document",
       sequence: ++this.eventSequence,
@@ -258,19 +235,6 @@ export class EditorHost {
   protected publishTree() {
     this.emit({ kind: "tree", sequence: ++this.eventSequence });
   }
-  protected async refreshViews(content = true) {
-    for (const raw of await this.execute<CoreDocument[]>("resident"))
-      this.publish(raw, content);
-  }
-  collaboration(): CollaborationSnapshot | null {
-    return null;
-  }
-  async setView(
-    _viewId: string,
-    _documentId: string | null,
-    _focused: boolean,
-    _selection: VersionedSelection | null = null,
-  ) {}
   protected publishMembers(state: CollaborationSnapshot | null) {
     this.emit({ kind: "members", sequence: ++this.eventSequence, state });
   }
@@ -288,109 +252,7 @@ export class EditorHost {
   ): Promise<[Version, number[]]> {
     return this.execute("resolve_anchors", { id, checkpoint, anchors });
   }
-  async releaseDocument(id: string) {
-    clearTimeout(this.timers.get(id));
-    this.timers.delete(id);
-    this.placeholders.delete(id);
-  }
-  async composition(_id: string, _active: boolean) {}
-  async open(path: VaultPath): Promise<ServiceDocument> {
-    try {
-      const raw = await this.execute<CoreDocument>("open", { path });
-      this.publish(raw);
-      return this.document(raw);
-    } catch (error) {
-      if (!(error instanceof VaultError) || error.code !== "Unsupported")
-        throw error;
-      const preview: ServiceDocument = {
-        id: crypto.randomUUID(),
-        path,
-        content: "",
-        savedContent: "",
-        bom: false,
-        lineEnding: "\n",
-        readOnlyReason: error.message.includes("5 MiB")
-          ? "文件超过 5 MiB，请通过文件树下载后编辑。"
-          : "这个文件不是 UTF-8 文本，无法在此编辑。可通过文件树下载。",
-        canPreview: false,
-
-        error: null,
-        conflict: false,
-      };
-      this.placeholders.set(preview.id, preview);
-      return preview;
-    }
-  }
   async read(id: string): Promise<ServiceDocument> {
     return this.document(await this.execute<CoreDocument>("read", { id }));
-  }
-  async retryHistory(id: string) {
-    const raw = await this.execute<CoreDocument>("retry_history", { id });
-    await this.refreshViews(false);
-    return this.document(raw);
-  }
-  async retryObservation(id: string) {
-    const raw = await this.execute<CoreDocument>("retry_observation", { id });
-    this.publish(raw);
-    return this.document(raw);
-  }
-  async save(id: string) {
-    const preview = this.placeholders.get(id);
-    if (preview) return preview;
-    const raw = await this.execute<CoreDocument>("save", { id });
-    this.publish(raw);
-    return this.document(raw);
-  }
-  async resolve(id: string, action: "overwrite" | "discard" | "retry") {
-    if (action === "retry")
-      throw new VaultError(
-        "Unsupported",
-        "本地保存冲突需要选择覆盖或丢弃。",
-        id,
-      );
-    try {
-      const raw = await this.execute<CoreDocument>("resolve", { id, action });
-      this.publish(raw, true);
-      return this.document(raw);
-    } catch (error) {
-      await this.refreshViews(false);
-      throw error;
-    }
-  }
-  async flush() {
-    try {
-      await this.execute("flush");
-    } finally {
-      await this.refreshViews(false);
-    }
-  }
-  async fileOperation(
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<unknown> {
-    let result: unknown;
-    try {
-      result = await this.execute("file", {
-        ...params,
-        method,
-        ...(params.data instanceof Uint8Array
-          ? { data: Array.from(params.data) }
-          : {}),
-      });
-    } finally {
-      await this.refreshViews();
-    }
-    if (method === "readFile") return new Uint8Array(result as number[]);
-    if (method === "readFileSnapshot") {
-      const file = result as { data: number[]; revision: string };
-      return { data: new Uint8Array(file.data), revision: file.revision };
-    }
-    return result;
-  }
-  async close() {
-    await this.execute("close");
-    for (const timer of this.timers.values()) clearTimeout(timer);
-    this.timers.clear();
-    await this.backend.close();
   }
 }

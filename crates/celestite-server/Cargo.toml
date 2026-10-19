@@ -5,10 +5,8 @@ edition = "2021"
 
 [dependencies]
 celestite-buffer.workspace = true
-celestite-core.workspace = true
-notist.workspace = true
+celestite-core = { workspace = true, features = ["native", "preview"] }
 futures-lite = "2.6.1"
-cap-std = "4"
 blake3 = "1"
 base64 = "0.22"
 getrandom = "0.3"

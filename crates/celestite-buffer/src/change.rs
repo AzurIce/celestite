@@ -4,8 +4,8 @@ use crate::{
     Buffer,
     types::{BufferError, HistoryPacket, TextEdit, Version},
 };
-use similar::{Algorithm, DiffTag, capture_diff_slices_deadline};
-use std::time::Duration;
+use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
+use std::{ops::Range, time::Duration};
 use web_time::Instant;
 
 /// A single-use isolated rewrite prepared by `Buffer::prepare_text_change`.
@@ -42,6 +42,9 @@ impl TextChangeTask {
                 .into_iter()
                 .map(|edit| (edit.from..edit.to, edit.insert)),
         )?;
+        if !self.branch.content_matches(new_text) {
+            return Err(BufferError::InvalidEdits);
+        }
         check_deadline(deadline)?;
         Ok((update.operation, update.after))
     }
@@ -64,6 +67,36 @@ fn offsets<T>(values: &[T], width: impl Fn(&T) -> usize) -> Vec<usize> {
         .collect()
 }
 
+fn changed_ranges(
+    operations: &[DiffOp],
+    old_len: usize,
+    new_len: usize,
+) -> Vec<(Range<usize>, Range<usize>)> {
+    let mut ranges = Vec::new();
+    let (mut old_cursor, mut new_cursor) = (0, 0);
+    // Similar 2.7's Compact hook can move an insertion/deletion across an
+    // equal block without updating the operation's empty-side index. Keep its
+    // pinned character alignment, but derive edit gaps from equal blocks.
+    for operation in operations {
+        if let DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = *operation
+        {
+            if old_cursor != old_index || new_cursor != new_index {
+                ranges.push((old_cursor..old_index, new_cursor..new_index));
+            }
+            old_cursor = old_index + len;
+            new_cursor = new_index + len;
+        }
+    }
+    if old_cursor != old_len || new_cursor != new_len {
+        ranges.push((old_cursor..old_len, new_cursor..new_len));
+    }
+    ranges
+}
+
 fn difference(old: &str, new: &str, deadline: Instant) -> Result<Vec<TextEdit>, BufferError> {
     check_deadline(deadline)?;
     let old_lines: Vec<_> = old.split_inclusive('\n').collect();
@@ -77,22 +110,14 @@ fn difference(old: &str, new: &str, deadline: Instant) -> Result<Vec<TextEdit>, 
     // timing controls rejection only, not the accepted edits or character identity.
     check_deadline(deadline)?;
     let mut edits: Vec<TextEdit> = vec![];
-    for op in lines {
-        let (tag, a, b) = op.as_tag_tuple();
-        if tag == DiffTag::Equal {
-            continue;
-        }
+    for (a, b) in changed_ranges(&lines, old_lines.len(), new_lines.len()) {
         let before: Vec<char> = old[old_bytes[a.start]..old_bytes[a.end]].chars().collect();
         let after: Vec<char> = new[new_bytes[b.start]..new_bytes[b.end]].chars().collect();
         let positions = offsets(&before, |ch| ch.len_utf8());
         let scalars =
             capture_diff_slices_deadline(Algorithm::Myers, &before, &after, Some(deadline));
         check_deadline(deadline)?;
-        for op in scalars {
-            let (tag, a_chars, b_chars) = op.as_tag_tuple();
-            if tag == DiffTag::Equal {
-                continue;
-            }
+        for (a_chars, b_chars) in changed_ranges(&scalars, before.len(), after.len()) {
             let edit = TextEdit {
                 from: old_bytes[a.start] + positions[a_chars.start],
                 to: old_bytes[a.start] + positions[a_chars.end],
@@ -134,6 +159,12 @@ mod tests {
             "A1 middle B1",
             "tail",
             "tail\n",
+            "before restart",
+            "external after restart",
+            "ba",
+            "aab",
+            "b\na\n",
+            "a\na\nb\n",
         ];
         for old in inputs {
             for new in inputs {
@@ -217,5 +248,44 @@ mod tests {
             difference("old", "new", Instant::now()),
             Err(BufferError::DiffTimeout)
         ));
+    }
+
+    #[test]
+    fn disjoint_rewrite_preserves_text_across_history_recovery() {
+        for (before, after) in [
+            ("before restart", "external after restart"),
+            ("ba", "aab"),
+            ("b\na\n", "a\na\nb\n"),
+            ("😀b\n😀a\n", "😀a\n😀a\n😀b\n"),
+        ] {
+            let edits = difference(before, after, Instant::now() + Duration::from_secs(5)).unwrap();
+            let mut text = before.to_string();
+            for edit in edits.iter().rev() {
+                text.replace_range(edit.from..edit.to, &edit.insert);
+            }
+            assert_eq!(text, after, "{edits:?}");
+            for restored in [false, true] {
+                let mut buffer = Buffer::new(
+                    DocumentIdentity {
+                        document_id: "rewrite".into(),
+                        history_id: "history".into(),
+                    },
+                    before,
+                )
+                .unwrap();
+                if restored {
+                    buffer = Buffer::from_snapshot(&buffer.export_snapshot().unwrap()).unwrap();
+                }
+                let baseline = buffer.version();
+                let (packet, version) = buffer
+                    .prepare_text_change(&baseline, before)
+                    .unwrap()
+                    .compute(after, Duration::from_secs(5))
+                    .unwrap();
+                let _ = buffer.import(packet.unwrap()).unwrap();
+                assert_eq!(buffer.text(), after, "restored={restored}, edits={edits:?}");
+                assert_eq!(buffer.historical_text(&version).unwrap(), after);
+            }
+        }
     }
 }

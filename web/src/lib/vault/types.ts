@@ -18,9 +18,9 @@ export interface ChangeHint {
 }
 
 export interface WriteFileOptions {
-  /** create 不覆盖已有条目；replace 要求文件已经存在。 */
-  mode: "create" | "replace";
-  /** Version-capable backends reject a replacement whose baseline has changed. */
+  /** create 不覆盖；replace 要求文件存在；upsert 用于私有恢复记录的完整发布。 */
+  mode: "create" | "replace" | "upsert";
+  /** 拒绝文件基线已改变的写入。 */
   expectedRevision?: string;
 }
 
@@ -36,19 +36,19 @@ export interface VaultBackend {
   stat(path: VaultPath): Promise<EntryStat | null>;
   readFile(path: VaultPath): Promise<Uint8Array>;
   /** Bytes and version from one read, so unrelated reads cannot advance an editor's baseline. */
-  readFileSnapshot?(
+  readFileSnapshot(
     path: VaultPath,
   ): Promise<{ data: Uint8Array; revision: string }>;
   /**
    * 保存调用时的完整内容，不隐式创建父目录。
    * 已有文件在提交前保留旧内容；成功不等于断电持久性保证。
-   * 返回提交版本（如支持）；传入预期版本而后端不支持时应拒绝。
+   * 返回已提交内容的版本；传入预期版本时必须核对基线。
    */
   writeFile(
     path: VaultPath,
     data: Uint8Array,
     options: WriteFileOptions,
-  ): Promise<void | string>;
+  ): Promise<string>;
   /** 默认只创建一级；recursive 可以部分完成，不提供回滚。 */
   mkdir(path: VaultPath, options?: { recursive?: boolean }): Promise<void>;
   /** 不允许删除 Vault 根；非空目录需要 recursive。 */

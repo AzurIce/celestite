@@ -89,7 +89,10 @@ async function blockWorkerWrites(page: Page, filename: string) {
         FileSystemFileHandle.prototype.createWritable = original;
       };
       FileSystemFileHandle.prototype.createWritable = async function (options) {
-        if (this.name === filename) {
+        if (
+          this.name === filename ||
+          (filename === "*.json" && this.name.endsWith(".json"))
+        ) {
           control.writeFailures++;
           throw new DOMException(
             "Injected quota failure",
@@ -423,7 +426,7 @@ test("binary files cannot be edited, and mobile can return to the tree and reope
   );
 });
 
-test("committed private history restores a draft after public-file IO fails, with stable identity and a fresh peer", async ({
+test("plaintext recovery restores a draft after public-file IO fails with a new CRDT identity", async ({
   page,
 }) => {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
@@ -458,8 +461,8 @@ test("committed private history restores a draft after public-file IO fails, wit
       (message) => message.kind === "reply" && message.result?.core,
     )?.result;
   });
-  expect(after.id).toBe(before.id);
-  expect(after.core.version.identity).toEqual(before.core.version.identity);
+  expect(after.id).not.toBe(before.id);
+  expect(after.core.version.identity).not.toEqual(before.core.version.identity);
   expect(after.core.peerId).not.toBe(before.core.peerId);
   expect(after.core.undo.canUndo).toBe(false); // Local undo is session-local.
   await page.keyboard.press("Control+s");
@@ -468,19 +471,21 @@ test("committed private history restores a draft after public-file IO fails, wit
   );
 });
 
-test("private history failure keeps the draft, pauses editing, and retries before writing the file", async ({
+test("recovery checkpoint failure keeps editing available and retries without losing text", async ({
   page,
 }) => {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toBeVisible();
-  await blockWorkerWrites(page, "head.json");
-  await editor.fill("history must commit first");
+  await blockWorkerWrites(page, "*.json");
+  await editor.fill("recoverable draft");
   await expect(
     page.getByRole("region", { name: "文件编辑器" }).getByRole("alert"),
-  ).toContainText("编辑历史尚未持久化");
-  await expect(editor).toHaveAttribute("contenteditable", "false");
-  await expect(editor).toContainText("history must commit first");
+  ).toContainText(/writeFile failed|草稿/);
+  await expect(editor).toHaveAttribute("contenteditable", "true");
+  await editor.press("End");
+  await editor.pressSequentially(" continues");
+  await expect(editor).toContainText("recoverable draft continues");
   expect(await readOpfsText(page, "a.md")).toBe("# Hello\n");
   await workerEvaluate(page, () =>
     (self as unknown as { restoreWriter: () => void }).restoreWriter(),
@@ -492,10 +497,10 @@ test("private history failure keeps the draft, pauses editing, and retries befor
   await expect(editor).toHaveAttribute("contenteditable", "true");
   await page.reload();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await expect(editor).toContainText("history must commit first");
+  await expect(editor).toContainText("recoverable draft continues");
 });
 
-test("rapid input remains ordered while Worker history writes are slow; core undo and redo work", async ({
+test("rapid input remains ordered while Worker recovery writes are slow; core undo and redo work", async ({
   page,
 }) => {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
@@ -508,7 +513,7 @@ test("rapid input remains ordered while Worker history writes are slow; core und
   await workerEvaluate(page, () => {
     const original = FileSystemFileHandle.prototype.createWritable;
     FileSystemFileHandle.prototype.createWritable = async function (options) {
-      if (this.name === "head.json")
+      if (this.name.endsWith(".json"))
         await new Promise((resolve) => setTimeout(resolve, 40));
       return original.call(this, options);
     };
@@ -541,7 +546,7 @@ test("OPFS external modification shows the conflict dialog and discard adopts di
   await expect(editor).toHaveText("outside editor");
 });
 
-test("a second tab cannot own the same OPFS history journal", async ({
+test("a second tab cannot own the same OPFS recovery store", async ({
   page,
   context,
 }) => {
@@ -588,68 +593,91 @@ test("reopening a closed view adopts external disk changes without reseeding its
   await expect(editor).toHaveText("external after closing view");
 });
 
-test("legacy OPFS journals restore identity and unsaved text before upgrading on save", async ({
+test("legacy OPFS journals migrate once to text recovery with a new CRDT identity", async ({
   page,
 }) => {
-  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  const editor = page.getByRole("textbox", { name: "代码编辑器" });
-  await expect(editor).toBeVisible();
-  await blockWorkerWrites(page, "a.md");
-  await editor.fill("legacy draft 😀 中文");
-  await page.keyboard.press("Control+s");
-  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
-    "保存失败",
-  );
   await page.evaluate(() =>
     (
       window as unknown as { editorWorkers: Worker[] }
     ).editorWorkers[0].terminate(),
   );
-  const identity = await page.evaluate(async () => {
+  const legacyIdentity = await page.evaluate(async () => {
+    const wasm = await import(
+      new URL("/src/lib/editor/generated/celestite_core.js", location.href).href
+    );
+    await wasm.default();
+    const identity = {
+      document_id: "00000000-0000-4000-8000-000000000001",
+      history_id: "00000000-0000-4000-8000-000000000002",
+    };
+    const seed = new wasm.BufferBinding(
+      JSON.stringify(identity),
+      "1234",
+      "legacy draft 😀 中文",
+    );
+    const packet = JSON.parse(seed.export_snapshot());
+    const version = JSON.parse(seed.snapshot()).version;
+    seed.free();
     const root = await (
       await (
         await navigator.storage.getDirectory()
       ).getDirectoryHandle("editor-instances")
     ).getDirectoryHandle("default");
-    const catalog = JSON.parse(
-      await (await (await root.getFileHandle("catalog.json")).getFile()).text(),
-    );
-    const entry = catalog.entries.find(
-      (item: { path: string }) => item.path === "a.md",
-    );
+    await root.removeEntry("recovery-format.json");
+    await root.removeEntry("recovery", { recursive: true });
     const directory = await (
-      await root.getDirectoryHandle("documents")
-    ).getDirectoryHandle(entry.id);
-    const head = JSON.parse(
-      await (
-        await (await directory.getFileHandle("head.json")).getFile()
-      ).text(),
-    );
-    const header = head.header;
-    const write = async (name: string, value: unknown) => {
+      await root.getDirectoryHandle("documents", { create: true })
+    ).getDirectoryHandle(identity.document_id, { create: true });
+    const write = async (
+      parent: FileSystemDirectoryHandle,
+      name: string,
+      data: Uint8Array,
+    ) => {
       const stream = await (
-        await directory.getFileHandle(name, { create: true })
+        await parent.getFileHandle(name, { create: true })
       ).createWritable();
-      await stream.write(JSON.stringify(value));
+      await stream.write(new Uint8Array(data));
       await stream.close();
     };
-    await write("projection.json", {
-      savedContent: header.saved_text,
-      diskRevision: header.disk_revision,
-      bom: header.bom,
-      lineEnding: header.line_ending,
-    });
-    await write("head.json", {
-      sequence: head.sequence,
-      version: head.version,
-    });
-    const updates = await directory.getDirectoryHandle("updates");
-    for (let sequence = 1; sequence <= head.sequence; sequence++)
-      await updates.removeEntry(`${sequence}.meta.json`);
-    return { document_id: entry.id, history_id: entry.historyId };
+    const json = (value: unknown) =>
+      new TextEncoder().encode(JSON.stringify(value));
+    await write(
+      root,
+      "catalog.json",
+      json({
+        schema: 1,
+        entries: [
+          {
+            id: identity.document_id,
+            historyId: identity.history_id,
+            path: "a.md",
+            deleted: false,
+          },
+        ],
+      }),
+    );
+    await write(directory, "seed.bin", new Uint8Array(packet.data));
+    await write(directory, "head.json", json({ sequence: 0, version }));
+    const baseline = new TextEncoder().encode("# Hello\n");
+    const hash = await crypto.subtle.digest("SHA-256", baseline);
+    const revision = Array.from(new Uint8Array(hash), (b) =>
+      b.toString(16).padStart(2, "0"),
+    ).join("");
+    await write(
+      directory,
+      "projection.json",
+      json({
+        savedContent: "# Hello\n",
+        diskRevision: revision,
+        bom: false,
+        lineEnding: "\n",
+      }),
+    );
+    return identity;
   });
   await page.reload();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(editor).toContainText("legacy draft 😀 中文");
   const restored = await page.evaluate(
     () =>
@@ -657,13 +685,134 @@ test("legacy OPFS journals restore identity and unsaved text before upgrading on
         (message) => message.kind === "reply" && message.result?.core,
       )?.result,
   );
-  expect(restored.core.version.identity).toEqual(identity);
-  await editor.fill("upgraded draft 😀");
+  expect(restored.core.version.identity).not.toEqual(legacyIdentity);
+  expect(restored.core.undo.canUndo).toBe(false);
+  await editor.fill("migrated plain text");
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
   await page.reload();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await expect(editor).toContainText("upgraded draft 😀");
+  await expect(editor).toContainText("migrated plain text");
 });
+
+for (const interrupted of [
+  "directory-intent.json",
+  "recovery-format.json",
+  "draft",
+] as const) {
+  test(`an interrupted first ${interrupted} write leaves an unpublished OPFS file and startup recovers`, async ({
+    page,
+  }) => {
+    const validKey = await page.evaluate(async (interrupted) => {
+      (window as unknown as { editorWorkers: Worker[] }).editorWorkers
+        .at(-1)!
+        .terminate();
+      const root = await (
+        await (
+          await navigator.storage.getDirectory()
+        ).getDirectoryHandle("editor-instances")
+      ).getDirectoryHandle("default");
+      const recovery = await root.getDirectoryHandle("recovery");
+      const key = `${crypto.randomUUID()}.json`;
+      const baseline = new TextEncoder().encode("const value = 1;\n");
+      const hash = await crypto.subtle.digest("SHA-256", baseline);
+      const revision = Array.from(new Uint8Array(hash), (b) =>
+        b.toString(16).padStart(2, "0"),
+      ).join("");
+      const stream = await (
+        await recovery.getFileHandle(key, { create: true })
+      ).createWritable();
+      await stream.write(
+        JSON.stringify({
+          schema: 1,
+          path: "notes/b.ts",
+          text: "valid recovered draft",
+          baseline: { bytes: Array.from(baseline), revision },
+          deleted: false,
+          pending_write: null,
+        }),
+      );
+      await stream.close();
+      if (interrupted !== "draft")
+        await root.removeEntry("recovery-format.json");
+      if (interrupted === "directory-intent.json")
+        await root.removeEntry("directory-intent.json");
+      return key;
+    }, interrupted);
+    const pattern = "**/src/lib/editor/local/worker.ts*";
+    const interruptWorker = async (route: import("@playwright/test").Route) => {
+      const response = await route.fetch();
+      const injection = `const originalRecoveryWriter=FileSystemFileHandle.prototype.createWritable;
+        FileSystemFileHandle.prototype.createWritable=async function(options) {
+          const interrupted=${JSON.stringify(interrupted)};
+          const match=interrupted==='draft'
+            ? /^[0-9a-f-]{36}\\.json$/.test(this.name) && this.name!==${JSON.stringify(validKey)}
+            : this.name===interrupted;
+          if(match) {
+            self.postMessage({kind:'test_unpublished_recovery',name:this.name});
+            await new Promise(()=>{});
+          }
+          return originalRecoveryWriter.call(this,options);
+        };\n`;
+      await route.fulfill({
+        response,
+        body: injection + (await response.text()),
+      });
+    };
+    await page.route(pattern, interruptWorker);
+    try {
+      await page.reload();
+      if (interrupted === "draft") {
+        await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+        await page
+          .getByRole("textbox", { name: "代码编辑器" })
+          .fill("unpublished draft");
+      }
+      await page.waitForFunction(() =>
+        (window as unknown as { editorMessages: any[] }).editorMessages.some(
+          (message) => message.kind === "test_unpublished_recovery",
+        ),
+      );
+      const size = await page.evaluate(async (interrupted) => {
+        const { name } = (
+          window as unknown as { editorMessages: any[] }
+        ).editorMessages.find(
+          (message) => message.kind === "test_unpublished_recovery",
+        );
+        let root = await (
+          await (
+            await navigator.storage.getDirectory()
+          ).getDirectoryHandle("editor-instances")
+        ).getDirectoryHandle("default");
+        if (interrupted === "draft")
+          root = await root.getDirectoryHandle("recovery");
+        return (await (await root.getFileHandle(name)).getFile()).size;
+      }, interrupted);
+      expect(size).toBe(0);
+      await page.evaluate(() =>
+        (window as unknown as { editorWorkers: Worker[] }).editorWorkers
+          .at(-1)!
+          .terminate(),
+      );
+    } finally {
+      await page.unroute(pattern, interruptWorker);
+    }
+    await page.reload();
+    await expect(
+      page.getByRole("treeitem", { name: "a.md", exact: true }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "展开 notes", exact: true }).click();
+    await page.getByRole("treeitem", { name: "b.ts", exact: true }).click();
+    await expect(
+      page.getByRole("textbox", { name: "代码编辑器" }),
+    ).toContainText("valid recovered draft");
+    if (interrupted === "draft") {
+      await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+      await expect(
+        page.getByRole("textbox", { name: "代码编辑器" }),
+      ).toContainText("# Hello");
+    }
+  });
+}

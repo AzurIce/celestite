@@ -57,6 +57,10 @@ class MemoryBackend implements VaultBackend {
     if (!bytes) throw new VaultError("NotFound", "Missing file");
     return bytes.slice();
   }
+  async readFileSnapshot(path: VaultPath) {
+    const data = await this.readFile(path);
+    return { data, revision: Array.from(data).join(",") };
+  }
   async writeFile(
     path: VaultPath,
     bytes: Uint8Array,
@@ -67,6 +71,7 @@ class MemoryBackend implements VaultBackend {
       throw new VaultError("AlreadyExists", "Exists");
     this.mutations.push(`write:${path}`);
     this.file(path, Array.from(bytes));
+    return Array.from(bytes).join(",");
   }
   async mkdir(path: VaultPath) {
     if (this.entries.has(path)) throw new VaultError("AlreadyExists", "Exists");

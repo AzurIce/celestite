@@ -1,3 +1,5 @@
+import { isDesktop, desktopInvoke } from "../desktop/platform";
+import { previewModulePath as modulePath, nativeComponentUrl } from "./path";
 import { registerComponents } from "../editor/generated/notist_html_runtime";
 import type { PreviewAssets, PreviewComponent } from "./contract";
 import { assetDigest } from "./asset-digest";
@@ -8,10 +10,6 @@ const registered = new Map<string, string>();
 let ready: Promise<void> | undefined;
 let bytes = 0;
 const MAX_BYTES = 64 * 1024 * 1024;
-
-function modulePath(path: string) {
-  return path.startsWith("/") ? `packages${path}` : `vault/${path}`;
-}
 
 function mediaType(path: string) {
   if (/\.(m?js)$/i.test(path)) return "text/javascript; charset=utf-8";
@@ -26,6 +24,7 @@ function mediaType(path: string) {
 }
 
 async function initialize() {
+  if (isDesktop()) return;
   if (!("serviceWorker" in navigator))
     throw new Error("当前环境无法加载 package 组件资源。");
   navigator.serviceWorker.addEventListener("message", (event) => {
@@ -103,6 +102,15 @@ export async function loadComponents(
       );
       if (bytes + size > MAX_BYTES)
         throw new Error("组件资源超过缓存容量，请刷新页面。");
+      if (isDesktop())
+        await desktopInvoke("desktop_assets_register", {
+          scope,
+          digest,
+          files: files.map((file) => ({
+            path: modulePath(file.path),
+            data: Array.from(file.data),
+          })),
+        });
       snapshots.set(
         digest,
         new Map(files.map((file) => [modulePath(file.path), file.data])),
@@ -115,13 +123,29 @@ export async function loadComponents(
   await registerComponents(
     components.map((component) => ({
       tag: component.tag,
-      module: new URL(
-        modulePath(component.path).split("/").map(encodeURIComponent).join("/"),
-        new URL(
-          `${import.meta.env.BASE_URL}__preview_resources/${scope}/${bundles.get(component.packageRoot)!.digest}/`,
-          location.href,
-        ),
-      ).href,
+      module: isDesktop()
+        ? nativeComponentUrl(
+            scope,
+            bundles.get(component.packageRoot)!.digest,
+            component.path,
+          )
+        : new URL(
+            modulePath(component.path)
+              .split("/")
+              .map(encodeURIComponent)
+              .join("/"),
+            new URL(
+              `${import.meta.env.BASE_URL}__preview_resources/${scope}/${bundles.get(component.packageRoot)!.digest}/`,
+              location.href,
+            ),
+          ).href,
     })),
   );
+}
+
+/** Release native immutable snapshots when the WebView completes shutdown. */
+export async function clearComponentAssets() {
+  if (isDesktop()) await desktopInvoke("desktop_assets_clear", { scope });
+  snapshots.clear();
+  bytes = 0;
 }

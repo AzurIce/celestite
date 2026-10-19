@@ -36,7 +36,7 @@ impl Fixture {
     }
 }
 fn uri(key: &str, tail: &str) -> String {
-    format!("/{key}/api/v4{tail}")
+    format!("/{key}/api/v5{tail}")
 }
 async fn response(
     router: &Router,
@@ -148,7 +148,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
         axum::serve(listener, router).await.unwrap();
     });
     let mut client =
-        support::ClientReplica::connect(&format!("http://{address}/{editor}/api/v4")).await;
+        support::ClientReplica::connect(&format!("http://{address}/{editor}/api/v5")).await;
     assert_eq!(client.open("a.md").await, id);
     let edited = client.edit(id, 0, 0, "edited ").await;
     assert_eq!(edited.snapshot.text.as_ref(), "edited original");
@@ -170,7 +170,7 @@ async fn independent_links_share_identity_and_readonly_blocks_every_write_entry(
         fs::read_to_string(f.dir.path().join("notes/a.md")).unwrap(),
         "original"
     );
-    for path in ["/api/v4/vaults/notes", "/vaults/notes/shares"] {
+    for path in ["/api/v5/vaults/notes", "/vaults/notes/shares"] {
         assert_eq!(
             server
                 .router

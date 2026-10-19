@@ -8,24 +8,35 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
+native = ["dep:cap-std", "dep:same-file", "dep:blake3", "dep:rustix"]
 wasm = ["celestite-buffer/wasm", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:tsify"]
-preview = ["dep:notist", "dep:notist-html"]
+preview = ["dep:notist", "dep:notist-html", "dep:toml"]
 
 [dependencies]
 celestite-buffer.workspace = true
 notist = { workspace = true, optional = true }
 notist-html = { workspace = true, optional = true }
+toml = { version = "0.8", optional = true }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
+uuid = { version = "1", features = ["v4", "js"] }
+web-time = "1.1.0"
 wasm-bindgen = { version = "=0.2.129", optional = true }
 wasm-bindgen-futures = { version = "=0.4.79", optional = true }
 js-sys = { version = "=0.3.106", optional = true }
 tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cap-std = { version = "4", optional = true }
+same-file = { version = "1", optional = true }
+blake3 = { version = "1", optional = true }
+rustix = { version = "1", features = ["fs"], optional = true }
+
 [dev-dependencies]
 futures-lite = "2.6.1"
+tempfile = "3"
 
 [lints]
 workspace = true

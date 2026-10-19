@@ -1,7 +1,7 @@
 //! Two host-derived capability keys per Vault, rotated through configuration.
 use crate::{failure, ApiError, HostedVault};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use celestite_core::backend::ErrorCode;
+use celestite_core::error::ErrorCode;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

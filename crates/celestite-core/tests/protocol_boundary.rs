@@ -1,8 +1,7 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{DocumentIdentity, EditOptions, UndoContext, Version};
-use celestite_core::backend::ErrorCode;
-use celestite_core::backend::memory::MemoryBackend;
 use celestite_core::editor::EditorCore;
+use celestite_core::error::ErrorCode;
 use celestite_core::instance::{InstanceIdentity, Vault};
 use celestite_core::preview::sessions::PreviewController;
 use celestite_core::preview::{PreviewCompletion, PreviewOutcome, PreviewOutput};
@@ -10,18 +9,43 @@ use celestite_core::protocol::editor::EditorAdapter;
 use futures_lite::future::block_on;
 use serde_json::{Value, json};
 
-async fn replica(text: &str) -> EditorCore<MemoryBackend> {
-    let mut core = EditorCore::open(MemoryBackend::new(
-        InstanceIdentity {
-            instance_id: "protocol-client".into(),
+#[test]
+fn core_rejects_incomplete_explicit_identity_without_filesystem_capabilities() {
+    block_on(async {
+        let valid = InstanceIdentity {
+            instance_id: "client".into(),
             vault: Vault {
                 vault_id: "vault".into(),
-                history_id: "vault-history".into(),
+                history_id: "history".into(),
             },
+        };
+        for missing in ["instance", "vault", "history"] {
+            let mut identity = valid.clone();
+            match missing {
+                "instance" => identity.instance_id.clear(),
+                "vault" => identity.vault.vault_id.clear(),
+                "history" => identity.vault.history_id.clear(),
+                _ => unreachable!(),
+            }
+            let error = EditorCore::memory(identity)
+                .err()
+                .expect("core must validate identity independently of storage");
+            assert_eq!(error.code, ErrorCode::Io);
+            assert!(error.message.contains("identity"));
+        }
+        let core = EditorCore::memory(valid.clone()).unwrap();
+        assert_eq!(core.identity(), &valid);
+    });
+}
+
+fn replica(text: &str) -> EditorCore {
+    let mut core = EditorCore::memory(InstanceIdentity {
+        instance_id: "protocol-client".into(),
+        vault: Vault {
+            vault_id: "vault".into(),
+            history_id: "vault-history".into(),
         },
-        || 1000,
-    ))
-    .await
+    })
     .unwrap();
     let buffer = Buffer::with_peer_id(
         DocumentIdentity {
@@ -33,7 +57,6 @@ async fn replica(text: &str) -> EditorCore<MemoryBackend> {
     )
     .unwrap();
     core.join("a.md", buffer.export_snapshot().unwrap())
-        .await
         .unwrap();
     core
 }
@@ -41,10 +64,10 @@ async fn replica(text: &str) -> EditorCore<MemoryBackend> {
 #[test]
 fn stale_wire_base_is_rejected_without_text_history_undo_or_preview_effects() {
     block_on(async {
-        let mut core = replica("A😀甲").await;
+        let mut core = replica("A😀甲");
         let mut adapter = EditorAdapter::default();
         let base = core.read("doc").unwrap().status.version;
-        core.replace_text("doc", "A😀甲!").await.unwrap();
+        core.replace_text("doc", "A😀甲!").unwrap();
         core.take_mutations();
         let mut controller = PreviewController::default();
         controller.synchronize(&core.document_source(&[]), 1000);
@@ -58,7 +81,7 @@ fn stale_wire_base_is_rejected_without_text_history_undo_or_preview_effects() {
         let preview = serde_json::to_value(controller.state("doc").unwrap()).unwrap();
         let packet = core.snapshot("doc").unwrap();
         // Native invalid UTF-8 boundaries have no accepted or derived effects either.
-        assert!(core.edit("doc", [(2..2, "invalid")]).await.is_err());
+        assert!(core.edit("doc", [(2..2, "invalid")]).is_err());
         controller.synchronize(&core.document_source(&[]), 1000);
         assert_eq!(core.read("doc").unwrap().snapshot, before.snapshot);
         assert_eq!(core.read("doc").unwrap().undo, before.undo);
@@ -81,10 +104,7 @@ fn stale_wire_base_is_rejected_without_text_history_undo_or_preview_effects() {
             assert_eq!(after.snapshot, before.snapshot);
             assert_eq!(after.undo, before.undo);
             assert_eq!(after.peer_id, before.peer_id);
-            assert_eq!(
-                after.status.persisted_version,
-                before.status.persisted_version
-            );
+            assert_eq!(after.status.recovery_error, before.status.recovery_error);
             assert_eq!(core.snapshot("doc").unwrap().data, packet.data);
             assert!(adapter.take_mutations(&mut core).unwrap().is_empty());
             controller.synchronize(&core.document_source(&[]), 1000);
@@ -113,7 +133,7 @@ fn wire_edit_and_undo_map_utf16_edits_lengths_and_metadata() {
     block_on(async {
         // UTF-16 boundaries: A=0..1, 😀=1..3, 甲=3..4, é=4..5.
         // UTF-8 boundaries:  A=0..1, 😀=1..5, 甲=5..8, é=8..10.
-        let mut core = replica("A😀甲é").await;
+        let mut core = replica("A😀甲é");
         let mut adapter = EditorAdapter::default();
         let base = core.read("doc").unwrap().status.version;
         let metadata = json!({"mainIndex":1,"selection":"甲é"});
@@ -200,7 +220,7 @@ fn version_codec_preserves_exact_u64_peers_and_rejects_noncanonical_clocks() {
 #[test]
 fn wire_anchor_resolution_is_a_utf16_number_array_without_refreshed_objects() {
     block_on(async {
-        let mut core = replica("A😀甲é").await;
+        let mut core = replica("A😀甲é");
         let mut adapter = EditorAdapter::default();
         let version = core.read("doc").unwrap().status.version;
         let anchors = adapter
@@ -216,7 +236,7 @@ fn wire_anchor_resolution_is_a_utf16_number_array_without_refreshed_objects() {
         assert_eq!(anchors.as_array().unwrap().len(), 3);
         let roundtrip: Value =
             serde_json::from_str(&serde_json::to_string(&anchors).unwrap()).unwrap();
-        core.edit("doc", [(5..5, "🚀")]).await.unwrap();
+        core.edit("doc", [(5..5, "🚀")]).unwrap();
         let checkpoint = core.read("doc").unwrap().status.version;
         let offsets = adapter
             .call(
@@ -239,7 +259,7 @@ fn wire_anchor_resolution_is_a_utf16_number_array_without_refreshed_objects() {
 #[test]
 fn wire_metadata_does_not_alias_a_native_callers_undo_tag() {
     block_on(async {
-        let mut core = replica("A").await;
+        let mut core = replica("A");
         let _ = core
             .edit_with(
                 "doc",
@@ -252,7 +272,6 @@ fn wire_metadata_does_not_alias_a_native_callers_undo_tag() {
                     ..EditOptions::default()
                 },
             )
-            .await
             .unwrap();
         core.take_mutations();
         let mut adapter = EditorAdapter::default();
@@ -289,8 +308,11 @@ fn wire_metadata_does_not_alias_a_native_callers_undo_tag() {
 
 #[test]
 fn shared_wire_values_keep_their_spelling() {
-    use celestite_core::backend::{EntryKind, ErrorCode, RenamePhase};
     use celestite_core::text::LineEnding;
+    use celestite_core::{
+        error::{ErrorCode, RenamePhase},
+        fs::{EntryKind, WriteMode},
+    };
 
     for (code, wire) in [
         (ErrorCode::Io, "IO"),
@@ -332,6 +354,13 @@ fn shared_wire_values_keep_their_spelling() {
         (EntryKind::Other, "other"),
     ] {
         assert_eq!(serde_json::to_value(kind).unwrap(), json!(wire));
+    }
+    for (mode, wire) in [
+        (WriteMode::Create, "create"),
+        (WriteMode::Replace, "replace"),
+        (WriteMode::Upsert, "upsert"),
+    ] {
+        assert_eq!(serde_json::to_value(mode).unwrap(), json!(wire));
     }
     assert_eq!(
         serde_json::to_value(RenamePhase::RemoveSource).unwrap(),

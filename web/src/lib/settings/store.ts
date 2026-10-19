@@ -44,6 +44,8 @@ export class SettingsStore {
   private readonly listeners = new Set<(snapshot: SettingsSnapshot) => void>();
   private tail: Promise<unknown> = Promise.resolve();
   private loaded = false;
+  private pendingWrite = false;
+  private pendingKey?: SettingKey;
   private projectGeneration = 0;
 
   constructor(options: SettingsStoreOptions) {
@@ -153,6 +155,8 @@ export class SettingsStore {
       const document = withSetting(this.app.document, key, normalized);
       this.app = parseDocument(document, "app");
       this.storage = "memory";
+      this.pendingWrite = true;
+      this.pendingKey = key;
       this.saveError = undefined;
       this.notify();
       if (options?.persist === false) return;
@@ -161,12 +165,35 @@ export class SettingsStore {
         this.storage =
           this.options.file.persistent === false ? "memory" : "file";
         this.saveError = undefined;
+        this.pendingWrite = false;
       } catch (error) {
         // 保留用户选择的内存态；磁盘仍是旧文档，后续成功写入会带上这次修改。
         this.storage = "memory";
         this.saveError = { key, reason: message(error) };
       }
       this.notify();
+    });
+  }
+
+  async flush(): Promise<void> {
+    await this.enqueue(async () => {
+      // A failed initial read has no owned document to overwrite. Only retry
+      // user changes, deferred previews, or a known legacy migration.
+      if (!this.pendingWrite && !this.saveError) return;
+      try {
+        await this.options.file.write(this.app.document);
+        this.storage =
+          this.options.file.persistent === false ? "memory" : "file";
+        this.saveError = undefined;
+        this.pendingWrite = false;
+      } catch (error) {
+        this.storage = "memory";
+        if (this.pendingKey)
+          this.saveError = { key: this.pendingKey, reason: message(error) };
+        throw new Error(`设置未保存：${message(error)}`);
+      } finally {
+        this.notify();
+      }
     });
   }
 
@@ -180,8 +207,10 @@ export class SettingsStore {
       values: parseSettingsText(JSON.stringify(legacy), "app").values,
     };
     this.notify();
+    this.pendingWrite = true;
     try {
       await this.options.file.write(legacy);
+      this.pendingWrite = false;
       this.storage = this.options.file.persistent === false ? "memory" : "file";
       this.options.clearLegacy();
     } catch {

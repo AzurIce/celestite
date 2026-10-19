@@ -1,8 +1,6 @@
 //! HTTP file and event endpoints for one hosted Vault.
-use crate::vault::{
-    fs::{revision, ChangeHint},
-    runtime::{execute, execute_files},
-};
+use crate::vault::changes::ChangeHint;
+use crate::vault::runtime::{execute, execute_files};
 use crate::{failure, ApiError, RemoteAccess, ServerState};
 use axum::{
     body::Bytes,
@@ -15,7 +13,9 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use celestite_core::backend::{EditorError, ErrorCode};
+use celestite_core::error::{EditorError, ErrorCode};
+use celestite_core::fs::native::revision;
+use celestite_core::fs::WriteMode;
 use serde::Deserialize;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio_stream::{
@@ -25,13 +25,13 @@ use tokio_stream::{
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/{id}/api/v4", get(describe))
-        .route("/{id}/api/v4/stat", get(stat))
-        .route("/{id}/api/v4/directory", get(read_dir).post(mkdir))
-        .route("/{id}/api/v4/file", get(read_file).put(write_file))
-        .route("/{id}/api/v4/entry", axum::routing::delete(remove))
-        .route("/{id}/api/v4/rename", post(rename))
-        .route("/{id}/api/v4/events", get(events))
+        .route("/{id}/api/v5", get(describe))
+        .route("/{id}/api/v5/stat", get(stat))
+        .route("/{id}/api/v5/directory", get(read_dir).post(mkdir))
+        .route("/{id}/api/v5/file", get(read_file).put(write_file))
+        .route("/{id}/api/v5/entry", axum::routing::delete(remove))
+        .route("/{id}/api/v5/rename", post(rename))
+        .route("/{id}/api/v5/events", get(events))
 }
 
 #[derive(Deserialize)]
@@ -52,13 +52,13 @@ async fn describe(
         .lock()
         .map_err(|_| failure(ErrorCode::Io, "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "protocolVersion": crate::PROTOCOL_VERSION, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.root, "vault": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "documentEvents": true, "websocketSync": true, "persistentHistory": documents.persistent(), "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "protocolVersion": crate::PROTOCOL_VERSION, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.resources.root, "vault": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "documentEvents": true, "websocketSync": true, "vaultCrdt": false } }),
     ))
 }
 async fn stat(
     Extension(access): Extension<RemoteAccess>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<Option<celestite_core::backend::FileEntry>>, ApiError> {
+) -> Result<Json<Option<celestite_core::fs::FileEntry>>, ApiError> {
     Ok(Json(
         execute_files(access.grant.vault.clone(), false, move |v| {
             v.stat(&query.path)
@@ -69,7 +69,7 @@ async fn stat(
 async fn read_dir(
     Extension(access): Extension<RemoteAccess>,
     Query(query): Query<FileQuery>,
-) -> Result<Json<Vec<celestite_core::backend::FileEntry>>, ApiError> {
+) -> Result<Json<Vec<celestite_core::fs::FileEntry>>, ApiError> {
     Ok(Json(
         execute_files(access.grant.vault.clone(), false, move |v| {
             v.read_dir(&query.path)
@@ -126,7 +126,17 @@ async fn write_file(
         let version = v.write_file(
             &query.path,
             &bytes,
-            query.mode.as_deref().unwrap_or(""),
+            match query.mode.as_deref() {
+                Some("create") => WriteMode::Create,
+                Some("replace") => WriteMode::Replace,
+                _ => {
+                    return Err(EditorError::new(
+                        ErrorCode::InvalidPath,
+                        "Expected create or replace write mode",
+                        &query.path,
+                    ))
+                }
+            },
             expected.as_deref(),
         )?;
         documents.refresh_path(&query.path)?;

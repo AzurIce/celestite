@@ -1,12 +1,15 @@
 //! Derived document previews. Scheduling policy lives here; platforms execute
 //! immutable tasks separately from editing and persistence.
-use crate::backend::{EditorError, EditorResult, ErrorCode};
 #[cfg(feature = "preview")]
 use crate::editor::MAX_TEXT_BYTES;
-use crate::editor::validate_editor_path;
+use crate::error::{EditorError, EditorResult, ErrorCode};
+use crate::fs::validate_path;
 use celestite_buffer::types::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+#[cfg(all(feature = "native", feature = "preview", not(target_arch = "wasm32")))]
+pub mod native;
 
 pub const PREVIEW_DEBOUNCE_MS: u64 = 120;
 pub const PREVIEW_MAX_WAIT_MS: u64 = 500;
@@ -98,6 +101,10 @@ pub struct PreviewComponent {
     pub package_root: String,
 }
 
+#[cfg(feature = "preview")]
+mod manifests;
+#[cfg(feature = "preview")]
+mod paths;
 #[cfg(feature = "preview")]
 pub mod project;
 
@@ -246,7 +253,7 @@ pub struct PreviewState {
     pub result: Option<PreviewResult>,
     pub error: Option<String>,
     pub diagnostics: Vec<PreviewDiagnostic>,
-    /// Deadline on the Backend clock. None while the current target is running
+    /// Deadline on the host-supplied clock. None while the current target is running
     /// or awaiting retry. An older running task can still delay dispatch.
     pub due_at: Option<u64>,
 }
@@ -364,7 +371,7 @@ pub fn resolve_preview_target(path: &str, target: &str) -> EditorResult<PreviewL
         }
     }
     let path = segments.join("/");
-    validate_editor_path(&path)?;
+    validate_path(&path)?;
     if path.is_empty() {
         return Err(invalid());
     }
@@ -394,7 +401,7 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
         // Frontend selection is case-sensitive; the logical path remains in
         // the ticket for resource resolution, while dispatch uses a canonical ext.
         let resources = project::SnapshotResources::new(task);
-        let mut vault = notist::Vault::new(resources);
+        let mut vault = notist::Vault::new(&resources);
         let path = std::path::Path::new(&task.ticket.path).with_extension(extension);
         let computed = vault
             .render_html(&path, &task.source, notist::RenderOptions::default())
@@ -402,26 +409,19 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
                 if let notist::VaultError::Environment(errors) = &error {
                     environment_diagnostics = errors
                         .iter()
-                        .map(|error| PreviewDiagnostic {
-                            from: error.source[..usize::from(error.diagnostic.span.start())]
-                                .encode_utf16()
-                                .count(),
-                            to: error.source[..usize::from(error.diagnostic.span.end())]
-                                .encode_utf16()
-                                .count(),
-                            origin: PreviewDiagnosticOrigin::Environment,
-                            phase: error.diagnostic.phase.to_string(),
-                            message: error.diagnostic.message.clone(),
-                            path: project::resource_key(&task.resource_root, &error.path),
-                            source: Some(error.source.clone()),
-                        })
+                        .map(|error| resources.diagnostic(error))
                         .collect();
                 }
-                EditorError::new(
-                    ErrorCode::InvalidPreview,
-                    error.to_string(),
-                    &task.ticket.path,
-                )
+                let message = if environment_diagnostics.is_empty() {
+                    error.to_string()
+                } else {
+                    environment_diagnostics
+                        .iter()
+                        .map(|diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                EditorError::new(ErrorCode::InvalidPreview, message, &task.ticket.path)
             })?;
         let analysis = computed.analysis;
         let transformed = computed.transformed;

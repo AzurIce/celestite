@@ -1,11 +1,6 @@
 //! Host-owned buffers and their committed state feed.
-use super::{
-    backend::NativeBackend,
-    fs::{FsVault, Result},
-    vault_identity,
-};
+use super::vault_identity;
 use celestite_buffer::types::{Anchor, HistoryPacket, HistoryPacketKind, Version};
-use celestite_core::backend::{EditorError, ErrorCode};
 #[cfg(test)]
 use celestite_core::editor::types::EditorMutation;
 use celestite_core::editor::{
@@ -13,31 +8,42 @@ use celestite_core::editor::{
     types::{EditorDocument, HostDocument},
     EditorCore, EditorOptions, ExternalChangePolicy,
 };
-use celestite_core::instance::Vault;
+use celestite_core::error::{EditorError, EditorResult, ErrorCode};
+use celestite_core::fs::native::FsVault;
+use celestite_core::instance::{InstanceIdentity, Vault};
 use futures_lite::future::block_on;
 use std::path::Path;
 
 pub(crate) struct Documents {
     pub identity: Vault,
     pub files: std::sync::Arc<FsVault>,
-    core: EditorCore<NativeBackend>,
+    core: EditorCore<std::sync::Arc<FsVault>>,
     feed: super::changes::DocumentFeed,
     peer_ids: std::collections::HashSet<u64>,
 }
 impl Documents {
-    pub fn open(root: &Path, seed: &[u8; 32]) -> Result<Self> {
-        let backend = NativeBackend::open(root, vault_identity(root, seed))?;
-        let files = backend.files.clone();
+    pub fn open(root: &Path, seed: &[u8; 32]) -> EditorResult<Self> {
+        let files = std::sync::Arc::new(
+            FsVault::open(root)
+                .map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), ""))?,
+        );
+        let identity = InstanceIdentity {
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            vault: vault_identity(root, seed),
+        };
         let core = block_on(EditorCore::open_with_options(
-            backend,
+            identity,
+            Some(files.clone()),
+            None,
             EditorOptions {
                 external_changes: ExternalChangePolicy::Merge,
                 defer_filesystem_diff: true,
+                ..Default::default()
             },
         ))?;
         let vault = &core.identity().vault;
         let identity = vault.clone();
-        let feed = super::changes::DocumentFeed::new(identity.clone(), core.persistent());
+        let feed = super::changes::DocumentFeed::new(identity.clone());
         Ok(Self {
             identity,
             files,
@@ -46,70 +52,68 @@ impl Documents {
             peer_ids: Default::default(),
         })
     }
-    pub fn reconcile(&mut self) -> Result<()> {
+    pub fn reconcile(&mut self) -> EditorResult<()> {
         for error in block_on(self.core.reconcile_files()) {
             tracing::warn!(path = %error.path, code = %error.code, message = %error.message, "File observation failed; preserving history and continuing other files");
         }
-        // History failures stay frozen; a filesystem hint is not permission to retry.
-        if let Some(error) = self
-            .core
-            .resident_status()?
-            .iter()
-            .find_map(|state| state.persistence_error.as_ref())
-        {
-            return Err(EditorError::new(ErrorCode::Io, error, ""));
-        }
         Ok(())
     }
-    pub fn resident(&self) -> Result<Vec<EditorDocument>> {
+    pub fn resident(&self) -> EditorResult<Vec<EditorDocument>> {
         self.core.resident()
     }
     pub fn has_file_observations(&self) -> bool {
         self.core.has_file_observations()
     }
-    pub fn take_file_observation(&mut self) -> Result<Option<FileObservationTask>> {
+    pub fn take_file_observation(&mut self) -> EditorResult<Option<FileObservationTask>> {
         self.core.take_file_observation()
     }
-    pub fn complete_file_observation(&mut self, result: FileObservationResult) -> Result<bool> {
+    pub fn complete_file_observation(
+        &mut self,
+        result: FileObservationResult,
+    ) -> EditorResult<bool> {
         block_on(self.core.complete_file_observation(result))
     }
-    pub fn retry_file_observation(&mut self, id: &str) -> Result<()> {
+    pub fn retry_file_observation(&mut self, id: &str) -> EditorResult<()> {
         block_on(self.core.retry_file_observation(id))
     }
-    pub fn publish_changes(&mut self) -> Result<bool> {
+    pub fn publish_changes(&mut self) -> EditorResult<bool> {
         // This transport publishes coalesced committed states; drain the owner's
         // mutation batch so it cannot accumulate behind the state feed.
         self.core.take_mutations();
         let states = self.core.resident_status()?;
         self.feed.publish(states)
     }
-    pub fn subscribe(&mut self) -> Result<super::changes::Subscription> {
+    pub fn subscribe(&mut self) -> EditorResult<super::changes::Subscription> {
         self.publish_changes()?;
         Ok(self.feed.subscribe())
     }
-    pub fn persistent(&self) -> bool {
-        self.core.persistent()
-    }
-    pub fn open_file(&mut self, path: &str) -> Result<String> {
+    pub fn open_file(&mut self, path: &str) -> EditorResult<String> {
         block_on(self.core.open_file(path))
     }
-    pub fn list(&mut self) -> Result<Vec<EditorDocument>> {
+    pub fn list(&mut self) -> EditorResult<Vec<EditorDocument>> {
         block_on(self.core.list())
     }
-    pub fn state(&self, id: &str) -> Result<EditorDocument> {
+    pub fn state(&self, id: &str) -> EditorResult<EditorDocument> {
         self.core.read(id)
     }
-    pub fn host_document(&self, id: &str, known_revision: Option<&str>) -> Result<HostDocument> {
+    pub fn host_document(
+        &self,
+        id: &str,
+        known_revision: Option<&str>,
+    ) -> EditorResult<HostDocument> {
         let status = self.core.status(id)?;
         self.core
             .host_document(id, known_revision != Some(status.file_revision.as_str()))
     }
-    pub fn committed_version(&self, id: &str) -> Result<Version> {
-        self.require_committed(id)?;
+    pub fn version(&self, id: &str) -> EditorResult<Version> {
         Ok(self.core.status(id)?.version)
     }
-    pub fn validate_presence(&self, id: &str, version: &Version, anchors: &[Anchor]) -> Result<()> {
-        self.require_committed(id)?;
+    pub fn validate_presence(
+        &self,
+        id: &str,
+        version: &Version,
+        anchors: &[Anchor],
+    ) -> EditorResult<()> {
         if !self.core.status(id)?.version.contains(version) {
             return Err(EditorError::new(
                 ErrorCode::StaleVersion,
@@ -119,10 +123,10 @@ impl Documents {
         }
         self.core.resolve_anchors(id, anchors).map(|_| ())
     }
-    pub fn refresh_path(&mut self, path: &str) -> Result<()> {
+    pub fn refresh_path(&mut self, path: &str) -> EditorResult<()> {
         block_on(self.core.refresh_path(path))
     }
-    pub fn refresh(&mut self, id: &str) -> Result<()> {
+    pub fn refresh(&mut self, id: &str) -> EditorResult<()> {
         block_on(self.core.refresh(id))
     }
     #[cfg(test)]
@@ -130,32 +134,18 @@ impl Documents {
         &mut self,
         id: &str,
         edits: impl IntoIterator<Item = (std::ops::Range<usize>, &'a str)>,
-    ) -> Result<std::sync::Arc<EditorMutation>> {
-        block_on(self.core.edit(id, edits))
+    ) -> EditorResult<std::sync::Arc<EditorMutation>> {
+        self.core.edit(id, edits)
     }
-    fn require_committed(&self, id: &str) -> Result<()> {
-        let state = self.core.status(id)?;
-        if !super::changes::exportable(&state, self.persistent()) {
-            return Err(EditorError::new(
-                ErrorCode::Io,
-                "Host history is not committed; synchronization is paused",
-                &state.path,
-            ));
-        }
-        Ok(())
-    }
-    pub fn snapshot(&self, id: &str) -> Result<HistoryPacket> {
-        self.require_committed(id)?;
+    pub fn snapshot(&self, id: &str) -> EditorResult<HistoryPacket> {
         self.core.snapshot(id)
     }
-    pub fn updates(&self, id: &str, version: &Version) -> Result<HistoryPacket> {
-        self.require_committed(id)?;
+    pub fn updates(&self, id: &str, version: &Version) -> EditorResult<HistoryPacket> {
         self.core.updates(id, version)
     }
     /// Peer IDs are reserved for the lifetime of this host, even before their
     /// first operation. A reconnect always receives a new peer ID.
-    pub fn allocate_peer_id(&mut self, id: &str) -> Result<u64> {
-        self.require_committed(id)?;
+    pub fn allocate_peer_id(&mut self, id: &str) -> EditorResult<u64> {
         let version = self.core.status(id)?.version;
         let host_peer_id = self.core.peer_id(id)?;
         loop {
@@ -183,7 +173,7 @@ impl Documents {
         packet: HistoryPacket,
         peer_id: u64,
         claimed: &Version,
-    ) -> Result<()> {
+    ) -> EditorResult<()> {
         if packet.kind != HistoryPacketKind::Updates || packet.data.len() > 16 * 1024 * 1024 {
             return Err(EditorError::new(
                 ErrorCode::InvalidEdit,
@@ -191,7 +181,6 @@ impl Documents {
                 id,
             ));
         }
-        self.require_committed(id)?;
         let prepared = self.core.prepare_import(id, packet)?;
         let before = prepared.before();
         let after = &prepared.preview().version;
@@ -208,19 +197,19 @@ impl Documents {
                 id,
             ));
         }
-        let mutation = block_on(self.core.commit_import(id, prepared))?;
-        mutation.require_committed()
+        self.core.commit_import(id, prepared)?;
+        Ok(())
     }
-    pub fn save(&mut self, id: &str, expected: Version) -> Result<()> {
+    pub fn save(&mut self, id: &str, expected: Version) -> EditorResult<()> {
         block_on(self.core.save(id, Some(expected)))
     }
-    pub fn before_replace(&self, path: &str) -> Result<()> {
+    pub fn before_replace(&self, path: &str) -> EditorResult<()> {
         self.core.before_replace(path)
     }
-    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+    pub fn rename(&mut self, from: &str, to: &str) -> EditorResult<()> {
         block_on(self.core.rename(from, to))
     }
-    pub fn remove(&mut self, path: &str, recursive: bool) -> Result<()> {
+    pub fn remove(&mut self, path: &str, recursive: bool) -> EditorResult<()> {
         block_on(self.core.remove(path, recursive))
     }
 }

@@ -355,3 +355,39 @@ test("a late project read cannot replace the current Vault settings", async () =
   store.clearProject();
   assert.equal(store.snapshot().source["theme.mode"], "default");
 });
+
+test("flush retries failed settings writes without requiring another settings change", async () => {
+  const file = new MemoryFile();
+  const { store } = createStore(file);
+  await store.load();
+  file.failWrites = true;
+  await store.set("theme.mode", "dark");
+  await assert.rejects(store.flush(), /quota exceeded/);
+  assert.equal(store.snapshot().storage, "memory");
+  file.failWrites = false;
+  await store.flush();
+  assert.equal(store.snapshot().storage, "file");
+  assert.equal(store.snapshot().saveError, undefined);
+  assert.deepEqual(JSON.parse(file.stored!), { "theme.mode": "dark" });
+});
+
+test("flush commits deferred settings but never overwrites a document it could not read", async () => {
+  const file = new MemoryFile();
+  const { store } = createStore(file);
+  await store.load();
+  await store.set("sidebar.width", 360, { persist: false });
+  await store.flush();
+  assert.equal(JSON.parse(file.stored!)["sidebar.width"], 360);
+  const unavailable = new SettingsStore({
+    file: {
+      async read() {
+        throw new Error("temporarily unavailable");
+      },
+      async write() {
+        assert.fail("unread settings must be retained");
+      },
+    },
+  });
+  await unavailable.load();
+  await unavailable.flush();
+});

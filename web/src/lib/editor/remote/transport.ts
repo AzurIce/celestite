@@ -77,7 +77,7 @@ export class RemoteTransport {
     ) => void,
     private disconnected: (error: unknown) => void,
   ) {
-    const address = new URL(url + "/api/v4/sync");
+    const address = new URL(url + "/api/v5/sync");
     address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
     this.socket = new WebSocket(address);
     this.socket.onopen = () =>

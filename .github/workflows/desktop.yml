@@ -1,0 +1,110 @@
+name: Desktop builds
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "crates/**"
+      - "web/**"
+      - "capabilities/**"
+      - "tauri.conf.json"
+      - "scripts/test-desktop.py"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            bundle: deb
+          - os: macos-latest
+            bundle: app
+          - os: windows-latest
+            bundle: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+          targets: wasm32-unknown-unknown
+      - name: Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev webkit2gtk-driver xvfb python3 libx11-6 \
+            build-essential file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+      - name: Rust cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            web/.cache
+          key: ${{ runner.os }}-desktop-${{ hashFiles('Cargo.lock', 'web/scripts/build-core.ts') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-desktop-${{ hashFiles('Cargo.lock', 'web/scripts/build-core.ts') }}-
+      - name: Clear restored Linux acceptance artifacts
+        if: runner.os == 'Linux'
+        run: rm -rf target/desktop-acceptance
+      - name: Install frontend
+        run: bun install --cwd web --frozen-lockfile
+      - name: Frontend formatting
+        run: bun run --cwd web format:check
+      - name: Frontend types
+        run: bun run --cwd web typecheck
+      - name: Frontend tests
+        run: bun run --cwd web test:vault
+      - name: Build frontend
+        run: bun run --cwd web build
+      - name: Core platform boundaries
+        run: |
+          cargo check --locked -p celestite-core --no-default-features
+          cargo check --locked -p celestite-core --all-features --target wasm32-unknown-unknown
+      - name: Native tests
+        run: cargo test --locked --workspace --features celestite-core/preview
+      - name: Build real remote server for Linux acceptance
+        if: runner.os == 'Linux'
+        run: cargo build --locked -p celestite-server
+      - name: Build desktop bundle
+        run: bun run --cwd web tauri build --bundles ${{ matrix.bundle }}
+      - name: Linux native WebView acceptance
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/test-desktop.py \
+            --binary target/release/celestite \
+            --server-binary target/debug/celestite-server \
+            --output target/desktop-acceptance
+      - name: Upload Linux native acceptance report and screenshots
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: celestite-Linux-acceptance
+          path: target/desktop-acceptance/
+          if-no-files-found: warn
+      - name: Archive macOS app with executable permissions and symlinks
+        if: runner.os == 'macOS'
+        run: tar -czf target/release/celestite-macos.tar.gz -C target/release/bundle/macos .
+      - name: Upload unsigned desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: celestite-${{ runner.os }}
+          path: ${{ runner.os == 'macOS' && 'target/release/celestite-macos.tar.gz' || 'target/release/bundle/' }}
+          if-no-files-found: error

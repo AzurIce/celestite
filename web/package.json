@@ -15,7 +15,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "serve": "vite preview",
-    "tauri": "tauri"
+    "tauri": "cd .. && tauri"
   },
   "license": "MIT",
   "dependencies": {

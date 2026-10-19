@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
-import { createMemoryFile, openAppSettingsFile } from "./app-file";
+import { createMemoryFile, openAppDocument } from "./app-file";
+import type { SettingsFile } from "./app-file";
 import { parseSettingsText, resolveSettings } from "./document";
 import { clearLegacySettings, readLegacyDocument } from "./legacy";
 import { SettingsStore, type SettingsSnapshot } from "./store";
@@ -21,9 +22,9 @@ let store: SettingsStore | null = null;
  */
 export async function initSettings(): Promise<SettingsStore> {
   if (store) return store;
-  let file: Awaited<ReturnType<typeof openAppSettingsFile>>;
+  let file: SettingsFile;
   try {
-    file = await openAppSettingsFile();
+    file = await openAppDocument("settings.json");
   } catch {
     file = createMemoryFile();
   }
@@ -72,6 +73,10 @@ export function setSetting<K extends SettingKey>(
   options?: { persist?: boolean },
 ) {
   return store?.set(key, value, options);
+}
+
+export async function flushSettings() {
+  await store?.flush();
 }
 
 export { SettingsStore };

@@ -1,5 +1,5 @@
 {
-  description = "Celestite devshell";
+  description = "Celestite desktop application and development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -19,7 +19,7 @@
       crane,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
       system:
       let
         overlays = [ (import rust-overlay) ];
@@ -37,8 +37,24 @@
         );
 
         inherit (pkgs.stdenv.hostPlatform) isDarwin isLinux;
+        desktop = pkgs.callPackage ./nix/desktop.nix { inherit craneLib; };
       in
       {
+        packages = {
+          default = desktop;
+          celestite = desktop;
+          web = desktop.frontend;
+        };
+        apps.default = {
+          type = "app";
+          program = pkgs.lib.getExe desktop;
+        };
+        checks = {
+          desktop = desktop;
+          frontend = desktop.frontend;
+        };
+        formatter = pkgs.nixfmt;
+
         devShells.default = craneLib.devShell {
           # Tauri renders with WebKitGTK on Linux but with the system WKWebView on
           # macOS, so all the GTK/WebKit/GStreamer deps below are Linux-only
@@ -57,6 +73,7 @@
             [
               bun
               cargo-tauri
+              desktop.wasmBindgen
               pkg-config
             ]
             ++ pkgs.lib.optionals isLinux [ wrapGAppsHook4 ];

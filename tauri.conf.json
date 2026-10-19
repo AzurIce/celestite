@@ -4,17 +4,27 @@
   "version": "0.1.0",
   "identifier": "com.azurice.celestite",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": {
+      "script": "bun run dev",
+      "cwd": "web"
+    },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": {
+      "script": "bun run build",
+      "cwd": "web"
+    },
     "frontendDist": "web/dist"
   },
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "celestite",
-        "width": 800,
-        "height": 600
+        "width": 1200,
+        "height": 800,
+        "minWidth": 640,
+        "minHeight": 480,
+        "dragDropEnabled": false
       }
     ],
     "security": {

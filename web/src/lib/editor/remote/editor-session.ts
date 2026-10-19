@@ -1,9 +1,8 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
 import type { HttpVaultBackend, RemoteVaultDescriptor } from "../../vault/http";
-import { EditorHost } from "../runtime/host";
+import { EditorSession } from "../runtime/session";
 import type { CoreDocument, CoreMutation, CorePort } from "../core";
-import { decodeError } from "../rpc";
 import type {
   ServiceDocument,
   HostDocument,
@@ -12,6 +11,7 @@ import type {
   PresenceSelection,
   ServiceEvent,
   HistoryPacket,
+  SessionReplacement,
 } from "../contract";
 import { RemoteTransport, type RemoteReceipt } from "./transport";
 import { SyncSession } from "./session";
@@ -19,21 +19,20 @@ import { anchorPositions } from "../presence";
 import { RemoteInbox } from "./inbox";
 import { executeFile, fileAffectsText, fileMutation } from "../files";
 
+interface RemoteView {
+  viewId: string;
+  documentId: string;
+  focused: boolean;
+  selection: VersionedSelection | null;
+}
+
 /** Private online replica: core owns history/undo; the transport carries
  * committed updates. Host file saves remain explicit. */
-export class RemoteEditorHost extends EditorHost {
+export class RemoteEditorSession extends EditorSession {
   private hosts = new Map<string, HostDocument>();
   private subscriptions = new Set<string>();
   private members: CollaborationSnapshot | null = null;
-  private views = new Map<
-    string,
-    {
-      viewId: string;
-      documentId: string;
-      focused: boolean;
-      selection: VersionedSelection | null;
-    }
-  >();
+  private views = new Map<string, RemoteView>();
   private sendingViews = new Set<string>();
   private sync?: SyncSession;
   private unsupported = new Map<string, ServiceDocument>();
@@ -54,10 +53,10 @@ export class RemoteEditorHost extends EditorHost {
     emit: (event: ServiceEvent) => void,
     private scheduleRemote: (task: () => Promise<unknown>) => void,
   ) {
-    super(core, http, emit, scheduleRemote);
+    super(core, emit);
   }
-  async connect() {
-    const identity = this.descriptor.vault!;
+  async connect(descriptor = this.descriptor): Promise<SessionReplacement> {
+    const identity = descriptor.vault!;
     this.inbox.stop();
     const inbox = (this.inbox = new RemoteInbox());
     const current = () => {
@@ -71,7 +70,7 @@ export class RemoteEditorHost extends EditorHost {
         if (this.transport !== transport || inbox.stopped) return;
         if (receipt.kind === "members") {
           this.members = receipt.state;
-          this.publishMembers(receipt.state);
+          if (!this.offline) this.publishMembers(receipt.state);
           return;
         }
         if (receipt.kind === "tree") {
@@ -102,7 +101,8 @@ export class RemoteEditorHost extends EditorHost {
             if (held) return;
             await this.receive(receipt);
           } catch (error) {
-            this.networkFailure(transport, error);
+            if (this.subscriptions.has(receipt.document.id))
+              this.networkFailure(transport, error);
           } finally {
             if (!held) inbox.release(receipt);
           }
@@ -111,7 +111,8 @@ export class RemoteEditorHost extends EditorHost {
       (error) => this.networkFailure(transport, error),
     );
     this.transport = transport;
-    this.sync = new SyncSession(
+    // The old sender still owns any unconfirmed edits until replacement commits.
+    const sync = new SyncSession(
       (update) => transport.request("updates", { ...update }),
       (unconfirmed) => {
         if (this.transport === transport && !this.offline)
@@ -123,6 +124,8 @@ export class RemoteEditorHost extends EditorHost {
       },
       (error) => this.networkFailure(transport, error),
     );
+    let committed = false;
+    let replacement!: { documents: CoreDocument[]; sequence: number };
     try {
       await transport.ready;
       current();
@@ -131,76 +134,161 @@ export class RemoteEditorHost extends EditorHost {
         receipts.push(await transport.request<RemoteReceipt>("open", { id }));
         current();
       }
+      // View registration can fail, and must finish before old histories vanish.
+      // setView may change while network requests await; restore the latest table.
+      const sentViews = new Map<string, RemoteView>();
+      for (;;) {
+        for (const [viewId, sent] of sentViews)
+          if (
+            !this.views.has(viewId) ||
+            !this.subscriptions.has(sent.documentId)
+          ) {
+            await transport.request("set_view", {
+              viewId,
+              documentId: null,
+              focused: false,
+              selection: null,
+            });
+            current();
+            sentViews.delete(viewId);
+          }
+        for (const [viewId, view] of this.views)
+          if (
+            this.subscriptions.has(view.documentId) &&
+            sentViews.get(viewId) !== view
+          ) {
+            await transport.request("set_view", { ...view, selection: null });
+            current();
+            sentViews.set(viewId, view);
+          }
+        if (
+          [...this.views].every(
+            ([id, view]) =>
+              !this.subscriptions.has(view.documentId) ||
+              sentViews.get(id) === view,
+          ) &&
+          [...sentViews].every(([id, view]) => this.views.get(id) === view)
+        )
+          break;
+      }
       const hosts = new Map<string, HostDocument>();
       const documents = new Map<
         string,
         { packets: HistoryPacket[]; peerId: string }
       >();
       const received = new Map<string, number>();
-      for (const receipt of receipts) {
+      const addReceipt = (receipt: RemoteReceipt) => {
         const id = receipt.document.id;
+        if (!this.subscriptions.has(id)) return;
         const host = this.receiptHost(receipt, hosts.get(id));
+        const sequence = received.get(id) ?? -1;
+        if (receipt.sequence <= sequence) return;
         const next = documents.get(id) ?? {
           packets: [],
           peerId: receipt.peerId,
         };
-        if (
-          next.peerId !== receipt.peerId ||
-          receipt.sequence <= (received.get(id) ?? -1)
-        )
+        if (next.peerId !== receipt.peerId)
           throw new VaultError("IO", "初始协作会话不连续。");
         next.packets.push(receipt.packet);
         documents.set(id, next);
         hosts.set(id, host);
         received.set(id, receipt.sequence);
-      }
-      const states = await this.execute<CoreDocument[]>("replica_session", {
-        documents: [...documents].map(([id, document]) => ({
-          ...document,
-          state: this.replicaState(hosts.get(id)!),
-        })),
+      };
+      for (const receipt of receipts) addReceipt(receipt);
+      const params: Record<string, unknown> = {};
+      let startup: RemoteReceipt[] = [];
+      await this.execute<CoreDocument[]>("replica_session", params, {
+        before: () => {
+          current();
+          // Stay in startup mode while the core request awaits. Arrivals after
+          // this point are ordinary updates of the committed session.
+          startup = inbox.drainStartup();
+          for (const receipt of startup) addReceipt(receipt);
+          // A release may commit while this replacement waits for its lease.
+          // Drop its earlier open receipts from the entire prepared catalogue.
+          for (const id of documents.keys())
+            if (!this.subscriptions.has(id)) {
+              documents.delete(id);
+              hosts.delete(id);
+              received.delete(id);
+            }
+          params.documents = [...documents].map(([id, document]) => ({
+            ...document,
+            state: {
+              ...this.replicaState(hosts.get(id)!),
+              readOnly: descriptor.readOnly,
+            },
+          }));
+        },
+        accept: (documents) => {
+          // Core success is the irreversible commit point, including native IPC
+          // that may complete after transport failure. Never report old buffers.
+          committed = true;
+          replacement = { documents, sequence: this.eventSequence };
+          this.descriptor = descriptor;
+          this.hosts = hosts;
+          this.received = received;
+          this.sync = sync;
+          for (const host of hosts.values())
+            sync.acknowledge(host.id, host.version);
+          this.clearPatches();
+          for (const view of this.views.values()) view.selection = null;
+          this.offline = inbox.stopped || this.transport !== transport;
+          if (this.offline)
+            sync.stop(new VaultError("Closed", "远端连接已中断。"), false);
+          for (const receipt of startup) inbox.release(receipt);
+        },
       });
-      current();
-      // Publish the new session only after every history and the final catalogue
-      // have been accepted. A failed handshake leaves old buffers and undo intact.
-      this.hosts = hosts;
-      for (const host of hosts.values())
-        this.sync.acknowledge(host.id, host.version);
-      this.received = received;
-      this.clearPatches();
-      for (const view of this.views.values())
-        if (this.subscriptions.has(view.documentId)) {
-          view.selection = null;
-          await transport.request("set_view", { ...view });
-          current();
-        }
-      this.offline = false;
-      const opened = new Map(
-        states.map((state) => [state.id, this.document(state)]),
-      );
-      // Keep collecting while imports await; drain only into the new session.
-      for (let receipt; (receipt = inbox.nextStartup());) {
-        current();
-        try {
-          if (this.subscriptions.has(receipt.document.id)) {
-            const document = await this.receive(receipt);
-            opened.set(document.id, document);
+      // Native IPC can yield long enough for an offline setView to change the
+      // table after preparation. These are changes to the committed session.
+      if (!this.offline) {
+        for (const [viewId] of sentViews)
+          if (
+            !this.views.has(viewId) ||
+            !this.subscriptions.has(this.views.get(viewId)!.documentId)
+          ) {
+            await transport.request("set_view", {
+              viewId,
+              documentId: null,
+              focused: false,
+              selection: null,
+            });
+            current();
           }
-          current();
-        } finally {
-          inbox.release(receipt);
-        }
+        for (const [viewId, view] of this.views)
+          if (sentViews.get(viewId) !== view) await this.sendView(viewId);
       }
-      return [...opened.values()];
+      if (!this.offline)
+        for (let receipt; (receipt = inbox.nextStartup());) {
+          try {
+            if (this.subscriptions.has(receipt.document.id))
+              await this.receive(receipt);
+          } finally {
+            inbox.release(receipt);
+          }
+        }
     } catch (error) {
       inbox.stop();
       this.networkFailure(transport, error);
       transport.close();
-      throw error;
+      if (!committed) throw error;
+      // A late push or connection loss cannot undo a successful core replacement.
     }
+    if (this.offline)
+      await this.pause(
+        new VaultError("Closed", "远端连接已中断，正文已保留。"),
+      ).catch(() => {});
+    else if (this.members) this.publishMembers(this.members);
+    // The successful replacement is the only snapshot baseline. Later imports
+    // and metadata are delivered as events after its sequence, even if derived
+    // offline-state IO fails. No later read can reverse this commit.
+    return {
+      documents: replacement.documents.map((state) => this.document(state)),
+      sequence: replacement.sequence,
+    };
   }
 
-  override async composition(id: string, active: boolean) {
+  async composition(id: string, active: boolean) {
     const inbox = this.inbox;
     const transport = this.transport;
     if (active) inbox.compose(id);
@@ -226,14 +314,6 @@ export class RemoteEditorHost extends EditorHost {
     if (this.offline || !this.transport)
       throw new VaultError("Closed", "远端连接已中断，编辑正文仍保留。");
     return this.transport;
-  }
-  protected override publish(
-    raw: CoreDocument,
-    content = false,
-    change?: ServiceDocument["change"],
-  ) {
-    if (!this.resetting)
-      super.publish({ ...raw, autosaveDelay: null }, content, change, true);
   }
   protected override document(
     raw: CoreDocument,
@@ -293,6 +373,8 @@ export class RemoteEditorHost extends EditorHost {
       .catch(() => {})
       .then(() => {
         this.requireTransport(transport);
+        if (!this.subscriptions.has(id))
+          throw new VaultError("Closed", "远端文档订阅已结束。");
         return this.importReceipt(receipt, transport);
       });
     this.imports.set(id, result);
@@ -364,10 +446,10 @@ export class RemoteEditorHost extends EditorHost {
           await this.pause(error);
       });
   }
-  override collaboration() {
+  collaboration() {
     return this.members;
   }
-  override async setView(
+  async setView(
     viewId: string,
     documentId: string | null,
     focused: boolean,
@@ -443,7 +525,7 @@ export class RemoteEditorHost extends EditorHost {
         void this.sendView(viewId);
     }
   }
-  override async releaseDocument(id: string) {
+  async releaseDocument(id: string) {
     if (this.subscriptions.has(id)) {
       const transport = this.requireOnline();
       const sync = this.sync!;
@@ -452,14 +534,23 @@ export class RemoteEditorHost extends EditorHost {
       this.requireTransport(transport);
       await transport.request("unsubscribe", { id });
       this.requireTransport(transport);
-      await this.execute("replica_release", { id });
-      this.subscriptions.delete(id);
-      for (const [viewId, view] of this.views)
-        if (view.documentId === id) this.views.delete(viewId);
-      this.inbox.discard(id);
+      await this.execute(
+        "replica_release",
+        { id },
+        {
+          before: () => this.requireTransport(transport),
+          accept: () => {
+            // Match the successful core release before a queued replacement
+            // captures its document inventory under the next core lease.
+            this.subscriptions.delete(id);
+            for (const [viewId, view] of this.views)
+              if (view.documentId === id) this.views.delete(viewId);
+            this.inbox.discard(id);
+          },
+        },
+      );
     }
     this.unsupported.delete(id);
-    await super.releaseDocument(id);
   }
   private requireTransport(transport: RemoteTransport) {
     if (this.transport !== transport)
@@ -494,15 +585,12 @@ export class RemoteEditorHost extends EditorHost {
       this.publish(raw, true);
     }
   }
-  override async open(path: VaultPath): Promise<ServiceDocument> {
+  async open(path: VaultPath): Promise<ServiceDocument> {
     const transport = this.requireOnline();
+    let receipt: RemoteReceipt;
     try {
-      const receipt = await transport.request<RemoteReceipt>("open", {
-        path,
-      });
+      receipt = await transport.request<RemoteReceipt>("open", { path });
       this.requireTransport(transport);
-      this.subscriptions.add(receipt.document.id);
-      return await this.receive(receipt);
     } catch (error) {
       if (this.transport !== transport) throw error;
       if (this.connectionFailure(error)) await this.pause(error);
@@ -515,8 +603,10 @@ export class RemoteEditorHost extends EditorHost {
         savedContent: "",
         bom: false,
         lineEnding: "\n",
-        readOnlyReason: error.message.includes("5 MiB")
-          ? "文件超过 5 MiB，请通过文件树下载后编辑。"
+        readOnlyReason: /5 MiB|read limit|file byte limit|supported size/i.test(
+          error.message,
+        )
+          ? "正文超过 5 MiB，请通过文件树下载后编辑。"
           : "这个文件不是 UTF-8 文本，无法在此编辑。可通过文件树下载。",
         canPreview: false,
 
@@ -526,12 +616,37 @@ export class RemoteEditorHost extends EditorHost {
       this.unsupported.set(document.id, document);
       return document;
     }
+    const id = receipt.document.id;
+    const subscribed = this.subscriptions.has(id);
+    this.subscriptions.add(id);
+    try {
+      return await this.receive(receipt);
+    } catch (error) {
+      // A valid host file can still contain an unsupported/corrupt CRDT packet.
+      // That is a failed join, never a non-UTF-8 placeholder with another id.
+      if (!subscribed) {
+        this.subscriptions.delete(id);
+        this.inbox.discard(id);
+        if (this.transport === transport && !this.offline)
+          try {
+            await transport.request("unsubscribe", { id });
+          } catch (cleanupError) {
+            this.networkFailure(transport, cleanupError);
+            await this.pause(cleanupError);
+          }
+      }
+      if (this.transport === transport && this.connectionFailure(error)) {
+        this.networkFailure(transport, error);
+        await this.pause(error);
+      }
+      throw error;
+    }
   }
   protected override ensureMutationAllowed() {
     this.requireOnline();
   }
-  protected override async onMutation(mutation: CoreMutation, inReply = false) {
-    await super.onMutation(mutation, inReply);
+  protected override onMutation(mutation: CoreMutation, inReply = false) {
+    super.onMutation(mutation, inReply);
     const { update } = mutation;
     if (update.pending)
       throw new VaultError(
@@ -543,12 +658,10 @@ export class RemoteEditorHost extends EditorHost {
       update.operation &&
       ["local", "undo", "redo"].includes(update.cause.kind)
     ) {
-      if (mutation.history.status === "failed")
-        throw decodeError(mutation.history.error);
       this.sync!.enqueue(mutation.document.id, update.operation, update.after);
     }
   }
-  override async save(id: string): Promise<ServiceDocument> {
+  async save(id: string): Promise<ServiceDocument> {
     const unsupported = this.unsupported.get(id);
     if (unsupported) return unsupported;
     const transport = this.requireOnline();
@@ -589,7 +702,14 @@ export class RemoteEditorHost extends EditorHost {
     }
     throw new VaultError("Busy", "远端正文仍在变化，请稍后保存。");
   }
-  override async retryObservation(id: string): Promise<ServiceDocument> {
+  async checkpoint(id: string) {
+    const transport = this.requireOnline();
+    const document = await this.execute<CoreDocument>("read", { id });
+    await this.sync!.wait(id, document.version);
+    this.requireTransport(transport);
+    return this.document(await this.execute<CoreDocument>("read", { id }));
+  }
+  async retryObservation(id: string): Promise<ServiceDocument> {
     const transport = this.requireOnline();
     const receipt = await transport.request<RemoteReceipt>(
       "retry_observation",
@@ -598,10 +718,7 @@ export class RemoteEditorHost extends EditorHost {
     this.requireTransport(transport);
     return this.receive(receipt);
   }
-  override async resolve(
-    id: string,
-    action: "overwrite" | "discard" | "retry",
-  ) {
+  async resolve(id: string, action: "overwrite" | "discard" | "retry") {
     if (action !== "retry")
       throw new VaultError(
         "Unsupported",
@@ -611,34 +728,29 @@ export class RemoteEditorHost extends EditorHost {
     return this.save(id);
   }
   async reconnect() {
-    let descriptor: RemoteVaultDescriptor;
-    try {
-      descriptor = await this.http.describe();
-    } catch (error) {
-      await this.pause(error);
-      throw error;
-    }
-    if (
-      descriptor.vault?.vaultId !== this.descriptor.vault?.vaultId ||
-      descriptor.vault?.historyId !== this.descriptor.vault?.historyId
-    ) {
-      const error = new VaultError(
-        "Conflict",
-        "远端 Vault 历史已改变，旧会话正文仍保留。请保留正文后重新打开连接。",
-      );
-      this.transport?.close();
-      await this.pause(error);
-      throw error;
-    }
+    if (this.resetting) throw new VaultError("Busy", "远端连接正在恢复。");
+    this.resetting = true;
     this.offline = true;
     this.sync?.stop(new VaultError("Closed", "协作会话已替换。"), false);
     this.transport?.close();
     this.members = null;
-    this.descriptor = descriptor;
-    this.resetting = true;
     try {
-      const documents = await this.connect();
-      this.publishConnection({ status: "online", error: null });
+      const descriptor = await this.http.describe();
+      if (
+        descriptor.vault?.vaultId !== this.descriptor.vault?.vaultId ||
+        descriptor.vault?.historyId !== this.descriptor.vault?.historyId
+      )
+        throw new VaultError(
+          "Conflict",
+          "远端 Vault 历史已改变，旧会话正文仍保留。请保留正文后重新打开连接。",
+        );
+      const documents = await this.connect(descriptor);
+      if (!this.offline)
+        this.publishConnection({
+          status: "online",
+          error: null,
+          unconfirmed: false,
+        });
       this.publishTree();
       return documents;
     } catch (error) {
@@ -649,7 +761,7 @@ export class RemoteEditorHost extends EditorHost {
       this.resetting = false;
     }
   }
-  override async flush() {
+  async flush() {
     try {
       await this.sync?.drain();
     } catch (error) {
@@ -658,10 +770,8 @@ export class RemoteEditorHost extends EditorHost {
         `未确认的协作编辑仍保留，连接仍保留。请导出正文后恢复连接。${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    // A volatile replica has no file projection. Flush history, never host files.
-    await this.execute("flush_history");
   }
-  override async fileOperation(
+  async fileOperation(
     method: string,
     p: Record<string, unknown>,
   ): Promise<unknown> {
@@ -725,12 +835,16 @@ export class RemoteEditorHost extends EditorHost {
     }
     return result;
   }
-  override async close() {
+  async close() {
     await this.flush();
+    await this.execute("close");
+    this.dispose();
+    await this.http.close();
+  }
+  dispose() {
     this.stopping = true;
     this.inbox.stop();
     this.sync?.stop(new VaultError("Closed", "协作会话已关闭。"), false);
     this.transport?.close();
-    await super.close();
   }
 }

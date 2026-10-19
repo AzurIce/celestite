@@ -1,3 +1,4 @@
+import { downloadBytes } from "@/lib/download";
 import { Show, createSignal, onCleanup } from "solid-js";
 import type { JSX } from "@solidjs/web";
 import { Button } from "@/components/ui";
@@ -18,24 +19,26 @@ export function VaultConnectionBoundary(props: {
   const recovering = () => disconnected() || !!failure();
   const rejected = () =>
     !disconnected() && failure()?.inputFailure?.outcome === "rejected";
-  function exportDrafts() {
-    const blob = new Blob(
-      [
-        JSON.stringify(
-          state().documents.map(({ path, content }) => ({ path, content })),
-          null,
-          2,
+  const [exportError, setExportError] = createSignal<string | null>(null);
+  async function exportDrafts() {
+    setExportError(null);
+    try {
+      await downloadBytes(
+        "celestite-drafts.json",
+        new TextEncoder().encode(
+          JSON.stringify(
+            state().documents.map(({ path, content }) => ({ path, content })),
+            null,
+            2,
+          ),
         ),
-      ],
-      { type: "application/json" },
-    );
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "celestite-drafts.json";
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+        "application/json",
+      );
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : String(error));
+    }
   }
+
   async function reconnect(discard = false) {
     try {
       await props.documents.reconnect?.(discard);
@@ -98,9 +101,16 @@ export function VaultConnectionBoundary(props: {
                 {state().connection?.error}
               </p>
             </Show>
+            <Show when={exportError()}>
+              <p role="alert" class="mt-3 text-ui-sm text-danger">
+                {exportError()}
+              </p>
+            </Show>
             <div class="mt-4 flex flex-wrap justify-center gap-2">
               <Show when={state().connection?.unconfirmed || failure()}>
-                <Button onClick={exportDrafts}>导出当前正文</Button>
+                <Button onClick={() => void exportDrafts()}>
+                  导出当前正文
+                </Button>
               </Show>
               <Show when={rejected()}>
                 <Button variant="primary" onClick={() => void withdraw()}>

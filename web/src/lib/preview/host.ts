@@ -4,42 +4,46 @@ import type {
   PreviewState,
   PreviewTask,
   PreviewAssets,
-  PreviewWorkerMessage,
+  PreviewResourceRequest,
+  PreviewResource,
   DocumentSource,
+  PreviewPort,
+  PreviewExecutor,
 } from "./contract";
 import { PreviewResources } from "./resources";
 import { VaultError } from "../vault/errors";
-import type {
-  DocumentSourceSnapshot,
-  PreviewBinding,
-} from "../editor/generated/celestite_core";
+import type { DocumentSourceSnapshot } from "../editor/generated/celestite_core";
+import { browserPreviewExecutor } from "./browser-executor";
+
+interface PreviewRun {
+  task: PreviewTask;
+  abort: AbortController;
+  completion: number;
+}
 
 /** Platform execution only. Rust owns subscriptions, deadlines and applicability. */
 export class PreviewHost {
   private states = new Map<string, PreviewState>();
-  private worker?: Worker;
-  private running?: PreviewTask;
+  private executor?: PreviewExecutor;
+  private running?: PreviewRun;
   private timer?: ReturnType<typeof setTimeout>;
   private timeout?: ReturnType<typeof setTimeout>;
   private closed = false;
+  private paused = false;
   private assetSnapshots = new Map<
     string,
     { taskId: string; generation: string; roots: string; assets: PreviewAssets }
   >();
   constructor(
     private source: DocumentSource,
-    private binding: PreviewBinding,
+    private binding: PreviewPort,
     private emit: (event: PreviewEvent) => void,
     private schedule: (task: () => Promise<unknown>) => void,
     private resources: PreviewResources,
-    private createExecutor: () => Worker = () =>
-      new Worker(new URL("./worker.ts", import.meta.url), {
-        type: "module",
-        name: "celestite-preview",
-      }),
+    private createExecutor: () => PreviewExecutor = browserPreviewExecutor,
   ) {}
-  private drain() {
-    for (const event of this.binding.events()) {
+  private async drain() {
+    for (const event of await this.binding.events()) {
       if (event.state) this.states.set(event.documentId, event.state);
       else this.states.delete(event.documentId);
       if (!event.state) this.assetSnapshots.delete(event.documentId);
@@ -48,21 +52,21 @@ export class PreviewHost {
   }
   private withSource<T>(
     ids: readonly string[],
-    consume: (source: DocumentSourceSnapshot) => T,
+    consume: (source: DocumentSourceSnapshot) => T | Promise<T>,
   ): Promise<T> {
     if (this.closed)
       return Promise.reject(new VaultError("Closed", "预览已关闭。"));
-    return this.source(ids, (source) => {
+    return this.source(ids, async (source) => {
       if (this.closed) throw new VaultError("Closed", "预览已关闭。");
-      if (this.binding.synchronize(source)) {
-        this.stopWorker();
+      if (await this.binding.synchronize(source)) {
+        this.stopExecution();
         this.assetSnapshots.clear();
         this.states.clear();
       }
       try {
-        return consume(source);
+        return await consume(source);
       } finally {
-        this.drain();
+        await this.drain();
       }
     });
   }
@@ -79,14 +83,15 @@ export class PreviewHost {
   }
   /** Called at the end of each host command and after an executor result. */
   async refresh() {
-    if (this.closed) return;
+    if (this.closed || this.paused) return;
     clearTimeout(this.timer);
     this.timer = undefined;
     await this.withSource([], () => {});
-    if (this.running && !this.states.has(this.running.ticket.documentId))
-      this.stopWorker();
+    if (this.paused) return;
+    if (this.running && !this.states.has(this.running.task.ticket.documentId))
+      this.stopExecution();
     if (!this.states.size) {
-      this.stopWorker();
+      this.stopExecution();
       return;
     }
     if (this.running) return;
@@ -103,8 +108,11 @@ export class PreviewHost {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         task = await this.withSource(
-          this.binding.required_snapshots(next.target.documentId),
-          (source) => this.binding.take_task(next.target.documentId, source),
+          await this.binding.required_snapshots(next.target.documentId),
+          (source) =>
+            this.paused
+              ? undefined
+              : this.binding.take_task(next.target.documentId, source),
         );
         break;
       } catch (error) {
@@ -119,13 +127,18 @@ export class PreviewHost {
     }
     if (!task) return;
     task.resourceRoot = this.resources.root;
-    this.running = task;
+    const run: PreviewRun = {
+      task,
+      abort: new AbortController(),
+      completion: 0,
+    };
+    this.running = run;
     try {
-      const worker = (this.worker ??= this.createWorker());
+      const executor = (this.executor ??= this.createExecutor());
       this.timeout = setTimeout(
         () =>
-          this.finish(
-            worker,
+          void this.finish(
+            run,
             {
               taskId: task.ticket.taskId,
               outcome: { kind: "failure", message: "预览计算超时，请重试。" },
@@ -134,101 +147,73 @@ export class PreviewHost {
           ),
         30000,
       );
-      worker.postMessage(task);
+      void executor
+        .execute(
+          task,
+          (requests) => this.readResources(run, requests),
+          run.abort.signal,
+        )
+        .then(
+          (completion) => {
+            if (!run.abort.signal.aborted) void this.finish(run, completion);
+          },
+          (error) => {
+            if (!run.abort.signal.aborted)
+              void this.finish(
+                run,
+                {
+                  taskId: task.ticket.taskId,
+                  outcome: { kind: "failure", message: String(error) },
+                },
+                true,
+              );
+          },
+        );
     } catch (error) {
-      this.running = undefined;
-      this.stopWorker();
-      await this.withSource([], () => {
-        this.binding.complete({
+      await this.finish(
+        run,
+        {
           taskId: task.ticket.taskId,
           outcome: { kind: "failure", message: String(error) },
-        });
-      });
+        },
+        true,
+      );
     }
   }
-  private createWorker() {
-    const worker = this.createExecutor();
-    worker.addEventListener(
-      "message",
-      (event: MessageEvent<PreviewWorkerMessage>) => {
-        if ("kind" in event.data) void this.readResources(worker, event.data);
-        else void this.finish(worker, event.data);
-      },
-    );
-    worker.addEventListener("error", (event) => {
-      event.preventDefault();
-      if (this.running)
-        this.finish(
-          worker,
-          {
-            taskId: this.running.ticket.taskId,
-            outcome: {
-              kind: "failure",
-              message: event.message || "预览 Worker 无法启动。",
-            },
-          },
-          true,
-        );
-    });
-    worker.addEventListener("messageerror", () => {
-      if (this.running)
-        this.finish(
-          worker,
-          {
-            taskId: this.running.ticket.taskId,
-            outcome: { kind: "failure", message: "无法读取预览计算结果。" },
-          },
-          true,
-        );
-    });
-    return worker;
+  private current(run: PreviewRun) {
+    return !this.closed && this.running === run;
   }
   private async readResources(
-    worker: Worker,
-    message: Extract<PreviewWorkerMessage, { kind: "resources" }>,
-  ) {
-    if (
-      this.closed ||
-      this.worker !== worker ||
-      this.running?.ticket.taskId !== message.taskId
-    )
-      return;
-    const task = this.running;
-    const resources: Record<
-      string,
-      Awaited<ReturnType<PreviewResources["read"]>>
-    > = {};
+    run: PreviewRun,
+    requests: PreviewResourceRequest[],
+  ): Promise<Record<string, PreviewResource>> {
+    const { task, abort } = run;
+    abort.signal.throwIfAborted();
+    const resources: Record<string, PreviewResource> = {};
     // Bound remote IO while leaving the editor command queue available.
     let next = 0;
     await Promise.all(
-      Array.from({ length: Math.min(8, message.requests.length) }, async () => {
-        while (next < message.requests.length) {
-          if (
-            this.closed ||
-            this.worker !== worker ||
-            this.running?.ticket.taskId !== message.taskId
-          )
-            return;
-          const request = message.requests[next++];
-          resources[request.path] = await this.resources.read(request, task);
-          (task.resources ??= {})[request.path] = resources[request.path];
+      Array.from({ length: Math.min(8, requests.length) }, async () => {
+        while (next < requests.length) {
+          abort.signal.throwIfAborted();
+          const request = requests[next++];
+          const resource = await this.resources.read(
+            request,
+            task,
+            abort.signal,
+          );
+          abort.signal.throwIfAborted();
+          resources[request.path] = resource;
+          (task.resources ??= {})[request.path] = resource;
         }
       }),
     );
-    if (
-      !this.closed &&
-      this.worker === worker &&
-      this.running?.ticket.taskId === message.taskId
-    )
-      worker.postMessage({
-        kind: "resources",
-        taskId: message.taskId,
-        resources,
-      });
+    abort.signal.throwIfAborted();
+    return resources;
   }
   async assets(id: string, taskId: string): Promise<PreviewAssets> {
-    return this.withSource([], () => {
-      const state = this.binding.state(id);
+    return this.withSource([], async () => {
+      const state = await this.binding.state(id);
       const snapshot = this.assetSnapshots.get(id);
       if (
         state.status !== "ready" ||
@@ -240,17 +225,19 @@ export class PreviewHost {
     });
   }
   private async finish(
-    worker: Worker,
+    run: PreviewRun,
     completion: PreviewCompletion,
-    terminate = false,
+    cancel = false,
   ) {
-    if (
-      this.closed ||
-      this.worker !== worker ||
-      this.running?.ticket.taskId !== completion.taskId
-    )
+    if (!this.current(run) || run.task.ticket.taskId !== completion.taskId)
       return;
-    const task = this.running;
+    const token = ++run.completion;
+    if (cancel) {
+      run.abort.abort();
+      this.executor?.dispose?.();
+      this.executor = undefined;
+    }
+    const task = run.task;
     let assets: PreviewAssets | undefined;
     let roots = "";
     if (completion.outcome.kind === "success") {
@@ -266,7 +253,7 @@ export class PreviewHost {
           previous?.generation === task.ticket.renderGeneration &&
           previous.roots === roots
             ? previous.assets
-            : await this.resources.assets(task, components);
+            : await this.resources.assets(task, components, run.abort.signal);
         const total = [...this.assetSnapshots]
           .filter(([id]) => id !== task.ticket.documentId)
           .reduce(
@@ -291,27 +278,16 @@ export class PreviewHost {
         };
       }
     }
-    if (
-      this.closed ||
-      this.worker !== worker ||
-      this.running?.ticket.taskId !== completion.taskId
-    )
-      return;
+    if (!this.current(run) || run.completion !== token) return;
     clearTimeout(this.timeout);
     this.schedule(async () => {
-      if (
-        this.closed ||
-        this.worker !== worker ||
-        this.running?.ticket.taskId !== completion.taskId
-      )
-        return;
-      await this.withSource([], () => {
-        if (this.running?.ticket.taskId !== completion.taskId) return;
-        const id = this.running.ticket.documentId;
+      if (!this.current(run) || run.completion !== token) return;
+      await this.withSource([], async () => {
+        if (!this.current(run) || run.completion !== token) return;
+        const id = task.ticket.documentId;
         this.running = undefined;
-        if (terminate) this.stopWorker();
-        const accepted = this.binding.complete(completion);
-        if (accepted && assets)
+        const accepted = await this.binding.complete(completion);
+        if (accepted && assets && !this.closed && !run.abort.signal.aborted)
           this.assetSnapshots.set(id, {
             taskId: completion.taskId,
             generation: task.ticket.renderGeneration,
@@ -321,49 +297,66 @@ export class PreviewHost {
       });
     });
   }
-  private interrupt() {
-    // Terminating the executor must also release its core task, including a
+  private async interrupt() {
+    // Cancelling execution must also release its core task, including a
     // stale task still occupying the single-flight slot after text/environment
     // changes. Otherwise no executor remains to deliver that task's completion.
     try {
       if (this.running)
-        this.binding.complete({
-          taskId: this.running.ticket.taskId,
+        await this.binding.complete({
+          taskId: this.running.task.ticket.taskId,
           outcome: { kind: "failure", message: "预览执行器已重启，请重试。" },
         });
     } finally {
-      this.stopWorker();
+      this.stopExecution();
     }
   }
   async retry(id: string) {
-    return this.withSource([], () => {
-      this.interrupt();
+    return this.withSource([], async () => {
+      await this.interrupt();
       this.assetSnapshots.delete(id);
       return this.binding.retry(id);
     });
   }
   async invalidateProject() {
-    await this.withSource([], () => {
-      this.interrupt();
+    await this.withSource([], async () => {
+      await this.interrupt();
       this.assetSnapshots.clear();
-      this.binding.invalidate_project();
+      await this.binding.invalidate_project();
     });
   }
-  private stopWorker() {
+  resume() {
+    this.paused = false;
+  }
+  async pause() {
+    this.paused = true;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    await this.withSource([], async () => {
+      const id = this.running?.task.ticket.documentId;
+      await this.interrupt();
+      if (id) await this.binding.retry(id);
+    });
+  }
+  private stopExecution() {
     clearTimeout(this.timeout);
     this.timeout = undefined;
-    this.worker?.terminate();
-    this.worker = undefined;
+    this.running?.abort.abort();
+    this.executor?.dispose?.();
+    this.executor = undefined;
     this.running = undefined;
   }
-  close() {
-    if (this.closed) return;
+  dispose() {
     this.closed = true;
     clearTimeout(this.timer);
     this.states.clear();
     this.assetSnapshots.clear();
-    this.stopWorker();
-    this.binding.clear();
-    this.binding.free();
+    this.stopExecution();
+  }
+  async close() {
+    if (this.closed) return;
+    this.dispose();
+    await this.binding.clear();
+    await this.binding.free();
   }
 }

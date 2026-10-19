@@ -16,6 +16,10 @@ export class RemoteInbox {
     return true;
   }
 
+  drainStartup() {
+    return this.startup?.splice(0) ?? [];
+  }
+
   nextStartup() {
     const receipt = this.startup?.shift();
     if (!receipt) this.startup = null;

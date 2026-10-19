@@ -1,47 +1,76 @@
 import { VaultError } from "../../vault/errors";
-import { vaultPath } from "../../vault/path";
+import { vaultPath, type VaultPath } from "../../vault/path";
 import { encodeError } from "../rpc";
 import { PreviewHost } from "../../preview/host";
 import type { PreviewResources } from "../../preview/resources";
-import type { PreviewBinding } from "../generated/celestite_core";
+import type { PreviewPort, PreviewExecutor } from "../../preview/contract";
 import { fileMutation } from "../files";
 import { TaskQueue } from "../queue";
-import type { EditorHost } from "./host";
 import type {
   InstanceIdentity,
   ServiceMethods,
-  WorkerMessage,
-  WorkerRequest,
+  ServiceMessage,
+  ServiceRequest,
   ServiceEvent,
   ServiceDocument,
+  BufferCommand,
+  MutationResult,
+  CollaborationSnapshot,
+  VersionedSelection,
+  Version,
+  Affinity,
+  Anchor,
 } from "../contract";
-export type EditorWorkerHost = Pick<
-  EditorHost,
-  | "collaboration"
-  | "setView"
-  | "anchorsAt"
-  | "resolveAnchors"
-  | "releaseDocument"
-  | "composition"
-  | "withSource"
-  | "open"
-  | "read"
-  | "apply"
-  | "retryHistory"
-  | "retryObservation"
-  | "save"
-  | "resolve"
-  | "flush"
-  | "fileOperation"
-  | "close"
-> & {
-  reconnect?: () => Promise<ServiceDocument[]>;
-};
+export interface EditorServiceHost {
+  collaboration(): CollaborationSnapshot | null;
+  setView(
+    viewId: string,
+    documentId: string | null,
+    focused: boolean,
+    selection?: VersionedSelection | null,
+  ): Promise<void>;
+  anchorsAt(
+    id: string,
+    version: Version,
+    positions: [number, Affinity][],
+  ): Promise<Anchor[]>;
+  resolveAnchors(
+    id: string,
+    checkpoint: Version,
+    anchors: Anchor[],
+  ): Promise<[Version, number[]]>;
+  releaseDocument(id: string): Promise<void>;
+  composition(id: string, active: boolean): Promise<void>;
+  withSource<T>(
+    ids: readonly string[],
+    consume: (
+      source: import("../generated/celestite_core").DocumentSourceSnapshot,
+    ) => T | Promise<T>,
+  ): Promise<T>;
+  open(path: VaultPath): Promise<ServiceDocument>;
+  read(id: string): Promise<ServiceDocument>;
+  apply(id: string, command: BufferCommand): Promise<MutationResult>;
+  checkpoint(id: string): Promise<ServiceDocument>;
+  retryObservation(id: string): Promise<ServiceDocument>;
+  save(id: string): Promise<ServiceDocument>;
+  resolve(
+    id: string,
+    action: "overwrite" | "discard" | "retry",
+  ): Promise<ServiceDocument>;
+  flush(): Promise<void>;
+  fileOperation(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown>;
+  close(): Promise<void>;
+  dispose(): void;
+  reconnect?: () => Promise<ServiceMethods["reconnect"]["result"]>;
+}
 export interface EditorServicePort {
-  postMessage(message: WorkerMessage): void;
+  postMessage(message: ServiceMessage): void;
   addEventListener(
     type: "message",
-    listener: (event: MessageEvent<WorkerRequest>) => void,
+    listener: (event: MessageEvent<ServiceRequest>) => void,
   ): void;
 }
 type Handlers = {
@@ -57,36 +86,72 @@ export async function serveEditor(
     schedule: (task: () => Promise<unknown>) => void,
   ) => Promise<{
     identity: InstanceIdentity;
-    host: EditorWorkerHost;
-    previewBinding: PreviewBinding;
+    host: EditorServiceHost;
+    previewBinding: PreviewPort;
+    createPreviewExecutor?: () => PreviewExecutor;
     previewResources: PreviewResources;
     invalidateResourcesOnTree?: boolean;
     setResourceScope?: (
       scope: import("../../vault/file-system-access").LocalDirectoryHandle,
     ) => Promise<void>;
-    dispose: () => void;
+    releaseOwner?: () => Promise<void>;
+    dispose: () => void | Promise<void>;
   }>,
+  receiveDetach?: (detach: () => void) => void,
 ) {
   const sessionId = crypto.randomUUID();
-  let host: EditorWorkerHost;
+  let host: EditorServiceHost;
   let previews: PreviewHost;
   let invalidateResourcesOnTree = false;
   const queue = new TaskQueue();
   let closing = false;
+  let suspended = false;
+  const deferred: (() => Promise<unknown>)[] = [];
   let release!: () => void;
   function enqueue<T>(task: () => Promise<T>) {
     return queue.run(async () => {
       try {
         return await task();
       } finally {
-        if (previews && !closing) await previews.refresh().catch(() => {});
+        if (previews && !closing && !suspended)
+          await previews.refresh().catch(() => {});
       }
     });
+  }
+  function schedule(task: () => Promise<unknown>) {
+    if (closing) return;
+    if (suspended) {
+      deferred.push(task);
+      return;
+    }
+    void enqueue(async () => {
+      if (suspended) {
+        deferred.push(task);
+        return;
+      }
+      if (!closing) return task();
+    }).catch(fatal);
   }
   function fatal(error: unknown) {
     port.postMessage({ kind: "fatal", error: encodeError(error) });
   }
+  function resumeWork() {
+    suspended = false;
+    previews.resume();
+    for (const task of deferred.splice(0)) schedule(task);
+    schedule(() => previews.refresh());
+  }
   const handlers: Handlers = {
+    suspend: async () => {
+      suspended = true;
+      try {
+        await previews.pause();
+      } catch (error) {
+        resumeWork();
+        throw error;
+      }
+    },
+    resume: resumeWork,
     collaboration: () => host.collaboration(),
     release_document: ({ id }) => host.releaseDocument(id),
     set_view: ({ viewId, documentId, focused, selection }) =>
@@ -119,7 +184,7 @@ export async function serveEditor(
     open: ({ path }) => host.open(vaultPath(path)),
     read: ({ id }) => host.read(id),
     apply: ({ id, command }) => host.apply(id, command),
-    retry_history: ({ id }) => host.retryHistory(id),
+    checkpoint: ({ id }) => host.checkpoint(id),
     retry_observation: ({ id }) => host.retryObservation(id),
     save: ({ id }) => host.save(id),
     resolve: ({ id, action }) => host.resolve(id, action),
@@ -133,12 +198,32 @@ export async function serveEditor(
       }
     },
     close: async () => {
-      closing = true;
       try {
-        await host.close();
-        previews.close();
+        if (runtime.releaseOwner) {
+          // Confirm text checkpoints and remote receipts before suspending IO.
+          // Until native release succeeds, transport and subscriptions survive.
+          await host.flush();
+          suspended = true;
+          await previews.pause();
+          await runtime.releaseOwner();
+          closing = true;
+          deferred.length = 0;
+          host.dispose();
+          previews.dispose();
+        } else {
+          // Closing remains reversible until the core's final checkpoint and
+          // backend close succeed. Timers admitted meanwhile must survive a
+          // failed close, just as they survive a failed native owner release.
+          suspended = true;
+          await host.close();
+          closing = true;
+          deferred.length = 0;
+          await previews.close();
+        }
+        await runtime.dispose();
       } catch (error) {
         closing = false;
+        resumeWork();
         throw error;
       }
       release();
@@ -150,6 +235,8 @@ export async function serveEditor(
     const dispatch = async () => {
       if (!host || closing || request.sessionId !== sessionId)
         throw new VaultError("Closed", "编辑服务会话无效或正在关闭。");
+      if (suspended && !["resume", "close", "suspend"].includes(request.method))
+        throw new VaultError("Busy", "编辑服务正在等待窗口关闭。");
       if (!Object.prototype.hasOwnProperty.call(handlers, request.method))
         throw new VaultError("Unsupported", "未知编辑服务命令。");
       // The transport is the only type-erased boundary. Each registered method
@@ -158,9 +245,11 @@ export async function serveEditor(
       return handler(request.params as never);
     };
     // Network waits yield the host queue; all actual core calls are serialized
-    // by EditorHost. Slow IO cannot hold incoming imports or accepted editing.
+    // by EditorSession. Slow IO cannot hold incoming imports or accepted editing.
     const detached = [
       "save",
+      "resolve",
+      "checkpoint",
       "release_document",
       "set_view",
       "open",
@@ -188,40 +277,44 @@ export async function serveEditor(
       .then(() => {
         // Deliver the command's own outcome first. Preview scheduling is derived
         // work: it must neither replace that outcome nor run before detached IO.
-        if (previews && !closing)
-          void queue.run(() => previews.refresh()).catch(() => {});
+        if (previews && !closing && !suspended)
+          void queue
+            .run(async () => {
+              if (!closing && !suspended) await previews.refresh();
+            })
+            .catch(() => {});
       });
   });
-  const runtime = await create(
-    (event) => {
-      port.postMessage(event);
-      if (
-        event.kind === "tree" &&
-        invalidateResourcesOnTree &&
-        previews &&
-        !closing
-      )
-        void queue.run(() => previews.invalidateProject()).catch(() => {});
-    },
-    (task) => {
-      if (!closing) void enqueue(task).catch(fatal);
-    },
-  );
+  const runtime = await create((event) => {
+    port.postMessage(event);
+    if (
+      event.kind === "tree" &&
+      invalidateResourcesOnTree &&
+      previews &&
+      !closing
+    )
+      schedule(() => previews.invalidateProject());
+  }, schedule);
   host = runtime.host;
   invalidateResourcesOnTree = runtime.invalidateResourcesOnTree ?? false;
   previews = new PreviewHost(
     (ids, consume) => host.withSource(ids, consume),
     runtime.previewBinding,
     (event) => port.postMessage({ kind: "preview", event }),
-    (task) => {
-      if (!closing) void enqueue(task).catch(() => {});
-    },
+    schedule,
     runtime.previewResources,
+    runtime.createPreviewExecutor,
   );
   const lifetime = new Promise<void>((resolve) => {
     release = resolve;
   });
+  receiveDetach?.(() => {
+    closing = true;
+    deferred.length = 0;
+    host.dispose();
+    previews.dispose();
+    release();
+  });
   port.postMessage({ kind: "ready", identity: runtime.identity, sessionId });
   await lifetime;
-  runtime.dispose();
 }

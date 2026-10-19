@@ -93,7 +93,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     );
   };
   const undo = (redo: boolean) => (editor: EditorView) => {
-    if (!props.document.readOnlyReason && !props.document.core?.historyError)
+    if (!props.document.readOnlyReason)
       props.onUndo(selectionContext(editor.state), redo);
     return true;
   };
@@ -118,9 +118,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     EditorState.transactionFilter.of((transaction) =>
       transaction.docChanged &&
       !transaction.annotation(serviceUpdate) &&
-      (props.document.locked ||
-        props.document.readOnlyReason ||
-        props.document.core?.historyError)
+      (props.document.locked || props.document.readOnlyReason)
         ? []
         : transaction,
     ),
@@ -191,15 +189,12 @@ export default function CodeEditor(props: CodeEditorProps) {
   ];
   const editable = () => [
     EditorState.readOnly.of(
-      props.document.locked ||
-        !!props.document.readOnlyReason ||
-        !!props.document.core?.historyError,
+      props.document.locked || !!props.document.readOnlyReason,
     ),
     EditorView.editable.of(
       (!props.document.locked || !!props.document.core) &&
         !props.document.inputFailure &&
-        !props.document.readOnlyReason &&
-        !props.document.core?.historyError,
+        !props.document.readOnlyReason,
     ),
   ];
   const vimBindings = () =>
@@ -212,7 +207,7 @@ export default function CodeEditor(props: CodeEditorProps) {
               props.document.dirty ||
               props.document.pending ||
               props.document.saving ||
-              props.document.core?.historyError
+              props.document.core?.recoveryError
             ),
           undo: (redo) => {
             if (view) undo(redo)(view);
@@ -330,8 +325,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     () =>
       props.document.locked ||
       !!props.document.inputFailure ||
-      !!props.document.readOnlyReason ||
-      !!props.document.core?.historyError,
+      !!props.document.readOnlyReason,
     () => {
       if (view)
         view.dispatch({ effects: buffer.editable.reconfigure(editable()) });

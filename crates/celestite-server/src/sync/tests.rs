@@ -9,7 +9,7 @@ use celestite_buffer::{
     types::{Affinity, Anchor, HistoryPacket},
     Buffer,
 };
-use celestite_core::backend::ErrorCode;
+use celestite_core::error::ErrorCode;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -54,7 +54,7 @@ async fn request(
 }
 
 #[test]
-fn v4_document_receipt_keeps_peer_precision_and_host_metadata() {
+fn v5_document_receipt_keeps_peer_precision_and_host_metadata() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.md"), "A😀B").unwrap();
     let mut documents = Documents::open(root.path(), &[0; 32]).unwrap();
@@ -77,9 +77,16 @@ fn v4_document_receipt_keeps_peer_precision_and_host_metadata() {
     assert_eq!(receipt["packet"], json!(expected_packet));
     assert_eq!(receipt["document"], json!(expected_host));
     let metadata = &receipt["document"];
-    assert!(metadata.get("persistedVersion").is_some());
+    assert!(metadata.get("recoveryError").is_some());
+    assert!(metadata["recoveryError"].is_null());
     assert!(metadata.get("fileRevision").is_some());
-    for key in ["writerId", "durableVersion", "backendRevision"] {
+    for key in [
+        "writerId",
+        "durableVersion",
+        "backendRevision",
+        "persistedVersion",
+        "persistenceError",
+    ] {
         assert!(metadata.get(key).is_none());
     }
     assert_eq!(metadata["savedContent"], "A😀B");

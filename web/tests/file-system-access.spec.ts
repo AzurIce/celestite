@@ -130,7 +130,7 @@ test("a disk change during staged replacement rejects the save and preserves the
     await backend.writeFile(path, new TextEncoder().encode("baseline"), {
       mode: "create",
     });
-    const snapshot = await backend.readFileSnapshot!(path);
+    const snapshot = await backend.readFileSnapshot(path);
     const original = FileSystemFileHandle.prototype.createWritable;
     let raced = false;
     FileSystemFileHandle.prototype.createWritable = async function (options) {

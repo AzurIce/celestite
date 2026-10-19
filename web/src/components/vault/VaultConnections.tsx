@@ -9,9 +9,9 @@ import {
   IconButton,
 } from "../ui";
 import { Folder, X } from "../icons";
+import { isDesktop } from "@/lib/desktop/platform";
 import { supportsLocalDirectories } from "@/lib/vault/file-system-access";
 import {
-  DEFAULT_VAULT_ID,
   type VaultManager,
   type VaultManagerSnapshot,
   type VaultConnection,
@@ -27,7 +27,8 @@ export function VaultConnections(props: {
   const [removing, setRemoving] = createSignal<VaultConnection | null>(null);
   const [open, setOpen] = createSignal(false);
   function description(connection: VaultConnection) {
-    if (connection.kind === "opfs") return "默认本地 Vault · 不可移除";
+    if (connection.kind === "opfs" || connection.kind === "native")
+      return "默认本地 Vault · 不可移除";
     if (connection.kind === "directory")
       return connection.directoryPath
         ? `本机目录 · ${connection.directoryPath}`
@@ -83,7 +84,7 @@ export function VaultConnections(props: {
       <select
         class="vault-switcher"
         aria-label="当前 Vault"
-        value={props.state.active?.id ?? DEFAULT_VAULT_ID}
+        value={props.state.active?.id ?? props.manager.defaultId}
         disabled={props.state.opening || busy()}
         onChange={(event) =>
           void props.manager.activate(event.currentTarget.value)
@@ -159,7 +160,7 @@ export function VaultConnections(props: {
                   >
                     打开
                   </Button>
-                  <Show when={connection.kind !== "opfs"}>
+                  <Show when={connection.id !== props.manager.defaultId}>
                     <IconButton
                       size="sm"
                       aria-label={`移除连接 ${connection.name}`}
@@ -200,7 +201,7 @@ export function VaultConnections(props: {
               </div>
             )}
           </Show>
-          <Show when={supportsLocalDirectories()}>
+          <Show when={isDesktop() || supportsLocalDirectories()}>
             <div class="mt-5 border-t border-solid border-border pt-5">
               <Button
                 disabled={busy() || props.state.opening}
@@ -209,7 +210,9 @@ export function VaultConnections(props: {
                 打开本机目录
               </Button>
               <p class="mt-2 text-ui-sm text-secondary">
-                选择目录并授权读写，已有文件可直接编辑。重新打开时可能需要再次授权。
+                {isDesktop()
+                  ? "选择本机目录，已有文件可直接编辑，连接会自动保留。"
+                  : "选择目录并授权读写，已有文件可直接编辑。重新打开时可能需要再次授权。"}
               </p>
             </div>
           </Show>

@@ -124,7 +124,7 @@ export class DirectoryHandleVaultBackend implements VaultBackend {
       // 在第一次 await 前复制，排队保存不受调用者之后修改 buffer 的影响。
       const bytes = new Uint8Array(data);
       const mode = options.mode;
-      if (mode !== "create" && mode !== "replace") {
+      if (mode !== "create" && mode !== "replace" && mode !== "upsert") {
         throw new VaultError("Unsupported", "Unknown file write mode", path);
       }
       return await this.mutate(async () => {

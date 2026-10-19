@@ -1,13 +1,14 @@
 import init, {
-  MemoryEditorBinding,
+  EditorBinding,
   PreviewBinding,
 } from "../generated/celestite_core";
 import { openHttpVault } from "../../vault/http";
 import { VaultError } from "../../vault/errors";
-import { RemoteEditorHost } from "./host";
+import { RemoteEditorSession } from "./editor-session";
 import { serveEditor, type EditorServicePort } from "../runtime/service";
 import { encodeError } from "../rpc";
 import { PreviewResources } from "../../preview/resources";
+import { wasmCore } from "../core";
 let initialized = false;
 self.addEventListener("message", (event) => {
   if (event.data?.kind !== "initialize" || initialized) return;
@@ -33,11 +34,9 @@ self.addEventListener("message", (event) => {
           vault,
         };
         await init();
-        const binding = await MemoryEditorBinding.open(
-          JSON.stringify(identity),
-        );
-        const host = new RemoteEditorHost(
-          binding,
+        const binding = await EditorBinding.memory(JSON.stringify(identity));
+        const host = new RemoteEditorSession(
+          wasmCore(binding),
           backend,
           descriptor,
           emit,

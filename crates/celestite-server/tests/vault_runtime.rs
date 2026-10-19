@@ -62,7 +62,8 @@ async fn listing_does_not_open_buffers_or_create_state_files() {
     let directory = host.ok("GET", "/directory?path=", Value::Null).await;
     assert_eq!(directory.as_array().unwrap().len(), 2);
     let opened = host.open("note.md").await;
-    assert!(opened["persistedVersion"].is_null());
+    assert!(opened.get("persistedVersion").is_none());
+    assert!(opened["recoveryError"].is_null());
     drop(host);
     let names: Vec<_> = fs::read_dir(f.0.path().join("a"))
         .unwrap()

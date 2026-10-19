@@ -18,32 +18,36 @@
 
 UI 的正文是 core 已接受正文与待确认输入的投影；已接受正文与其因果版本成对保存，保存中等本机视图状态不由 core 回执覆盖。CRDT 历史和个人撤销只由 Rust Buffer 管理，CodeMirror 不安装另一份撤销历史。预览另有按需创建的分析 Worker，计算结果与资源快照也是内存中的派生状态，不构成文档持久化。
 
-文本命令统一为 `apply`。Buffer 同步返回一份含显示增量与原始操作的结果；EditorCore 另行报告历史提交状态，并将回执交给所属运行时分发。WASM `call` 同时返回结果和 mutations，包括文件操作报错前已经接受的修改。Worker 共用一个结果处理与版本映射入口，调用方不再分别导出增量、推断是否接受或从前后字符串重算变化。
+文本命令统一为 `apply`。Buffer 和 EditorCore 同步接受正文并返回显示增量与原始操作，标记待写恢复材料，再将修改回执交给所属运行时分发；本地会话另行调度明文 checkpoint，失败通过 recoveryError 展示且不阻止继续编辑。WASM `call` 保持异步，同时返回结果和 mutations，包括文件操作报错前已经接受的修改。Worker 共用一个结果处理与版本映射入口，调用方不再分别导出增量、推断是否接受或从前后字符串重算变化。
 
 主线程按输入发生时刻及显式 Vim 会话生成撤销组 ID。目录实例只额外协调文件观察和 IME，远端实例只额外协调网络与 host 元数据；文本编辑和撤销没有平台专用实现。
 
-## 两种 Backend 契约
+`EditorSession` 只共用串行 core 调用、输入版本映射、只读源与 mutation 交付。`LocalEditorSession` 持有文件打开、保存、冲突处理、恢复和自动保存计时及外部文件观察；`RemoteEditorSession` 持有 HTTP / WebSocket、host 快照接入、操作上传、确认和重连。`serveEditor` 面向结构化的服务接口分发，不依赖本地类。Browser / Tauri 在 CorePort 的承载方式上分歧，与本地 / 远端的角色选择独立。
 
-代码中需要区分两种 Backend（内核注入面详见 [EditorCore API 面](../core.md)）：
+## 文件 IO 与恢复边界
 
-- Rust `Backend`：EditorCore 注入的存储与 IO 契约，包含身份、历史恢复与提交、可选普通文件投影。浏览器使用 `BrowserBackend` 或 `MemoryBackend`。
-- TypeScript `VaultBackend`：文件访问契约，提供 `readDir`、`stat`、字节读写、目录操作、变化监听和关闭。OPFS、本机目录与 HTTP 文件适配器实现该接口；UI 通常使用经 Worker RPC 转发的 `treeBackend`。
+Rust `FileSystem` 是 core 的纯文件 IO 契约：字节读取、目录操作、内容 revision 和条件写入。普通文件与私有恢复空间是同一契约的两个独立实例，不提供 CRDT load / commit、身份或时钟服务。CRDT 历史只由内存 Buffer 持有，明文恢复格式与操作顺序由 core 决定。
 
-远端实例的 Rust core 使用 `MemoryBackend` 保存客户端历史；它的文件访问由 `HttpVaultBackend` 连接 host。HTTP 文件适配器不会将客户端历史存入 OPFS。WebSocket 则承担独立的文本同步与保存命令。
+TypeScript `VaultBackend` 提供文件访问、变化监听和关闭；OPFS、本机目录与 HTTP 实现该接口，UI 通常使用 Worker RPC 的 `treeBackend`。本地绑定分别接收 `createBrowserIo(backend)` 和 `createBrowserIo(store.files)`，复用同一基础桥。`OpfsInstanceStore` 只管理稳定 profile 与私有文件空间。
+
+远端实例通过 `EditorBinding.memory(identity)` 创建无普通文件空间或恢复区的 core，直接持有内存 Buffer，不提供内存文件树；其 core 保存与文件操作返回 `Unsupported`，自动保存延迟为 null。文件访问由 `HttpVaultBackend` 连接 host，WebSocket 承担文本同步与保存命令。远端 checkpoint 等待 host 确认，不能替代 host 的普通文件保存。
 
 ## 存储与持久化
 
-| 数据                           | 本地默认 Vault                     | 远端 Vault 客户端                                                            |
-| ------------------------------ | ---------------------------------- | ---------------------------------------------------------------------------- |
-| 普通文件与目录                 | OPFS `/vaults/default`             | host 的普通目录；浏览器没有镜像                                              |
-| core 私有历史与实例身份        | OPFS `/editor-instances/default`   | `MemoryBackend`；每次创建 Worker 分配新的实例身份                            |
-| 当前正文、撤销、视图与目录缓存 | 当前实例内存                       | 当前实例内存                                                                 |
-| 全局设置                       | OPFS `/celestite/settings.json`    | 同一份应用设置                                                               |
-| 远端连接记录                   | OPFS `/celestite/connections.json` | 保存独立连接 ID、完整分享 URL 与名称；URL 本身是凭证，不保存正文或 CRDT 历史 |
+| 数据                           | 本地默认 Vault                       | 远端 Vault 客户端                                                            |
+| ------------------------------ | ------------------------------------ | ---------------------------------------------------------------------------- |
+| 普通文件与目录                 | OPFS `/vaults/default`               | host 的普通目录；浏览器没有镜像                                              |
+| 明文草稿与恢复证据             | OPFS `/editor-instances/default`     | 无；仅保留当前会话内存                                                       |
+| 实例身份                       | 从 OPFS 私有 profile 恢复后传入 core | 每次创建 Worker 分配新会话身份后传入 core                                    |
+| 当前正文、撤销、视图与目录缓存 | 当前实例内存                         | 当前实例内存                                                                 |
+| 全局设置                       | OPFS `/celestite/settings.json`      | 同一份应用设置                                                               |
+| 远端连接记录                   | OPFS `/celestite/connections.json`   | 保存独立连接 ID、完整分享 URL 与名称；URL 本身是凭证，不保存正文或 CRDT 历史 |
 
-应用设置与连接记录在存储能力不可用时可以退回会话内存；默认本地 Vault 的 OPFS 后端不降级为内存存储。普通目录和 core 私有历史分开，文件树不展示私有历史目录。
+稳定 profile schema 2 只保存 instanceId / vaultId；每次 Worker 运行生成新的 historyId。恢复区保存明文、磁盘基线及操作意图，不写 CRDT 快照、增量或撤销栈。旧私有历史只一次性迁移明文与恢复证据。checkpoint 尝试全部文档及目录意图，失败不饿死其他草稿且清除本轮自动计时，首个错误通过 `recoveryError` 展示，编辑继续；显式 checkpoint 和关闭可重试，失败保留运行时。
 
-本机目录 Vault 通过 File System Access API 直接访问所选目录，私有身份与历史仍存于 OPFS `/editor-instances/directory-<uuid>`。目录 handle 与连接身份位于 IndexedDB，按同一目录去重；页面启动只加载连接，用户点击后申请读写权限并打开独立 Worker。同一实例仅允许一个标签页持有内核。移除连接不删除普通文件或私有历史；再次登记会创建新的实例身份。
+应用设置与连接记录在存储能力不可用时可以退回会话内存；默认本地 Vault 的 OPFS 后端不降级为内存存储。普通目录和 core 私有恢复区分开，文件树不展示恢复材料。
+
+本机目录 Vault 通过 File System Access API 直接访问所选目录，稳定实例身份与明文恢复材料存于 OPFS `/editor-instances/directory-<uuid>`。目录 handle 与连接身份位于 IndexedDB，按同一目录去重；页面启动只加载连接，用户点击后申请读写权限并打开独立 Worker。同一实例仅允许一个标签页持有内核。移除连接不删除普通文件或私有恢复材料；再次登记会创建新的实例身份。
 
 本机目录预览可另行授权包含 Vault 的共同父目录，仅通过 package 资源接口读取外部依赖。资源 handle 按实例保存在 IndexedDB，`resolve()` 确定 Vault 在授权范围中的相对位置；编译资源使用 `/workspace` 虚拟命名空间，文件树与写回仍使用原来的 Vault handle。授权更新使项目预览失效，取消或选错目录保留原授权；资源权限失效不阻止文档编辑。
 
@@ -53,9 +57,9 @@ UI 的正文是 core 已接受正文与待确认输入的投影；已接受正�
 
 本机目录在前台定期、恢复焦点及页面可见时核对已登记文档，core 从磁盘历史合入外部修改。未打开文件不主动加载正文，文件树按缓存范围刷新；IME 期间延后后台核对。保存前再次核对，失败保留正文；暂存写入在提交前复查内容 revision。Web Locks 无法协调本机程序，检查与最终写入／删除之间仍存在竞争窗口。
 
-一个 server 进程只托管一个 Vault，Web 可连接多个独立 server。远端连接以 `https://host/<key>` 为基址，接口追加 `/api/v4/...`。不同分享即使指向同一 Vault，也保留独立实例和权限。宿主启动时固定提供 readonly / edit 两条链接；修改 `share_key` 并重启同时轮换这对链接。宿主退出终止 WebSocket 与 SSE，客户端冻结工作区并保留待确认正文。管理列表显示服务器与有效权限，完整链接通过明确的复制操作取得。
+一个 server 进程只托管一个 Vault，Web 可连接多个独立 server。远端连接以 `https://host/<key>` 为基址，接口追加 `/api/v5/...`。不同分享即使指向同一 Vault，也保留独立实例和权限。宿主启动时固定提供 readonly / edit 两条链接；修改 `share_key` 并重启同时轮换这对链接。宿主退出终止 WebSocket 与 SSE，客户端冻结工作区并保留待确认正文。管理列表显示服务器与有效权限，完整链接通过明确的复制操作取得。
 
-host 不使用私有状态库，描述响应的 `persistentHistory` 为 false。历史确认与普通文件保存分别完成：已确认但尚未写回的正文只保留到 host 进程结束。每次启动生成新的 `historyId`；配置固定 `share_key` 和相同根目录可保留链接，但不能恢复旧历史。
+host 不使用私有恢复区。历史确认与普通文件保存分别完成：已确认但尚未写回的正文只保留到 host 进程结束。每次启动生成新的 `historyId`；配置固定 `share_key` 和相同根目录可保留链接，但不能恢复旧历史。
 
 客户端刷新后从 host 重建会话。未获 host 确认的输入没有客户端 OPFS 恢复副本；它们只能在当前页面仍存活时保留和导出。
 
@@ -79,9 +83,9 @@ expanded          = {"notes"}
 
 host 启动时没有已加载文档，目录列表和文件监听不创建 Buffer。首次打开文本时读取文件、验证编码与大小并建立 CRDT，后续打开复用该 Buffer；监听和定期核对只协调已加载 Buffer。非 UTF-8 文本、超过当前文本限制的文件等不会作为可编辑文本加入。
 
-客户端初次连接收到 `hello`、`ready` 和不含正文的成员快照。打开标签时发送 `open {path}`，取得对应快照、元数据和会话分配的 peer ID，Worker 建立副本后创建 UI buffer。server 只向当前订阅该 Buffer 的会话推送其变化；`MemoryBackend` 保存这些副本的内存历史记录。
+客户端初次连接收到 `hello`、`ready` 和不含正文的成员快照。打开标签时发送 `open {path}`，取得对应快照、元数据和会话分配的 peer ID，Worker 建立副本后创建 UI buffer。server 只向当前订阅该 Buffer 的会话推送其变化；Buffer 直接持有这些副本的内存历史。
 
-关闭标签在本机输入获 host 确认后退订正文并释放成员视图；Worker 保留历史与个人撤销缓存，释放活动路径和预览需求。同会话重开保留 peer 与撤销。host 的 Buffer 继续驻留，保留已接受但未保存的修改；尚未实现 host Buffer 卸载。
+关闭标签在本机输入获 host 确认后退订正文并释放成员视图；core 释放与会话订阅表的变更处于同一串行边界，重连不重新接入已关闭的候选文档。关闭成功只移除对应 UI record，迟到回复不移除后来打开的视图。Worker 保留历史与个人撤销缓存，释放活动路径和预览需求。同会话重开保留 peer 与撤销。host 的 Buffer 继续驻留，保留已接受但未保存的修改；尚未实现 host Buffer 卸载。
 
 文本内存占用随本进程曾打开的文档及其历史增长，不随全库正文增长，也不只随当前标签数量增长。连接无需等待整库快照；有界工作集和 Buffer 回收尚未实现。
 
@@ -96,10 +100,10 @@ flowchart LR
   U[主线程文件树与编辑视图]
   W[编辑 Worker 平台包装]
   C[客户端 EditorCore]
-  M[MemoryBackend]
+  M[内存 Buffer]
   S[server 请求入口]
   H[host EditorCore]
-  B[NativeBackend]
+  B[普通目录 FileSystem]
   F[普通文件目录]
   U <-->|Worker RPC 与事件| W
   W <--> C
@@ -114,9 +118,9 @@ flowchart LR
 
 UI 调用统一的文档和文件接口，经 Worker RPC 到编辑 Worker。远端 Worker 再选择 HTTP 或 WebSocket；本地 Worker 则由 core 调用 OPFS 后端，不访问 host。
 
-下表 HTTP 路径相对于 `/<key>/api/v4`，WebSocket 命令共用该 Vault 的 `/sync` 连接。
+下表 HTTP 路径相对于 `/<key>/api/v5`，WebSocket 命令共用该 Vault 的 `/sync` 连接。
 
-协议为 v4：HTTP、SSE 与 WebSocket 统一使用 `peerId`、`persistedVersion`、`fileRevision`、`stateRevision`；文档读取模型在顶层只有一个 `version`，`snapshot` 只包含 `{ text, stateRevision }`。JSON history packet、Version 的 identity / clocks 与 Loro bytes 不变。peer 是 Loro 操作来源，不等于 Member、Session 或 User；`stateRevision` 是 Buffer 本地状态计数，不能作为因果版本或文件 revision。`persistedVersion` 不承诺 fsync，也不表示普通文件已保存或 host 已确认。
+协议为 v5：HTTP、SSE 与 WebSocket 统一使用 `peerId`、`fileRevision`、`stateRevision` 和 `recoveryError`；读取模型的顶层只有一个 `version`，`snapshot` 只含 `{ text, stateRevision }`。CRDT 历史包、Version 的 identity / clocks 与 Loro bytes 表示不变。peer 是操作来源，`stateRevision` 是 Buffer 本地计数，均不等于 Member、Session 或文件 revision。协议不报告 CRDT 持久化版本，host 确认与普通文件保存分开。
 
 | 行为               | 网络请求                                             | 返回与后续处理                                                         |
 | ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------- |
@@ -141,13 +145,13 @@ UI 调用统一的文档和文件接口，经 Worker RPC 到编辑 Worker。远�
 
 ### 初始连接
 
-1. HTTP 读取 Vault 描述；创建 Worker、内存后端与客户端 core。
+1. HTTP 读取 Vault 描述；创建 Worker 与不接入文件系统的内存 core。
 2. WebSocket upgrade 前根据 URL 的完整 key 校验分享授权；首条握手提交协议版本与 Vault / 历史身份，server 校验后返回会话 ID。
 3. server 建立变化监听并发送 `ready`，不发送文档快照。
 4. 用户打开文件时发送 `open {path}`；host 在同一串行边界创建或复用 Buffer、分配 peer 并建立该会话的订阅，返回快照。
 5. 客户端导入快照与元数据，建立对应编辑视图后开放文本编辑，后续变化按版本增量推送。
 
-同一 host 历史内重连时，客户端在 `ready` 后按 ID 重新打开活动订阅的 Buffer。快照、最终路径与删除状态整批校验后原子替换会话；删除记录与已退订缓存不占用活动路径，失败保留旧正文、peer、撤销与预览订阅。
+同一 host 历史内重连时，客户端在 `ready` 后按 ID 重新打开活动订阅的 Buffer，完成视图登记并收集启动期间的更新。快照、最终路径与删除状态整批校验后，在 core 串行调用内提交会话与同步状态；提交前失败保留旧正文、peer、撤销、未确认屏障与预览订阅。编辑服务的重连回复为 `{ documents, sequence }`，直接使用成功提交的快照及同一 core 调用边界捕获的事件序号，不再另行读取全库正文。客户端等待回复时继续接收旧投影的更新，失败不撤回这些更新或待确认输入；同时每份现有文档最多暂存最后一份正文与最后一份元数据通知。成功后以基线与其序号之后的状态一次替换投影，清除旧输入及临时投影错误；完整正文按快照接入，不重放已包含的增量或旧会话事件。提交后的维护错误不反转已提交结果，其间断线以新会话快照和离线状态交付 UI。删除记录与已退订缓存不占用活动路径。打开新文档时，host 文件不支持与客户端快照接入失败分别处理；接入失败撤销真实订阅。
 
 ### 编辑与保存
 
@@ -164,9 +168,9 @@ UI 即时显示输入
 
 发送队列、接收队列和请求队列均有界；超限或回执不匹配暂停协作并保留未确认正文。成员快照与视图焦点、选区独立于文本历史，断线时清空，重连时重新登记活动视图。成员栏显示在线人数、本文档参与人数、名称、颜色、只读状态与焦点。CodeMirror 装饰层显示远端光标和多范围选区；锚点附带因果版本，先按 core 已接受正文解析，再映射到 UI 待确认输入。发送按 50 ms 合并，待确认输入与 IME 期间暂停位置发送；异步解析过期时丢弃，关闭视图、退订和断线立即清理。
 
-`updates` 确认共同历史提交，`save` 先等待目标版本获 host 确认，再要求普通文件写回，两个动作分别完成。保存携带客户端已见的因果版本；host 状态已经前进时，客户端先取得新状态再重试，不直接覆盖尚未见过的正文。
+`updates` 确认 host 已接受共同历史，`save` 先等待目标版本获 host 确认，再要求普通文件写回，两个动作分别完成。保存携带客户端已见的因果版本；host 状态已经前进时，客户端先取得新状态再重试，不直接覆盖尚未见过的正文。
 
-远端关闭标签只等待输入确认，再移除视图；关闭连接只处理历史提交并释放资源，不写回共享文档。下载读取普通文件的已保存字节，不隐式保存共享正文。移动、删除和普通文件写入仍可能先保存涉及的未保存文本；预览资源访问使用只读查询。
+远端关闭标签只等待输入确认，再移除视图；关闭连接只排空确认队列并释放会话资源，不写回共享文档。下载读取普通文件的已保存字节，不隐式保存共享正文。移动、删除和普通文件写入仍可能先保存涉及的未保存文本；预览资源访问使用只读查询。
 
 core 明确拒绝的输入保留在 UI 投影中，工作区暂停交互并提供导出与撤回入口。撤回同时移除依赖它的后续输入，重新读取当前已接受正文后继续编辑；结果未知的输入只能走重连恢复。共享文档的保存冲突提供取消与重试保存，不提供独立实例的覆盖或丢弃动作。
 
@@ -204,10 +208,10 @@ host 普通目录的外部修改由文件监听提示和定期核对发现。已
 
 - [VaultManager](../../web/src/lib/vault/manager.ts)：实例创建、切换、关闭与连接记录。
 - [FileTreeModel](../../web/src/lib/file-tree/model.ts)：局部目录缓存、展开与刷新。
-- [WorkerDocuments](../../web/src/lib/editor/client/documents.ts)：主线程视图投影、文件 RPC 与关闭标签。
+- [ClientDocuments](../../web/src/lib/editor/client/documents.ts)：主线程视图投影、文件 RPC 与关闭标签。
 - [本地 Worker](../../web/src/lib/editor/local/worker.ts)、[远端 Worker](../../web/src/lib/editor/remote/worker.ts)：core 与后端的构造。
-- [RemoteEditorHost](../../web/src/lib/editor/remote/host.ts)、[RemoteTransport](../../web/src/lib/editor/remote/transport.ts)：远端命令、快照导入、请求关联与重连。
+- [RemoteEditorSession](../../web/src/lib/editor/remote/editor-session.ts)、[RemoteTransport](../../web/src/lib/editor/remote/transport.ts)：远端命令、快照导入、请求关联与重连。
 - [HTTP 文件适配器](../../web/src/lib/vault/http.ts)、[预览资源读取](../../web/src/lib/preview/resources.ts)：普通文件访问与只读资源。
-- [BrowserBackend](../../crates/celestite-core/src/backend/browser.rs)、[MemoryBackend](../../crates/celestite-core/src/backend/memory.rs)：客户端存储实现；内存后端显式导入 `celestite_core::backend::memory::MemoryBackend`，核心无根 reexport。
+- 本地 FileSystem 函数桥与 OPFS 私有空间：普通文件 IO 和明文恢复区分别注入，远端副本不需要历史存储适配器。
 - [EditorCore](../../crates/celestite-core/src/editor/mod.rs)：Buffer 集合、打开恢复、身份与保存；模块与 API 导航见 [core](../core.md)。
 - [server 同步](../../crates/celestite-server/src/sync.rs)、[HTTP 文件入口](../../crates/celestite-server/src/lib.rs)、[文件核对](../../crates/celestite-server/src/reconcile.rs)：host 协作与普通目录协调。

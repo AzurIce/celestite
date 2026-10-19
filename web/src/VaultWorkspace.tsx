@@ -32,6 +32,7 @@ import {
 } from "@/lib/settings";
 import { readProjectSettings } from "@/lib/settings/project";
 import "./workspace.css";
+import { isDesktop } from "@/lib/desktop/platform";
 
 /** 侧边栏宽度与 Zed 的左侧 dock 一样可拖动；取值范围由设置 schema 决定。 */
 const SIDEBAR_STEP = 16;
@@ -61,7 +62,8 @@ export default function VaultWorkspace() {
   const unsubscribe = manager.subscribe(setVaults);
   const documents = () => vaults().active;
   const opening = () => vaults().opening;
-  const openError = () => vaults().error;
+  const [lifecycleError, setLifecycleError] = createSignal<string | null>(null);
+  const openError = () => lifecycleError() ?? vaults().error;
   const [resizing, setResizing] = createSignal(false);
   let treeStatusMount!: HTMLDivElement;
   let editorStatusMount!: HTMLDivElement;
@@ -149,6 +151,18 @@ export default function VaultWorkspace() {
   });
   onSettled(() => {
     void manager.initialize();
+    let detached = false;
+    let detachDesktop: (() => void) | undefined;
+    if (isDesktop())
+      void import("@/lib/desktop/lifecycle")
+        .then(({ attachDesktopLifecycle }) =>
+          attachDesktopLifecycle(manager, setLifecycleError),
+        )
+        .then((detach) => {
+          if (detached) detach();
+          else detachDesktop = detach;
+        })
+        .catch((error) => setLifecycleError(String(error)));
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (manager.snapshot().opened.some((v) => v.documents.hasUnsaved())) {
         event.preventDefault();
@@ -166,6 +180,8 @@ export default function VaultWorkspace() {
     window.addEventListener("pagehide", flush);
     document.addEventListener("visibilitychange", visibility);
     return () => {
+      detached = true;
+      detachDesktop?.();
       window.removeEventListener("beforeunload", beforeUnload);
       window.removeEventListener("pagehide", flush);
       document.removeEventListener("visibilitychange", visibility);
@@ -174,7 +190,7 @@ export default function VaultWorkspace() {
   onCleanup(() => {
     unsubscribe();
     clearProjectSettings();
-    void manager.close();
+    void manager.close().catch(() => {});
   });
 
   return (
@@ -202,7 +218,7 @@ export default function VaultWorkspace() {
             <Show when={openError()}>
               <Button
                 class="mt-4"
-                onClick={() => void manager.activate("opfs:default")}
+                onClick={() => void manager.activate(manager.defaultId)}
               >
                 重试
               </Button>
@@ -280,7 +296,7 @@ export default function VaultWorkspace() {
             class="max-w-36 truncate text-danger"
             title={openError()!}
           >
-            连接失败
+            操作失败
           </span>
         </Show>
         <div class="workspace-tree-status" ref={treeStatusMount} />

@@ -1,7 +1,8 @@
 //! Filesystem observation coordination. The platform executes detached work;
 //! this module alone validates its baseline and commits it into current history.
-use super::{EditorCore, MAX_TEXT_BYTES, Record, decode};
-use crate::backend::{Backend, EditorError, EditorResult, ErrorCode, FileSnapshot, JournalEntry};
+use super::{EditorCore, MAX_FILE_BYTES, Record, decode};
+use crate::error::{EditorError, EditorResult, ErrorCode};
+use crate::fs::{FileSnapshot, FileSystem};
 use crate::text::DecodedText;
 use celestite_buffer::change::TextChangeTask;
 use celestite_buffer::types::{DocumentIdentity, HistoryPacket, Version};
@@ -128,21 +129,15 @@ fn baseline(record: &Record) -> Option<&Version> {
         .or(record.header.saved_version.as_ref())
 }
 
-impl<B: Backend> EditorCore<B> {
+impl<F: FileSystem, R: FileSystem> EditorCore<F, R> {
     pub fn has_file_observations(&self) -> bool {
-        self.health.is_ok()
-            && self.records.values().any(|r| {
-                !r.header.deleted
-                    && r.observation.active.is_none()
-                    && r.observation.queued.is_some()
-            })
+        self.records.values().any(|r| {
+            !r.header.deleted && r.observation.active.is_none() && r.observation.queued.is_some()
+        })
     }
 
     /// Take at most one task for each document. New disk hints coalesce while it runs.
     pub fn take_file_observation(&mut self) -> EditorResult<Option<FileObservationTask>> {
-        if !self.health.is_ok() {
-            return Ok(None);
-        }
         let ready = |record: &Record| {
             !record.header.deleted
                 && record.observation.active.is_none()
@@ -182,7 +177,7 @@ impl<B: Backend> EditorCore<B> {
             )
         })?;
         let token = ObservationToken {
-            task_id: self.backend.new_id()?,
+            task_id: Self::new_id(),
             id: id.into(),
             identity: record.buffer.identity().clone(),
             path: record.header.path.clone(),
@@ -228,11 +223,11 @@ impl<B: Backend> EditorCore<B> {
         if record.observation.active.as_ref() != Some(&result.token) {
             return Ok(false);
         }
-        let applicable = result.token.applies_to(record) && self.health.is_ok();
+        let applicable = result.token.applies_to(record);
         self.records.get_mut(id).unwrap().observation.active = None;
         if !applicable {
             self.records.get_mut(id).unwrap().observation.queued = None;
-            if self.health.is_ok() && !self.record(id)?.header.deleted {
+            if !self.record(id)?.header.deleted {
                 // A new cursor/path may already have newer disk hints. Re-read
                 // at that baseline rather than waiting for another watcher event.
                 self.refresh_disk(id).await?;
@@ -240,8 +235,8 @@ impl<B: Backend> EditorCore<B> {
             return Ok(false);
         }
         let disk = match self
-            .backend
-            .read_file(&result.token.path, Some(MAX_TEXT_BYTES as u64))
+            .files()?
+            .read_file(&result.token.path, Some(MAX_FILE_BYTES as u64))
             .await
         {
             Ok(disk) => disk,
@@ -270,7 +265,7 @@ impl<B: Backend> EditorCore<B> {
             if error.path.is_empty() {
                 error.path = result.token.path.clone();
             }
-            if self.health.is_ok() {
+            if result.token.applies_to(self.record(id)?) {
                 self.fail_observation(result.token, error.clone());
             }
             return Err(error);
@@ -279,7 +274,7 @@ impl<B: Backend> EditorCore<B> {
     }
 
     fn fail_observation(&mut self, token: ObservationToken, error: EditorError) {
-        let now = self.backend.now_ms();
+        let now = self.now_ms();
         let state = &mut self.records.get_mut(&token.id).unwrap().observation;
         let attempts = state
             .failure
@@ -337,7 +332,6 @@ impl<B: Backend> EditorCore<B> {
 
     pub(super) async fn compute_inline_observation(&mut self, id: &str) -> EditorResult<()> {
         if !self.options.defer_filesystem_diff
-            && self.health.is_ok()
             && !self.record(id)?.header.deleted
             && let Some(task) = self.take_observation(id)?
         {
@@ -394,7 +388,7 @@ impl<B: Backend> EditorCore<B> {
         if let Some(failure) = &record.observation.failure
             && failure.token.applies_to(record)
             && failure.token.revision == disk.revision
-            && self.backend.now_ms() < failure.retry_at
+            && self.now_ms() < failure.retry_at
         {
             return Ok(());
         }
@@ -424,24 +418,12 @@ impl<B: Backend> EditorCore<B> {
         let prepared = packet
             .map(|packet| self.prepare_import(id, packet))
             .transpose()?;
-        let entry = if let Some(prepared) = prepared.as_ref().filter(|p| p.accepts_operations()) {
-            header.sequence = header.sequence.checked_add(1).ok_or_else(|| {
-                EditorError::new(ErrorCode::Io, "Journal counter exhausted", &header.path)
-            })?;
-            header.applied = prepared.preview().version.clone();
-            Some(JournalEntry {
-                packet: prepared.packet().clone(),
-                applied: header.applied.clone(),
-            })
-        } else {
-            None
-        };
         header.saved_text = decoded.text;
         header.bom = decoded.bom;
         header.line_ending = decoded.line_ending;
         header.saved_version = Some(disk_version.clone());
         header.disk_revision = disk.revision;
-        header.disk_cursor = self.cursor(id, disk_version, disk.data)?;
-        self.stage_observation(id, header, entry, prepared).await
+        header.disk_cursor = Some(self.cursor(id, disk_version, disk.data)?);
+        self.stage_observation(id, header, prepared).await
     }
 }

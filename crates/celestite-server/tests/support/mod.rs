@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use celestite_buffer::types::{HistoryPacket, Version};
 use celestite_core::{
-    backend::memory::MemoryBackend,
     editor::{
         replica::ReplicaDocument,
         types::{EditorDocument, EditorMutation, ReplicaHostState},
@@ -26,13 +25,20 @@ pub struct Host {
 }
 impl Host {
     pub async fn start(root: &Path, read_only: bool) -> Self {
+        Self::start_with_origins(root, read_only, vec!["http://allowed".into()]).await
+    }
+    pub async fn start_with_origins(
+        root: &Path,
+        read_only: bool,
+        allowed_origins: Vec<String>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = build_server(
             Config {
                 server: ServerConfig {
                     listen: address,
-                    allowed_origins: vec!["http://allowed".into()],
+                    allowed_origins,
                     ..Default::default()
                 },
                 vault: VaultConfig {
@@ -46,11 +52,11 @@ impl Host {
         )
         .unwrap();
         let url = format!(
-            "http://{address}/{}/api/v4",
+            "http://{address}/{}/api/v5",
             server.links.key(Permission::Edit)
         );
         let readonly_url = format!(
-            "http://{address}/{}/api/v4",
+            "http://{address}/{}/api/v5",
             server.links.key(Permission::Readonly)
         );
         let stopping = server.shutdown;
@@ -130,7 +136,7 @@ impl Drop for Host {
 /// The headless client runs the production EditorCore and session protocol.
 /// It does not call privileged HTTP edit/import/save endpoints.
 pub struct ClientReplica {
-    pub core: EditorCore<MemoryBackend>,
+    pub core: EditorCore,
     pub session: String,
     pub members: Value,
     pub socket: Socket,
@@ -155,7 +161,7 @@ impl ClientReplica {
             .0;
         socket
             .send(Message::Text(
-                json!({"protocolVersion":4,"vault":identity})
+                json!({"protocolVersion":5,"vault":identity})
                     .to_string()
                     .into(),
             ))
@@ -170,17 +176,13 @@ impl ClientReplica {
                 break;
             }
         }
-        let core = EditorCore::open(MemoryBackend::new(
-            InstanceIdentity {
-                instance_id: uuid::Uuid::new_v4().to_string(),
-                vault: Vault {
-                    vault_id: identity["vaultId"].as_str().unwrap().into(),
-                    history_id: identity["historyId"].as_str().unwrap().into(),
-                },
+        let core = EditorCore::memory(InstanceIdentity {
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            vault: Vault {
+                vault_id: identity["vaultId"].as_str().unwrap().into(),
+                history_id: identity["historyId"].as_str().unwrap().into(),
             },
-            || 0,
-        ))
-        .await
+        })
         .unwrap();
         Self {
             core,
@@ -263,8 +265,8 @@ impl ClientReplica {
                 self.core.peer_id(&id).unwrap(),
                 frame["peerId"].as_str().unwrap().parse::<u64>().unwrap()
             );
-            self.core.import(&id, packet).await.unwrap();
-            self.core.apply_host_state(&id, state).await.unwrap();
+            self.core.import(&id, packet).unwrap();
+            self.core.apply_host_state(&id, state).unwrap();
         } else {
             self.core
                 .join_replica_document(ReplicaDocument {
@@ -272,7 +274,6 @@ impl ClientReplica {
                     peer_id: Some(frame["peerId"].as_str().unwrap().parse().unwrap()),
                     state,
                 })
-                .await
                 .unwrap();
         }
         self.core.take_mutations();
@@ -283,7 +284,6 @@ impl ClientReplica {
         id: &str,
         mutation: std::sync::Arc<EditorMutation>,
     ) -> EditorDocument {
-        mutation.require_committed().unwrap();
         if let Some(packet) = &mutation.update.operation {
             self.operation += 1;
             let receipt = self.ok("updates", json!({"id":id,"packet":packet,"version":mutation.update.after,"operation":self.operation})).await;
@@ -294,18 +294,18 @@ impl ClientReplica {
         self.core.read(id).unwrap()
     }
     pub async fn edit(&mut self, id: &str, from: usize, to: usize, insert: &str) -> EditorDocument {
-        let mutation = self.core.edit(id, [(from..to, insert)]).await.unwrap();
+        let mutation = self.core.edit(id, [(from..to, insert)]).unwrap();
         self.publish(id, mutation).await
     }
     pub async fn replace(&mut self, id: &str, text: &str) -> EditorDocument {
-        let mutation = self.core.replace_text(id, text).await.unwrap();
+        let mutation = self.core.replace_text(id, text).unwrap();
         self.publish(id, mutation).await
     }
     pub async fn undo(&mut self, id: &str, redo: bool) -> EditorDocument {
         let mutation = if redo {
-            self.core.redo(id).await.unwrap()
+            self.core.redo(id).unwrap()
         } else {
-            self.core.undo(id).await.unwrap()
+            self.core.undo(id).unwrap()
         };
         self.publish(id, mutation).await
     }

@@ -7,30 +7,30 @@ import {
 } from "../../src/lib/editor/rpc";
 import { VaultError, VaultRenameError } from "../../src/lib/vault/errors";
 import type {
-  WorkerMessage,
-  WorkerRequest,
+  ServiceMessage,
+  ServiceRequest,
 } from "../../src/lib/editor/contract";
 class Transport implements MessageTransport {
-  sent: WorkerRequest[] = [];
-  listeners = new Set<(event: MessageEvent<WorkerMessage>) => void>();
-  postMessage(message: WorkerRequest) {
+  sent: ServiceRequest[] = [];
+  listeners = new Set<(event: MessageEvent<ServiceMessage>) => void>();
+  postMessage(message: ServiceRequest) {
     this.sent.push(message);
   }
   addEventListener(
     _type: "message",
-    listener: (event: MessageEvent<WorkerMessage>) => void,
+    listener: (event: MessageEvent<ServiceMessage>) => void,
   ) {
     this.listeners.add(listener);
   }
   removeEventListener(
     _type: "message",
-    listener: (event: MessageEvent<WorkerMessage>) => void,
+    listener: (event: MessageEvent<ServiceMessage>) => void,
   ) {
     this.listeners.delete(listener);
   }
-  emit(data: WorkerMessage) {
+  emit(data: ServiceMessage) {
     for (const listener of this.listeners)
-      listener({ data } as MessageEvent<WorkerMessage>);
+      listener({ data } as MessageEvent<ServiceMessage>);
   }
   ready() {
     this.emit({

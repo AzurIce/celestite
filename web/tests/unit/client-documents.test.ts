@@ -1,38 +1,38 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { WorkerDocuments } from "../../src/lib/editor/client/documents";
+import { ClientDocuments } from "../../src/lib/editor/client/documents";
 import { EditorClient, type MessageTransport } from "../../src/lib/editor/rpc";
 import { vaultPath } from "../../src/lib/vault/path";
 import type {
   BufferCommand,
   ServiceDocument,
-  WorkerMessage,
-  WorkerRequest,
+  ServiceMessage,
+  ServiceRequest,
   ViewEdit,
 } from "../../src/lib/editor/contract";
 
 class Transport implements MessageTransport {
-  sent: WorkerRequest[] = [];
-  listeners = new Set<(event: MessageEvent<WorkerMessage>) => void>();
+  sent: ServiceRequest[] = [];
+  listeners = new Set<(event: MessageEvent<ServiceMessage>) => void>();
   sequence = 0;
-  constructor(readonly reply: (request: WorkerRequest) => unknown) {}
+  constructor(readonly reply: (request: ServiceRequest) => unknown) {}
   addEventListener(
     _type: "message",
-    listener: (event: MessageEvent<WorkerMessage>) => void,
+    listener: (event: MessageEvent<ServiceMessage>) => void,
   ) {
     this.listeners.add(listener);
   }
   removeEventListener(
     _type: "message",
-    listener: (event: MessageEvent<WorkerMessage>) => void,
+    listener: (event: MessageEvent<ServiceMessage>) => void,
   ) {
     this.listeners.delete(listener);
   }
-  emit(message: WorkerMessage) {
+  emit(message: ServiceMessage) {
     for (const listener of this.listeners)
-      listener({ data: message } as MessageEvent<WorkerMessage>);
+      listener({ data: message } as MessageEvent<ServiceMessage>);
   }
-  postMessage(request: WorkerRequest) {
+  postMessage(request: ServiceRequest) {
     this.sent.push(request);
     queueMicrotask(() =>
       this.emit({
@@ -82,14 +82,13 @@ function document(): ServiceDocument {
         identity: { document_id: "file", history_id: "history" },
         clocks: { "1": 4 },
       },
-      persistedVersion: null,
       peerId: "2",
       undo: { canUndo: false, canRedo: false },
-      historyError: null,
+      recoveryError: null,
     },
   };
 }
-function setup(reply: (request: WorkerRequest) => unknown, remote = true) {
+function setup(reply: (request: ServiceRequest) => unknown, remote = true) {
   const transport = new Transport((request) =>
     request.method === "collaboration" ? null : reply(request),
   );
@@ -102,7 +101,7 @@ function setup(reply: (request: WorkerRequest) => unknown, remote = true) {
     },
     sessionId: "session",
   });
-  const documents = new WorkerDocuments(client, () => {}, remote);
+  const documents = new ClientDocuments(client, () => {}, remote);
   return { transport, client, documents };
 }
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -144,31 +143,40 @@ test("consecutive input receipts advance accepted history without replacing the 
   client.dispose();
 });
 
-test("an accepted native history failure consumes its input, not its dependent draft", async () => {
+test("a recovery checkpoint failure warns without blocking subsequent input", async () => {
   const initial = document();
-  const failed = {
-    ...initial,
-    content: "baseX",
-    core: {
-      ...initial.core!,
-      version: { ...initial.core!.version, clocks: { "1": 4, "2": 1 } },
-      historyError: "native append failed",
-    },
-  };
-  const { transport, client, documents } = setup((request) =>
-    request.method === "apply" ? { document: failed, edits: [] } : initial,
-  );
+  let applied = 0;
+  const { transport, client, documents } = setup((request) => {
+    if (request.method !== "apply") return initial;
+    applied++;
+    return {
+      document: {
+        ...initial,
+        content: applied === 1 ? "baseX" : "baseXY",
+        core: {
+          ...initial.core!,
+          version: {
+            ...initial.core!.version,
+            clocks: { "1": 4, "2": applied },
+          },
+          recoveryError: "draft checkpoint failed",
+        },
+      },
+      edits: [],
+    };
+  });
   await documents.open(vaultPath("a.md"));
-  documents.edit("file", input("baseX"));
-  documents.edit("file", input("baseXY"));
+  assert.equal(documents.edit("file", input("baseX")), true);
+  await settle();
+  assert.equal(documents.edit("file", input("baseXY")), true);
   await settle();
   const view = documents.snapshot().documents[0];
   assert.equal(view.content, "baseXY");
-  assert.equal(view.pending, 1);
-  assert.equal(view.error, "native append failed");
+  assert.equal(view.pending, 0);
+  assert.equal(view.error, "draft checkpoint failed");
   assert.equal(view.inputFailure, undefined);
   assert.equal(await documents.discardRejectedInput("file"), false);
-  assert.equal(transport.sent.filter((r) => r.method === "apply").length, 1);
+  assert.equal(transport.sent.filter((r) => r.method === "apply").length, 2);
   client.dispose();
 });
 
@@ -184,12 +192,14 @@ for (const discard of [false, true]) {
       },
     };
     const { transport, client, documents } = setup((request) =>
-      request.method === "reconnect" ? [accepted] : initial,
+      request.method === "reconnect"
+        ? { documents: [accepted], sequence: transport.sequence }
+        : initial,
     );
     try {
       await documents.open(vaultPath("a.md"));
       const post = transport.postMessage.bind(transport);
-      let pending!: WorkerRequest;
+      let pending!: ServiceRequest;
       transport.postMessage = (request) => {
         if (request.method !== "apply") return post(request);
         pending = request;
@@ -214,6 +224,46 @@ for (const discard of [false, true]) {
       assert.equal(documents.snapshot().documents[0].pending, 0);
       assert.equal(documents.snapshot().documents[0].content, "baseX");
       assert.equal(documents.snapshot().connection?.status, "online");
+    } finally {
+      client.dispose();
+    }
+  });
+}
+
+for (const online of [false, true]) {
+  test(`reconnect installs committed snapshots and uses the latest connection status (online=${online})`, async () => {
+    const joined = {
+      ...document(),
+      content: "joined history",
+      core: { ...document().core!, peerId: "3" },
+    };
+    const { transport, client, documents } = setup((request) => {
+      if (request.method !== "reconnect") return document();
+      transport.emit({
+        kind: "connection",
+        sequence: ++transport.sequence,
+        connection: { status: "offline", error: "connection lost" },
+      });
+      if (online)
+        transport.emit({
+          kind: "connection",
+          sequence: ++transport.sequence,
+          connection: { status: "online", error: null },
+        });
+      // The service has committed the new core before returning these snapshots.
+      // A disconnect before its reply cannot leave the UI on the old history.
+      return { documents: [joined], sequence: transport.sequence };
+    });
+    try {
+      await documents.open(vaultPath("a.md"));
+      await documents.reconnectSession();
+      const state = documents.snapshot();
+      assert.equal(state.documents[0].content, "joined history");
+      assert.equal(state.documents[0].core?.peerId, "3");
+      assert.equal(state.connection?.status, online ? "online" : "offline");
+      assert.equal(state.connection?.error, online ? null : "connection lost");
+      if (!online)
+        assert.equal(documents.edit("file", input("joined historyX")), false);
     } finally {
       client.dispose();
     }
@@ -357,4 +407,33 @@ test("closing a connection refuses retained input without submitting a save", as
   );
   assert.equal(documents.snapshot().documents[0].content, "baseX");
   client.dispose();
+});
+
+test("reconnect drops pre-baseline metadata even when its history version matches the new snapshot", async () => {
+  const joined = {
+    ...document(),
+    content: "new session",
+    core: { ...document().core!, peerId: "3" },
+  };
+  const { transport, client, documents } = setup((request) => {
+    if (request.method !== "reconnect") return document();
+    transport.document({
+      ...joined,
+      content: undefined,
+      error: "old session error",
+      readOnlyReason: "old session permission",
+    });
+    return { documents: [joined], sequence: transport.sequence };
+  });
+  try {
+    await documents.open(vaultPath("a.md"));
+    await documents.reconnectSession();
+    const view = documents.snapshot().documents[0];
+    assert.equal(view.content, "new session");
+    assert.equal(view.error, null);
+    assert.equal(view.readOnlyReason, null);
+    assert.equal(view.core?.peerId, "3");
+  } finally {
+    client.dispose();
+  }
 });

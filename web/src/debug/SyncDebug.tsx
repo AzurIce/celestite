@@ -220,10 +220,6 @@ export default function SyncDebug() {
                     label="已接受正文版本"
                     version={replica().document.core?.version}
                   />
-                  <VersionView
-                    label="本机历史提交"
-                    version={replica().document.core?.persistedVersion}
-                  />
                 </div>
               </section>
             )}

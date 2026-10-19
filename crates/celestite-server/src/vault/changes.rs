@@ -1,12 +1,26 @@
 //! Invalidation feed, serialized by the same lock as the host core.
 //! It carries committed causal versions, never text or operation acknowledgements.
-use super::fs::Result;
-use celestite_core::backend::{EditorError, ErrorCode};
 use celestite_core::editor::types::DocumentStatus;
+use celestite_core::error::{EditorError, EditorResult, ErrorCode};
 use celestite_core::instance::Vault;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
+
+/// File tree invalidation sent by the server's SSE stream.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ChangeHint {
+    paths: Vec<String>,
+    recursive: bool,
+}
+impl ChangeHint {
+    pub(crate) fn all() -> Self {
+        Self {
+            paths: vec![String::new()],
+            recursive: true,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DocumentNotice {
@@ -15,13 +29,12 @@ pub(crate) struct DocumentNotice {
     /// Whether this document can currently be exported to a session.
     available: bool,
 }
-pub(crate) fn exportable(state: &DocumentStatus, persistent: bool) -> bool {
-    state.persistence_error.is_none()
-        && (!persistent || state.persisted_version.as_ref() == Some(&state.version))
+pub(crate) fn exportable(state: &DocumentStatus) -> bool {
+    state.recovery_error.is_none()
 }
 impl DocumentNotice {
-    fn from_state(status: DocumentStatus, persistent: bool) -> Self {
-        let available = exportable(&status, persistent);
+    fn from_state(status: DocumentStatus) -> Self {
+        let available = exportable(&status);
         Self { status, available }
     }
 }
@@ -33,7 +46,6 @@ pub(crate) struct DocumentEvent {
     pub stream_id: String,
     pub sequence: u64,
     pub vault: Vault,
-    pub persistent_history: bool,
     pub documents: Vec<DocumentNotice>,
 }
 pub(crate) struct Subscription {
@@ -43,27 +55,25 @@ pub(crate) struct Subscription {
 pub(crate) struct DocumentFeed {
     stream_id: String,
     identity: Vault,
-    persistent: bool,
     sequence: u64,
     states: BTreeMap<String, DocumentNotice>,
     sender: broadcast::Sender<DocumentEvent>,
 }
 impl DocumentFeed {
-    pub fn new(identity: Vault, persistent: bool) -> Self {
+    pub fn new(identity: Vault) -> Self {
         Self {
             stream_id: uuid::Uuid::new_v4().to_string(),
             identity,
-            persistent,
             sequence: 0,
             states: BTreeMap::new(),
             sender: broadcast::channel(128).0,
         }
     }
-    pub fn publish(&mut self, states: Vec<DocumentStatus>) -> Result<bool> {
+    pub fn publish(&mut self, states: Vec<DocumentStatus>) -> EditorResult<bool> {
         let states: BTreeMap<_, _> = states
             .into_iter()
             .map(|state| {
-                let notice = DocumentNotice::from_state(state, self.persistent);
+                let notice = DocumentNotice::from_state(state);
                 (notice.status.id.clone(), notice)
             })
             .collect();
@@ -88,7 +98,6 @@ impl DocumentFeed {
             stream_id: self.stream_id.clone(),
             sequence: self.sequence,
             vault: self.identity.clone(),
-            persistent_history: self.persistent,
             documents,
         }
     }
@@ -135,7 +144,7 @@ mod tests {
     #[test]
     fn lagged_subscribers_can_atomically_replace_the_snapshot_and_receiver() {
         let (_root, documents) = fixture();
-        let mut feed = DocumentFeed::new(documents.identity.clone(), false);
+        let mut feed = DocumentFeed::new(documents.identity.clone());
         feed.publish(vec![state(&documents)]).unwrap();
         let mut old = feed.subscribe();
         for revision in 0..140 {
@@ -160,16 +169,18 @@ mod tests {
         );
     }
     #[test]
-    fn volatile_history_is_available_without_a_persisted_version() {
+    fn accepted_history_is_available_without_a_recovery_error() {
         let (_root, documents) = fixture();
-        let mut feed = DocumentFeed::new(documents.identity.clone(), false);
+        let mut feed = DocumentFeed::new(documents.identity.clone());
         let initial = state(&documents);
-        assert!(initial.persisted_version.is_none());
-        assert!(exportable(&initial, false));
+        assert!(initial.recovery_error.is_none());
+        assert!(exportable(&initial));
         let version = initial.version.clone();
         feed.publish(vec![initial]).unwrap();
         let event: Value = serde_json::to_value(feed.subscribe().initial).unwrap();
-        assert_eq!(event["persistentHistory"], false);
+        assert!(event.get("persistentHistory").is_none());
+        assert!(event["documents"][0].get("persistedVersion").is_none());
+        assert!(event["documents"][0]["recoveryError"].is_null());
         assert_eq!(
             event["documents"][0]["version"],
             serde_json::to_value(version).unwrap()

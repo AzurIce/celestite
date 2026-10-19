@@ -114,7 +114,7 @@ async fn moves_preserve_identity_and_deleted_documents_reject_late_updates_and_s
         .await;
     client.sync(&id).await;
     assert_eq!(client.core.read(&id).unwrap().status.path, "b.md");
-    let late = client.core.edit(&id, [(0..0, "late")]).await.unwrap();
+    let late = client.core.edit(&id, [(0..0, "late")]).unwrap();
     host.json("DELETE", "/entry?path=b.md", Value::Null).await;
     assert_eq!(client.request("updates", json!({"id":id,"packet":late.update.operation,"version":late.update.after,"operation":1})).await["error"]["code"], "NotFound");
     client.sync(&id).await;

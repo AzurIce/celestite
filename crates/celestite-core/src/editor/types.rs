@@ -1,6 +1,5 @@
 //! Observable documents and receipts, shared by native and serialized callers.
 use super::observation::ExternalChangeStatus;
-use crate::backend::{EditorError, EditorResult};
 use crate::text::LineEnding;
 use celestite_buffer::types::{BufferUpdate, UndoState, Version};
 use serde::{Deserialize, Serialize};
@@ -19,6 +18,7 @@ pub struct EditorDocument {
     pub bom: bool,
     pub line_ending: LineEnding,
     pub autosave_delay: Option<u64>,
+    pub recovery_delay: Option<u64>,
 }
 /// Text of one read view. The document version lives in `DocumentStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,14 +36,13 @@ pub struct DocumentStatus {
     pub path: String,
     pub version: Version,
     pub saved_version: Option<Version>,
-    pub persisted_version: Option<Version>,
     pub file_revision: String,
     pub dirty: bool,
     pub deleted: bool,
     pub conflict: bool,
     pub error: Option<String>,
     pub external_change: Option<ExternalChangeStatus>,
-    pub persistence_error: Option<String>,
+    pub recovery_error: Option<String>,
 }
 
 /// Only host-owned facts cross the collaboration transport. Personal undo and
@@ -59,33 +58,13 @@ pub struct HostDocument {
     pub line_ending: LineEnding,
 }
 
-/// Acceptance of text and commitment of history are different facts. A failed
-/// history write never turns an accepted Buffer mutation into a rejected edit.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum HistoryCommit {
-    Committed { version: Version, persisted: bool },
-    Failed { error: EditorError },
-}
-
+/// One accepted Buffer mutation, including its exact display and transport effects.
 #[derive(Debug)]
 pub struct EditorMutation {
     pub document: EditorDocument,
     pub update: BufferUpdate,
-    pub history: HistoryCommit,
     /// Accepted imports with missing causal dependencies, at this acceptance.
     pub pending: bool,
-}
-
-impl EditorMutation {
-    /// Network acknowledgements and ordinary-file saves require this separately
-    /// from accepting the edit. Local UI still receives the accepted update.
-    pub fn require_committed(&self) -> EditorResult<()> {
-        match &self.history {
-            HistoryCommit::Committed { .. } => Ok(()),
-            HistoryCommit::Failed { error } => Err(error.clone()),
-        }
-    }
 }
 
 /// Host receipt for a private client replica. File baselines remain host-owned;

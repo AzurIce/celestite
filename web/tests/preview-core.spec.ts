@@ -16,7 +16,7 @@ test("WASM preview tasks execute in an independent Worker and reject stale resul
     ).href;
     const wasm = (await import(moduleUrl)) as CoreModule;
     await wasm.default();
-    const core = await wasm.MemoryEditorBinding.open(
+    const core = await wasm.EditorBinding.memory(
       JSON.stringify({
         instanceId: "preview-test",
         vault: { vaultId: "vault", historyId: "vault-history" },
@@ -308,12 +308,12 @@ test("preview Worker applies package default transforms and retains Unicode diag
             reject(new Error("unexpected resource request"));
             return;
           }
-          resolve(event.data);
+          resolve(event.data.completion);
         });
         worker.addEventListener("error", (event) =>
           reject(new Error(event.message)),
         );
-        worker.postMessage(task);
+        worker.postMessage({ kind: "execute", task });
       });
     } finally {
       worker.terminate();

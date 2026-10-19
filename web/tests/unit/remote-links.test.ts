@@ -28,7 +28,7 @@ test("share URL normalization preserves deployment prefixes and the complete key
     );
   }
   for (const url of [
-    "https://host/api/v4/vaults/notes",
+    "https://host/api/v5/vaults/notes",
     `https://user:pass@host/${random}`,
     `https://host/${random}?permission=edit`,
     `https://host/${random}#token`,
@@ -47,7 +47,7 @@ test("HTTP requests append API paths and negotiate identity independently of the
     requests.push({ url: String(input), init });
     return Response.json({
       protocol: "celestite-vault",
-      protocolVersion: 4,
+      protocolVersion: 5,
       shareId: "share-id",
       name: "Notes",
       readOnly: true,
@@ -61,7 +61,7 @@ test("HTTP requests append API paths and negotiate identity independently of the
     );
     assert.equal(descriptor.shareId, "share-id");
     assert.equal(descriptor.vault?.vaultId, "vault-id");
-    assert.equal(requests[0].url, `https://host/deploy/ro-${random}/api/v4`);
+    assert.equal(requests[0].url, `https://host/deploy/ro-${random}/api/v5`);
     assert.equal(
       new Headers(requests[0].init?.headers).has("Authorization"),
       false,
@@ -105,7 +105,7 @@ test("successful local-network HTTP requests remain available when the browser p
   globalThis.fetch = (async () =>
     Response.json({
       protocol: "celestite-vault",
-      protocolVersion: 4,
+      protocolVersion: 5,
       shareId: "local",
       name: "Home",
       readOnly: false,

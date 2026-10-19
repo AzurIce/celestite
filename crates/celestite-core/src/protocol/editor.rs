@@ -3,10 +3,11 @@ use super::{
     buffer::{Command, Contexts, Input, edits, encode_update, validate_base},
     byte_to_utf16,
 };
-use crate::backend::{Backend, EditorError, EditorResult, ErrorCode};
 use crate::editor::EditorCore;
 use crate::editor::replica::ReplicaDocument;
 use crate::editor::types::{EditorMutation, ReplicaHostState};
+use crate::error::{EditorError, EditorResult, ErrorCode};
+use crate::fs::{FileSystem, WriteMode};
 use celestite_buffer::codec::peer_id;
 use celestite_buffer::text::utf16_to_byte;
 use celestite_buffer::types::{
@@ -76,17 +77,16 @@ fn decode_peer_id(params: &Value, path: &str) -> EditorResult<Option<u64>> {
 }
 
 impl EditorAdapter {
-    pub async fn call<B: Backend>(
+    pub async fn call<F: FileSystem, R: FileSystem>(
         &mut self,
-        core: &mut EditorCore<B>,
+        core: &mut EditorCore<F, R>,
         method: &str,
         params: Value,
     ) -> EditorResult<Value> {
         let id = params["id"].as_str().unwrap_or("");
         let value = match method {
             "apply" => {
-                self.apply(core, id, decode(params["command"].clone(), id)?)
-                    .await?;
+                self.apply(core, id, decode(params["command"].clone(), id)?)?;
                 to_value(id)
             }
             "anchors_at" => {
@@ -123,7 +123,7 @@ impl EditorAdapter {
                 })?;
                 let packet = decode(params["packet"].clone(), path)?;
                 let peer_id = decode_peer_id(&params, path)?;
-                let id = core.join_with_peer_id(path, packet, peer_id).await?;
+                let id = core.join_with_peer_id(path, packet, peer_id)?;
                 to_value(core.read(&id)?)
             }
             "replica_session" => {
@@ -135,7 +135,7 @@ impl EditorAdapter {
                     .into_iter()
                     .map(WireReplicaDocument::native)
                     .collect::<EditorResult<Vec<_>>>()?;
-                core.replace_replica_session(documents).await?;
+                core.replace_replica_session(documents)?;
                 to_value(core.resident()?)
             }
             "replica_release" => {
@@ -144,12 +144,11 @@ impl EditorAdapter {
             }
             "replica_join" => {
                 let document: WireReplicaDocument = decode(params["document"].clone(), id)?;
-                let id = core.join_replica_document(document.native()?).await?;
+                let id = core.join_replica_document(document.native()?)?;
                 to_value(core.read(&id)?)
             }
             "replica_host_state" => {
-                core.apply_host_state(id, decode(params["state"].clone(), id)?)
-                    .await?;
+                core.apply_host_state(id, decode(params["state"].clone(), id)?)?;
                 to_value(core.read(id)?)
             }
             "export_snapshot" => to_value(core.snapshot(id)?),
@@ -174,15 +173,15 @@ impl EditorAdapter {
                 to_value(core.observe_files(&ids).await?)
             }
             "save" => {
-                let _ = core.save(id, None).await;
+                if let Err(error) = core.save(id, None).await
+                    && error.code == ErrorCode::Unsupported
+                {
+                    return Err(error);
+                }
                 to_value(core.read(id)?)
             }
             "retry_observation" => {
                 core.retry_file_observation(id).await?;
-                to_value(core.read(id)?)
-            }
-            "retry_history" => {
-                core.retry_history().await?;
                 to_value(core.read(id)?)
             }
             "resolve" => {
@@ -194,8 +193,8 @@ impl EditorAdapter {
                 core.flush().await?;
                 Ok(Value::Null)
             }
-            "flush_history" => {
-                core.retry_history().await?;
+            "checkpoint" => {
+                core.checkpoint().await?;
                 Ok(Value::Null)
             }
             "close" => {
@@ -214,9 +213,9 @@ impl EditorAdapter {
         value.map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), ""))
     }
 
-    async fn apply<B: Backend>(
+    fn apply<F: FileSystem, R: FileSystem>(
         &mut self,
-        core: &mut EditorCore<B>,
+        core: &mut EditorCore<F, R>,
         id: &str,
         command: Command,
     ) -> EditorResult<()> {
@@ -246,8 +245,8 @@ impl EditorAdapter {
                 allocated = tag;
                 let options = EditOptions { group, undo };
                 match input {
-                    Ok(script) => core.edit_with(id, script, options).await,
-                    Err(text) => core.replace_text_with(id, &text, options).await,
+                    Ok(script) => core.edit_with(id, script, options),
+                    Err(text) => core.replace_text_with(id, &text, options),
                 }
             }
             Command::Undo { base, context } | Command::Redo { base, context } => {
@@ -255,16 +254,15 @@ impl EditorAdapter {
                 let (context, tag) = self.contexts.context(&before.text, context)?;
                 allocated = tag;
                 if redo {
-                    core.redo_with(id, context).await
+                    core.redo_with(id, context)
                 } else {
-                    core.undo_with(id, context).await
+                    core.undo_with(id, context)
                 }
             }
             Command::Import { packet, reset_undo } => {
                 core.import_with(id, packet, ImportOptions { reset_undo })
-                    .await
             }
-            Command::ClearUndo => core.clear_undo(id).await,
+            Command::ClearUndo => core.clear_undo(id),
         };
         if !result.as_ref().is_ok_and(|receipt| receipt.update.changed) {
             self.contexts.discard(allocated);
@@ -278,7 +276,10 @@ impl EditorAdapter {
 
     /// Encode before releasing native receipts. If encoding fails, retain the
     /// entire batch for retry, including its restoration metadata lifetimes.
-    fn capture<B: Backend>(&mut self, core: &mut EditorCore<B>) -> EditorResult<()> {
+    fn capture<F: FileSystem, R: FileSystem>(
+        &mut self,
+        core: &mut EditorCore<F, R>,
+    ) -> EditorResult<()> {
         self.pending.extend(core.take_mutations());
         let mut encoded = Vec::with_capacity(self.pending.len());
         for mutation in &self.pending {
@@ -312,7 +313,6 @@ impl EditorAdapter {
             encoded.push(json!({
                 "document": mutation.document,
                 "update": update,
-                "history": mutation.history,
             }));
         }
         self.ready.extend(encoded);
@@ -321,9 +321,9 @@ impl EditorAdapter {
         Ok(())
     }
 
-    pub fn take_mutations<B: Backend>(
+    pub fn take_mutations<F: FileSystem, R: FileSystem>(
         &mut self,
-        core: &mut EditorCore<B>,
+        core: &mut EditorCore<F, R>,
     ) -> EditorResult<Vec<Value>> {
         self.capture(core)?;
         let mut live = Vec::new();
@@ -334,9 +334,9 @@ impl EditorAdapter {
         Ok(std::mem::take(&mut self.ready))
     }
 
-    async fn file<B: Backend>(
+    async fn file<F: FileSystem, R: FileSystem>(
         &mut self,
-        core: &mut EditorCore<B>,
+        core: &mut EditorCore<F, R>,
         params: &Value,
     ) -> EditorResult<Value> {
         let path = params
@@ -363,7 +363,7 @@ impl EditorAdapter {
                     core.file_write(
                         path,
                         &data,
-                        params["options"]["mode"].as_str().unwrap_or("create"),
+                        decode::<WriteMode>(params["options"]["mode"].clone(), path)?,
                         params["options"]["expectedRevision"].as_str(),
                     )
                     .await?,

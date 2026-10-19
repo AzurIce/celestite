@@ -1,7 +1,5 @@
-pub(crate) mod backend;
 pub(crate) mod changes;
 pub(crate) mod documents;
-pub mod fs;
 pub(crate) mod runtime;
 
 use celestite_core::instance::Vault;

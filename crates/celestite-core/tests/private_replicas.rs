@@ -1,10 +1,9 @@
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{DocumentIdentity, HistoryPacket, Version};
-use celestite_core::backend::ErrorCode;
-use celestite_core::backend::memory::MemoryBackend;
 use celestite_core::editor::EditorCore;
 use celestite_core::editor::replica::ReplicaDocument;
 use celestite_core::editor::types::ReplicaHostState;
+use celestite_core::error::ErrorCode;
 use celestite_core::instance::{InstanceIdentity, Vault};
 use celestite_core::preview::sessions::PreviewController;
 use celestite_core::preview::{PreviewCompletion, PreviewOutcome, PreviewOutput};
@@ -57,17 +56,16 @@ fn hosted(packet: HistoryPacket, path: &str, deleted: bool) -> ReplicaDocument {
 #[test]
 fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_epochs() {
     block_on(async {
-        let mut core = replica("client", seed("file", "A😀")).await;
+        let mut core = replica("client", seed("file", "A😀"));
         core.replace_replica_session(vec![
             hosted(core.snapshot("file").unwrap(), "a.md", false),
             hosted(seed("other", "other"), "b.md", false),
             hosted(seed("deleted", "deleted"), "deleted.md", true),
             hosted(seed("detached", "detached"), "detached.md", false),
         ])
-        .await
         .unwrap();
         core.release_replica_document("detached").unwrap();
-        let receipt = core.edit("file", [(5..5, "!")]).await.unwrap();
+        let receipt = core.edit("file", [(5..5, "!")]).unwrap();
         let before = core.read("file").unwrap();
         let metadata = core.document_source(&[]);
         let mut catalogue = metadata
@@ -130,7 +128,7 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
 
         let mut invalid = hosted(history.clone(), "a.md", false);
         invalid.state.version = with_unseen_clock(&invalid.state.version);
-        assert!(core.replace_replica_session(vec![invalid]).await.is_err());
+        assert!(core.replace_replica_session(vec![invalid]).is_err());
         assert_eq!(core.document_source(&[]).epoch, metadata.epoch);
         preview.synchronize(&core.document_source(&[]), 1000);
         assert_eq!(
@@ -138,7 +136,6 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
             preview_before
         );
         core.replace_replica_session(vec![hosted(history, "a.md", false)])
-            .await
             .unwrap();
         let replaced = core.document_source(&["file".into()]);
         assert_ne!(replaced.epoch, metadata.epoch);
@@ -158,7 +155,7 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
                 },
             },
         }));
-        core.replace_text("file", "changed").await.unwrap();
+        core.replace_text("file", "changed").unwrap();
         assert_eq!(captured.snapshots[0].snapshot.text, before.snapshot.text);
         assert_eq!(
             captured.snapshots[0].snapshot.state_revision,
@@ -176,11 +173,10 @@ fn readonly_source_captures_eligible_bodies_without_effects_and_tracks_session_e
 fn native_session_replacement_preserves_undrained_accepted_receipts() {
     block_on(async {
         let packet = seed("file", "base");
-        let mut core = replica("client", packet.clone()).await;
+        let mut core = replica("client", packet.clone());
         core.take_mutations();
-        let receipt = core.edit("file", [(4..4, " draft")]).await.unwrap();
+        let receipt = core.edit("file", [(4..4, " draft")]).unwrap();
         core.replace_replica_session(vec![hosted(packet, "a.md", false)])
-            .await
             .unwrap();
         assert_eq!(core.read("file").unwrap().snapshot.text.as_ref(), "base");
         let batch = core.take_mutations();
@@ -196,7 +192,7 @@ fn native_session_replacement_preserves_undrained_accepted_receipts() {
 fn adapter_delivers_old_session_effects_before_new_session_effects() {
     block_on(async {
         let packet = seed("file", "base");
-        let mut core = replica("client", packet.clone()).await;
+        let mut core = replica("client", packet.clone());
         let mut adapter = EditorAdapter::default();
         for (index, suffix) in [" old", " new"].into_iter().enumerate() {
             if index == 1 {
@@ -237,7 +233,7 @@ fn adapter_delivers_old_session_effects_before_new_session_effects() {
 fn deleted_and_recreated_paths_join_in_either_order() {
     block_on(async {
         for reverse in [false, true] {
-            let mut core = replica("client", seed("base", "base")).await;
+            let mut core = replica("client", seed("base", "base"));
             let mut inputs = vec![
                 hosted(seed("old", "old"), "same.md", true),
                 hosted(seed("new", "new"), "same.md", false),
@@ -245,17 +241,15 @@ fn deleted_and_recreated_paths_join_in_either_order() {
             if reverse {
                 inputs.reverse();
             }
-            core.replace_replica_session(inputs).await.unwrap();
+            core.replace_replica_session(inputs).unwrap();
             assert!(core.read("old").unwrap().status.deleted);
             assert_eq!(core.read("new").unwrap().snapshot.text.as_ref(), "new");
             assert_eq!(core.read("base").unwrap_err().code, ErrorCode::NotFound);
         }
-        let mut core = replica("client", seed("base", "base")).await;
+        let mut core = replica("client", seed("base", "base"));
         core.join_replica_document(hosted(seed("new", "new"), "same.md", false))
-            .await
             .unwrap();
         core.join_replica_document(hosted(seed("old", "old"), "same.md", true))
-            .await
             .unwrap();
         assert!(core.read("old").unwrap().status.deleted);
     });
@@ -266,9 +260,9 @@ fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
     block_on(async {
         let a = seed("A", "A");
         let b = seed("B", "B");
-        let mut core = replica("client", a.clone()).await;
-        core.join("b.md", b.clone()).await.unwrap();
-        core.replace_text("A", "retained draft").await.unwrap();
+        let mut core = replica("client", a.clone());
+        core.join("b.md", b.clone()).unwrap();
+        core.replace_text("A", "retained draft").unwrap();
         let original = core.read("A").unwrap();
         let mut preview = PreviewController::default();
         preview.synchronize(&core.document_source(&[]), 1000);
@@ -277,7 +271,6 @@ fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
         invalid.state.version = with_unseen_clock(&invalid.state.version);
         assert!(
             core.replace_replica_session(vec![hosted(a.clone(), "c.md", false), invalid])
-                .await
                 .is_err()
         );
         let retained = core.read("A").unwrap();
@@ -287,7 +280,6 @@ fn reconnect_validates_final_paths_and_rejects_whole_invalid_sessions() {
         assert_eq!(retained.status.path, "a.md");
         // B precedes A, while B's new path was owned by A in the old session.
         core.replace_replica_session(vec![hosted(b, "a.md", false), hosted(a, "c.md", false)])
-            .await
             .unwrap();
         assert_eq!(core.read("A").unwrap().status.path, "c.md");
         assert_eq!(core.read("B").unwrap().status.path, "a.md");
@@ -319,8 +311,8 @@ fn session_imports_catch_up_packets_and_close_does_not_require_write_permission(
             source.export_updates_since(&before).unwrap(),
         ];
         input.state.read_only = true;
-        let mut core = replica("client", initial).await;
-        core.replace_replica_session(vec![input]).await.unwrap();
+        let mut core = replica("client", initial);
+        core.replace_replica_session(vec![input]).unwrap();
         assert_eq!(
             core.read("file").unwrap().snapshot.text.as_ref(),
             "remote seed"
@@ -328,58 +320,53 @@ fn session_imports_catch_up_packets_and_close_does_not_require_write_permission(
         let before = source.version();
         let _ = source.edit([(0..0, "next ")]).unwrap();
         core.import("file", source.export_updates_since(&before).unwrap())
-            .await
             .unwrap();
         assert_eq!(
             core.read("file").unwrap().snapshot.text.as_ref(),
             "next remote seed"
         );
         assert_eq!(
-            core.replace_text("file", "blocked").await.unwrap_err().code,
+            core.replace_text("file", "blocked").unwrap_err().code,
             ErrorCode::PermissionDenied
         );
         core.close().await.unwrap();
     });
 }
 
-async fn replica(name: &str, packet: HistoryPacket) -> EditorCore<MemoryBackend> {
-    let mut core = EditorCore::open(MemoryBackend::new(
-        InstanceIdentity {
-            instance_id: name.into(),
-            vault: Vault {
-                vault_id: "vault".into(),
-                history_id: "vault-history".into(),
-            },
+fn replica(name: &str, packet: HistoryPacket) -> EditorCore {
+    let mut core = EditorCore::memory(InstanceIdentity {
+        instance_id: name.into(),
+        vault: Vault {
+            vault_id: "vault".into(),
+            history_id: "vault-history".into(),
         },
-        || 1000,
-    ))
-    .await
+    })
     .unwrap();
-    core.join("a.md", packet).await.unwrap();
+    core.join("a.md", packet).unwrap();
     core
 }
 #[test]
 fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
     block_on(async {
         let seed = seed("file", "A😀B");
-        let mut a = replica("a", seed.clone()).await;
-        let mut b = replica("b", seed.clone()).await;
-        let mut c = replica("c", seed).await;
+        let mut a = replica("a", seed.clone());
+        let mut b = replica("b", seed.clone());
+        let mut c = replica("c", seed);
         let base = a.read("file").unwrap().status.version;
         assert_ne!(
             a.read("file").unwrap().peer_id,
             b.read("file").unwrap().peer_id
         );
         for (core, text) in [(&mut a, "A😀aB"), (&mut b, "A😀bB")] {
-            core.replace_text("file", text).await.unwrap();
+            core.replace_text("file", text).unwrap();
         }
         let a_packet = a.updates("file", &base).unwrap();
         let b_packet = b.updates("file", &base).unwrap();
-        a.import("file", b_packet.clone()).await.unwrap();
-        b.import("file", a_packet.clone()).await.unwrap();
-        c.import("file", b_packet.clone()).await.unwrap();
-        c.import("file", a_packet).await.unwrap();
-        c.import("file", b_packet).await.unwrap();
+        a.import("file", b_packet.clone()).unwrap();
+        b.import("file", a_packet.clone()).unwrap();
+        c.import("file", b_packet.clone()).unwrap();
+        c.import("file", a_packet).unwrap();
+        c.import("file", b_packet).unwrap();
         let merged = a.read("file").unwrap();
         assert_eq!(merged.snapshot.text, b.read("file").unwrap().snapshot.text);
         assert_eq!(
@@ -389,7 +376,7 @@ fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
         assert!(merged.snapshot.text.contains('a') && merged.snapshot.text.contains('b'));
         for core in [&a, &b, &c] {
             let state = core.read("file").unwrap();
-            assert!(state.status.persisted_version.is_none());
+            assert!(state.status.recovery_error.is_none());
             assert!(state.status.saved_version.is_none());
             assert!(state.autosave_delay.is_none());
         }
@@ -400,19 +387,49 @@ fn three_private_cores_merge_concurrent_edits_and_keep_personal_undo() {
 }
 
 #[test]
+fn a_memory_replica_neither_schedules_file_writes_nor_accepts_local_save() {
+    block_on(async {
+        let mut core = replica("client", seed("file", "saved"));
+        core.replace_text("file", "draft").unwrap();
+        let before = core.read("file").unwrap();
+        assert!(before.status.dirty);
+        assert!(before.autosave_delay.is_none());
+        assert!(before.recovery_delay.is_none());
+        assert_eq!(
+            core.save("file", None).await.unwrap_err().code,
+            ErrorCode::Unsupported,
+        );
+        assert_eq!(
+            core.file_mkdir("notes", false).await.unwrap_err().code,
+            ErrorCode::Unsupported,
+        );
+        assert_eq!(
+            core.file_read("a.md").await.unwrap_err().code,
+            ErrorCode::Unsupported,
+        );
+        let after = core.read("file").unwrap();
+        assert_eq!(after.snapshot, before.snapshot);
+        assert_eq!(after.status.saved_version, before.status.saved_version);
+        assert_eq!(after.undo, before.undo);
+        core.checkpoint().await.unwrap();
+        core.close().await.unwrap();
+    });
+}
+
+#[test]
 fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
     block_on(async {
         let packet = seed("file", "seed");
-        let mut core = replica("client", packet.clone()).await;
-        core.replace_text("file", "draft").await.unwrap();
-        core.join("a.md", packet.clone()).await.unwrap();
+        let mut core = replica("client", packet.clone());
+        core.replace_text("file", "draft").unwrap();
+        core.join("a.md", packet.clone()).unwrap();
         assert_eq!(core.read("file").unwrap().snapshot.text.as_ref(), "draft");
-        assert!(core.join("../a.md", packet.clone()).await.is_err());
-        assert!(core.join("b.md", packet.clone()).await.is_err());
+        assert!(core.join("../a.md", packet.clone()).is_err());
+        assert!(core.join("b.md", packet.clone()).is_err());
         let mut other = packet.clone();
         other.identity.history_id = "different".into();
         assert_eq!(
-            core.join("a.md", other).await.unwrap_err().code,
+            core.join("a.md", other).unwrap_err().code,
             ErrorCode::Conflict
         );
         // Stale caller checkpoints belong to the JSON protocol, not native ownership.
@@ -421,30 +438,50 @@ fn joining_a_known_history_does_not_reseed_or_alias_another_identity() {
 }
 
 #[test]
+fn host_save_receipts_recompute_dirty_without_changing_live_history() {
+    block_on(async {
+        let mut core = replica("client", seed("file", "saved"));
+        core.replace_text("file", "draft").unwrap();
+        let saved = hosted(core.snapshot("file").unwrap(), "a.md", false).state;
+        let version = core.status("file").unwrap().version;
+        core.apply_host_state("file", saved.clone()).unwrap();
+        let state = core.read("file").unwrap();
+        assert!(!state.status.dirty);
+        assert!(state.autosave_delay.is_none());
+        assert_eq!(state.status.version, version);
+        assert!(state.undo.can_undo);
+
+        core.replace_text("file", "new draft").unwrap();
+        core.apply_host_state("file", saved).unwrap();
+        assert!(core.status("file").unwrap().dirty);
+        assert!(core.read("file").unwrap().autosave_delay.is_none());
+        let saved = hosted(core.snapshot("file").unwrap(), "a.md", false).state;
+        core.apply_host_state("file", saved).unwrap();
+        assert!(!core.status("file").unwrap().dirty);
+        assert!(core.read("file").unwrap().autosave_delay.is_none());
+    });
+}
+
+#[test]
 fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() {
     block_on(async {
         let packet = seed("file", "seed");
-        let mut core = replica("client", packet.clone()).await;
+        let mut core = replica("client", packet.clone());
         let other = seed("other", "other");
-        core.join("other.md", other).await.unwrap();
+        core.join("other.md", other).unwrap();
         for (id, text) in [("file", "draft"), ("other", "keep other edit")] {
-            core.replace_text(id, text).await.unwrap();
+            core.replace_text(id, text).unwrap();
         }
         let mut state = hosted(packet.clone(), "a.md", false).state;
         state.version = core.read("file").unwrap().status.version;
         state.file_revision = "remote-1".into();
-        core.apply_host_state("file", state.clone()).await.unwrap();
-        assert!(core.read("file").unwrap().autosave_delay.is_some());
-        assert!(
-            core.read("file")
-                .unwrap()
-                .status
-                .persisted_version
-                .is_none()
-        );
+        core.apply_host_state("file", state.clone()).unwrap();
+        assert!(core.status("file").unwrap().dirty);
+        assert!(core.read("file").unwrap().autosave_delay.is_none());
+        assert!(core.read("file").unwrap().status.recovery_error.is_none());
         let mut unseen = state.clone();
         unseen.version = with_unseen_clock(&unseen.version);
-        assert!(core.apply_host_state("file", unseen).await.is_err());
+        assert!(core.apply_host_state("file", unseen).is_err());
         assert_eq!(core.read("file").unwrap().status.file_revision, "remote-1");
         let collision = hosted(packet.clone(), "other.md", false);
         let other_packet = core.snapshot("other").unwrap();
@@ -453,7 +490,6 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
                 collision,
                 hosted(other_packet.clone(), "other.md", false),
             ])
-            .await
             .unwrap_err()
             .code,
             ErrorCode::Conflict
@@ -463,7 +499,6 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
             hosted(packet, "a.md", false),
             hosted(other_packet, "other.md", false),
         ])
-        .await
         .unwrap();
         assert_eq!(core.read("file").unwrap().snapshot.text.as_ref(), "seed");
         assert!(!core.read("file").unwrap().undo.can_undo);
@@ -475,9 +510,9 @@ fn host_receipts_and_session_replacement_keep_history_and_clear_personal_undo() 
         let mut read_only = state;
         read_only.version = core.read("file").unwrap().status.version;
         read_only.read_only = true;
-        core.apply_host_state("file", read_only).await.unwrap();
+        core.apply_host_state("file", read_only).unwrap();
         assert_eq!(
-            core.replace_text("file", "blocked").await.unwrap_err().code,
+            core.replace_text("file", "blocked").unwrap_err().code,
             ErrorCode::PermissionDenied
         );
         let mut preview = PreviewController::default();
@@ -498,22 +533,19 @@ fn a_closed_cache_can_rejoin_after_replacing_the_active_session_catalogue() {
     block_on(async {
         let closed = seed("closed", "cached");
         let active = seed("active", "active");
-        let mut core = replica("client", closed.clone()).await;
+        let mut core = replica("client", closed.clone());
         core.join_replica_document(hosted(active.clone(), "b.md", false))
-            .await
             .unwrap();
         let peer_id = core.read("closed").unwrap().peer_id;
         let mut preview = PreviewController::default();
         preview.synchronize(&core.document_source(&[]), 1000);
         preview.subscribe("closed", "view", 1000).unwrap();
         core.replace_replica_session(vec![hosted(active, "b.md", false)])
-            .await
             .unwrap();
         assert_eq!(core.read("closed").unwrap_err().code, ErrorCode::NotFound);
         preview.synchronize(&core.document_source(&[]), 1000);
         assert!(preview.state("closed").is_err());
         core.join_replica_document(hosted(closed, "a.md", false))
-            .await
             .unwrap();
         assert_eq!(
             core.read("closed").unwrap().snapshot.text.as_ref(),
@@ -526,23 +558,21 @@ fn a_closed_cache_can_rejoin_after_replacing_the_active_session_catalogue() {
 #[test]
 fn released_replica_caches_keep_undo_without_reserving_a_live_path() {
     block_on(async {
-        let mut core = replica("client", seed("old", "old")).await;
+        let mut core = replica("client", seed("old", "old"));
         // Make this document a host-owned replica before exercising its lifecycle.
         let packet = core.snapshot("old").unwrap();
         core.replace_replica_session(vec![hosted(packet.clone(), "a.md", false)])
-            .await
             .unwrap();
-        core.replace_text("old", "draft").await.unwrap();
+        core.replace_text("old", "draft").unwrap();
         let state = core.read("old").unwrap();
         core.release_replica_document("old").unwrap();
         assert!(!core.read("old").unwrap().status.deleted);
         assert!(core.read("old").unwrap().undo.can_undo);
-        assert_eq!(core.undo("old").await.unwrap_err().code, ErrorCode::Closed);
+        assert_eq!(core.undo("old").unwrap_err().code, ErrorCode::Closed);
         let mut preview = PreviewController::default();
         preview.synchronize(&core.document_source(&[]), 1000);
         assert!(preview.subscribe("old", "view", 1000).is_err());
         core.join_replica_document(hosted(seed("new", "new"), "a.md", false))
-            .await
             .unwrap();
         core.apply_host_state(
             "old",
@@ -552,11 +582,10 @@ fn released_replica_caches_keep_undo_without_reserving_a_live_path() {
                 ..hosted(packet, "a.md", false).state
             },
         )
-        .await
         .unwrap();
         assert_eq!(core.read("old").unwrap().peer_id, state.peer_id);
         assert!(core.read("old").unwrap().undo.can_undo);
-        core.undo("old").await.unwrap();
+        core.undo("old").unwrap();
         assert_eq!(core.read("old").unwrap().snapshot.text.as_ref(), "old");
         assert_eq!(core.read("new").unwrap().snapshot.text.as_ref(), "new");
     });

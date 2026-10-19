@@ -6,7 +6,7 @@ use super::{
     PreviewStatus, PreviewSubscription, PreviewTask, PreviewTicket, default_resource_root,
     diagnostic_bytes, resolve_preview_target, supports_preview,
 };
-use crate::backend::{EditorError, EditorResult, ErrorCode};
+use crate::error::{EditorError, EditorResult, ErrorCode};
 use crate::source::{DocumentSourceSnapshot, SourceDocument};
 use celestite_buffer::new_peer_id;
 use celestite_buffer::types::{TextSnapshot, Version};
@@ -31,7 +31,7 @@ struct PreviewSessions {
 impl Default for PreviewSessions {
     fn default() -> Self {
         Self {
-            // A volatile backend's new_id can restart its counter on reopen.
+            // Scope task and subscription counters to this controller's lifetime.
             // Use the same ephemeral identity source as Buffer peers.
             scope: new_peer_id().to_string(),
             next_id: 0,

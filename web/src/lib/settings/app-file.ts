@@ -1,4 +1,6 @@
-/** 全局设置的存储后端：OPFS `/celestite/settings.json`。 */
+import { isDesktop, desktopInvoke } from "../desktop/platform";
+
+/** App 文档保存到桌面私有目录，浏览器使用 OPFS `/celestite/`。 */
 
 export interface SettingsFile {
   /** False for a session-only backend. Omitted means persistent. */
@@ -27,18 +29,6 @@ interface OpfsStorage {
   getDirectory(): Promise<FileSystemDirectoryHandle>;
 }
 
-/**
- * 与 `/vaults/<id>` 平级的 `/celestite/settings.json`。
- * 读改写由 Web Locks 串行化，写入沿用 createWritable + abort 保留旧内容。
- */
-export async function openAppSettingsFile(
-  storage: OpfsStorage | undefined = typeof navigator === "undefined"
-    ? undefined
-    : navigator.storage,
-): Promise<SettingsFile> {
-  return openAppDocument("settings.json", storage);
-}
-
 /** Separate app documents share the same OPFS app directory. */
 export async function openAppDocument(
   fileName: "settings.json" | "connections.json",
@@ -46,6 +36,13 @@ export async function openAppDocument(
     ? undefined
     : navigator.storage,
 ): Promise<SettingsFile> {
+  if (isDesktop())
+    return {
+      read: () =>
+        desktopInvoke<string | null>("desktop_app_read", { name: fileName }),
+      write: (document) =>
+        desktopInvoke<void>("desktop_app_write", { name: fileName, document }),
+    };
   if (
     !storage ||
     typeof storage.getDirectory !== "function" ||

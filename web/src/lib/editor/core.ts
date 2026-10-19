@@ -8,7 +8,7 @@ import type {
 } from "./protocol";
 
 export interface CorePort {
-  call(method: string, params: string): Promise<string>;
+  call(method: string, params: Record<string, unknown>): Promise<CoreReply>;
 }
 export interface CoreTextSnapshot {
   text: string;
@@ -29,8 +29,8 @@ export interface CoreDocument {
   lineEnding: "\n" | "\r\n" | "\r";
   deleted: boolean;
   conflict: boolean;
-  persistedVersion: Version | null;
-  persistenceError: string | null;
+  recoveryError: string | null;
+  recoveryDelay: number | null;
   error: string | null;
   autosaveDelay: number | null;
   fileRevision: string;
@@ -38,34 +38,35 @@ export interface CoreDocument {
 export interface CoreMutation {
   document: CoreDocument;
   update: BufferUpdate;
-  history:
-    | { status: "committed"; version: Version; persisted: boolean }
-    | { status: "failed"; error: RpcError };
 }
 export type CoreReply =
   | { status: "ok"; value: unknown; mutations: CoreMutation[] }
   | { status: "error"; error: RpcError; mutations: CoreMutation[] };
 
-/** Decode only. The owner consumes mutations BEFORE handling a command error. */
-export async function callCore(
-  core: CorePort,
-  method: string,
-  params: Record<string, unknown> = {},
-): Promise<CoreReply> {
-  try {
-    return JSON.parse(
-      await core.call(method, JSON.stringify(params)),
-    ) as CoreReply;
-  } catch (error) {
-    let decoded: RpcError;
-    try {
-      decoded = JSON.parse(String(error));
-    } catch {
-      throw error;
-    }
-    throw decodeError(decoded);
-  }
+/** JSON belongs to the WASM ABI; platform-neutral callers exchange values. */
+export function wasmCore(binding: {
+  call(method: string, params: string): Promise<string>;
+}): CorePort {
+  return {
+    async call(method, params) {
+      try {
+        return JSON.parse(
+          await binding.call(method, JSON.stringify(params)),
+        ) as CoreReply;
+      } catch (error) {
+        let decoded: RpcError;
+        try {
+          decoded = JSON.parse(String(error));
+        } catch {
+          throw error;
+        }
+        throw decodeError(decoded);
+      }
+    },
+  };
 }
+
+/** The owner consumes mutations BEFORE interpreting an explicit command error. */
 export function coreValue<T>(reply: CoreReply): T {
   if (reply.status === "error") throw decodeError(reply.error);
   return reply.value as T;

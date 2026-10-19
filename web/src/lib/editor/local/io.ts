@@ -1,29 +1,14 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath } from "../../vault/path";
 import type { VaultBackend } from "../../vault/types";
-import type { OpfsInstanceStore } from "./store";
 import { encodeError } from "../rpc";
 
-/** Browser primitives for the Rust Backend. No editing or recovery policy here. */
-export function createBrowserIo(
-  store: Pick<OpfsInstanceStore, "json" | "putJson" | "bytes" | "put">,
-  backend: VaultBackend,
-) {
-  return (request: string): string | Promise<string> => {
+/** File primitives for one root; Rust owns text recovery and editor policy. */
+export function createBrowserIo(backend: VaultBackend) {
+  return (request: string): Promise<string> => {
     const { method, params: p } = JSON.parse(request);
-    if (method === "newId") return crypto.randomUUID();
     const execute = async () => {
       switch (method) {
-        case "readJson":
-          return store.json(p.path);
-        case "writeJson":
-          return store.putJson(p.path, p.data);
-        case "readHistory": {
-          const data = await store.bytes(p.path);
-          return data ? Array.from(data) : null;
-        }
-        case "writeHistory":
-          return store.put(p.path, new Uint8Array(p.data));
         case "stat":
           return backend.stat(vaultPath(p.path));
         case "readDir": {
@@ -34,20 +19,20 @@ export function createBrowserIo(
         }
         case "readFile": {
           const path = vaultPath(p.path);
-          if (p.limit !== null) {
+          if (p.limit != null) {
             const stat = await backend.stat(path);
             if (stat?.size !== undefined && stat.size > p.limit)
               throw new VaultError(
                 "Unsupported",
-                "文件超过 5 MiB，请通过文件树下载后编辑。",
+                "File exceeds the read limit",
                 path,
               );
           }
-          const file = await backend.readFileSnapshot!(path);
-          if (p.limit !== null && file.data.byteLength > p.limit)
+          const file = await backend.readFileSnapshot(path);
+          if (p.limit != null && file.data.byteLength > p.limit)
             throw new VaultError(
               "Unsupported",
-              "文件超过 5 MiB，请通过文件树下载后编辑。",
+              "File exceeds the read limit",
               path,
             );
           return { data: Array.from(file.data), revision: file.revision };
@@ -55,7 +40,7 @@ export function createBrowserIo(
         case "writeFile":
           return backend.writeFile(vaultPath(p.path), new Uint8Array(p.data), {
             mode: p.mode,
-            ...(p.expected !== null ? { expectedRevision: p.expected } : {}),
+            ...(p.expected != null ? { expectedRevision: p.expected } : {}),
           });
         case "mkdir":
           return backend.mkdir(vaultPath(p.path), { recursive: p.recursive });

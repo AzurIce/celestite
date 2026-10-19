@@ -13,6 +13,152 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn strict_tauri_origin_allows_http_cors_without_widening_share_permissions() {
+    let root = fixture();
+    let host = Host::start_with_origins(root.path(), false, vec!["tauri://localhost".into()]).await;
+    for (origin, allowed) in [
+        ("tauri://localhost", true),
+        ("http://evil", false),
+        ("tauri://other", false),
+        ("tauri://localhost:80", false),
+        ("null", false),
+    ] {
+        let preflight = host
+            .client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{}/file?path=a.md", host.url),
+            )
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "PUT")
+            .header("Access-Control-Request-Headers", "content-type,if-match")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .and_then(|value| value.to_str().ok()),
+            allowed.then_some(origin)
+        );
+        let response = host
+            .client
+            .get(&host.url)
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if allowed {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::FORBIDDEN
+            },
+            "{origin}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .and_then(|value| value.to_str().ok()),
+            allowed.then_some(origin)
+        );
+    }
+    let denied_write = host
+        .client
+        .put(format!(
+            "{}/file?path=forbidden.md&mode=create",
+            host.readonly_url
+        ))
+        .header("Origin", "tauri://localhost")
+        .body("forbidden")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_write.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(!root.path().join("forbidden.md").exists());
+    let invalid_share = host
+        .url
+        .replace(host.url.split('/').nth(3).unwrap(), "invalid-share");
+    assert_eq!(
+        host.client
+            .get(invalid_share)
+            .header("Origin", "tauri://localhost")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    host.stop().await;
+}
+
+#[tokio::test]
+async fn websocket_tauri_origin_is_exact_and_opt_in() {
+    let root = fixture();
+    let host = Host::start_with_origins(root.path(), false, vec!["tauri://localhost".into()]).await;
+    for origin in [
+        "http://evil",
+        "tauri://other",
+        "tauri://localhost:80",
+        "null",
+    ] {
+        let mut request = (host.url.replace("http:", "ws:") + "/sync")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", origin.parse().unwrap());
+        assert!(
+            matches!(connect_async(request).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 403),
+            "{origin}"
+        );
+    }
+    let mut request = (host.url.replace("http:", "ws:") + "/sync")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Origin", "tauri://localhost".parse().unwrap());
+    let (mut socket, response) = connect_async(request).await.unwrap();
+    assert_eq!(response.status(), 101);
+    send(
+        &mut socket,
+        json!({"protocolVersion":5,"vault":host.identity().await}),
+    )
+    .await;
+    assert_eq!(next(&mut socket).await["kind"], "hello");
+    socket.close(None).await.unwrap();
+    host.stop().await;
+
+    let strict_http = Host::start(root.path(), false).await;
+    let mut request = (strict_http.url.replace("http:", "ws:") + "/sync")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Origin", "tauri://localhost".parse().unwrap());
+    assert!(
+        matches!(connect_async(request).await.unwrap_err(), tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 403)
+    );
+    assert_eq!(
+        strict_http
+            .client
+            .get(&strict_http.url)
+            .header("Origin", "tauri://localhost")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    strict_http.stop().await;
+}
+
+#[tokio::test]
 async fn sessions_subscribe_only_when_they_open_a_buffer() {
     let root = fixture();
     let host = Host::start(root.path(), false).await;
@@ -73,7 +219,7 @@ async fn operation_replay_is_idempotent_and_new_sessions_reject_old_peers() {
     let host = Host::start(root.path(), false).await;
     let mut old = host.client_replica().await;
     let id = old.open("a.md").await;
-    let mutation = old.core.edit(&id, [(0..0, "confirmed")]).await.unwrap();
+    let mutation = old.core.edit(&id, [(0..0, "confirmed")]).unwrap();
     let update = json!({"id":id,"packet":mutation.update.operation,"version":mutation.update.after,"operation":1});
     let ack = old.ok("updates", update.clone()).await;
     assert_eq!(old.ok("updates", update.clone()).await, ack);
@@ -83,7 +229,7 @@ async fn operation_replay_is_idempotent_and_new_sessions_reject_old_peers() {
         old.request("updates", altered).await["error"]["code"],
         "InvalidEdit"
     );
-    let orphan = old.core.edit(&id, [(0..0, "unsent")]).await.unwrap();
+    let orphan = old.core.edit(&id, [(0..0, "unsent")]).unwrap();
     let unsent = orphan.update.after.clone();
     let peer_id = old.core.peer_id(&id).unwrap();
     old.close().await;
@@ -163,12 +309,12 @@ async fn handshake_auth_history_and_read_only_are_enforced() {
     for (label, handshake, code) in [
         (
             "protocol",
-            json!({"protocolVersion":0,"vault":identity}),
+            json!({"protocolVersion":4,"vault":identity}),
             "Unsupported",
         ),
         (
             "history",
-            json!({"protocolVersion":4,"vault":{"vaultId":"wrong","historyId":"wrong"}}),
+            json!({"protocolVersion":5,"vault":{"vaultId":"wrong","historyId":"wrong"}}),
             "Conflict",
         ),
     ] {
@@ -284,10 +430,9 @@ async fn restart_discards_unsaved_history_and_invalidates_old_sessions() {
         new.core.read(&restored).unwrap().snapshot.text.as_ref(),
         "saved text"
     );
-    assert_eq!(
-        host.json("GET", "", Value::Null).await["capabilities"]["persistentHistory"],
-        false
-    );
+    assert!(host.json("GET", "", Value::Null).await["capabilities"]
+        .get("persistentHistory")
+        .is_none());
     assert_eq!(
         new.ok("probe", json!({"id":next_id,"version":version}))
             .await["committed"],

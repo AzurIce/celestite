@@ -1,7 +1,9 @@
 //! Host snapshots and metadata are validated together before replacing a session.
+use super::state::DocumentState;
 use super::types::ReplicaHostState;
-use super::{EditorCore, Record, validate_editor_path, validate_text};
-use crate::backend::{Backend, DocumentHeader, EditorError, EditorResult, ErrorCode};
+use super::{EditorCore, Record, validate_path, validate_text};
+use crate::error::{EditorError, EditorResult, ErrorCode};
+use crate::fs::FileSystem;
 use celestite_buffer::Buffer;
 use celestite_buffer::types::{HistoryPacket, HistoryPacketKind};
 use std::collections::BTreeMap;
@@ -32,7 +34,7 @@ pub struct ReplicaDocument {
 
 fn record(input: ReplicaDocument) -> EditorResult<Record> {
     let state = input.state;
-    validate_editor_path(&state.path)?;
+    validate_path(&state.path)?;
     validate_text(&state.saved_content, &state.path)?;
     if state.path.is_empty() {
         return Err(EditorError::new(
@@ -86,12 +88,9 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
             &state.path,
         ));
     }
-    let header = DocumentHeader {
+    let header = DocumentState {
         id: document.identity().document_id.clone(),
         path: state.path,
-        seed: document.export_snapshot()?,
-        sequence: 0,
-        applied: snapshot.version,
         saved_text: state.saved_content,
         disk_revision: state.file_revision,
         saved_version: None,
@@ -116,12 +115,12 @@ fn record(input: ReplicaDocument) -> EditorResult<Record> {
     Ok(record)
 }
 
-impl<B: Backend> EditorCore<B> {
+impl<F: FileSystem, R: FileSystem> EditorCore<F, R> {
     /// Stop a remote subscription while keeping the Buffer and its personal undo.
     /// A closed cache releases its path reservation; it is not a deleted file.
     pub fn release_replica_document(&mut self, id: &str) -> EditorResult<()> {
-        if self.backend.has_projection()
-            || self.backend.persistent()
+        if self.files.is_some()
+            || self.recovery.is_some()
             || !self.record(id)?.replica.host_authoritative
         {
             return Err(EditorError::new(
@@ -134,9 +133,8 @@ impl<B: Backend> EditorCore<B> {
         Ok(())
     }
     /// A new document's deletion flag participates in path validation immediately.
-    pub async fn join_replica_document(&mut self, input: ReplicaDocument) -> EditorResult<String> {
-        self.writable()?;
-        if self.backend.has_projection() {
+    pub fn join_replica_document(&mut self, input: ReplicaDocument) -> EditorResult<String> {
+        if self.files.is_some() {
             return Err(EditorError::new(
                 ErrorCode::Unsupported,
                 "Host snapshots require a private replica",
@@ -159,17 +157,13 @@ impl<B: Backend> EditorCore<B> {
                 &next.header.path,
             ));
         }
-        self.backend.commit(&next.header, None).await?;
         self.records.insert(id.clone(), next);
         Ok(id)
     }
 
     /// Validate the final catalogue and all histories before touching the old session.
-    pub async fn replace_replica_session(
-        &mut self,
-        inputs: Vec<ReplicaDocument>,
-    ) -> EditorResult<()> {
-        if self.backend.has_projection() || self.backend.persistent() {
+    pub fn replace_replica_session(&mut self, inputs: Vec<ReplicaDocument>) -> EditorResult<()> {
+        if self.files.is_some() || self.recovery.is_some() {
             return Err(EditorError::new(
                 ErrorCode::Unsupported,
                 "Only volatile private sessions can be replaced",
@@ -205,8 +199,6 @@ impl<B: Backend> EditorCore<B> {
         }
         // The caller supplies the complete active session catalogue. Closed,
         // unsubscribed caches must not be resurrected as phantom tombstones.
-        let headers: Vec<_> = next.values().map(|record| record.header.clone()).collect();
-        self.backend.replace_volatile_documents(&headers).await?;
         self.records = next;
         self.source_epoch = self
             .source_epoch
@@ -214,7 +206,6 @@ impl<B: Backend> EditorCore<B> {
             .expect("source epoch exhausted");
         // Accepted effects are owned receipts, not borrowed session state.
         // Replacement must not erase an undrained native owner's batch.
-        self.health = super::HistoryHealth::Ok;
         Ok(())
     }
 }

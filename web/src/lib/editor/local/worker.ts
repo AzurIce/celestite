@@ -11,12 +11,12 @@ import { VaultError } from "../../vault/errors";
 import { vaultPath } from "../../vault/path";
 import { OpfsInstanceStore } from "./store";
 import { createBrowserIo } from "./io";
-import { EditorHost } from "../runtime/host";
-import { DirectoryEditorHost } from "./host";
+import { LocalEditorSession } from "./session";
 import { encodeError } from "../rpc";
 import { serveEditor, type EditorServicePort } from "../runtime/service";
 import { DirectoryPackageResources } from "./package-resources";
 import { PreviewResources } from "../../preview/resources";
+import { wasmCore } from "../core";
 
 export type LocalEditorSource =
   | { kind: "opfs"; id: "default" }
@@ -54,7 +54,8 @@ async function start(source: LocalEditorSource) {
             const store = await OpfsInstanceStore.open(storeId);
             const binding = await EditorBinding.open(
               JSON.stringify(store.identity),
-              createBrowserIo(store, backend),
+              createBrowserIo(backend),
+              createBrowserIo(store.files),
               source.kind === "directory",
             );
             // A stale optional resource capability must not prevent opening the Vault.
@@ -66,10 +67,13 @@ async function start(source: LocalEditorSource) {
                   ).catch(() => undefined)
                 : undefined;
             const previewResources = new PreviewResources(backend, packages);
-            const host =
-              source.kind === "directory"
-                ? new DirectoryEditorHost(binding, backend, emit, schedule)
-                : new EditorHost(binding, backend, emit, schedule);
+            const host = new LocalEditorSession(
+              wasmCore(binding),
+              backend,
+              emit,
+              schedule,
+              source.kind === "directory",
+            );
             return {
               identity: store.identity,
               host,
@@ -87,7 +91,10 @@ async function start(source: LocalEditorSource) {
                     },
                   }
                 : {}),
-              dispose: () => binding.free(),
+              dispose: async () => {
+                binding.free();
+                await store.files.close();
+              },
             };
           } catch (error) {
             await backend.close();

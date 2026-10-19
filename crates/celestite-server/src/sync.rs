@@ -1,7 +1,7 @@
 //! One online session per connection. Opening a buffer subscribes that session
 //! to its history. A receipt acknowledges in-memory CRDT acceptance; saving the
 //! ordinary file is a separate command.
-use celestite_core::backend::{EditorError, ErrorCode};
+use celestite_core::error::{EditorError, EditorResult, ErrorCode};
 use celestite_core::instance::Vault;
 #[cfg(test)]
 mod tests;
@@ -34,7 +34,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 pub(crate) fn routes() -> Router<Arc<ServerState>> {
-    Router::new().route("/{id}/api/v4/sync", get(upgrade))
+    Router::new().route("/{id}/api/v5/sync", get(upgrade))
 }
 async fn upgrade(
     State(state): State<Arc<ServerState>>,
@@ -144,7 +144,7 @@ impl SessionState {
         &mut self,
         docs: &mut crate::vault::documents::Documents,
         id: &str,
-    ) -> crate::vault::fs::Result<Value> {
+    ) -> EditorResult<Value> {
         if !self.documents.contains_key(id) {
             self.documents.insert(
                 id.into(),
@@ -199,7 +199,7 @@ async fn collect(
         let frames = ids
             .into_iter()
             .map(|id| session.receipt(docs, &id))
-            .collect::<crate::vault::fs::Result<Vec<_>>>()?;
+            .collect::<EditorResult<Vec<_>>>()?;
         // Subscription and all snapshot versions are established in the same
         // serial boundary. New changes queue while frames are transmitted.
         let subscription = docs.subscribe()?;
@@ -349,10 +349,9 @@ async fn command(
             }
             match &request.command {
                 Command::Updates { id, .. } | Command::Save { id, .. }
-                | Command::Probe { id, .. } | Command::RetryObservation { id } => {
-                    if !session.subscribed(id) {
-                        return Err(EditorError::new(ErrorCode::InvalidEdit, "Buffer is not open in this session", id));
-                    }
+                | Command::Probe { id, .. } | Command::RetryObservation { id }
+                    if !session.subscribed(id) => {
+                    return Err(EditorError::new(ErrorCode::InvalidEdit, "Buffer is not open in this session", id));
                 }
                 _ => {}
             }
@@ -371,7 +370,7 @@ async fn command(
                     session.receipt(docs, &id)
                 }
                 Command::Probe { id, version } => {
-                    let current = docs.committed_version(&id)?;
+                    let current = docs.version(&id)?;
                     Ok(json!({"committed": current.contains(&version), "version": current}))
                 }
                 Command::RetryObservation { id } => {
@@ -402,7 +401,7 @@ async fn command(
                     let peer_id = session.documents.get(&id)
                         .ok_or_else(|| EditorError::new(ErrorCode::InvalidEdit, "Document not subscribed in this session", &id))?.peer_id;
                     docs.import_session(&id, packet, peer_id, &version)?;
-                    let version = docs.committed_version(&id)?;
+                    let version = docs.version(&id)?;
                     let ack = json!({"operation": operation, "version": version});
                     tracing::debug!(document_id=%id, session_id=%session.id, peer_id=%peer_id, operation, "Committed session CRDT update");
                     session.next_operation += 1;

@@ -87,8 +87,9 @@ test("failed startup discards startup and composition receipts together", () => 
   inbox.release(held);
 });
 
-test("connect imports pushes only after every open and the new replica session installation", async () => {
-  const { RemoteEditorHost } = await import("../../src/lib/editor/remote/host");
+test("connect validates startup pushes with every open in one replica session", async () => {
+  const { RemoteEditorSession } =
+    await import("../../src/lib/editor/remote/editor-session");
   const original = globalThis.WebSocket;
   let socket!: Socket;
   class Socket {
@@ -127,16 +128,31 @@ test("connect imports pushes only after every open and the new replica session i
       },
     }) as RemoteReceipt;
   const order: string[] = [];
-  const host = Object.assign(Object.create(RemoteEditorHost.prototype), {
+  const host = Object.assign(Object.create(RemoteEditorSession.prototype), {
     inbox: new RemoteInbox(),
     http: { url: "http://localhost" },
     descriptor: { vault: { vaultId: "vault", historyId: "history" } },
     subscriptions: new Set(["a", "b"]),
     views: new Map(),
     offline: true,
-    execute: async () => {
-      order.push("session");
-      return [{ id: "a" }, { id: "b" }];
+    eventSequence: 7,
+    execute: async (
+      method: string,
+      params: { documents?: { packets: unknown[] }[] },
+      lease?: { before(): void; accept(value: unknown): void },
+    ) => {
+      if (method === "replica_session") {
+        lease!.before();
+        assert.deepEqual(
+          params.documents!.map((document) => document.packets.length),
+          [2, 1],
+        );
+        order.push("session");
+        const documents = [{ id: "a", content: "latest" }, { id: "b" }];
+        lease!.accept(documents);
+        return documents;
+      }
+      assert.fail(`unexpected derived read: ${method}`);
     },
     clearPatches: () => {},
     document: (state: { id: string }) => state,
@@ -167,8 +183,9 @@ test("connect imports pushes only after every open and the new replica session i
       requestId: socket.requests[1].requestId,
       result: opened("b"),
     });
-    const documents = await connecting;
-    assert.deepEqual(order, ["session", "push"]);
+    const { documents, sequence } = await connecting;
+    assert.equal(sequence, 7);
+    assert.deepEqual(order, ["session"]);
     assert.equal(
       documents.find((document: { id: string }) => document.id === "a").content,
       "latest",
@@ -182,7 +199,8 @@ test("connect imports pushes only after every open and the new replica session i
 });
 
 test("first failed composition import pauses the real host and never imports remaining packets", async () => {
-  const { RemoteEditorHost } = await import("../../src/lib/editor/remote/host");
+  const { RemoteEditorSession } =
+    await import("../../src/lib/editor/remote/editor-session");
   const inbox = new RemoteInbox();
   const first = receipt();
   const second = receipt();
@@ -196,7 +214,7 @@ test("first failed composition import pauses the real host and never imports rem
   let pauseScheduled = false;
   // Exercise the real composition and networkFailure methods, substituting
   // only transport/core IO; no Worker or websocket is needed for this failure.
-  const host = Object.assign(Object.create(RemoteEditorHost.prototype), {
+  const host = Object.assign(Object.create(RemoteEditorSession.prototype), {
     inbox,
     offline: false,
     transport: {
@@ -221,11 +239,12 @@ test("first failed composition import pauses the real host and never imports rem
 });
 
 test("file writes return the backend revision after remote metadata reopening", async () => {
-  const { RemoteEditorHost } = await import("../../src/lib/editor/remote/host");
+  const { RemoteEditorSession } =
+    await import("../../src/lib/editor/remote/editor-session");
   const reopened: RemoteReceipt[] = [];
   const opened = receipt();
   const transport = { request: async () => opened };
-  const host = Object.assign(Object.create(RemoteEditorHost.prototype), {
+  const host = Object.assign(Object.create(RemoteEditorSession.prototype), {
     offline: false,
     transport,
     hosts: new Map([["a", { id: "a", path: "a" }]]),

@@ -5,19 +5,19 @@ import type {
   InstanceIdentity,
   RpcError,
   ServiceEvent,
-  WorkerMessage,
-  WorkerRequest,
+  ServiceMessage,
+  ServiceRequest,
 } from "./contract";
 
 export interface MessageTransport {
-  postMessage(message: WorkerRequest): void;
+  postMessage(message: ServiceRequest): void;
   addEventListener(
     type: "message",
-    listener: (event: MessageEvent<WorkerMessage>) => void,
+    listener: (event: MessageEvent<ServiceMessage>) => void,
   ): void;
   removeEventListener(
     type: "message",
-    listener: (event: MessageEvent<WorkerMessage>) => void,
+    listener: (event: MessageEvent<ServiceMessage>) => void,
   ): void;
 }
 export function encodeError(error: unknown): RpcError {
@@ -117,7 +117,7 @@ export class EditorClient {
       30000,
     );
   }
-  private message = (event: MessageEvent<WorkerMessage>) => {
+  private message = (event: MessageEvent<ServiceMessage>) => {
     const message = event.data;
     if (!message || this.closed) return;
     if (message.kind === "ready") {
