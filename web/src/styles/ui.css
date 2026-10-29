@@ -4,11 +4,15 @@
 }
 
 .ui-button[data-variant="primary"] {
-  --uno: "border-transparent bg-accent text-accent-foreground";
+  --uno: "border-transparent bg-foreground text-surface";
 }
 
 .ui-button[data-variant="primary"]:hover {
-  --uno: "bg-accent-hover";
+  background: color-mix(
+    in srgb,
+    var(--color-foreground) 88%,
+    var(--color-surface)
+  );
 }
 
 .ui-button[data-variant="ghost"] {
@@ -52,7 +56,7 @@
 }
 
 .ui-dialog > h2 {
-  --uno: "pr-6 text-ui-heading font-medium";
+  --uno: "pr-6 text-ui-heading font-semibold";
 }
 
 .ui-dialog > p {
@@ -90,13 +94,34 @@
 }
 
 .ui-input:hover {
-  border-color: var(--color-focus);
+  border-color: var(--color-secondary);
 }
 
 .ui-input:focus-visible {
   border-color: var(--color-focus);
   outline: 2px solid var(--color-focus);
   outline-offset: 2px;
+}
+
+@media (max-width: 700px) {
+  .ui-dialog {
+    padding: 24px 20px;
+  }
+
+  .ui-dialog .ui-button,
+  .ui-menu-item {
+    min-height: 44px;
+  }
+
+  .ui-dialog .ui-icon-button {
+    min-width: 44px;
+    width: 44px;
+  }
+
+  .ui-input {
+    min-height: 44px;
+    font-size: 16px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

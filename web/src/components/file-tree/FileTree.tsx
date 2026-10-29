@@ -3,6 +3,7 @@ import {
   For,
   Show,
   createEffect,
+  createMemo,
   createSignal,
   onCleanup,
   onSettled,
@@ -25,6 +26,8 @@ import {
   Download,
   Upload,
   Move,
+  Link2,
+  Ellipsis,
 } from "@/components/icons";
 import {
   Button,
@@ -41,8 +44,13 @@ import {
   TextField,
   TextFieldLabel,
   TextFieldInput,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "@/components/ui";
-import { ROOT_PATH, vaultPath } from "@/lib/vault";
+import { ROOT_PATH, childPath, vaultPath } from "@/lib/vault";
 import type { VaultBackend, VaultPath } from "@/lib/vault";
 import {
   FileTreeModel,
@@ -52,20 +60,47 @@ import {
   describeTreeError,
 } from "@/lib/file-tree/model";
 import type { TreeChange } from "@/lib/file-tree/model";
+import type { GitStatusSnapshot } from "@/lib/editor/generated/celestite_core";
+import {
+  GIT_STATUS_LABELS,
+  summarizeGitStatus,
+  type GitDisplayStatus,
+  type GitStatusSource,
+} from "@/lib/git/status";
 import { StatusSlot } from "@/components/ui/status-slot";
+import { FileQuickOpen } from "./FileQuickOpen";
 import "./file-tree.css";
+
+export interface FileTreeActions {
+  createNote: () => void;
+  focus: () => void;
+}
+
+/** 按根目录的写法选择分隔符，把 Vault 相对路径拼成本地绝对路径。 */
+function joinRootPath(root: string, path: VaultPath): string {
+  const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  const base = root.replace(/[\\/]+$/, "");
+  return path ? `${base}${separator}${path.split("/").join(separator)}` : base;
+}
 
 export interface FileTreeProps {
   disabled?: boolean;
+  readOnly?: boolean;
   backend: VaultBackend;
   model?: FileTreeModel;
   viewState?: { scrollTop: number };
   statusMount?: Element;
+  /** Optional read-only Git decoration supplied by the Vault host. */
+  git?: GitStatusSource;
   label?: string;
+  /** 本地 Vault 的绝对根目录；浏览器或远端 Vault 没有绝对路径时为 null。 */
+  rootPath?: string | null;
   onOpen?: (path: VaultPath) => void;
   onChange?: (change: TreeChange) => void;
+  onReady?: (actions: FileTreeActions | undefined) => void;
 }
 type TreeDialog =
+  | { kind: "create-note"; parent: VaultPath }
   | { kind: "create-file"; parent: VaultPath }
   | { kind: "create-directory"; parent: VaultPath }
   | { kind: "rename"; path: VaultPath }
@@ -79,9 +114,16 @@ export function FileTree(props: FileTreeProps) {
     new FileTreeModel(props.backend, (change) => props.onChange?.(change));
   const [state, setState] = createSignal(model.snapshot());
   const unsubscribe = model.subscribe(setState);
+  const [gitSnapshot, setGitSnapshot] = createSignal<GitStatusSnapshot | null>(
+    null,
+  );
+  const gitView = createMemo(() => summarizeGitStatus(gitSnapshot()));
+  let stopGit: (() => void) | undefined;
   const [dialog, setDialog] = createSignal<TreeDialog | null>(null);
   const [dropTarget, setDropTarget] = createSignal<VaultPath | null>(null);
   const [localError, setLocalError] = createSignal<string | null>(null);
+  const [notice, setNotice] = createSignal<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   const id = `file-tree-${crypto.randomUUID()}`;
   const mime = "application/x-celestite-tree";
   let tree!: HTMLDivElement;
@@ -95,7 +137,10 @@ export function FileTree(props: FileTreeProps) {
   let disposed = false;
   let previousDisabled: boolean | undefined;
   let unwatch: (() => void) | undefined;
+  let dialogOpener: HTMLElement | undefined;
   const itemId = (path: VaultPath) => `${id}-${encodeURIComponent(path)}`;
+  const canWrite = () =>
+    !props.disabled && !props.readOnly && !model.snapshot().busy;
   /**
    * 菜单或弹窗关闭后把焦点还给文件树。Kobalte 的 ContextMenu 在 Esc 关闭时
    * 不触发 onCloseAutoFocus，且浮层卸载可能把焦点落到 body，因此这里同步聚焦
@@ -111,10 +156,19 @@ export function FileTree(props: FileTreeProps) {
   const closeDialog = () => {
     setDialog(null);
   };
+  const announce = (message: string) => {
+    setNotice(message);
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => setNotice(null), 2200);
+  };
   const requestDialog = (value: TreeDialog) => {
-    if (!props.disabled && !model.snapshot().busy) {
+    if (canWrite()) {
       model.clearError();
       setLocalError(null);
+      dialogOpener =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : undefined;
       setDialog(value);
     }
   };
@@ -124,6 +178,8 @@ export function FileTree(props: FileTreeProps) {
     kind: "create-file" | "create-directory",
     parent = newParent(),
   ) => requestDialog({ kind, parent });
+  const createNote = () =>
+    requestDialog({ kind: "create-note", parent: newParent() });
   const selectedPaths = () => model.selection();
   const open = (path: VaultPath) => {
     const row = model.snapshot().rows.find((row) => row.path === path);
@@ -142,12 +198,32 @@ export function FileTree(props: FileTreeProps) {
     const paths = selectedPaths();
     if (paths.length) requestDialog({ kind: "move", paths });
   };
+  const copyPaths = (absolute: boolean) => {
+    const paths = selectedPaths();
+    const root = props.rootPath;
+    if (!paths.length || (absolute && !root)) return;
+    const text = paths
+      .map((path) => (absolute ? joinRootPath(root!, path) : path))
+      .join("\n");
+    void navigator.clipboard.writeText(text).then(
+      () =>
+        announce(
+          paths.length > 1 ? `已复制 ${paths.length} 个路径` : "已复制路径",
+        ),
+      () => setLocalError("无法复制路径，请检查剪贴板权限。"),
+    );
+  };
   const importFiles = (parent: VaultPath) => {
+    if (!canWrite()) return;
     importParent = parent;
     fileInput.click();
   };
   const paste = (parent: VaultPath) => {
+    if (!canWrite()) return;
     void model.paste(parent).then(focusTree);
+  };
+  const cut = () => {
+    if (canWrite()) model.cutSelection();
   };
   // These operations are the same in the toolbar and context menu; only the
   // destination differs (current selection versus the clicked row/root).
@@ -194,7 +270,74 @@ export function FileTree(props: FileTreeProps) {
       }
     },
   );
+  createEffect(
+    () => props.readOnly,
+    (readOnly) => {
+      if (!readOnly) return;
+      closeDialog();
+      clearDropTarget();
+      dragPaths = [];
+      if (model.snapshot().clipboard.mode === "cut") model.cancelCut();
+    },
+  );
+  // Git decoration is best-effort: a slow or failing host must never affect
+  // tree input, and the last snapshot stays visible until a new scan succeeds.
+  createEffect(
+    () => [props.git, !!props.disabled] as const,
+    ([source, blocked]) => {
+      stopGit?.();
+      stopGit = undefined;
+      if (!source || blocked) return;
+      let stopped = false;
+      let inflight = false;
+      let again = false;
+      const refresh = async () => {
+        if (
+          stopped ||
+          (typeof document !== "undefined" &&
+            document.visibilityState === "hidden")
+        )
+          return;
+        if (inflight) {
+          again = true;
+          return;
+        }
+        inflight = true;
+        try {
+          const next = await source.status();
+          if (!stopped) setGitSnapshot(next);
+        } catch {
+          // Decoration is optional; keep the previous view and retry later.
+        } finally {
+          inflight = false;
+          if (again && !stopped) {
+            again = false;
+            void refresh();
+          }
+        }
+      };
+      void refresh();
+      const timer = setInterval(() => void refresh(), 3500);
+      const focus = () => void refresh();
+      const visibility = () => {
+        if (document.visibilityState === "visible") void refresh();
+      };
+      if (typeof window !== "undefined")
+        window.addEventListener("focus", focus);
+      if (typeof document !== "undefined")
+        document.addEventListener("visibilitychange", visibility);
+      stopGit = () => {
+        stopped = true;
+        clearInterval(timer);
+        if (typeof window !== "undefined")
+          window.removeEventListener("focus", focus);
+        if (typeof document !== "undefined")
+          document.removeEventListener("visibilitychange", visibility);
+      };
+    },
+  );
   onSettled(() => {
+    props.onReady?.({ createNote, focus: focusTree });
     // A new tree already starts at zero. Assigning scrollTop during mounting
     // forces layout before the rest of the workspace has finished rendering.
     if (props.viewState?.scrollTop) tree.scrollTop = props.viewState.scrollTop;
@@ -211,11 +354,14 @@ export function FileTree(props: FileTreeProps) {
   });
   onCleanup(() => {
     disposed = true;
+    props.onReady?.(undefined);
+    stopGit?.();
     unwatch?.();
     unsubscribe();
     if (props.viewState) props.viewState.scrollTop = tree?.scrollTop ?? 0;
     if (!props.model) model.dispose();
     stopHover();
+    clearTimeout(noticeTimer);
   });
   createEffect(
     () => state().focused,
@@ -257,7 +403,7 @@ export function FileTree(props: FileTreeProps) {
     }
     if (command && event.key.toLowerCase() === "x") {
       event.preventDefault();
-      model.cutSelection();
+      cut();
       return;
     }
     if (command && event.key.toLowerCase() === "c") {
@@ -360,7 +506,7 @@ export function FileTree(props: FileTreeProps) {
     }
   }
   function accepts(event: DragEvent, parent: VaultPath) {
-    if (props.disabled || model.snapshot().busy) return false;
+    if (!canWrite()) return false;
     if (dragPaths.length) return model.canMove(dragPaths, parent);
     return Array.from(event.dataTransfer?.types ?? []).includes("Files");
   }
@@ -449,6 +595,7 @@ export function FileTree(props: FileTreeProps) {
             <MenuAction
               icon={action.icon}
               label={action.icon === Upload ? `${action.label}…` : action.label}
+              disabled={props.readOnly}
               onSelect={() => action.run(destination())}
             />
           )}
@@ -467,12 +614,16 @@ export function FileTree(props: FileTreeProps) {
                 icon: Pencil,
                 label: "重命名…",
                 shortcut: "F2",
+                disabled: props.readOnly,
                 onSelect: requestRename,
               },
             ]}
           >
             {(action) => (
-              <MenuAction {...action} disabled={state().selected.size !== 1} />
+              <MenuAction
+                {...action}
+                disabled={state().selected.size !== 1 || action.disabled}
+              />
             )}
           </For>
           <For
@@ -481,7 +632,8 @@ export function FileTree(props: FileTreeProps) {
                 icon: Scissors,
                 label: "剪切",
                 shortcut: "Ctrl X",
-                onSelect: () => model.cutSelection(),
+                disabled: props.readOnly,
+                onSelect: cut,
               },
               {
                 icon: Copy,
@@ -489,19 +641,41 @@ export function FileTree(props: FileTreeProps) {
                 shortcut: "Ctrl C",
                 onSelect: () => model.copySelection(),
               },
-              { icon: Move, label: "移动到…", onSelect: requestMove },
             ]}
           >
             {(action) => (
-              <MenuAction {...action} disabled={!state().selected.size} />
+              <MenuAction
+                {...action}
+                disabled={!state().selected.size || action.disabled}
+              />
             )}
           </For>
+          <MenuAction
+            icon={Link2}
+            label="复制相对路径"
+            disabled={!state().selected.size}
+            onSelect={() => copyPaths(false)}
+          />
+          <Show when={props.rootPath}>
+            <MenuAction
+              icon={Link2}
+              label="复制绝对路径"
+              disabled={!state().selected.size}
+              onSelect={() => copyPaths(true)}
+            />
+          </Show>
+          <MenuAction
+            icon={Move}
+            label="移动到…"
+            disabled={props.readOnly || !state().selected.size}
+            onSelect={requestMove}
+          />
         </Show>
         <MenuAction
           icon={ClipboardPaste}
           label="粘贴"
           shortcut="Ctrl V"
-          disabled={!state().clipboard.count}
+          disabled={props.readOnly || !state().clipboard.count}
           onSelect={() => paste(destination())}
         />
         <Show
@@ -524,7 +698,7 @@ export function FileTree(props: FileTreeProps) {
             label="删除…"
             shortcut="Del"
             danger
-            disabled={!state().selected.size}
+            disabled={props.readOnly || !state().selected.size}
             onSelect={requestDelete}
           />
         </Show>
@@ -550,6 +724,20 @@ export function FileTree(props: FileTreeProps) {
     const directory = () => row()?.kind === "directory";
     const destination = () =>
       directory() ? rowProps.path : parentPath(rowProps.path);
+    const gitStatus = (): GitDisplayStatus | undefined =>
+      (directory() ? gitView().directories : gitView().files).get(
+        rowProps.path,
+      );
+    const gitLabel = () => {
+      const status = gitStatus();
+      return status ? GIT_STATUS_LABELS[status] : undefined;
+    };
+    const rowLabel = () => {
+      const label = gitLabel();
+      return label
+        ? `${entryName(rowProps.path)}（${label}）`
+        : entryName(rowProps.path);
+    };
     let pointer: { x: number; y: number } | null = null;
     return (
       <ContextMenu
@@ -561,7 +749,7 @@ export function FileTree(props: FileTreeProps) {
         <div
           role="treeitem"
           id={itemId(rowProps.path)}
-          aria-label={entryName(rowProps.path)}
+          aria-label={rowLabel()}
           aria-selected={state().selected.has(rowProps.path) ? "true" : "false"}
           aria-expanded={
             directory() ? (expanded() ? "true" : "false") : undefined
@@ -580,9 +768,12 @@ export function FileTree(props: FileTreeProps) {
             disabled={props.disabled}
             as="div"
             class="tree-row"
-            title={rowProps.path}
+            title={
+              gitLabel() ? `${rowProps.path} · ${gitLabel()}` : rowProps.path
+            }
             tabindex={-1}
             data-path={rowProps.path}
+            data-git={gitStatus() ?? "none"}
             data-selected={
               state().selected.has(rowProps.path) ? "true" : "false"
             }
@@ -595,7 +786,11 @@ export function FileTree(props: FileTreeProps) {
             style={{
               "padding-left": `${8 + ((row()?.level ?? 1) - 1) * 18}px`,
             }}
-            draggable={state().busy ? "false" : "true"}
+            draggable={
+              state().busy || props.readOnly || props.disabled
+                ? "false"
+                : "true"
+            }
             onClick={(event) => {
               event.stopPropagation();
               const modifier = event.ctrlKey || event.metaKey || event.shiftKey;
@@ -631,6 +826,10 @@ export function FileTree(props: FileTreeProps) {
             onPointerCancel={(event) => event.stopPropagation()}
             onDragStart={(event) => {
               clearDropTarget();
+              if (!canWrite()) {
+                event.preventDefault();
+                return;
+              }
               if (!model.snapshot().selected.has(rowProps.path))
                 model.select(rowProps.path);
               dragPaths = model.selection();
@@ -651,7 +850,10 @@ export function FileTree(props: FileTreeProps) {
             }
             onDrop={(event) => drop(event, destination())}
           >
-            <Show when={directory()} fallback={<span class="w-5 shrink-0" />}>
+            <Show
+              when={directory()}
+              fallback={<span class="tree-chevron-spacer" />}
+            >
               <button
                 type="button"
                 tabindex={-1}
@@ -681,7 +883,9 @@ export function FileTree(props: FileTreeProps) {
                 <FolderOpen size={16} class="text-secondary" />
               </Show>
             </Show>
-            <span class="min-w-0 truncate">{entryName(rowProps.path)}</span>
+            <span class="tree-name min-w-0 truncate">
+              {entryName(rowProps.path)}
+            </span>
           </ContextMenuTrigger>
           <Show when={directory() && expanded()}>
             <div role="group">
@@ -702,7 +906,29 @@ export function FileTree(props: FileTreeProps) {
   }
   function OperationDialog(dialogProps: { value: TreeDialog }) {
     let input!: HTMLInputElement;
+    let openedNote = false;
     const value = dialogProps.value;
+    const opener = dialogOpener;
+    const restoreFocus = () => {
+      if (
+        value.kind !== "create-note" ||
+        !opener?.isConnected ||
+        !opener.getClientRects().length
+      ) {
+        focusTree();
+        return;
+      }
+      opener.focus();
+      setTimeout(() => {
+        if (
+          !disposed &&
+          !dialog() &&
+          opener.isConnected &&
+          opener.getClientRects().length
+        )
+          opener.focus();
+      }, 0);
+    };
     const title =
       value.kind === "delete"
         ? `删除 ${value.paths.length} 项`
@@ -710,17 +936,21 @@ export function FileTree(props: FileTreeProps) {
           ? "重命名"
           : value.kind === "move"
             ? "移动到文件夹"
-            : value.kind === "create-file"
-              ? "新建文件"
-              : "新建文件夹";
+            : value.kind === "create-note"
+              ? "新建笔记"
+              : value.kind === "create-file"
+                ? "新建文件"
+                : "新建文件夹";
     const initial =
       value.kind === "rename"
         ? entryName(value.path)
-        : value.kind === "create-file"
-          ? "未命名.md"
-          : value.kind === "create-directory"
-            ? "新建文件夹"
-            : "";
+        : value.kind === "create-note"
+          ? "未命名"
+          : value.kind === "create-file"
+            ? "未命名"
+            : value.kind === "create-directory"
+              ? "新建文件夹"
+              : "";
     onSettled(() => {
       if (input) {
         input.focus();
@@ -736,9 +966,21 @@ export function FileTree(props: FileTreeProps) {
     });
     const submit = async (event: SubmitEvent) => {
       event.preventDefault();
-      if (props.disabled) return;
+      if (!canWrite()) return;
       setLocalError(null);
-      const name = input?.value ?? "";
+      const entered =
+        value.kind === "create-note"
+          ? (input?.value ?? "").trim()
+          : (input?.value ?? "");
+      if (value.kind === "create-note" && !entered) {
+        setLocalError("请输入笔记标题。");
+        input.focus();
+        return;
+      }
+      const name =
+        value.kind === "create-note" && entered && !/\.md$/i.test(entered)
+          ? `${entered}.md`
+          : entered;
       let result = false;
       if (value.kind === "delete") result = await model.remove(value.paths);
       else if (value.kind === "move") {
@@ -753,18 +995,21 @@ export function FileTree(props: FileTreeProps) {
         result = await model.create(
           value.parent,
           name,
-          value.kind === "create-file" ? "file" : "directory",
+          value.kind === "create-directory" ? "directory" : "file",
         );
       if (result) {
+        openedNote = value.kind === "create-note";
         closeDialog();
-        focusTree();
+        if (value.kind === "create-note")
+          props.onOpen?.(childPath(value.parent, name));
+        else focusTree();
       }
     };
     return (
       <DialogContent
         onCloseAutoFocus={(event) => {
           event.preventDefault();
-          focusTree();
+          if (!openedNote) restoreFocus();
         }}
       >
         <DialogTitle>{title}</DialogTitle>
@@ -775,7 +1020,9 @@ export function FileTree(props: FileTreeProps) {
               ? "填写 Vault 内的文件夹路径，留空表示根目录。已有文件不会被覆盖。"
               : value.kind === "rename"
                 ? value.path
-                : `位置：${value.parent || props.label || "Vault"}`}
+                : value.kind === "create-note"
+                  ? `保存为 Markdown 笔记 · 位置：${value.parent || props.label || "Vault"}`
+                  : `位置：${value.parent || props.label || "Vault"}`}
         </DialogDescription>
         <form
           onSubmit={(event) => void submit(event)}
@@ -791,7 +1038,11 @@ export function FileTree(props: FileTreeProps) {
           <Show when={value.kind !== "delete"}>
             <TextField defaultValue={initial}>
               <TextFieldLabel>
-                {value.kind === "move" ? "目标文件夹路径" : "名称"}
+                {value.kind === "move"
+                  ? "目标文件夹路径"
+                  : value.kind === "create-note"
+                    ? "笔记标题"
+                    : "名称"}
               </TextFieldLabel>
               <TextFieldInput
                 ref={input}
@@ -812,7 +1063,7 @@ export function FileTree(props: FileTreeProps) {
               disabled={state().busy}
               onClick={() => {
                 closeDialog();
-                focusTree();
+                restoreFocus();
               }}
             >
               取消
@@ -848,63 +1099,87 @@ export function FileTree(props: FileTreeProps) {
           clearDropTarget();
       }}
     >
-      <header class="tree-toolbar">
-        <span class="mr-auto min-w-0 truncate px-1 text-ui-sm">文件</span>
-        <For each={creationActions}>
-          {(action) => (
-            <IconButton
-              aria-label={action.label}
-              title={action.label}
-              size="sm"
-              disabled={state().busy}
-              onClick={() => action.run(newParent())}
-            >
-              <action.icon size={16} />
-            </IconButton>
-          )}
-        </For>
-        <For
-          each={[
-            {
-              label: "折叠全部",
-              icon: ChevronsUp,
-              run: () => model.collapseAll(),
-            },
-            {
-              label: "刷新文件树",
-              icon: RefreshCw,
-              run: () => void model.refresh(),
-            },
-          ]}
+      <div class="tree-navigation-actions">
+        <FileQuickOpen
+          backend={props.backend}
+          entries={state().rows}
+          disabled={props.disabled}
+          onOpen={props.onOpen}
+        />
+        <Button
+          class="tree-new-note"
+          variant="ghost"
+          disabled={state().busy || props.disabled || props.readOnly}
+          onClick={createNote}
         >
-          {(action) => (
-            <IconButton
-              aria-label={action.label}
-              title={action.label}
-              size="sm"
-              disabled={state().busy}
-              onClick={action.run}
-            >
-              <action.icon size={16} />
-            </IconButton>
-          )}
-        </For>
-      </header>
+          <FilePlus size={16} />
+          <span>新建笔记</span>
+        </Button>
+      </div>
       <div
         class="tree-region"
         data-drop={dropTarget() === ROOT_PATH ? "true" : "false"}
       >
-        <div
-          class="tree-root"
+        <header
+          class="tree-toolbar tree-root"
           onDragOver={(event) => dragOver(event, ROOT_PATH)}
           onDrop={(event) => drop(event, ROOT_PATH)}
         >
-          <FolderOpen size={16} />
-          <span class="truncate font-medium">{props.label ?? "Vault"}</span>
-          <span class="ml-auto text-ui-sm text-secondary">
+          <span class="tree-heading-label">文件</span>
+          <span class="tree-root-count">
             {state().rows.filter((row) => row.parent === ROOT_PATH).length}
           </span>
-        </div>
+          <Show when={props.readOnly}>
+            <span class="tree-readonly">只读</span>
+          </Show>
+          <Show when={props.disabled ? "disabled" : "enabled"} keyed>
+            {(_connectionState) => (
+              <DropdownMenu placement="bottom-end" gutter={6}>
+                <DropdownMenuTrigger
+                  as={IconButton}
+                  aria-label="文件操作"
+                  title="文件操作"
+                  size="sm"
+                  disabled={state().busy || props.disabled}
+                >
+                  <Ellipsis size={16} />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  onCloseAutoFocus={(event) => {
+                    if (dialog()) event.preventDefault();
+                  }}
+                >
+                  <For each={creationActions}>
+                    {(action) => (
+                      <DropdownMenuItem
+                        disabled={state().busy || props.readOnly}
+                        onSelect={() => action.run(newParent())}
+                      >
+                        <action.icon size={15} />
+                        {action.label}
+                      </DropdownMenuItem>
+                    )}
+                  </For>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={state().busy}
+                    onSelect={() => model.collapseAll()}
+                  >
+                    <ChevronsUp size={15} />
+                    折叠全部
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={state().busy}
+                    onSelect={() => void model.refresh()}
+                  >
+                    <RefreshCw size={15} />
+                    刷新文件树
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </Show>
+        </header>
         <Show when={props.disabled ? "disabled" : "enabled"} keyed>
           {(_connectionState) => (
             <ContextMenu
@@ -940,7 +1215,11 @@ export function FileTree(props: FileTreeProps) {
                 <Show when={!state().rows.length}>
                   <div class="px-5 py-8 text-center text-ui-sm text-secondary">
                     {state().busy ? "正在读取…" : "这里还没有文件"}
-                    <p class="mt-2">新建文件，或把文件拖到这里</p>
+                    <p class="mt-2">
+                      {props.readOnly
+                        ? "此文件库仅供查看"
+                        : "新建笔记，或把文件拖到这里"}
+                    </p>
                   </div>
                 </Show>
               </ContextMenuTrigger>
@@ -985,15 +1264,17 @@ export function FileTree(props: FileTreeProps) {
         >
           {state().busy
             ? state().status
-            : state().clipboard.count
-              ? `已${state().clipboard.mode === "cut" ? "剪切" : "复制"} ${state().clipboard.count} 项`
-              : state().selected.size
-                ? `已选择 ${state().selected.size} 项`
-                : state().status}
+            : (notice() ??
+              (state().clipboard.count
+                ? `已${state().clipboard.mode === "cut" ? "剪切" : "复制"} ${state().clipboard.count} 项`
+                : state().selected.size
+                  ? `已选择 ${state().selected.size} 项`
+                  : state().status))}
         </p>
       </StatusSlot>
       <p id={`${id}-help`} class="sr-only">
-        单击打开 · Ctrl / ⌘ 多选 · Shift 连选 · 拖入文件夹移动
+        单击打开 · Ctrl / ⌘ 多选 · Shift 连选
+        {props.readOnly ? " · 只读文件库" : " · 拖入文件夹移动"}
       </p>
       <input
         ref={fileInput}
@@ -1001,10 +1282,11 @@ export function FileTree(props: FileTreeProps) {
         multiple
         class="hidden"
         aria-label="选择要导入的文件"
+        disabled={props.disabled || props.readOnly}
         onChange={(event) => {
           const files = Array.from(event.currentTarget.files ?? []);
           event.currentTarget.value = "";
-          if (files.length && !props.disabled)
+          if (files.length && canWrite())
             void model.importFiles(files, importParent).then(focusTree);
         }}
       />

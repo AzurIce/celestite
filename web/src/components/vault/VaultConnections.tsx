@@ -1,16 +1,21 @@
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createEffect, createSignal } from "solid-js";
 import {
   Button,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogTitle,
-  DialogTrigger,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
   IconButton,
 } from "../ui";
-import { Folder, X } from "../icons";
+import { Check, ChevronDown, Folder, X } from "../icons";
 import { isDesktop } from "@/lib/desktop/platform";
 import { supportsLocalDirectories } from "@/lib/vault/file-system-access";
+import brandIcon from "../../../../icons/64x64.png";
 import {
   type VaultManager,
   type VaultManagerSnapshot,
@@ -26,19 +31,79 @@ export function VaultConnections(props: {
   const [error, setError] = createSignal<string | null>(null);
   const [removing, setRemoving] = createSignal<VaultConnection | null>(null);
   const [open, setOpen] = createSignal(false);
+  let vaultTrigger: HTMLButtonElement | undefined;
+  let dialogContent: HTMLDivElement | undefined;
+  // The menu item opens the dialog programmatically, so move focus into it for
+  // Escape handling and the focus trap that a trigger would normally install.
+  createEffect(
+    () => open(),
+    (value) => {
+      if (value) queueMicrotask(() => dialogContent?.focus());
+    },
+  );
+  function permission(connection: VaultConnection) {
+    const vault = props.state.opened.find(
+      (vault) => vault.id === connection.id,
+    );
+    if (vault) return vault.readOnly ? "只读" : "可编辑";
+    if (
+      connection.kind === "remote" &&
+      new URL(connection.url!).pathname.split("/").pop()?.startsWith("ro-")
+    )
+      return "只读";
+    return "未连接";
+  }
+  function source(connection: VaultConnection) {
+    if (connection.kind === "opfs") return "此浏览器";
+    if (connection.kind === "native") return "本机";
+    if (connection.kind === "directory")
+      return connection.directoryPath ?? "本机目录";
+    const url = new URL(connection.url!);
+    return url.host + url.pathname.slice(0, url.pathname.lastIndexOf("/"));
+  }
+  function switcherLabel(connection: VaultConnection) {
+    const sameName =
+      props.state.connections.filter((other) => other.name === connection.name)
+        .length > 1;
+    const details = sameName ? [source(connection)] : [];
+    const access = permission(connection);
+    if (access === "只读" || (sameName && connection.kind === "remote"))
+      details.push(access);
+    return [connection.name, ...details].join(" · ");
+  }
   function description(connection: VaultConnection) {
-    if (connection.kind === "opfs" || connection.kind === "native")
-      return "默认本地 Vault · 不可移除";
+    if (connection.kind === "opfs")
+      return "保存在此浏览器 · 默认 Vault，不可移除";
+    if (connection.kind === "native")
+      return "保存在本机 · 默认 Vault，不可移除";
     if (connection.kind === "directory")
       return connection.directoryPath
         ? `本机目录 · ${connection.directoryPath}`
         : "本机目录 · 文件直接保存到此目录";
-    const vault = props.state.opened.find(
-      (vault) => vault.id === connection.id,
-    );
-    const status = vault ? (vault.readOnly ? "只读" : "可编辑") : "未连接";
-    return `${new URL(connection.url!).origin} · ${status}`;
+    return `${new URL(connection.url!).origin} · ${permission(connection)}`;
   }
+  function removalDescription(connection: VaultConnection) {
+    if (connection.kind !== "remote")
+      return "会先保存已打开的文件，目录中的文件仍保留。";
+    if (permission(connection) === "只读")
+      return "会关闭当前会话，服务器上的文件仍保留。";
+    return "会确认编辑已发送并关闭当前会话，不会将更改保存到服务器磁盘。需要落盘的更改请先保存，服务器上的文件仍保留。";
+  }
+  const activeConnection = () =>
+    props.state.connections.find(
+      (connection) => connection.id === props.state.active?.id,
+    ) ??
+    props.state.connections.find(
+      (connection) => connection.id === props.manager.defaultId,
+    );
+  const activeLabel = () => {
+    const connection = activeConnection();
+    return connection ? switcherLabel(connection) : "Vault";
+  };
+  const activeDescription = () => {
+    const connection = activeConnection();
+    return connection ? description(connection) : undefined;
+  };
   async function connect(event: SubmitEvent) {
     event.preventDefault();
     if (busy()) return;
@@ -80,22 +145,61 @@ export function VaultConnections(props: {
     }
   }
   return (
-    <>
-      <select
-        class="vault-switcher"
-        aria-label="当前 Vault"
-        value={props.state.active?.id ?? props.manager.defaultId}
-        disabled={props.state.opening || busy()}
-        onChange={(event) =>
-          void props.manager.activate(event.currentTarget.value)
-        }
-      >
-        <For each={props.state.connections}>
-          {(connection) => (
-            <option value={connection.id}>{connection.name}</option>
-          )}
-        </For>
-      </select>
+    <div class="vault-connections-header">
+      <img class="vault-brand-icon" src={brandIcon} alt="" aria-hidden="true" />
+      <DropdownMenu placement="bottom-start" gutter={6}>
+        <DropdownMenuTrigger
+          ref={vaultTrigger}
+          class="vault-switcher"
+          aria-label="当前 Vault"
+          aria-description={activeLabel()}
+          title={activeDescription()}
+          data-vault-id={props.state.active?.id ?? props.manager.defaultId}
+          disabled={props.state.opening || busy()}
+        >
+          <span class="vault-switcher-label">{activeLabel()}</span>
+          <ChevronDown class="vault-switcher-chevron" size={14} />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent class="vault-switcher-menu">
+          <DropdownMenu.RadioGroup
+            value={props.state.active?.id ?? props.manager.defaultId}
+            onChange={(value) => void props.manager.activate(value)}
+            aria-label="选择 Vault"
+          >
+            <For each={props.state.connections}>
+              {(connection) => (
+                <DropdownMenu.RadioItem
+                  closeOnSelect
+                  value={connection.id}
+                  aria-label={switcherLabel(connection)}
+                  class="ui-menu-item vault-switcher-item"
+                >
+                  <span class="vault-switcher-item-label">
+                    {switcherLabel(connection)}
+                  </span>
+                  <Show
+                    when={
+                      (props.state.active?.id ?? props.manager.defaultId) ===
+                      connection.id
+                    }
+                  >
+                    <Check size={14} />
+                  </Show>
+                </DropdownMenu.RadioItem>
+              )}
+            </For>
+          </DropdownMenu.RadioGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            class="vault-switcher-manage"
+            disabled={props.state.opening || busy()}
+            onSelect={() => setOpen(true)}
+          >
+            <Folder size={15} />
+            <span>管理 Vault</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <Dialog
         open={open()}
         onOpenChange={(value) => {
@@ -108,15 +212,14 @@ export function VaultConnections(props: {
           }
         }}
       >
-        <DialogTrigger
-          as={IconButton}
-          size="sm"
-          aria-label="管理 Vault"
-          title="管理 Vault"
+        <DialogContent
+          ref={dialogContent}
+          class="vault-connections-dialog"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            vaultTrigger?.focus();
+          }}
         >
-          <Folder size={15} />
-        </DialogTrigger>
-        <DialogContent class="vault-connections-dialog">
           <DialogTitle>管理 Vault</DialogTitle>
           <DialogDescription>
             默认 Vault 始终保留。可打开本机目录，或连接服务器上的远端 Vault。
@@ -125,7 +228,7 @@ export function VaultConnections(props: {
             <For each={props.state.connections}>
               {(connection) => (
                 <li>
-                  <div class="min-w-0 flex-1">
+                  <div class="vault-connection-copy">
                     <p class="text-ui-sm font-medium">{connection.name}</p>
                     <p
                       class="mt-1 break-all text-ui-sm text-secondary"
@@ -138,38 +241,40 @@ export function VaultConnections(props: {
                       {description(connection)}
                     </p>
                   </div>
-                  <Show when={connection.kind === "remote"}>
+                  <div class="vault-connection-actions">
+                    <Show when={connection.kind === "remote"}>
+                      <Button
+                        size="sm"
+                        onClick={() =>
+                          void navigator.clipboard
+                            .writeText(connection.url!)
+                            .catch(() => setError("无法复制连接链接。"))
+                        }
+                      >
+                        复制链接
+                      </Button>
+                    </Show>
                     <Button
                       size="sm"
-                      onClick={() =>
-                        void navigator.clipboard
-                          .writeText(connection.url!)
-                          .catch(() => setError("无法复制连接链接。"))
-                      }
+                      disabled={busy() || props.state.opening}
+                      onClick={async () => {
+                        if (await props.manager.activate(connection.id))
+                          setOpen(false);
+                      }}
                     >
-                      复制链接
+                      打开
                     </Button>
-                  </Show>
-                  <Button
-                    size="sm"
-                    disabled={busy() || props.state.opening}
-                    onClick={async () => {
-                      if (await props.manager.activate(connection.id))
-                        setOpen(false);
-                    }}
-                  >
-                    打开
-                  </Button>
-                  <Show when={connection.id !== props.manager.defaultId}>
-                    <IconButton
-                      size="sm"
-                      aria-label={`移除连接 ${connection.name}`}
-                      disabled={busy()}
-                      onClick={() => setRemoving(connection)}
-                    >
-                      <X size={14} />
-                    </IconButton>
-                  </Show>
+                    <Show when={connection.id !== props.manager.defaultId}>
+                      <IconButton
+                        size="sm"
+                        aria-label={`移除连接 ${connection.name}`}
+                        disabled={busy()}
+                        onClick={() => setRemoving(connection)}
+                      >
+                        <X size={14} />
+                      </IconButton>
+                    </Show>
+                  </div>
                 </li>
               )}
             </For>
@@ -178,8 +283,8 @@ export function VaultConnections(props: {
             {(connection) => (
               <div class="mt-4 rounded-control border border-solid border-border p-3">
                 <p class="text-ui-sm">
-                  移除“{connection.name}
-                  ”的连接？会先保存已打开的文件，目录中的文件仍保留。
+                  移除“{connection.name}”的连接？
+                  {removalDescription(connection)}
                 </p>
                 <div class="mt-3 flex justify-end gap-2">
                   <Button
@@ -254,6 +359,6 @@ export function VaultConnections(props: {
           </Show>
         </DialogContent>
       </Dialog>
-    </>
+    </div>
   );
 }

@@ -13,6 +13,8 @@ import { VaultConnectionBoundary } from "@/components/vault/VaultConnectionBound
 import { VaultConnections } from "@/components/vault/VaultConnections";
 import "./components/vault/vault.css";
 import { FileTree } from "@/components/file-tree";
+import type { FileTreeActions } from "@/components/file-tree/FileTree";
+import { supportsLocalDirectories } from "@/lib/vault/file-system-access";
 import {
   Button,
   IconButton,
@@ -21,7 +23,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui";
-import { Moon, Sun, Monitor, Check } from "@/components/icons";
+import { Moon, Sun, Monitor, Check, X } from "@/components/icons";
 import { theme, setTheme } from "@/lib/theme";
 import { SETTINGS_SCHEMA } from "@/lib/settings/schema";
 import {
@@ -58,12 +60,148 @@ function clampSidebarWidth(value: number) {
 
 export default function VaultWorkspace() {
   const manager = new VaultManager();
+  const narrowQuery = window.matchMedia("(max-width: 700px)");
+  const [narrow, setNarrow] = createSignal(narrowQuery.matches);
+  const [sidebarOpen, setSidebarOpen] = createSignal(!narrowQuery.matches);
+  const [focusMode, setFocusMode] = createSignal(false);
+  const sidebarVisible = () => sidebarOpen() && !focusMode();
+  const drawerOpen = () => narrow() && sidebarVisible();
+  let sidebar: HTMLElement | undefined;
+  let editorPane: HTMLDivElement | undefined;
+  let drawerOpener: HTMLElement | undefined;
+  let drawerWasOpen = false;
+  function toggleSidebar() {
+    drawerOpener =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : undefined;
+    const next = !sidebarVisible();
+    setFocusMode(false);
+    setSidebarOpen(next);
+  }
+  function toggleFocus() {
+    setFocusMode(!focusMode());
+  }
+  function focusable(element: Element): element is HTMLElement {
+    return (
+      element instanceof HTMLElement &&
+      !element.closest("[inert], [hidden]") &&
+      !element.matches(":disabled") &&
+      element.getClientRects().length > 0
+    );
+  }
+  function drawerTargets() {
+    return Array.from(
+      sidebar?.querySelectorAll(
+        "button, select, input, a[href], [tabindex='0']",
+      ) ?? [],
+    ).filter(focusable);
+  }
+  function restoreDrawerFocus() {
+    const target = [
+      drawerOpener,
+      editorPane?.querySelector("[aria-label='切换文件导航']"),
+      editorPane?.querySelector(".cm-content"),
+    ].find(
+      (element): element is HTMLElement =>
+        !!element && element.isConnected && focusable(element),
+    );
+    target?.focus();
+  }
+  createEffect(drawerOpen, (open) => {
+    if (open === drawerWasOpen) return;
+    drawerWasOpen = open;
+    queueMicrotask(() => {
+      if (drawerOpen()) drawerTargets()[0]?.focus();
+      else if (sidebar?.contains(document.activeElement)) restoreDrawerFocus();
+    });
+  });
+  createEffect(sidebarVisible, (visible) => {
+    if (!visible && sidebar?.contains(document.activeElement)) {
+      queueMicrotask(restoreDrawerFocus);
+    }
+  });
+  onSettled(() => {
+    const resize = () => {
+      setNarrow(narrowQuery.matches);
+      setSidebarOpen(!narrowQuery.matches);
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (
+        !drawerOpen() ||
+        !sidebar ||
+        !focusable(sidebar) ||
+        document.querySelector(
+          ".ui-dialog[data-expanded], .ui-menu[data-expanded]",
+        ) ||
+        event.defaultPrevented ||
+        event.isComposing
+      )
+        return;
+      const floating = (event.target as Element | null)?.closest?.(
+        ".ui-dialog, .ui-menu",
+      );
+      if (floating) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false);
+      } else if (event.key === "Tab") {
+        const targets = drawerTargets();
+        const first = targets[0],
+          last = targets[targets.length - 1];
+        if (!targets.length) return;
+        if (
+          !sidebar.contains(document.activeElement) ||
+          (event.shiftKey
+            ? document.activeElement === first
+            : document.activeElement === last)
+        ) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus();
+        }
+      }
+    };
+    const focusin = (event: FocusEvent) => {
+      const target = event.target as Element | null;
+      if (
+        !drawerOpen() ||
+        !sidebar ||
+        !focusable(sidebar) ||
+        document.querySelector(
+          ".ui-dialog[data-expanded], .ui-menu[data-expanded]",
+        ) ||
+        !target ||
+        target.closest(".ui-dialog, .ui-menu") ||
+        sidebar.contains(target)
+      )
+        return;
+      drawerTargets()[0]?.focus();
+    };
+    narrowQuery.addEventListener("change", resize);
+    document.addEventListener("keydown", keydown);
+    document.addEventListener("focusin", focusin);
+    return () => {
+      narrowQuery.removeEventListener("change", resize);
+      document.removeEventListener("keydown", keydown);
+      document.removeEventListener("focusin", focusin);
+    };
+  });
   const [vaults, setVaults] = createSignal(manager.snapshot());
   const unsubscribe = manager.subscribe(setVaults);
   const documents = () => vaults().active;
   const opening = () => vaults().opening;
   const [lifecycleError, setLifecycleError] = createSignal<string | null>(null);
   const openError = () => lifecycleError() ?? vaults().error;
+  const [startupRecovery, setStartupRecovery] = createSignal(false);
+  createEffect(
+    () => ({ ready: !!documents(), failed: !!openError() }),
+    ({ ready, failed }) => {
+      if (ready) setStartupRecovery(false);
+      else if (failed) setStartupRecovery(true);
+      // Keep recovery controls mounted during retries so a failed attempt
+      // preserves the dialog and its actionable error.
+    },
+  );
   const [resizing, setResizing] = createSignal(false);
   let treeStatusMount!: HTMLDivElement;
   let editorStatusMount!: HTMLDivElement;
@@ -80,6 +218,7 @@ export default function VaultWorkspace() {
     (vault) => {
       if (settingsVault === (vault?.id ?? null)) return;
       settingsVault = vault?.id ?? null;
+      if (narrowQuery.matches) setSidebarOpen(false);
       clearProjectSettings();
       if (vault)
         void attachProjectSettings(() => readProjectSettings(vault.backend));
@@ -193,114 +332,10 @@ export default function VaultWorkspace() {
     void manager.close().catch(() => {});
   });
 
-  return (
-    <main
-      class="workspace flex h-dvh min-h-0 flex-col"
-      onKeyDown={(event) => {
-        if (
-          !event.defaultPrevented &&
-          (event.ctrlKey || event.metaKey) &&
-          event.key.toLowerCase() === "s"
-        ) {
-          event.preventDefault();
-          void vaults().active?.documents.requestSave();
-        }
-      }}
-    >
-      <Show
-        when={documents()}
-        keyed
-        fallback={
-          <div class="m-auto max-w-md p-8 text-center">
-            <p role={openError() ? "alert" : "status"} class="text-secondary">
-              {opening() ? "正在打开文件库…" : openError()}
-            </p>
-            <Show when={openError()}>
-              <Button
-                class="mt-4"
-                onClick={() => void manager.activate(manager.defaultId)}
-              >
-                重试
-              </Button>
-            </Show>
-          </div>
-        }
-      >
-        {(workspace) => (
-          <VaultConnectionBoundary documents={workspace.documents}>
-            {(disabled) => (
-              <div
-                class="workspace-grid grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] sm:grid-cols-[var(--workspace-sidebar-width)_5px_minmax(0,1fr)]"
-                data-resizing={resizing() ? "true" : "false"}
-                style={{
-                  "--workspace-sidebar-width": `${sidebarWidth()}px`,
-                }}
-              >
-                <div class="workspace-sidebar flex min-h-0 flex-col">
-                  <FileTree
-                    disabled={disabled()}
-                    backend={workspace.documents.treeBackend}
-                    model={workspace.tree}
-                    viewState={workspace.treeView}
-                    statusMount={treeStatusMount}
-                    label={workspace.name}
-                    onOpen={(path) => void workspace.documents.open(path)}
-                  />
-                </div>
-                <div
-                  class="workspace-divider"
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label="调整侧边栏宽度"
-                  aria-valuenow={sidebarWidth()}
-                  aria-valuemin={SETTINGS_SCHEMA["sidebar.width"].range?.min}
-                  aria-valuemax={sidebarLimit()}
-                  title="拖动调整侧边栏宽度"
-                  tabindex={0}
-                  data-dragging={resizing() ? "true" : "false"}
-                  onKeyDown={dividerKeyDown}
-                  onPointerDown={dividerPointerDown}
-                >
-                  <span class="workspace-divider-line" />
-                </div>
-                <VaultEditor
-                  settings={{
-                    previewMode: settings().values["editor.previewMode"],
-                    wordWrap: settings().values["editor.wordWrap"],
-                    vimMode: settings().values["editor.vimMode"],
-                    wordWrapFromProject:
-                      settings().source["editor.wordWrap"] === "project",
-                  }}
-                  onSettingsChange={(patch) => {
-                    if (patch.previewMode !== undefined)
-                      void setSetting("editor.previewMode", patch.previewMode);
-                    if (patch.wordWrap !== undefined)
-                      void setSetting("editor.wordWrap", patch.wordWrap);
-                    if (patch.vimMode !== undefined)
-                      void setSetting("editor.vimMode", patch.vimMode);
-                  }}
-                  authorizeResources={workspace.authorizeResources}
-                  documents={workspace.documents}
-                  statusMount={editorStatusMount}
-                />
-              </div>
-            )}
-          </VaultConnectionBoundary>
-        )}
-      </Show>
-      <footer class="workspace-statusbar" aria-label="工作区状态栏">
-        <VaultConnections manager={manager} state={vaults()} />
-        <Show when={openError()}>
-          <span
-            role="alert"
-            class="max-w-36 truncate text-danger"
-            title={openError()!}
-          >
-            操作失败
-          </span>
-        </Show>
-        <div class="workspace-tree-status" ref={treeStatusMount} />
-        <div class="workspace-editor-status" ref={editorStatusMount} />
+  function SidebarSettings() {
+    return (
+      <div class="workspace-sidebar-footer">
+        <GlobalSettings />
         <DropdownMenu placement="top-end" gutter={6}>
           <DropdownMenuTrigger
             as={IconButton}
@@ -308,7 +343,9 @@ export default function VaultWorkspace() {
             title="主题"
             size="sm"
           >
-            <Monitor size={15} />
+            <Show when={theme() === "dark"} fallback={<Moon size={15} />}>
+              <Sun size={15} />
+            </Show>
           </DropdownMenuTrigger>
           <DropdownMenuContent>
             <DropdownMenuItem onSelect={() => setTheme("system")}>
@@ -334,7 +371,247 @@ export default function VaultWorkspace() {
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
-        <GlobalSettings />
+      </div>
+    );
+  }
+  return (
+    <main
+      class="workspace"
+      data-sidebar-open={sidebarVisible() ? "true" : "false"}
+      data-focus={focusMode() ? "true" : "false"}
+      onKeyDown={(event) => {
+        if (event.defaultPrevented || event.isComposing) return;
+        if (
+          (event.ctrlKey || event.metaKey) &&
+          event.shiftKey &&
+          event.key === "Enter"
+        ) {
+          event.preventDefault();
+          toggleFocus();
+        } else if ((event.ctrlKey || event.metaKey) && event.key === "\\") {
+          event.preventDefault();
+          toggleSidebar();
+        } else if (event.key === "Escape" && focusMode()) {
+          event.preventDefault();
+          setFocusMode(false);
+        } else if (
+          (event.ctrlKey || event.metaKey) &&
+          event.key.toLowerCase() === "s"
+        ) {
+          event.preventDefault();
+          void vaults().active?.documents.requestSave();
+        }
+      }}
+    >
+      <Show
+        when={documents()}
+        keyed
+        fallback={
+          <div class="workspace-opening">
+            <Show when={startupRecovery()}>
+              <div class="workspace-opening-tools">
+                <VaultConnections manager={manager} state={vaults()} />
+                <SidebarSettings />
+              </div>
+            </Show>
+            <div class="workspace-opening-message">
+              <p role={openError() ? "alert" : "status"} class="text-secondary">
+                {opening() || !openError() ? "正在打开文件库…" : openError()}
+              </p>
+              <Show when={openError()}>
+                <Button
+                  class="mt-4"
+                  onClick={() => void manager.activate(manager.defaultId)}
+                >
+                  重试
+                </Button>
+              </Show>
+            </div>
+          </div>
+        }
+      >
+        {(workspace) => {
+          let treeActions: FileTreeActions | undefined;
+          const connection = () =>
+            vaults().connections.find((item) => item.id === workspace.id);
+          const storageDescription = () =>
+            connection()?.kind === "opfs"
+              ? supportsLocalDirectories()
+                ? "笔记保存在此浏览器，也可以打开本机目录直接编辑。"
+                : "笔记保存在此浏览器。"
+              : connection()?.kind === "remote"
+                ? workspace.readOnly
+                  ? "当前是只读文件库。浏览文件，开始阅读。"
+                  : "已连接远端文件库。打开文件即可协作编辑。"
+                : "笔记保存在本机，编辑后会自动保存。";
+          return (
+            <VaultConnectionBoundary
+              documents={workspace.documents}
+              recoveryControls={() => (
+                <VaultConnections manager={manager} state={vaults()} />
+              )}
+            >
+              {(disabled) => {
+                createEffect(disabled, (blocked) => {
+                  if (blocked && narrowQuery.matches) setSidebarOpen(false);
+                });
+                return (
+                  <div
+                    class="workspace-grid"
+                    data-resizing={resizing() ? "true" : "false"}
+                    data-blocked={disabled() ? "true" : "false"}
+                    style={{
+                      "--workspace-sidebar-width": `${sidebarWidth()}px`,
+                    }}
+                  >
+                    <aside
+                      class="workspace-sidebar"
+                      aria-label="文件导航"
+                      role={drawerOpen() ? "dialog" : undefined}
+                      aria-modal={drawerOpen() ? "true" : undefined}
+                      ref={sidebar}
+                    >
+                      <div class="workspace-vault-header">
+                        <VaultConnections manager={manager} state={vaults()} />
+                        <Show when={narrow()}>
+                          <IconButton
+                            class="workspace-drawer-close"
+                            size="sm"
+                            aria-label="收起文件导航"
+                            title="收起文件导航"
+                            onClick={() => setSidebarOpen(false)}
+                          >
+                            <X size={17} />
+                          </IconButton>
+                        </Show>
+                      </div>
+                      <FileTree
+                        disabled={disabled()}
+                        readOnly={workspace.readOnly}
+                        onReady={(actions) => {
+                          treeActions = actions;
+                        }}
+                        backend={workspace.documents.treeBackend}
+                        model={workspace.tree}
+                        viewState={workspace.treeView}
+                        statusMount={treeStatusMount}
+                        git={workspace.git}
+                        label={workspace.name}
+                        rootPath={workspace.root}
+                        onOpen={(path) => {
+                          const opening = workspace.documents.open(path);
+                          if (narrowQuery.matches) setSidebarOpen(false);
+                          return opening;
+                        }}
+                      />
+                      <SidebarSettings />
+                    </aside>
+                    <div
+                      class="workspace-divider"
+                      role="separator"
+                      aria-orientation="vertical"
+                      aria-label="调整侧边栏宽度"
+                      aria-valuenow={sidebarWidth()}
+                      aria-valuemin={
+                        SETTINGS_SCHEMA["sidebar.width"].range?.min
+                      }
+                      aria-valuemax={sidebarLimit()}
+                      title="拖动调整侧边栏宽度"
+                      tabindex={sidebarVisible() && !narrow() ? 0 : -1}
+                      data-dragging={resizing() ? "true" : "false"}
+                      onKeyDown={dividerKeyDown}
+                      onPointerDown={dividerPointerDown}
+                    >
+                      <span class="workspace-divider-line" />
+                    </div>
+                    <div
+                      class="workspace-editor-pane"
+                      ref={editorPane}
+                      inert={drawerOpen()}
+                      aria-hidden={drawerOpen() ? "true" : undefined}
+                    >
+                      <VaultEditor
+                        storageDescription={storageDescription()}
+                        onNewNote={
+                          workspace.readOnly
+                            ? undefined
+                            : () => treeActions?.createNote()
+                        }
+                        onBrowseFiles={() => {
+                          setFocusMode(false);
+                          setSidebarOpen(true);
+                          onSettled(() => treeActions?.focus());
+                        }}
+                        onOpenDirectory={
+                          isDesktop() || supportsLocalDirectories()
+                            ? () => {
+                                void manager
+                                  .openDirectory()
+                                  // VaultManager reports picker errors and clears
+                                  // them when another attempt begins.
+                                  .catch(() => {});
+                              }
+                            : undefined
+                        }
+                        sidebarOpen={sidebarVisible()}
+                        onToggleSidebar={toggleSidebar}
+                        focusMode={focusMode()}
+                        onToggleFocus={toggleFocus}
+                        settings={{
+                          previewMode: settings().values["editor.previewMode"],
+                          wordWrap: settings().values["editor.wordWrap"],
+                          vimMode: settings().values["editor.vimMode"],
+                          wordWrapFromProject:
+                            settings().source["editor.wordWrap"] === "project",
+                        }}
+                        onSettingsChange={(patch) => {
+                          if (patch.previewMode !== undefined)
+                            void setSetting(
+                              "editor.previewMode",
+                              patch.previewMode,
+                            );
+                          if (patch.wordWrap !== undefined)
+                            void setSetting("editor.wordWrap", patch.wordWrap);
+                          if (patch.vimMode !== undefined)
+                            void setSetting("editor.vimMode", patch.vimMode);
+                        }}
+                        authorizeResources={workspace.authorizeResources}
+                        documents={workspace.documents}
+                        statusMount={editorStatusMount}
+                      />
+                    </div>
+                    <Show when={drawerOpen()}>
+                      <button
+                        class="workspace-drawer-backdrop"
+                        aria-label="关闭文件导航"
+                        onClick={() => setSidebarOpen(false)}
+                        tabindex={-1}
+                      />
+                    </Show>
+                  </div>
+                );
+              }}
+            </VaultConnectionBoundary>
+          );
+        }}
+      </Show>
+      <footer
+        class="workspace-statusbar"
+        aria-label="工作区状态栏"
+        inert={drawerOpen()}
+        aria-hidden={drawerOpen() ? "true" : undefined}
+      >
+        <Show when={openError()}>
+          <span
+            role="alert"
+            class="workspace-status-error"
+            title={openError()!}
+          >
+            {openError()}
+          </span>
+        </Show>
+        <div class="workspace-tree-status" ref={treeStatusMount} />
+        <div class="workspace-editor-status" ref={editorStatusMount} />
       </footer>
     </main>
   );

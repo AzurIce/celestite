@@ -347,20 +347,20 @@ test("cancelling component assets never continues from a pending directory read"
   });
   const abort = new AbortController();
   const result = resources.assets(
-    task("assets"),
+    { ...task("assets"), overlays: { "/pkg/a/index.js": "// captured entry" } },
     [
       {
         package: "pkg",
         name: "a",
         packageRoot: "/pkg",
-        path: "/pkg/components/a.js",
+        path: "/pkg/a/index.js",
         tag: "pkg-a",
       },
     ],
     abort.signal,
   );
   abort.abort();
-  entries.resolve([{ path: "/pkg/components/a.js", kind: "file" }]);
+  entries.resolve([{ path: "/pkg/a/index.js", kind: "file" }]);
   await assert.rejects(result, { name: "AbortError" });
   assert.equal(reads, 0);
 });

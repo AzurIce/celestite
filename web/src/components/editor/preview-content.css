@@ -6,6 +6,10 @@
   line-height: var(--line-height-reading);
   overflow-wrap: anywhere;
 }
+::selection {
+  background: var(--color-selected);
+  color: var(--color-foreground);
+}
 [data-notist-sync-target] {
   outline: 2px solid var(--color-accent);
   outline-offset: 3px;
@@ -39,10 +43,10 @@ article {
   box-sizing: border-box;
   max-width: var(--reading-width);
   margin: 0 auto;
-  padding: 24px var(--reading-padding) 48px;
+  padding: 50px var(--reading-padding) 120px;
 }
 article > :first-child,
-section > :first-child {
+article > section:first-child > :first-child {
   margin-top: 0;
 }
 h1,
@@ -52,21 +56,29 @@ h4,
 h5,
 h6,
 .notist-heading {
-  line-height: 1.4;
-  margin: var(--reading-section-gap) 0 10px;
+  line-height: 1.45;
+  margin: var(--reading-section-gap) 0 var(--reading-heading-after);
   font-weight: var(--reading-heading-weight);
 }
 h1 {
-  font-size: 1.75em;
+  font-size: 30px;
 }
 h2 {
-  font-size: 1.375em;
+  font-size: 23px;
 }
 h3 {
-  font-size: 1.125em;
+  font-size: 19px;
+}
+h4,
+h5,
+h6 {
+  font-size: 1em;
 }
 p {
   margin: var(--reading-paragraph-gap) 0;
+}
+strong {
+  font-weight: 600;
 }
 a {
   color: var(--color-accent);
@@ -76,19 +88,22 @@ a {
 code,
 pre {
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: 0.83em;
 }
 code {
-  background: var(--color-muted);
-  padding: 0.1em 0.3em;
+  background: var(--color-background);
+  padding: 2px 5px;
   border-radius: 3px;
 }
 pre {
-  padding: 14px 16px;
+  margin: 22px 0;
+  padding: 19px 22px;
   overflow: auto;
-  background: var(--color-muted);
-  border-radius: 4px;
-  line-height: 1.6;
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  border-radius: 5px;
+  font-size: 14px;
+  line-height: 1.8;
 }
 pre code {
   background: transparent;
@@ -97,9 +112,9 @@ pre code {
 }
 blockquote,
 .notist-callout {
-  border-left: 2px solid var(--color-accent);
-  margin: 22px 0;
-  padding: 0.2em 1em;
+  border-left: 2px solid var(--color-control-border);
+  margin: var(--reading-quote-gap) 0;
+  padding: 2px 0 2px 21px;
   color: var(--color-secondary);
 }
 blockquote > :first-child,
@@ -113,21 +128,40 @@ blockquote > :last-child,
 li > p {
   margin: 0.25em 0;
 }
+ul,
+ol {
+  padding-left: 23px;
+  margin: 17px 0 22px;
+}
+li {
+  padding-left: 3px;
+  margin: 5px 0;
+}
+li::marker {
+  color: var(--color-secondary);
+}
 table {
   display: block;
   overflow: auto;
   border-collapse: collapse;
-  margin: 1em 0;
+  width: 100%;
+  margin: 24px 0;
   max-width: 100%;
+  font-size: 14px;
 }
 th,
 td {
-  border: 1px solid var(--color-border);
-  padding: 0.35em 0.75em;
+  border-bottom: 1px solid var(--color-border);
+  padding: 10px 13px;
+  text-align: left;
 }
 th {
-  background: var(--color-muted);
-  font-weight: 600;
+  color: var(--color-secondary);
+  font-weight: 500;
+}
+th:first-child,
+td:first-child {
+  padding-left: 0;
 }
 th p,
 td p {
@@ -136,19 +170,41 @@ td p {
 hr {
   border: 0;
   border-top: 1px solid var(--color-border);
-  margin: 1.5em 0;
+  margin: 32px 0 22px;
 }
 .notist-math {
   font-family: serif;
 }
-@media (min-width: 640px) and (max-width: 959px) {
+@media (min-width: 701px) and (max-width: 1199px) {
   article {
-    padding-right: 28px;
-    padding-left: 28px;
+    max-width: 744px;
+    padding-right: 42px;
+    padding-left: 42px;
   }
 }
-@media (max-width: 639px) {
+@media (max-width: 700px) {
   article {
-    padding: 20px 16px 40px;
+    padding: 42px 22px 70px;
+  }
+  h1 {
+    font-size: 27px;
+    line-height: 1.5;
+  }
+  h2 {
+    font-size: 22px;
+  }
+  blockquote,
+  .notist-callout {
+    padding-left: 17px;
+  }
+  pre {
+    padding: 15px;
+  }
+  table {
+    font-size: 13px;
+  }
+  th,
+  td {
+    padding: 9px 7px;
   }
 }

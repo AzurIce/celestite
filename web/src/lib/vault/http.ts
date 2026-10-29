@@ -1,4 +1,4 @@
-import type { PackageResourceProvider, PreviewTask } from "../preview/contract";
+import type { PackageResourceProvider } from "../preview/contract";
 import { VaultError, type VaultErrorCode } from "./errors";
 import { vaultPath, type VaultPath } from "./path";
 import type {
@@ -22,6 +22,7 @@ export interface RemoteVaultDescriptor {
     conditionalWrite: boolean;
     documentEditing?: boolean;
     websocketSync?: boolean;
+    gitStatus?: boolean;
   };
 }
 export function normalizeVaultUrl(value: string): string {
@@ -120,31 +121,16 @@ export class HttpVaultBackend implements VaultBackend {
     descriptor: RemoteVaultDescriptor,
   ): PackageResourceProvider | undefined {
     if (!descriptor.previewResourceRoot) return;
-    const context = (task: PreviewTask) => {
-      const overlays: Record<string, string> = {};
-      for (const [path, resource] of Object.entries(task.resources ?? {}))
-        if (
-          (path === "Notist.toml" || path.endsWith("/Notist.toml")) &&
-          resource.data
-        )
-          overlays[path] = new TextDecoder().decode(
-            new Uint8Array(resource.data),
-          );
-      for (const [path, source] of Object.entries(task.overlays ?? {}))
-        if (path === "Notist.toml" || path.endsWith("/Notist.toml"))
-          overlays[path] = source;
-      return { documentPath: task.ticket.path, overlays };
-    };
     return {
       root: descriptor.previewResourceRoot,
-      read: (request, task) =>
+      read: (request, context) =>
         this.documentRequest("/preview/resources", {
-          context: context(task),
+          context,
           request,
         }),
-      readDir: (path, task) =>
+      readDir: (path, context) =>
         this.documentRequest("/preview/directory", {
-          context: context(task),
+          context,
           path,
         }),
     };

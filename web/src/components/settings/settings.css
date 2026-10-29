@@ -5,7 +5,7 @@
   --uno: "mt-6 border-t border-solid border-border pt-5";
 }
 .settings-group > h3 {
-  --uno: "m-0 mb-3 text-ui-sm font-medium text-secondary";
+  --uno: "m-0 mb-3 text-ui font-semibold text-foreground";
 }
 .settings-row {
   --uno: "grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-5 gap-y-2 py-3";
@@ -13,11 +13,15 @@
 .settings-copy {
   --uno: "min-w-0";
 }
-.settings-copy label {
-  --uno: "text-ui-sm font-medium";
+.settings-copy label,
+.settings-toggle-title {
+  --uno: "text-ui font-medium";
 }
-.settings-copy p {
+.settings-copy p,
+.settings-help {
   --uno: "mt-1 text-ui-sm text-secondary";
+  display: block;
+  line-height: 1.6;
 }
 .settings-control {
   --uno: "flex items-center gap-2";
@@ -32,8 +36,53 @@
   --uno: "border-danger";
 }
 .settings-checkbox {
-  --uno: "h-4 w-4 cursor-pointer";
-  accent-color: var(--color-accent);
+  appearance: none;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  padding: 2px;
+  border: 1px solid var(--color-secondary);
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+.settings-checkbox::before {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--color-secondary);
+  transition: transform 120ms ease;
+}
+.settings-checkbox:checked {
+  border-color: var(--color-foreground);
+  background: var(--color-foreground);
+}
+.settings-checkbox:checked::before {
+  transform: translateX(14px);
+  background: var(--color-surface);
+}
+.settings-checkbox:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+.settings-toggle {
+  display: flex;
+  min-height: 44px;
+  align-items: flex-start;
+  gap: 16px;
+  cursor: pointer;
+}
+.settings-toggle .settings-copy {
+  flex: 1;
+}
+.settings-row-toggle {
+  column-gap: 8px;
 }
 .settings-checkbox:disabled {
   --uno: "cursor-not-allowed opacity-45";
@@ -46,7 +95,7 @@
   --uno: "text-danger";
 }
 .settings-notice {
-  --uno: "mt-4 rounded-control bg-muted px-3 py-2 text-ui-sm text-secondary";
+  --uno: "mt-4 rounded-control bg-background px-3 py-2 text-ui-sm text-secondary";
 }
 .settings-error {
   --uno: "mt-4 flex items-center gap-3 text-ui-sm text-danger";
@@ -71,5 +120,18 @@
   .settings-select,
   .settings-number {
     --uno: "w-full";
+  }
+  .settings-row-toggle {
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 8px;
+  }
+  .settings-row-toggle .settings-override {
+    grid-column: span 2;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-checkbox,
+  .settings-checkbox::before {
+    transition: none;
   }
 }

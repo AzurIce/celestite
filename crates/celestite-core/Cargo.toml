@@ -11,12 +11,14 @@ default = []
 native = ["dep:cap-std", "dep:same-file", "dep:blake3", "dep:rustix"]
 wasm = ["celestite-buffer/wasm", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:tsify"]
 preview = ["dep:notist", "dep:notist-html", "dep:toml"]
+language = ["dep:notist", "dep:toml", "dep:lsp-types"]
 
 [dependencies]
 celestite-buffer.workspace = true
 notist = { workspace = true, optional = true }
 notist-html = { workspace = true, optional = true }
 toml = { version = "0.8", optional = true }
+lsp-types = { version = "0.94", optional = true }
 
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

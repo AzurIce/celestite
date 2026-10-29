@@ -34,6 +34,7 @@ const themeLabels: Record<ThemeModeSetting, string> = {
 };
 const previewLabels: Record<PreviewModeSetting, string> = {
   source: "源码",
+  live: "实时渲染",
   split: "分栏",
   preview: "预览",
 };
@@ -271,52 +272,61 @@ function SettingsFields() {
               }
             >
               <option value="source">源码</option>
+              <option value="live">实时渲染</option>
               <option value="split">分栏</option>
               <option value="preview">预览</option>
             </select>
             <Reset setting="editor.previewMode" label="文档显示模式" />
           </div>
         </div>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <label for={`${id}-wrap`}>自动换行</label>
-            <p id={`${id}-wrap-help`}>长行随编辑区宽度折行。</p>
-          </div>
-          <div class="settings-control">
+        <div class="settings-row settings-row-toggle">
+          <label class="settings-toggle" for={`${id}-wrap`}>
+            <span class="settings-copy">
+              <span class="settings-toggle-title" id={`${id}-wrap-label`}>
+                自动换行
+              </span>
+              <span class="settings-help" id={`${id}-wrap-help`}>
+                长行随编辑区宽度折行。
+              </span>
+            </span>
             <input
               id={`${id}-wrap`}
               class="settings-checkbox"
               type="checkbox"
               checked={global()["editor.wordWrap"]}
+              aria-labelledby={`${id}-wrap-label`}
               aria-describedby={`${id}-wrap-help`}
               onChange={(event) =>
                 void save("editor.wordWrap", event.currentTarget.checked)
               }
             />
-            <Reset setting="editor.wordWrap" label="自动换行" />
-          </div>
+          </label>
+          <Reset setting="editor.wordWrap" label="自动换行" />
           <OverrideNotice setting="editor.wordWrap" />
         </div>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <label for={`${id}-vim`}>Vim 模式</label>
-            <p id={`${id}-vim-help`}>
-              i 进入插入模式，Esc 返回普通模式；:w 保存。
-            </p>
-          </div>
-          <div class="settings-control">
+        <div class="settings-row settings-row-toggle">
+          <label class="settings-toggle" for={`${id}-vim`}>
+            <span class="settings-copy">
+              <span class="settings-toggle-title" id={`${id}-vim-label`}>
+                Vim 模式
+              </span>
+              <span class="settings-help" id={`${id}-vim-help`}>
+                i 进入插入模式，Esc 返回普通模式；:w 保存。
+              </span>
+            </span>
             <input
               id={`${id}-vim`}
               class="settings-checkbox"
               type="checkbox"
               checked={global()["editor.vimMode"]}
+              aria-labelledby={`${id}-vim-label`}
               aria-describedby={`${id}-vim-help`}
               onChange={(event) =>
                 void save("editor.vimMode", event.currentTarget.checked)
               }
             />
-            <Reset setting="editor.vimMode" label="Vim 模式" />
-          </div>
+          </label>
+          <Reset setting="editor.vimMode" label="Vim 模式" />
           <OverrideNotice setting="editor.vimMode" />
         </div>
       </section>
@@ -359,12 +369,15 @@ export function GlobalSettings() {
   return (
     <Dialog>
       <DialogTrigger
-        as={IconButton}
+        as={Button}
+        variant="ghost"
+        class="workspace-settings-entry"
         size="sm"
         aria-label="全局设置"
         title="全局设置"
       >
         <Settings2 size={15} />
+        <span>设置</span>
       </DialogTrigger>
       <DialogContent class="settings-dialog">
         <SettingsFields />

@@ -1,5 +1,12 @@
 import { expect, test as base } from "@playwright/test";
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
+import {
+  chooseEditorMode,
+  editorMenuClosed,
+  expectEditorMode,
+  openDocumentOptions,
+} from "./editor-actions";
+import { openVaultManager, selectVault } from "./vault-actions";
 const test = base.extend<{ runtimeErrors: string[] }>({
   runtimeErrors: [
     async ({ page }, use) => {
@@ -31,7 +38,7 @@ test.beforeEach(async ({ page }) => {
       ],
       [
         "a.not",
-        '@(id: "spot")\n= Notist\n\n[go](notes/b.not#dest) [missing](missing.not) [escape](../outside.not)\n\n😀中文 #unknown[ok]',
+        '@(id: "spot")\n= Notist\n\n[go](notes/b.not#dest) [missing](missing.not) [escape](../outside.not)\n\n😀中文 *ok*\n\n#unknown[bad]',
       ],
       ["notes/b.not", '@(id: "dest")\n= Destination\n\n目标正文'],
       [
@@ -67,27 +74,75 @@ test.beforeEach(async ({ page }) => {
   ).toBeVisible();
 });
 
+test("reading clicks and outline navigation keep the reading mode, while narrow screens explain split fallback", async ({
+  page,
+}) => {
+  await page.getByRole("treeitem", { name: "sync.md", exact: true }).click();
+  await chooseEditorMode(page, "预览");
+  const preview = page.getByRole("region", { name: "文档预览" });
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览已更新",
+  );
+  await preview.locator("h2").first().click();
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "preview",
+  );
+  await page.getByRole("button", { name: "文档大纲", exact: true }).click();
+  await page
+    .getByRole("complementary", { name: "文档大纲" })
+    .getByRole("button", { name: "Section 40", exact: true })
+    .click();
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "preview",
+  );
+  await expect(
+    preview.getByRole("heading", { name: "Section 40", exact: true }),
+  ).toBeInViewport();
+  await page.getByRole("button", { name: "收起文档大纲", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openDocumentOptions(page);
+  await expect(
+    page.getByRole("menuitemradio", { name: "分栏", exact: true }),
+  ).toHaveAttribute("aria-disabled", "true");
+  await expect(
+    page.getByRole("menuitemradio", { name: "预览", exact: true }),
+  ).toHaveAttribute("aria-checked", "true");
+  await expect(
+    page.getByText("窗口较窄，当前显示预览；加宽后恢复分栏。", { exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "split",
+  );
+});
+
 test("display mode is shared across files and Vaults and persists through settings and reload", async ({
   page,
 }) => {
   const preview = page.getByRole("region", { name: "文档预览" });
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   await page.getByRole("treeitem", { name: "a.not", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "分栏", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "split",
+  );
   await expect(preview.locator("h1")).toHaveText("Notist");
-  await page.getByRole("button", { name: "预览", exact: true }).click();
+  await chooseEditorMode(page, "预览");
   await page.getByRole("tab", { name: "a.md", exact: true }).click();
   await expect(preview.locator("h1")).toHaveText("First");
   await expect(editor).toHaveCount(0);
-  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await chooseEditorMode(page, "源码");
   await page.getByRole("tab", { name: "a.not", exact: true }).click();
   await expect(preview).toHaveCount(0);
   await expect(editor).toBeVisible();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   await expect
     .poll(() =>
       page.evaluate(async () => {
@@ -113,9 +168,10 @@ test("display mode is shared across files and Vaults and persists through settin
     .toBe("split");
   await page.reload();
   await page.getByRole("treeitem", { name: "range.md", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "分栏", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "split",
+  );
   await expect(preview.locator("h1")).toHaveText("Range");
   await page.evaluate(async () => {
     const root = await (
@@ -128,13 +184,14 @@ test("display mode is shared across files and Vaults and persists through settin
     await stream.close();
     Object.assign(window, { showDirectoryPicker: async () => root });
   });
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await openVaultManager(page);
   await page.getByRole("button", { name: "打开本机目录", exact: true }).click();
   await page.getByRole("treeitem", { name: "local.md", exact: true }).click();
   await expect(preview.locator("h1")).toHaveText("Local Vault");
-  await expect(
-    page.getByRole("button", { name: "分栏", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "split",
+  );
   await page.getByRole("button", { name: "全局设置", exact: true }).click();
   await page
     .getByRole("combobox", { name: "文档显示模式", exact: true })
@@ -143,9 +200,7 @@ test("display mode is shared across files and Vaults and persists through settin
     "已保存",
   );
   await page.keyboard.press("Escape");
-  await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .selectOption("opfs:default");
+  await selectVault(page, "我的 Vault");
   await expect(preview.locator("h1")).toHaveText("Range");
   await expect(editor).toHaveCount(0);
   await page.reload();
@@ -180,15 +235,16 @@ test("split click mapping preserves split mode and rejects stale or dragged cont
     };
   });
   await page.getByRole("treeitem", { name: "sync.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await expect(preview.locator("h2").first()).toHaveText("Section 0");
   await preview.locator("h2").first().click();
   await expect(editor).toBeFocused();
-  await expect(
-    page.getByRole("button", { name: "分栏", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "split",
+  );
   await expect
     .poll(() => page.evaluate(() => window.getSelection()?.toString()))
     .toContain("Section 0");
@@ -257,7 +313,7 @@ test("split clicks keep visible targets still and scrolling resumes without snap
   page,
 }) => {
   await page.getByRole("treeitem", { name: "sync.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   const sourceScroller = page.locator(".cm-scroller");
   const previewScroller = preview.locator(".preview-scroller");
@@ -364,7 +420,7 @@ test("preview click on a long node keeps its visible source start in place", asy
   page,
 }) => {
   await page.getByRole("treeitem", { name: "range.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   const source = page.locator(".cm-scroller");
   await expect(preview.locator("pre")).toContainText("long range");
@@ -400,7 +456,7 @@ test("split scroll uses content anchors in both directions without changing focu
   page,
 }) => {
   await page.getByRole("treeitem", { name: "sync.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h2").first()).toHaveText("Section 0");
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
@@ -471,7 +527,14 @@ test("split scroll uses content anchors in both directions without changing focu
     followedTop,
     0,
   );
-  await page.getByRole("button", { name: "滚动同步", exact: true }).click();
+  await openDocumentOptions(page);
+  const sync = page.getByRole("menuitemcheckbox", {
+    name: "滚动同步",
+    exact: true,
+  });
+  await expect(sync).toHaveAttribute("aria-checked", "true");
+  await sync.click();
+  await editorMenuClosed(page);
   const previewTop = await preview
     .locator(".preview-scroller")
     .evaluate((element) => element.scrollTop);
@@ -492,7 +555,7 @@ test("live split preview keeps the editor session and preview scroll across mode
 }) => {
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h1")).toHaveText("First");
   await expect(preview.locator("strong")).toHaveText("bold");
@@ -500,9 +563,9 @@ test("live split preview keeps the editor session and preview scroll across mode
   await preview.locator(".preview-scroller").evaluate((element) => {
     element.scrollTop = 600;
   });
-  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await chooseEditorMode(page, "源码");
   await expect(preview).toHaveCount(0);
-  await page.getByRole("button", { name: "预览", exact: true }).click();
+  await chooseEditorMode(page, "预览");
   await expect(preview.locator("h1")).toHaveText("First");
   await expect
     .poll(() =>
@@ -512,18 +575,18 @@ test("live split preview keeps the editor session and preview scroll across mode
     )
     .toBeGreaterThan(500);
   await expect(editor).toBeHidden();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   await editor.focus();
   await page.keyboard.press("Control+a");
   await page.keyboard.insertText("# Updated 😀\n\n未保存正文");
   await expect(preview.locator("h1")).toHaveText("Updated 😀");
   await expect(preview.locator("p")).toHaveText("未保存正文");
-  await page.getByRole("button", { name: "预览", exact: true }).click();
-  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await chooseEditorMode(page, "预览");
+  await chooseEditorMode(page, "源码");
   await editor.focus();
   await page.keyboard.press("Control+z");
   await expect(editor).toContainText("First");
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   await expect(preview.locator("h1")).toHaveText("First");
 });
 
@@ -532,11 +595,17 @@ test("scroll anchors are remeasured after wrapping, folding and resizing", async
 }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.getByRole("treeitem", { name: "sync.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h2").first()).toHaveText("Section 0");
-  const wrap = page.getByRole("button", { name: "自动换行", exact: true });
-  if ((await wrap.getAttribute("aria-pressed")) !== "true") await wrap.click();
+  await openDocumentOptions(page);
+  const wrap = page.getByRole("menuitemcheckbox", {
+    name: "自动换行",
+    exact: true,
+  });
+  if ((await wrap.getAttribute("aria-checked")) !== "true") await wrap.click();
+  else await page.keyboard.press("Escape");
+  await editorMenuClosed(page);
   await page.getByTitle("Fold line", { exact: true }).first().click();
   await expect(page.getByLabel("folded code")).toBeVisible();
   await page.setViewportSize({ width: 950, height: 780 });
@@ -631,22 +700,30 @@ test("Notist preview recovers errors, reports invalid links and opens Vault-rela
   page,
 }) => {
   await page.getByRole("treeitem", { name: "a.not", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h1")).toHaveText("Notist");
-  await expect(preview.locator(".notist-custom")).toHaveText("ok");
-  await preview.locator(".notist-custom").click();
+  await expect(preview.locator("strong")).toHaveText("ok");
+  await preview.locator("strong").click();
   await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeFocused();
   await expect
     .poll(() => page.evaluate(() => window.getSelection()?.toString()))
-    .toContain("ok");
-  await expect(
-    page.getByRole("button", { name: "分栏", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
+    .toBe("ok");
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "split",
+  );
   await preview.getByRole("link", { name: "escape", exact: true }).click();
-  await expect(preview.getByRole("alert")).toContainText("outside Vault");
+  await expect(
+    preview.getByRole("alert").filter({ hasText: "outside Vault" }),
+  ).toBeVisible();
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
+    "预览遇到问题",
+  );
   await preview.getByRole("link", { name: "missing", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("missing.not");
+  await expect(
+    page.getByRole("alert").filter({ hasText: "missing.not" }),
+  ).toBeVisible();
   await expect(preview.locator("h1")).toHaveText("Notist");
   await preview.getByRole("link", { name: "go", exact: true }).click();
   await expect(
@@ -658,10 +735,17 @@ test("Notist preview recovers errors, reports invalid links and opens Vault-rela
   await expect(preview.locator("h1")).toHaveText("Notist");
   await preview.locator("summary").click();
   await preview
-    .getByRole("button", { name: "unknown constructor `unknown`", exact: true })
+    .getByRole("button", {
+      name: "unknown constructor or function `unknown`",
+      exact: true,
+    })
+    .first()
     .click();
   await expect(preview).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeFocused();
+  await expect
+    .poll(() => page.evaluate(() => window.getSelection()?.toString()))
+    .toContain("unknown");
 });
 
 test("preview executor failure leaves editing usable and retry creates a new Worker", async ({
@@ -682,9 +766,9 @@ test("preview executor failure leaves editing usable and retry creates a new Wor
     };
   });
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
@@ -695,7 +779,7 @@ test("preview executor failure leaves editing usable and retry creates a new Wor
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   await workerEvaluate(page, () => {
@@ -737,7 +821,7 @@ test("a slow preview does not block saving and cannot publish an old snapshot", 
     };
   });
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect
     .poll(() =>
@@ -762,7 +846,7 @@ test("a slow preview does not block saving and cannot publish an old snapshot", 
     (self as unknown as { releasePreview: () => void }).releasePreview(),
   );
   await expect(preview.locator("h1")).toHaveText("Latest while busy");
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览已更新",
   );
 });
@@ -778,7 +862,7 @@ test("preview prose follows the theme and remains usable on narrow screens", asy
   await page.keyboard.insertText(
     '# 排版预览\n\n正文支持 **强调**、`a < b` 和 Unicode 😀。\n\n- 第一项\n  - 嵌套项\n- 第二项\n\n> 引用内容\n\n| 名称 | 内容 |\n| --- | --- |\n| 中文 | 单元格 |\n\n```rust\nfn main() { println!("hello"); }\n```\n',
   );
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h1")).toHaveText("排版预览");
   await expect(preview.locator("ul ul")).toBeVisible();
@@ -813,19 +897,21 @@ test("preview prose follows the theme and remains usable on narrow screens", asy
   await page.setViewportSize({ width: 375, height: 812 });
   await expect(editor).toBeHidden();
   await expect(preview.locator("h1")).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "预览", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
-  await expect(
-    page.getByRole("button", { name: "分栏", exact: true }),
-  ).toBeHidden();
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "preview",
+  );
+  await expectEditorMode(page, "预览");
   await page.screenshot({ path: testInfo.outputPath("preview-mobile.png") });
-  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await chooseEditorMode(page, "源码");
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("排版预览");
-  await page.getByRole("button", { name: "预览", exact: true }).click();
+  await chooseEditorMode(page, "预览");
   await expect(preview.locator("h1")).toHaveText("排版预览");
   await preview.locator("h1").click();
-  await expect(editor).toBeFocused();
-  await expect(preview).toHaveCount(0);
+  await expect(editor).toBeHidden();
+  await expect(page.locator(".editor-layout")).toHaveAttribute(
+    "data-mode",
+    "preview",
+  );
 });

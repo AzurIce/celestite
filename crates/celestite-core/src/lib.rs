@@ -3,6 +3,8 @@ pub mod editor;
 pub mod error;
 pub mod fs;
 pub mod instance;
+#[cfg(feature = "language")]
+pub mod language;
 pub mod preview;
 pub mod protocol;
 pub mod source;

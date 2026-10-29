@@ -91,6 +91,7 @@ export class EditorClient {
   private sequence = 0;
   private previewSequence = 0;
   private previewListeners = new Set<(event: PreviewEvent) => void>();
+  private languageListeners = new Set<(message: string) => void>();
   private pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -140,6 +141,9 @@ export class EditorClient {
       }
       this.previewSequence = message.event.sequence;
       for (const listener of this.previewListeners) listener(message.event);
+    } else if (message.kind === "language") {
+      // Language traffic is unordered best-effort; no sequence tracking.
+      for (const listener of this.languageListeners) listener(message.message);
     } else if (
       message.kind === "members" ||
       message.kind === "document" ||
@@ -194,6 +198,12 @@ export class EditorClient {
       this.previewListeners.delete(listener);
     };
   }
+  subscribeLanguage(listener: (message: string) => void) {
+    this.languageListeners.add(listener);
+    return () => {
+      this.languageListeners.delete(listener);
+    };
+  }
   fail(error: Error) {
     if (this.closed) return;
     this.closed = true;
@@ -206,6 +216,7 @@ export class EditorClient {
     this.transport.removeEventListener("message", this.message);
     this.listeners.clear();
     this.previewListeners.clear();
+    this.languageListeners.clear();
   }
   dispose() {
     this.fail(new VaultError("Closed", "编辑服务已关闭。"));

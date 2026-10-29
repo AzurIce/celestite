@@ -84,8 +84,22 @@ export async function loadComponents(
   for (const packageRoot of new Set(
     components.map((component) => component.packageRoot),
   )) {
-    const prefix = packageRoot ? `${packageRoot}/components/` : "components/";
-    const files = assets.files.filter((file) => file.path.startsWith(prefix));
+    // Component assets are the entry file and, for a directory entry, its
+    // subtree — both recorded under the component path itself.
+    const owned = components
+      .filter((component) => component.packageRoot === packageRoot)
+      .map((component) =>
+        component.path.endsWith("/index.js")
+          ? component.path.slice(0, -"index.js".length)
+          : component.path,
+      );
+    const files = assets.files.filter((file) =>
+      owned.some((prefix) =>
+        prefix.endsWith("/")
+          ? file.path.startsWith(prefix)
+          : file.path === prefix,
+      ),
+    );
     bundles.set(packageRoot, { digest: await assetDigest(files), files });
   }
   for (const component of components) {

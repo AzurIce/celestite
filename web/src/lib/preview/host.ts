@@ -10,7 +10,7 @@ import type {
   PreviewPort,
   PreviewExecutor,
 } from "./contract";
-import { PreviewResources } from "./resources";
+import { PreviewResources, resourceContext } from "./resources";
 import { VaultError } from "../vault/errors";
 import type { DocumentSourceSnapshot } from "../editor/generated/celestite_core";
 import { browserPreviewExecutor } from "./browser-executor";
@@ -199,7 +199,7 @@ export class PreviewHost {
           const request = requests[next++];
           const resource = await this.resources.read(
             request,
-            task,
+            resourceContext(task),
             abort.signal,
           );
           abort.signal.throwIfAborted();

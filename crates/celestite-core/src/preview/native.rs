@@ -4,9 +4,11 @@ use crate::error::{EditorError, EditorResult, ErrorCode};
 use crate::fs::native::FsVault;
 use crate::fs::validate_path;
 use crate::fs::{EntryKind, FileEntry};
-use crate::preview::{PreviewResource, PreviewResourceKind, PreviewResourceRequest};
+use crate::preview::{
+    PreviewResource, PreviewResourceKind, PreviewResourceRequest, ResourceContext,
+    manifests::ManifestSource,
+};
 use notist::{ResourceError, Resources, resources::ResourceKind};
-use serde::Deserialize;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -15,13 +17,6 @@ use std::{
 };
 
 const LIMIT: u64 = 16 * 1024 * 1024;
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Context {
-    pub document_path: String,
-    #[serde(default)]
-    pub overlays: BTreeMap<String, String>,
-}
 struct Discovery<'a> {
     root: &'a FsPath,
     overlays: BTreeMap<PathBuf, &'a str>,
@@ -33,7 +28,9 @@ impl Resources for Discovery<'_> {
     }
     fn read(&self, path: &FsPath) -> Result<Vec<u8>, ResourceError> {
         let path = self.resolve(path);
-        if path.file_name().is_some_and(|name| name == "lib.notc")
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "notc")
             || (!path.starts_with(self.root)
                 && path.file_name().is_some_and(|name| name == "Notist.toml"))
         {
@@ -84,10 +81,18 @@ impl Resources for Discovery<'_> {
     fn source(&self, path: &FsPath) -> Result<String, ResourceError> {
         let source = String::from_utf8(self.read(path)?)
             .map_err(|_| ResourceError::InvalidUtf8(self.resolve(path)))?;
-        Ok(source
+        let source = source
             .trim_start_matches('\u{feff}')
             .replace("\r\n", "\n")
-            .replace('\r', "\n"))
+            .replace('\r', "\n");
+        let path = self.resolve(path);
+        if path.file_name().is_some_and(|name| name == "Notist.toml") {
+            // Package grants must not run user processes while discovering the
+            // import graph. The real preview execution later runs them once.
+            Ok(ManifestSource::new(source, true).analysis)
+        } else {
+            Ok(source)
+        }
     }
 }
 pub struct PackageResources {
@@ -97,40 +102,50 @@ impl PackageResources {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
-    pub fn grant(&self, context: &Context) -> EditorResult<PackageGrant> {
+    pub fn grant(&self, context: &ResourceContext) -> EditorResult<PackageGrant> {
         validate_path(&context.document_path)?;
+        if context.document_path.is_empty() {
+            return Err(EditorError::new(
+                ErrorCode::InvalidPath,
+                "Expected a source document path",
+                "",
+            ));
+        }
         let mut overlays = BTreeMap::new();
-        let mut bytes = 0usize;
+        let mut roots = BTreeMap::new();
+        let mut bytes = context.source.len();
         for (path, source) in &context.overlays {
             let identity = if FsPath::new(path).is_absolute() {
                 let identity = FsPath::new(path);
-                if notist::resources::normalize(identity) != identity {
+                if notist::resources::normalize(identity) != identity
+                    || identity
+                        .file_name()
+                        .is_none_or(|name| name != "Notist.toml")
+                {
                     return Err(EditorError::new(
                         ErrorCode::InvalidPath,
-                        "Expected a normalized package manifest identity",
+                        "External overlays must be normalized Notist configuration paths",
                         path,
                     ));
                 }
                 identity.to_owned()
             } else {
                 validate_path(path)?;
+                if path.is_empty() {
+                    return Err(EditorError::new(
+                        ErrorCode::InvalidPath,
+                        "Expected an overlay file path",
+                        path,
+                    ));
+                }
+                roots.insert(self.root.join(path), source.as_str());
                 self.root.join(path)
             };
-            if FsPath::new(path)
-                .file_name()
-                .is_none_or(|name| name != "Notist.toml")
-            {
-                return Err(EditorError::new(
-                    ErrorCode::InvalidPath,
-                    "Only Notist configuration snapshots are accepted",
-                    path,
-                ));
-            }
             bytes = bytes.saturating_add(source.len());
             if bytes > 32 * 1024 * 1024 {
                 return Err(EditorError::new(
                     ErrorCode::Unsupported,
-                    "Configuration overlays exceed 32 MiB",
+                    "Source snapshots exceed 32 MiB",
                     path,
                 ));
             }
@@ -138,16 +153,54 @@ impl PackageResources {
             // the document's dependency graph. They do not grant arbitrary resource IO.
             overlays.insert(identity, source.as_str());
         }
+        if bytes > 32 * 1024 * 1024 {
+            return Err(EditorError::new(
+                ErrorCode::Unsupported,
+                "Source snapshots exceed 32 MiB",
+                &context.document_path,
+            ));
+        }
+        let document = self.root.join(&context.document_path);
+        overlays.insert(document.clone(), context.source.as_str());
+        roots.insert(document, context.source.as_str());
         let resources = Discovery {
             root: &self.root,
             overlays,
             packages: RefCell::new(BTreeSet::new()),
         };
-        // Capture Notist's manifest/declaration reads even when assembly is invalid.
-        let _ = notist::Vault::new(&resources).environment_for(&context.document_path);
+        // Capture Notist's module graph reads even when assembly is invalid.
+        for (path, source) in roots {
+            let mut vault = notist::Vault::new(&resources);
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "notc")
+            {
+                let _ = vault.analyze_code(&path, source);
+            } else {
+                let _ = vault.environment_for(&path, source);
+            }
+        }
         let packages = resources.packages.into_inner();
         Ok(PackageGrant { packages })
     }
+}
+
+/// Module resources live next to their declaration: .notc modules,
+/// configuration, and component implementation assets.
+fn allowed_file_extension(relative: &FsPath) -> bool {
+    relative.extension().is_some_and(|extension| {
+        extension == "notc"
+            || extension == "js"
+            || extension == "mjs"
+            || extension == "wasm"
+            || extension == "css"
+            || extension == "json"
+            || extension == "svg"
+            || extension == "png"
+            || extension == "jpg"
+            || extension == "jpeg"
+            || extension == "woff2"
+    })
 }
 
 /// A bounded capability assembled from one document configuration snapshot.
@@ -171,11 +224,12 @@ impl PackageGrant {
             let Ok(relative) = resource.strip_prefix(root) else {
                 continue;
             };
-            if relative.as_os_str().is_empty()
-                || relative == FsPath::new("lib.notc")
-                || relative == FsPath::new("Notist.toml")
-                || relative.starts_with("components")
-            {
+            // Module resources live next to their declaration. Paths without
+            // an extension may be directories; file reads re-check the suffix.
+            let allowed = relative.extension().is_none()
+                || allowed_file_extension(relative)
+                || relative == FsPath::new("Notist.toml");
+            if relative.as_os_str().is_empty() || allowed {
                 let relative = relative.to_str().ok_or_else(|| {
                     EditorError::new(
                         ErrorCode::InvalidPath,
@@ -265,6 +319,16 @@ impl PackageGrant {
                 error: None,
             });
         };
+        if stat.kind == EntryKind::File
+            && !allowed_file_extension(FsPath::new(&path))
+            && path != "Notist.toml"
+        {
+            return Err(EditorError::new(
+                ErrorCode::PermissionDenied,
+                "Resource is not a manifest, declaration or component of a configured package",
+                &request.path,
+            ));
+        }
         let kind = match stat.kind {
             EntryKind::File => PreviewResourceKind::File,
             EntryKind::Directory => PreviewResourceKind::Directory,
@@ -314,24 +378,21 @@ mod tests {
     fn observation_is_scoped_to_authorized_resources_and_existing_ancestors() {
         let package = tempfile::tempdir().unwrap();
         let root = package.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("components/panel")).unwrap();
+        std::fs::create_dir_all(root.join("panel")).unwrap();
         let grant = PackageGrant {
             packages: BTreeSet::from([root.clone()]),
         };
         assert_eq!(
             grant
-                .observation_directory(
-                    root.join("components/panel/index.js").to_str().unwrap(),
-                    false
-                )
+                .observation_directory(root.join("panel/index.js").to_str().unwrap(), false)
                 .unwrap(),
-            root.join("components/panel")
+            root.join("panel")
         );
         assert_eq!(
             grant
-                .observation_directory(root.join("components/missing/deep").to_str().unwrap(), true)
+                .observation_directory(root.join("missing/deep").to_str().unwrap(), true)
                 .unwrap(),
-            root.join("components")
+            root
         );
         assert_eq!(
             grant
@@ -349,9 +410,10 @@ mod tests {
         let base = directory.path().canonicalize().unwrap();
         let root = base.join("actual");
         let link = base.join("linked-package");
-        std::fs::create_dir_all(root.join("components")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(&root, &link).unwrap();
-        std::os::unix::fs::symlink(&base, root.join("components/escape")).unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&base, root.join("nested/escape")).unwrap();
         let grant = PackageGrant {
             packages: BTreeSet::from([link.clone()]),
         };
@@ -364,12 +426,91 @@ mod tests {
         assert_eq!(
             grant
                 .observation_directory(
-                    link.join("components/escape/secret.js").to_str().unwrap(),
+                    link.join("nested/escape/secret.js").to_str().unwrap(),
                     false
                 )
                 .unwrap_err()
                 .code,
             ErrorCode::Unsupported
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::PackageResources;
+    use crate::error::ErrorCode;
+    use crate::preview::{PreviewResourceRequest, ResourceContext};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn grants_follow_unsaved_roots_and_module_overlays_without_saving_them() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let vault = root.join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("a.not"), "saved without imports").unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(name).join("lib.notc"),
+                "fn panel() -> BlockContent;",
+            )
+            .unwrap();
+        }
+        let resources = PackageResources::new(vault.clone());
+        let mut context = ResourceContext {
+            document_path: "a.not".into(),
+            source: "#import \"../one/lib.notc\" as one;\n".into(),
+            overlays: BTreeMap::from([
+                (
+                    "b.not".into(),
+                    "#import \"../two/lib.notc\" as two;\n".into(),
+                ),
+                (
+                    "lib.notc".into(),
+                    "import \"../three/lib.notc\" as three;\nfn local() -> BlockContent;".into(),
+                ),
+            ]),
+        };
+        let grant = resources.grant(&context).unwrap();
+        for name in ["one", "two", "three"] {
+            assert!(
+                grant.roots().contains(&root.join(name)),
+                "{name} must be reached through a source snapshot"
+            );
+            assert!(
+                grant
+                    .read(PreviewResourceRequest {
+                        path: root.join(name).join("lib.notc").to_str().unwrap().into(),
+                        read: true
+                    })
+                    .unwrap()
+                    .data
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(vault.join("a.not")).unwrap(),
+            "saved without imports"
+        );
+        context.source = "plain\n".into();
+        assert!(
+            !resources
+                .grant(&context)
+                .unwrap()
+                .roots()
+                .contains(&root.join("one")),
+            "saved sources must not restore a removed snapshot import"
+        );
+        context.overlays.insert(
+            root.join("one/forged.notc").to_str().unwrap().into(),
+            "fn forged() -> BlockContent;".into(),
+        );
+        assert_eq!(
+            resources.grant(&context).err().unwrap().code,
+            ErrorCode::InvalidPath,
+            "absolute declarations cannot add authorization roots"
         );
     }
 }

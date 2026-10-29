@@ -1,4 +1,4 @@
-import { For } from "solid-js";
+import { For, Show } from "solid-js";
 import type { CollaborationSnapshot } from "@/lib/editor/contract";
 import { memberColor } from "@/lib/editor/presence";
 
@@ -23,52 +23,60 @@ export function CollaborationBar(props: {
           : "未打开视图";
   };
   return (
-    <details class="collaboration-bar" aria-label="协作成员">
-      <summary>
-        <span class="collaboration-avatars" aria-hidden="true">
-          <For each={props.state.members.slice(0, 5)}>
+    <Show when={props.state.members.length > 1}>
+      <details class="collaboration-bar" aria-label="协作成员">
+        <summary
+          title={`${props.state.members.length} 人在线 · ${viewing().length} 人查看本文档`}
+        >
+          <span class="collaboration-avatars" aria-hidden="true">
+            <For each={props.state.members.slice(0, 5)}>
+              {(member) => (
+                <span
+                  class="collaboration-avatar"
+                  style={{ "--collaborator-color": memberColor(member.color) }}
+                  title={member.name}
+                >
+                  {member.sessionId === props.state.sessionId
+                    ? "我"
+                    : member.name.slice(-2)}
+                </span>
+              )}
+            </For>
+          </span>
+          <span class="collaboration-summary-count" aria-hidden="true">
+            {props.state.members.length}
+          </span>
+          <span class="sr-only" role="status" aria-label="在线成员">
+            {props.state.members.length} 人在线 · {viewing().length}{" "}
+            人查看本文档
+          </span>
+        </summary>
+        <ul aria-label="在线成员列表">
+          <For each={props.state.members}>
             {(member) => (
-              <span
-                class="collaboration-avatar"
-                style={{ "--collaborator-color": memberColor(member.color) }}
-                title={member.name}
-              >
-                {member.sessionId === props.state.sessionId
-                  ? "我"
-                  : member.name.slice(-2)}
-              </span>
+              <li data-member-id={member.sessionId}>
+                <span
+                  class="collaboration-avatar"
+                  style={{ "--collaborator-color": memberColor(member.color) }}
+                  aria-hidden="true"
+                >
+                  {member.name.slice(-2)}
+                </span>
+                <span class="collaboration-member-info">
+                  <span>
+                    {member.name}
+                    {member.sessionId === props.state.sessionId ? "（我）" : ""}
+                  </span>
+                  <small>
+                    {description(member)}
+                    {member.readOnly ? " · 只读" : ""}
+                  </small>
+                </span>
+              </li>
             )}
           </For>
-        </span>
-        <span role="status" aria-label="在线成员">
-          {props.state.members.length} 人在线 · {viewing().length} 人查看本文档
-        </span>
-      </summary>
-      <ul aria-label="在线成员列表">
-        <For each={props.state.members}>
-          {(member) => (
-            <li data-member-id={member.sessionId}>
-              <span
-                class="collaboration-avatar"
-                style={{ "--collaborator-color": memberColor(member.color) }}
-                aria-hidden="true"
-              >
-                {member.name.slice(-2)}
-              </span>
-              <span class="collaboration-member-info">
-                <span>
-                  {member.name}
-                  {member.sessionId === props.state.sessionId ? "（我）" : ""}
-                </span>
-                <small>
-                  {description(member)}
-                  {member.readOnly ? " · 只读" : ""}
-                </small>
-              </span>
-            </li>
-          )}
-        </For>
-      </ul>
-    </details>
+        </ul>
+      </details>
+    </Show>
   );
 }

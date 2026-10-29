@@ -4,6 +4,7 @@
 //! exclusively owns its core, wire context and derived preview controller. No
 //! future or lock is held by the UI event loop.
 mod files;
+mod language;
 mod watch;
 
 #[cfg(test)]
@@ -15,14 +16,16 @@ use celestite_core::{
     fs::{EntryKind, FileEntry, WriteMode, native::FsVault},
     instance::{InstanceIdentity, Vault},
     preview::{
-        PreviewResource, PreviewResourceKind, PreviewResourceRequest, PreviewTask,
-        native::{Context, PackageResources},
-        sessions::PreviewController,
+        PreviewCompletion, PreviewResource, PreviewResourceKind, PreviewResourceRequest,
+        PreviewTask, ResourceContext, compute_preview, compute_preview_native,
+        native::PackageResources, sessions::PreviewController,
     },
     protocol::editor::EditorAdapter,
+    protocol::git::GitStatusSnapshot,
 };
 use files::LocalFiles;
 use futures_lite::future::block_on;
+pub(crate) use language::LanguageCommand;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
@@ -67,6 +70,8 @@ struct Session {
     files: Option<Arc<LocalFiles>>,
     watches: Option<Arc<WatchService>>,
     owner: Mutex<Owner>,
+    /// Read-only derived consumer; never blocks the editing owner.
+    language: Mutex<Option<celestite_core::language::LanguageService>>,
 }
 impl Session {
     fn owner(&self) -> EditorResult<MutexGuard<'_, Owner>> {
@@ -143,6 +148,43 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn read_resource(
+        &self,
+        context: &ResourceContext,
+        request: PreviewResourceRequest,
+    ) -> EditorResult<PreviewResource> {
+        let packages = self.packages.as_ref().ok_or_else(no_local_resources)?;
+        if !Path::new(&request.path).is_absolute() {
+            let files = self.files.as_ref().ok_or_else(no_local_resources)?;
+            let kind = match files.stat(&request.path)?.map(|entry| entry.kind) {
+                None => None,
+                Some(EntryKind::File) => Some(PreviewResourceKind::File),
+                Some(EntryKind::Directory) => Some(PreviewResourceKind::Directory),
+                _ => {
+                    return Err(EditorError::new(
+                        ErrorCode::Unsupported,
+                        "Preview resource must be a file or directory",
+                        &request.path,
+                    ));
+                }
+            };
+            let data = if request.read && kind == Some(PreviewResourceKind::File) {
+                Some(files.read_file_limited(&request.path, 16 * 1024 * 1024)?)
+            } else {
+                None
+            };
+            return Ok(PreviewResource {
+                kind,
+                data,
+                error: None,
+            });
+        }
+        let grant = packages.grant(context)?;
+        self.watch_packages(grant.roots())?;
+        self.watch_package_resource(&grant, &request.path, false)?;
+        grant.read(request)
     }
 
     fn stop_watching(&self) {
@@ -290,6 +332,7 @@ impl DesktopRuntime {
                 adapter: EditorAdapter::default(),
                 preview: PreviewController::default(),
             }),
+            language: Mutex::new(None),
         };
         lock(&self.sessions)?.insert(descriptor.handle.clone(), Arc::new(session));
         Ok(descriptor)
@@ -384,56 +427,39 @@ impl DesktopRuntime {
         value.map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), ""))
     }
 
-    pub(crate) fn package_read(
+    /// Only local native sessions may run configured process extensions. A
+    /// remote replica keeps the executor namespace: its configuration comes
+    /// from the host and must not execute commands on this machine.
+    pub(crate) fn preview_render(
         &self,
         handle: &str,
         task: PreviewTask,
+    ) -> EditorResult<PreviewCompletion> {
+        let session = self.session(handle)?;
+        Ok(if session.descriptor.root.is_some() {
+            compute_preview_native(&task)
+        } else {
+            compute_preview(&task)
+        })
+    }
+
+    pub(crate) fn package_read(
+        &self,
+        handle: &str,
+        context: ResourceContext,
         request: PreviewResourceRequest,
     ) -> EditorResult<PreviewResource> {
         let session = self.session(handle)?;
-        // Read-only immutable task IO does not borrow the editing owner. An
-        // already-started read can finish after close; its late completion is
-        // rejected by the preview controller's ticket checks.
+        // Validate ownership before derived IO; never hold the editor lock
+        // while registering watches or reading a resource.
         drop(session.owner()?);
-        let packages = session.packages.as_ref().ok_or_else(no_local_resources)?;
-        if !Path::new(&request.path).is_absolute() {
-            let files = session.files.as_ref().ok_or_else(no_local_resources)?;
-            let kind = match files.stat(&request.path)?.map(|entry| entry.kind) {
-                None => None,
-                Some(EntryKind::File) => Some(PreviewResourceKind::File),
-                Some(EntryKind::Directory) => Some(PreviewResourceKind::Directory),
-                _ => {
-                    return Err(EditorError::new(
-                        ErrorCode::Unsupported,
-                        "Preview resource must be a file or directory",
-                        &request.path,
-                    ));
-                }
-            };
-            let data = if request.read && kind == Some(PreviewResourceKind::File) {
-                Some(files.read_file_limited(&request.path, 16 * 1024 * 1024)?)
-            } else {
-                None
-            };
-            return Ok(PreviewResource {
-                kind,
-                data,
-                error: None,
-            });
-        }
-        let grant = packages.grant(&Context {
-            document_path: task.ticket.path,
-            overlays: task.overlays,
-        })?;
-        session.watch_packages(grant.roots())?;
-        session.watch_package_resource(&grant, &request.path, false)?;
-        grant.read(request)
+        session.read_resource(&context, request)
     }
 
     pub(crate) fn package_directory(
         &self,
         handle: &str,
-        task: PreviewTask,
+        context: ResourceContext,
         path: &str,
     ) -> EditorResult<Vec<FileEntry>> {
         let session = self.session(handle)?;
@@ -446,13 +472,41 @@ impl DesktopRuntime {
                 .ok_or_else(no_local_resources)?
                 .read_dir(path);
         }
-        let grant = packages.grant(&Context {
-            document_path: task.ticket.path,
-            overlays: task.overlays,
-        })?;
+        let grant = packages.grant(&context)?;
         session.watch_packages(grant.roots())?;
         session.watch_package_resource(&grant, path, true)?;
         grant.directory(path)
+    }
+
+    /// Language hosting owns no editor state; it answers from disk snapshots.
+    pub(crate) fn language(
+        &self,
+        handle: &str,
+        command: LanguageCommand,
+    ) -> EditorResult<Vec<String>> {
+        let session = self.session(handle)?;
+        drop(session.owner()?);
+        session.language(command)
+    }
+
+    /// Read-only Git decoration for local sessions. Remote sessions leave this
+    /// to the host, whose HTTP API owns the repository and its permissions.
+    pub(crate) fn git_status(&self, handle: &str) -> EditorResult<Option<GitStatusSnapshot>> {
+        let session = self.session(handle)?;
+        let root = {
+            let _owner = session.owner()?;
+            session.descriptor.root.clone()
+        };
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        // Git must observe the same retained root as file IO. A replaced or
+        // symlinked Vault must report disconnection instead of scanning elsewhere.
+        if let Some(files) = &session.files {
+            files.stat("")?;
+        }
+        celestite_git::inspect(Path::new(&root))
+            .map_err(|error| EditorError::new(ErrorCode::Io, error.to_string(), &root))
     }
 
     /// Drain one coalesced native watch hint. Reading files and editing private
@@ -521,6 +575,9 @@ impl DesktopRuntime {
             // tasks but deliberately preserves sequence numbers and queued
             // closure events for the existing consumer.
             owner.preview = PreviewController::default();
+            // The new view's client reopens its documents; open-document state
+            // and resource snapshots of the old view must not leak into it.
+            *lock(&session.language)? = None;
             if session.descriptor.root.is_none() {
                 owner.editor = None;
             }

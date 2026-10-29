@@ -567,7 +567,7 @@ fn recovery_and_render_diagnostics_use_utf16_offsets_after_emoji_and_cjk() {
         let task = core.take_preview_task("doc").unwrap().unwrap();
         assert!(core.complete_preview(compute_preview(&task)));
         let output = core.preview_state("doc").unwrap().result.unwrap().output;
-        assert!(output.html.contains("notist-custom"));
+        assert!(output.html.contains("notist-error"));
         assert_eq!(output.diagnostics.len(), 2);
         for diagnostic in &output.diagnostics {
             assert_eq!((diagnostic.from, diagnostic.to), (5, 17));
@@ -579,7 +579,7 @@ fn recovery_and_render_diagnostics_use_utf16_offsets_after_emoji_and_cjk() {
         );
         assert_eq!(
             output.diagnostics[1].origin,
-            PreviewDiagnosticOrigin::Render
+            PreviewDiagnosticOrigin::Transform
         );
     });
 }
@@ -653,25 +653,22 @@ fn links_resolve_from_the_document_directory_and_cannot_escape_vault() {
 
 #[cfg(feature = "preview")]
 #[test]
-fn packages_render_with_project_sources_and_cross_file_diagnostics() {
+fn modules_render_with_project_sources_and_cross_file_diagnostics() {
     block_on(async {
-        let mut core = core("notes/a.not", "#widgets::badge(\"x\")[😀正文]");
+        let mut core = core(
+            "notes/a.not",
+            "#import \"../packages/widgets/lib.notc\" as widgets;\n\n#widgets.badge(\"x\")[😀正文]",
+        );
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
-        task.overlays.insert(
-            "Notist.toml".into(),
-            "[dependencies]\nwidgets = {path = 'packages/widgets'}".into(),
-        );
         task.overlays.insert(
             "packages/widgets/lib.notc".into(),
             "fn badge(label: String)[children: InlineContent] -> InlineContent;".into(),
         );
-        task.overlays.insert(
-            "packages/widgets/Notist.toml".into(),
-            "[package]\nname = 'widgets'\n".into(),
-        );
         task.resources
             .insert("notes/Notist.toml".into(), resource(None, None));
+        task.resources
+            .insert("Notist.toml".into(), resource(None, None));
         let requests = preview_resource_requests(&task);
         assert_eq!(requests.len(), 2);
         for request in requests {
@@ -688,14 +685,13 @@ fn packages_render_with_project_sources_and_cross_file_diagnostics() {
         }
         assert!(preview_resource_requests(&task).is_empty());
         let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
-            panic!("package failed")
+            panic!("module failed")
         };
         assert!(output.diagnostics.is_empty());
-        assert!(output.html.contains("<widgets-badge"));
-        assert_eq!(
-            output.used_components[0].path,
-            "packages/widgets/components/badge.js"
-        );
+        assert!(output.html.contains("<notist-"));
+        assert!(output.html.contains("-badge"));
+        assert_eq!(output.used_components[0].path, "packages/widgets/badge.js");
+        assert_eq!(output.used_components[0].package_root, "packages/widgets");
         assert!(
             output
                 .source_map
@@ -709,13 +705,24 @@ fn packages_render_with_project_sources_and_cross_file_diagnostics() {
             panic!("bad declaration accepted")
         };
         assert!(!diagnostics.is_empty());
-        for diagnostic in diagnostics {
-            assert_eq!(diagnostic.path, "packages/widgets/lib.notc");
+        let foreign: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.path == "packages/widgets/lib.notc")
+            .collect();
+        assert!(!foreign.is_empty(), "module errors keep their path");
+        for diagnostic in foreign {
             assert_eq!(diagnostic.source.as_deref(), Some(broken));
             assert!(
                 diagnostic.from < diagnostic.to && diagnostic.to <= broken.encode_utf16().count()
             );
         }
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "notes/a.not"
+                    && diagnostic.message.contains("cannot import")),
+            "the importing document reports the failure: {diagnostics:?}"
+        );
     });
 }
 
@@ -731,7 +738,7 @@ fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits
             "defs",
             "defs-history",
             101,
-            "fn leaf() -> Content;",
+            "fn leaf() -> BlockContent;",
         );
         assert!(!core.complete_preview(output(&old, "stale environment")));
         time(2000);
@@ -740,7 +747,7 @@ fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits
         assert_ne!(old.ticket.render_generation, new.ticket.render_generation);
         assert_eq!(
             new.overlays["packages/demo/lib.notc"],
-            "fn leaf() -> Content;"
+            "fn leaf() -> BlockContent;"
         );
         core.invalidate_preview_project();
         assert!(!core.complete_preview(output(&new, "stale file snapshot")));
@@ -749,36 +756,32 @@ fn declaration_edits_and_file_changes_revoke_running_previews_without_body_edits
 
 #[cfg(feature = "preview")]
 #[test]
-fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnostics() {
+fn configured_extensions_preserve_unicode_mappings_and_report_extension_diagnostics() {
     block_on(async {
         let source = "😀 $x$ #math(false)";
         let mut core = core("math.not", source);
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
-        let config = "future_option = true\n[dependencies]\nkatex = {path = 'packages/katex', future_option = true}\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'katex::math'\nfuture_option = true\n";
+        let config = "[[extensions]]\nkind = 'replace'\nimports = { katex = 'packages/katex/lib.notc' }\nfrom = 'notist.math'\nto = 'katex.math'\n";
         task.overlays.insert("Notist.toml".into(), config.into());
         task.overlays.insert(
-            "packages/katex/Notist.toml".into(),
-            "[package]\nname = 'katex'\n".into(),
-        );
-        task.overlays.insert(
             "packages/katex/lib.notc".into(),
-            "fn math(text: String, block?: Bool) -> Content<block>;".into(),
+            "fn math<C: Type = InlineContent>(text: String) -> C;".into(),
         );
         task.overlays.insert(
-            "packages/katex/components/math.js".into(),
+            "packages/katex/math.js".into(),
             "export default class extends HTMLElement {}".into(),
         );
-        task.resources.insert(
-            "packages/katex/components/math/index.js".into(),
-            resource(None, None),
-        );
+        task.resources
+            .insert("packages/katex/math/index.js".into(), resource(None, None));
         assert!(preview_resource_requests(&task).is_empty());
         let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
-            panic!("transform config failed")
+            panic!("extension config failed")
         };
-        assert!(output.html.contains("<katex-math"));
-        assert_eq!(output.used_components[0].package, "katex");
+        assert!(output.html.contains("<notist-"));
+        assert!(output.html.contains("-math"));
+        assert_eq!(output.used_components[0].package, "packages/katex/lib.notc");
+        assert_eq!(output.used_components[0].package_root, "packages/katex");
         assert!(
             output
                 .source_map
@@ -789,21 +792,21 @@ fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnost
             .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.origin == PreviewDiagnosticOrigin::Transform)
-            .expect("missing transform diagnostic");
+            .expect("missing extension diagnostic");
         assert_eq!(diagnostic.path, "math.not");
         assert_eq!(
             (diagnostic.from, diagnostic.to),
             (7, source.encode_utf16().count())
         );
         assert!(diagnostic.source.is_none());
-        assert!(diagnostic.message.contains("replace skipped"));
-        // Known transform identities still produce source-bearing configuration errors.
+        assert!(diagnostic.message.contains("must be string"));
+        // Known extension identities still produce source-bearing configuration errors.
         task.overlays.insert(
             "Notist.toml".into(),
-            config.replace("katex::math", "missing::math"),
+            config.replace("katex.math", "missing.math"),
         );
         let PreviewOutcome::Failure { diagnostics, .. } = compute_preview(&task).outcome else {
-            panic!("invalid transform accepted")
+            panic!("invalid extension accepted")
         };
         assert!(
             diagnostics
@@ -815,60 +818,43 @@ fn configured_transforms_preserve_unicode_mappings_and_report_transform_diagnost
 
 #[cfg(feature = "preview")]
 #[test]
-fn resource_snapshots_support_sibling_and_absolute_packages_with_a_stable_document_root() {
+fn resource_snapshots_support_sibling_and_absolute_modules_with_a_stable_document_root() {
     block_on(async {
-        let mut core = core("a.not", "#widgets::badge(\"x\")[正文]");
+        let mut core = core(
+            "a.not",
+            "#import \"../packages/widgets/lib.notc\" as widgets;\n\n#widgets.badge(\"x\")[正文]",
+        );
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
-        for (root, package_root, relative) in [
-            (
-                "/workspace/docs",
-                "/workspace/packages/widgets",
-                "../packages/widgets",
-            ),
-            (
-                "C:/workspace/docs",
-                "C:/workspace/packages/widgets",
-                "../packages/widgets",
-            ),
-            (
-                r"C:\workspace\docs",
-                "C:/workspace/packages/widgets",
-                r"..\packages\widgets",
-            ),
-            (
-                "//host/share/docs",
-                "//host/share/packages/widgets",
-                "../packages/widgets",
-            ),
+        for (root, package_root) in [
+            ("/workspace/docs", "/workspace/packages/widgets"),
+            ("C:/workspace/docs", "C:/workspace/packages/widgets"),
+            (r"C:\workspace\docs", "C:/workspace/packages/widgets"),
+            ("//host/share/docs", "//host/share/packages/widgets"),
         ] {
             task.resource_root = root.into();
-            for dependency in [relative, package_root] {
-                task.resources.clear();
-                task.overlays.clear();
-                task.resources.insert(
-                    format!("{package_root}/Notist.toml"),
-                    resource(
-                        Some(PreviewResourceKind::File),
-                        Some("[package]\nname = 'widgets'\n"),
-                    ),
-                );
-                let original_manifest =
-                    format!("[dependencies]\nwidgets = {{path = '{dependency}'}}");
-                task.overlays
-                    .insert("Notist.toml".into(), original_manifest.clone());
-                task.resources.insert(
-                    format!("{package_root}/lib.notc"),
-                    resource(
-                        Some(PreviewResourceKind::File),
-                        Some("fn badge(label: String)[children: InlineContent] -> InlineContent;"),
-                    ),
-                );
-                for request in preview_resource_requests(&task) {
+            task.resources.clear();
+            task.overlays.clear();
+            task.resources.insert(
+                format!("{package_root}/lib.notc"),
+                resource(
+                    Some(PreviewResourceKind::File),
+                    Some("fn badge(label: String)[children: InlineContent] -> InlineContent;"),
+                ),
+            );
+            loop {
+                let requests = preview_resource_requests(&task);
+                if requests.is_empty() {
+                    break;
+                }
+                for request in requests {
+                    if request.path == "Notist.toml" {
+                        task.resources
+                            .insert(request.path.clone(), resource(None, None));
+                        continue;
+                    }
                     assert!(
-                        request
-                            .path
-                            .starts_with(&format!("{package_root}/components/")),
+                        request.path.starts_with(&format!("{package_root}/")),
                         "unexpected {root}: {}",
                         request.path
                     );
@@ -883,39 +869,34 @@ fn resource_snapshots_support_sibling_and_absolute_packages_with_a_stable_docume
                         ),
                     );
                 }
-                assert!(preview_resource_requests(&task).is_empty());
-                let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
-                    panic!("external package failed: {root}, {dependency}")
-                };
-                assert!(output.html.contains("<widgets-badge"));
-                assert_eq!(output.used_components[0].package_root, package_root);
-                assert_eq!(
-                    output.used_components[0].path,
-                    format!("{package_root}/components/badge.js")
-                );
-                assert_eq!(task.ticket.path, "a.not");
-                assert_eq!(task.overlays["Notist.toml"], original_manifest);
             }
+            let PreviewOutcome::Success { output } = compute_preview(&task).outcome else {
+                panic!("external module failed: {root}")
+            };
+            assert!(output.html.contains("<notist-"));
+            assert!(output.html.contains("-badge"));
+            assert_eq!(output.used_components[0].package_root, package_root);
+            assert_eq!(
+                output.used_components[0].path,
+                format!("{package_root}/badge.js")
+            );
+            assert_eq!(task.ticket.path, "a.not");
         }
     });
 }
 
 #[cfg(feature = "preview")]
 #[test]
-fn foreign_manifests_keep_original_diagnostic_sources_and_offsets_after_path_rewriting() {
+fn foreign_manifests_keep_original_diagnostic_sources_and_offsets() {
     block_on(async {
-        let mut core = core("a.not", "#widgets::badge(\"x\")[正文]");
+        let mut core = core("a.not", "正文\n");
         core.subscribe_preview("doc", "client").unwrap();
         let mut task = core.take_preview_task("doc").unwrap().unwrap();
         task.resource_root = "C:/workspace/docs".into();
-        let source = "# 配置 😀\n[dependencies]\nwidgets = {path = 'D:\\packages\\widgets'}\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'widgets::missing'\n";
+        let source = "# 配置 😀\n[[extensions]]\nkind = 'replace'\nimports = { widgets = '../packages/widgets/lib.notc' }\nfrom = 'notist.math'\nto = 'widgets.missing'\n";
         task.overlays.insert("Notist.toml".into(), source.into());
         task.overlays.insert(
-            "D:/packages/widgets/Notist.toml".into(),
-            "[package]\nname = 'widgets'\n".into(),
-        );
-        task.overlays.insert(
-            "D:/packages/widgets/lib.notc".into(),
+            "C:/workspace/packages/widgets/lib.notc".into(),
             "fn badge(label: String)[children: InlineContent] -> InlineContent;".into(),
         );
         assert!(preview_resource_requests(&task).is_empty());
@@ -924,7 +905,7 @@ fn foreign_manifests_keep_original_diagnostic_sources_and_offsets_after_path_rew
             message,
         } = compute_preview(&task).outcome
         else {
-            panic!("invalid transform accepted")
+            panic!("invalid extension accepted")
         };
         assert!(!message.contains("__celestite_preview__"));
         let diagnostic = diagnostics
@@ -935,8 +916,56 @@ fn foreign_manifests_keep_original_diagnostic_sources_and_offsets_after_path_rew
         let utf16 = source.encode_utf16().collect::<Vec<_>>();
         let selected = String::from_utf16(&utf16[diagnostic.from..diagnostic.to]).unwrap();
         assert!(
-            selected.contains("widgets::missing"),
+            selected.contains("widgets.missing"),
             "wrong original span: {selected}"
         );
+    });
+}
+
+#[cfg(all(
+    feature = "preview",
+    feature = "native",
+    not(target_arch = "wasm32"),
+    unix
+))]
+#[test]
+fn native_preview_runs_command_extensions_in_the_real_configuration_directory() {
+    block_on(async {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("ext.sh"),
+            "#!/bin/sh\ncat >/dev/null\n: > ran\nprintf '{\"version\":1}'\n",
+        )
+        .unwrap();
+        let config = "[[extensions]]\nkind = 'command'\ncommand = ['sh', 'ext.sh']\nstages = ['after_evaluate']\n";
+        let mut fixture = core("a.not", "正文\n");
+        fixture.subscribe_preview("doc", "client").unwrap();
+        let mut task = fixture.take_preview_task("doc").unwrap().unwrap();
+        task.resource_root = root.to_string_lossy().into_owned();
+        task.overlays.insert("Notist.toml".into(), config.into());
+
+        assert!(preview_resource_requests(&task).is_empty());
+        assert!(
+            !root.join("ran").exists(),
+            "resource discovery ran a command extension"
+        );
+        let PreviewOutcome::Success { .. } =
+            celestite_core::preview::compute_preview(&task).outcome
+        else {
+            panic!("logical execution must not run the command")
+        };
+        assert!(
+            !root.join("ran").exists(),
+            "logical execution used the real configuration directory"
+        );
+
+        let PreviewOutcome::Success { output } =
+            celestite_core::preview::compute_preview_native(&task).outcome
+        else {
+            panic!("native command extension failed")
+        };
+        assert!(root.join("ran").exists());
+        assert!(output.html.contains("正文"));
     });
 }

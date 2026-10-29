@@ -10,6 +10,7 @@ import {
   untrack,
 } from "solid-js";
 import { Button } from "@/components/ui";
+import { StatusSlot } from "@/components/ui/status-slot";
 import type {
   EditorDocument,
   EditorDocuments,
@@ -33,6 +34,10 @@ function sameVersion(a: Version, b: Version) {
     Object.entries(a.clocks).every(([peer, clock]) => b.clocks[peer] === clock)
   );
 }
+export interface PreviewActions {
+  refresh: () => void;
+  authorize?: () => void;
+}
 export function DocumentPreview(props: {
   document: EditorDocument;
   documents: EditorDocuments;
@@ -40,6 +45,9 @@ export function DocumentPreview(props: {
   scrollTop: number;
   fragment?: string;
   sync: PreviewSync;
+  statusMount?: Element;
+  revealOnClick: boolean;
+  onReady: (actions: PreviewActions | undefined) => void;
   onScroll: (top: number) => void;
   onReveal: (from: number, to: number, keepSplit?: boolean) => void;
   onNavigate: (path: string, fragment: string | null) => Promise<boolean>;
@@ -85,13 +93,37 @@ export function DocumentPreview(props: {
   const status = () =>
     state()?.status === "failed" || unavailable()
       ? "预览失败"
-      : current()
-        ? loadingComponents()
-          ? "正在加载组件…"
-          : "预览已更新"
-        : state()?.result
-          ? "预览正在更新…"
-          : "正在生成预览…";
+      : error()
+        ? "预览遇到问题"
+        : current()
+          ? loadingComponents()
+            ? "正在加载组件…"
+            : "预览已更新"
+          : state()?.result
+            ? "预览正在更新…"
+            : "正在生成预览…";
+  function refresh() {
+    if (state()?.status === "pending" || state()?.status === "computing")
+      return;
+    setError(null);
+    void documents.previews!.retry(documentId).catch((error) => {
+      if (!disposed) setError(String(error));
+    });
+  }
+  function authorize() {
+    if (authorizing() || !props.authorizeResources) return;
+    setError(null);
+    setAuthorizing(true);
+    void props
+      .authorizeResources()
+      .catch((error) => {
+        if (!disposed)
+          setError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!disposed) setAuthorizing(false);
+      });
+  }
   function fragment(id: string) {
     sync.navigatePreview();
     if (!id) {
@@ -176,6 +208,10 @@ export function DocumentPreview(props: {
     article = document.createElement("article");
     root.append(style, article);
     detachSync = sync.mountPreview(documentId, scroller, article);
+    props.onReady({
+      refresh,
+      authorize: props.authorizeResources ? authorize : undefined,
+    });
     display(latestDisplay);
     root.addEventListener("pointerdown", (event) => {
       if (!(event instanceof PointerEvent)) return;
@@ -196,6 +232,7 @@ export function DocumentPreview(props: {
         .find((element) => element instanceof HTMLAnchorElement) as
         HTMLAnchorElement | undefined;
       if (!anchor) {
+        if (!untrack(() => props.revealOnClick)) return;
         const mapping = sync.previewClick(event);
         if (mapping) onReveal(mapping.from, mapping.to, true);
         return;
@@ -248,6 +285,7 @@ export function DocumentPreview(props: {
   });
   onCleanup(() => {
     disposed = true;
+    props.onReady(undefined);
     detachSync?.();
     untrack(() =>
       props.onScroll(mountedResult ? scroller.scrollTop : initialScrollTop),
@@ -256,49 +294,36 @@ export function DocumentPreview(props: {
   });
   return (
     <section class="document-preview" aria-label="文档预览">
-      <div class="preview-status">
+      <StatusSlot mount={props.statusMount} class="preview-status">
         <span role="status" aria-label="预览状态">
           {status()}
         </span>
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={
-            state()?.status === "pending" || state()?.status === "computing"
-          }
-          onClick={() => {
-            setError(null);
-            void documents
-              .previews!.retry(documentId)
-              .catch((error) => setError(String(error)));
-          }}
-        >
-          {state()?.status === "failed" || unavailable()
-            ? "重试预览"
-            : "刷新预览"}
-        </Button>
-        <Show when={props.authorizeResources}>
+      </StatusSlot>
+      <Show when={state()?.status === "failed" || unavailable() || error()}>
+        <div class="preview-recovery">
           <Button
             size="sm"
             variant="ghost"
-            disabled={authorizing()}
-            title="选择包含当前 Vault 和依赖的共同父目录，Vault 根目录保持不变"
-            onClick={() => {
-              setError(null);
-              setAuthorizing(true);
-              void props.authorizeResources!()
-                .catch((error) =>
-                  setError(
-                    error instanceof Error ? error.message : String(error),
-                  ),
-                )
-                .finally(() => setAuthorizing(false));
-            }}
+            disabled={
+              state()?.status === "pending" || state()?.status === "computing"
+            }
+            onClick={refresh}
           >
-            {authorizing() ? "正在授权…" : "授权依赖目录"}
+            重试预览
           </Button>
-        </Show>
-      </div>
+          <Show when={props.authorizeResources}>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={authorizing()}
+              title="选择包含当前 Vault 和依赖的共同父目录，Vault 根目录保持不变"
+              onClick={authorize}
+            >
+              {authorizing() ? "正在授权…" : "授权依赖目录"}
+            </Button>
+          </Show>
+        </div>
+      </Show>
       <Show
         when={
           props.authorizeResources &&

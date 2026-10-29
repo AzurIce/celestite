@@ -1,5 +1,14 @@
 import {
   Check as check,
+  PanelLeft as panelLeft,
+  ListTree as listTree,
+  Maximize as maximize,
+  Minimize as minimize,
+  Ellipsis as ellipsis,
+  CodeXml as codeXml,
+  Columns2 as columns2,
+  BookOpen as bookOpen,
+  Search as search,
   ChevronDown as chevronDown,
   ChevronRight as chevronRight,
   ChevronLeft as chevronLeft,
@@ -17,6 +26,7 @@ import {
   Download as download,
   Upload as upload,
   Move as move,
+  Link2 as link2,
   Save as save,
   Settings2 as settings2,
   LoaderCircle as loaderCircle,
@@ -88,6 +98,7 @@ export const Trash2 = createIcon(trash2, "trash-2");
 export const Download = createIcon(download, "download");
 export const Upload = createIcon(upload, "upload");
 export const Move = createIcon(move, "move");
+export const Link2 = createIcon(link2, "link-2");
 export const Save = createIcon(save, "save");
 export const Settings2 = createIcon(settings2, "settings-2");
 export const LoaderCircle = createIcon(loaderCircle, "loader-circle");
@@ -97,3 +108,13 @@ export const Moon = createIcon(moon, "moon");
 export const Plus = createIcon(plus, "plus");
 export const Sun = createIcon(sun, "sun");
 export const X = createIcon(x, "x");
+
+export const PanelLeft = createIcon(panelLeft, "panel-left");
+export const ListTree = createIcon(listTree, "list-tree");
+export const Maximize = createIcon(maximize, "maximize");
+export const Minimize = createIcon(minimize, "minimize");
+export const Ellipsis = createIcon(ellipsis, "ellipsis");
+export const CodeXml = createIcon(codeXml, "code-xml");
+export const Columns2 = createIcon(columns2, "columns-2");
+export const BookOpen = createIcon(bookOpen, "book-open");
+export const Search = createIcon(search, "search");

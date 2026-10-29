@@ -1,9 +1,62 @@
+.vault-connections-header {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.vault-brand-icon {
+  display: block;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
 .vault-switcher {
-  --uno: "max-w-36 min-w-0 rounded-control border-none bg-transparent px-1 py-1 text-ui-sm text-secondary";
+  display: flex;
+  flex: 1;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  width: 0;
+  height: 30px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-foreground);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+.vault-switcher:hover,
+.vault-switcher[data-expanded] {
+  background: var(--color-muted);
 }
 .vault-switcher:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 1px;
+}
+.vault-switcher-label,
+.vault-switcher-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vault-switcher-chevron {
+  flex: none;
+  color: var(--color-secondary);
+}
+.vault-switcher-menu {
+  min-width: 220px;
+  max-width: min(320px, calc(100vw - 16px));
+}
+.vault-switcher-item {
+  min-height: 32px;
 }
 .ui-dialog.vault-connections-dialog {
   width: min(560px, calc(100vw - 32px));
@@ -13,4 +66,27 @@
 }
 .vault-connection-list > li {
   --uno: "flex items-center gap-2 border-b border-solid border-border py-3";
+}
+.vault-connection-copy {
+  min-width: 0;
+  flex: 1;
+}
+.vault-connection-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 479px) {
+  .vault-connection-list > li {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .vault-connection-copy {
+    flex-basis: 100%;
+  }
+  .vault-connection-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }

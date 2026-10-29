@@ -9,6 +9,11 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(() => ({
   plugins: [UnoCSS(), solid()],
   worker: { format: "es" as const },
+  // Editor languages are loaded lazily. Discover them before opening a file
+  // so dependency optimization cannot reload an in-memory editing session.
+  optimizeDeps: {
+    include: ["web-tree-sitter", "@codemirror/lsp-client", "@codemirror/lint"],
+  },
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },

@@ -7,6 +7,8 @@ import {
   render_preview,
 } from "../../src/lib/editor/generated/celestite_core";
 import { nativePreviewExecutor } from "../../src/lib/desktop/preview";
+import { nativeLanguageWorker } from "../../src/lib/desktop/language";
+import type { LanguageWorkerReply } from "../../src/lib/language/protocol";
 import {
   openNativeEditor,
   openNativeRemoteEditor,
@@ -25,7 +27,11 @@ import {
   nativeComponentUrl,
 } from "../../src/lib/preview/path";
 import { PreviewResources } from "../../src/lib/preview/resources";
-import type { PreviewState, PreviewTask } from "../../src/lib/preview/contract";
+import type {
+  PreviewState,
+  PreviewTask,
+  ResourceContext,
+} from "../../src/lib/preview/contract";
 import { VaultManager } from "../../src/lib/vault/manager";
 import { openAppDocument } from "../../src/lib/settings/app-file";
 import { shutdownDesktopWorkspace } from "../../src/lib/desktop/shutdown";
@@ -454,10 +460,11 @@ test("native package resources preserve drive and UNC roots without accepting ab
     },
   });
   assert.deepEqual(
-    await resources.read(
-      { path: "C:/workspace/a.not", read: true },
-      {} as PreviewTask,
-    ),
+    await resources.read({ path: "C:/workspace/a.not", read: true }, {
+      documentPath: "a.not",
+      source: "",
+      overlays: {},
+    } satisfies ResourceContext),
     { kind: "file", data: [65], error: null },
   );
   assert.equal(requested, "C:/workspace/a.not");
@@ -839,10 +846,13 @@ test("an aborted native executor never reads resources or renders after an in-fl
     release = resolve;
   });
   const commands: string[] = [];
-  const executor = nativePreviewExecutor(async <T>(command: string) => {
-    commands.push(command);
-    return (await pending) as T;
-  });
+  const executor = nativePreviewExecutor(
+    "session",
+    async <T>(command: string) => {
+      commands.push(command);
+      return (await pending) as T;
+    },
+  );
   const abort = new AbortController();
   const result = executor.execute(
     {
@@ -1183,4 +1193,74 @@ test("desktop preparation drains accepted initialization and its internal defaul
     finishRead(null);
     await manager.close();
   }
+});
+
+test("native language worker maps worker traffic to desktop_language invokes", async () => {
+  const calls: { command: string; args: unknown }[] = [];
+  const invoke: DesktopInvoke = async <T>(command: string, args = {}) => {
+    calls.push({ command, args });
+    const request = (args as { command: { kind: string } }).command;
+    if (command === "desktop_language")
+      return (
+        request.kind === "invalidate" || request.kind === "reset"
+          ? []
+          : ['{"jsonrpc":"2.0","id":1,"result":null}']
+      ) as T;
+    throw new Error(`unexpected ${command}`);
+  };
+  const worker = nativeLanguageWorker("handle-1", invoke);
+  const replies: LanguageWorkerReply[] = [];
+  worker.addEventListener("message", (event) => replies.push(event.data));
+  worker.postMessage({
+    kind: "message",
+    id: 3,
+    root: "/vault",
+    message: '{"jsonrpc":"2.0"}',
+  });
+  await settle();
+  assert.deepEqual(calls, [
+    {
+      command: "desktop_language",
+      args: { handle: "handle-1", command: { kind: "reset" } },
+    },
+    {
+      command: "desktop_language",
+      args: {
+        handle: "handle-1",
+        command: { kind: "message", message: '{"jsonrpc":"2.0"}' },
+      },
+    },
+  ]);
+  assert.deepEqual(replies, [
+    {
+      kind: "messages",
+      id: 3,
+      messages: ['{"jsonrpc":"2.0","id":1,"result":null}'],
+    },
+    { kind: "done", id: 3 },
+  ]);
+  worker.postMessage({ kind: "invalidate", id: 4, root: "/vault" });
+  await settle();
+  assert.deepEqual(calls[2].args, {
+    handle: "handle-1",
+    command: { kind: "invalidate" },
+  });
+  assert.deepEqual(replies[2], { kind: "done", id: 4 });
+  // Resource replies never cross the invoke boundary; failures settle items.
+  worker.postMessage({ kind: "resources", id: 5, resources: {} });
+  await settle();
+  assert.equal(calls.length, 3);
+  const failing = nativeLanguageWorker("handle-2", async () => {
+    throw new Error("closed");
+  });
+  const failures: LanguageWorkerReply[] = [];
+  failing.addEventListener("message", (event) => failures.push(event.data));
+  failing.postMessage({
+    kind: "message",
+    id: 6,
+    root: "/vault",
+    message: "{}",
+  });
+  await settle();
+  assert.deepEqual(failures, [{ kind: "error", id: 6, message: "closed" }]);
 });

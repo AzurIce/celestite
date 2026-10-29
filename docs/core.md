@@ -33,6 +33,7 @@ Rust / core / WASM、Web 与 v5 远端协议统一使用这些名称。文档读
 | [`protocol`](../crates/celestite-core/src/protocol/mod.rs)                                                            | 外部 JSON 分发、UTF-16 转换与撤销 metadata                           |
 | [`text`](../crates/celestite-core/src/text.rs)                                                                        | 行尾枚举与解码后的物理文本格式；编辑历史只保存 LF                    |
 | [`preview`](../crates/celestite-core/src/preview.rs) / [`sessions`](../crates/celestite-core/src/preview/sessions.rs) | 独立预览控制器、任务、调度、缓存与 feature-gated 纯计算              |
+| [`language`](../crates/celestite-core/src/language.rs)                                                                | Notist 语言服务：无头 LSP JSON-RPC 端点、打开文档表与资源快照两阶段  |
 | [`fs`](../crates/celestite-core/src/fs/mod.rs) / [`wasm`](../crates/celestite-core/src/wasm.rs)                       | 纯文件 IO trait / 绑定与命令批次封装                                 |
 
 平台文件适配器实现同一个 `FileSystem`：普通文件空间与私有恢复空间使用不同实例，不在适配器中解释 CRDT 或恢复格式。浏览器桥位于 [`fs/browser.rs`](../crates/celestite-core/src/fs/browser.rs)，[`fs/native`](../crates/celestite-core/src/fs/native/mod.rs) 的 `FsVault` 本机文件能力按 `native` feature 与非 Wasm 目标启用；package 授权位于 [`preview/native.rs`](../crates/celestite-core/src/preview/native.rs)。
@@ -82,6 +83,7 @@ UI 的待确认输入是展示投影，协作会话的发送队列是确认进�
 | `EditorBinding`                                | `memory(identity)`                              | 同一绑定的内存构造，直接持有 Buffer，无普通文件空间或恢复区              |
 | `BufferBinding`                                | `new` / `from_snapshot`                         | 底层 Buffer（正文命令、个人撤销、锚点与历史导出），用于 Buffer 契约测试  |
 | `PreviewBinding`                               | `new()`                                         | 独立 `PreviewController`，消费只读源快照，不持有 Editor                  |
+| `LanguageBinding`                              | `new(root?)`                                    | 有状态 Notist 语言端点；`handle` / `provide` / `invalidateResources`     |
 | `render_preview` / `preview_resource_requests` | 纯函数                                          | 分析 Worker 直接调用，不建 EditorCore                                    |
 
 EditorBinding 的两种构造统一经异步 `call(method, paramsJson) -> JSON` 进入下述服务分发面，返回：
@@ -96,13 +98,14 @@ type CallReply =
 
 ## Web 接入形态
 
-内核只在 Worker 内出现，主线程始终经 RPC 与 Worker 通信，不直接接触内核。直接引用 `generated/celestite_core` 的只有三个 Worker：
+内核只在 Worker 内出现，主线程始终经 RPC 与 Worker 通信，不直接接触内核。直接引用 `generated/celestite_core` 的只有四个 Worker：
 
 | Worker                        | 绑定                                                          | 交给谁                | 说明                                                                                                            |
 | ----------------------------- | ------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `lib/editor/local/worker.ts`  | `EditorBinding.open(identity, io, recoveryIo, mergeExternal)` | `LocalEditorSession`  | `io = createBrowserIo(backend)`，`recoveryIo = createBrowserIo(store.files)`；`mergeExternal` 仅本机目录为 true |
 | `lib/editor/remote/worker.ts` | `EditorBinding.memory(identity)`                              | `RemoteEditorSession` | 身份每次加入时生成；文件与保存命令另走 `HttpVaultBackend` / WebSocket                                           |
 | `lib/preview/worker.ts`       | `render_preview` / `preview_resource_requests` 纯函数         | 无 EditorCore 实例    | 独立预览计算 Worker，由浏览器执行适配器按需创建                                                                 |
+| `lib/language/worker.ts`      | `LanguageBinding`（有状态 JSON-RPC 端点）                     | 无 EditorCore 实例    | 语言服务 Worker，由编辑 Worker 的 LanguageHost 惰性创建；桌面本机会话由 native 适配器替代                       |
 
 交互形状：
 
@@ -162,6 +165,10 @@ flowchart TB
         RP["render_preview / preview_resource_requests（纯函数，不建 EditorCore）"]
     end
 
+    subgraph LGW["语言 Worker（language/worker.ts，按需创建）"]
+        LB["LanguageBinding（有状态 JSON-RPC 端点，不建 EditorCore）"]
+    end
+
     DBG["调试页 /debug/sync：独立的生产 EditorDocuments 实例"]
     DBG --> WD
 
@@ -172,6 +179,8 @@ flowchart TB
     WD <--> SVC2
     SVC1 -.->|"独立 PreviewHost：快照、任务与完成"| PW
     SVC2 -.-> PW
+    SVC1 -.->|"LanguageHost：JSON-RPC 与资源回填"| LGW
+    SVC2 -.-> LGW
 ```
 
 ## 典型路径：打开、编辑与预览
@@ -320,6 +329,12 @@ Rust `save(id, Some(version))` 有精确因果版本前置条件；JSON core 服
 | `PreviewBinding.events()`                                                          | 独立控制器拉取合并状态事件                   |
 | `preview_link`                                                                     | 校验当前结果并解析片段、Vault 路径或外部 URL |
 | `preview_invalidate_project`                                                       | 项目级资源失效，下次任务重建                 |
+
+语言服务经 RPC `language_message`（无头 LSP JSON-RPC 字符串）进入组合壳的 `LanguageHost`，通知与回复以 `{kind:"language"}` 消息回流。host 负责串行、防抖、有界排队与资源回填；故障结束旧请求，下一次使用先重新初始化并恢复打开文档。编辑器侧通过 `@codemirror/lsp-client` 提供诊断、hover、F12 定义跳转及文档符号入口。
+
+`VaultWorkspace` 从 `EditorDocuments` 同步所有打开文档的正文与生命周期，包含未保存和待确认输入。CodeMirror 视图只附接该文档，不因切换标签发送 `didClose`。正文版本随同步递增，诊断携带版本并在显示前校验；文件改名、关闭和重连按最新文档集合同步。
+
+`LanguageStep` 的资源请求带 `ResourceContext { documentPath, source, overlays }`，与预览资源读取共用。分析资源根来自宿主，稳定的 Vault URI 只用于文档查询，不参与真实父目录计算。native 与 HTTP 的 package 准入使用同一份正文和依赖快照，外部正文覆盖不能授予额外路径；资源读取注册对应观察。补全、格式化及其他语言服务器不在当前 Notist 服务的能力声明内。
 
 ### 文件操作（`method = "file"`）
 

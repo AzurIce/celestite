@@ -32,11 +32,21 @@
 .preview-status {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  min-height: 32px;
-  padding: 0 16px;
+  min-width: 0;
   color: var(--color-secondary);
   font-size: var(--font-size-ui-sm);
+}
+.preview-status > [role="status"] {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.preview-recovery {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 16px 0;
 }
 .preview-scroller {
   overflow: auto;
@@ -75,7 +85,12 @@
   opacity: 0.6;
   cursor: default;
 }
-@media (max-width: 639px) {
+@media (max-width: 700px) {
+  .preview-recovery .ui-button,
+  .preview-diagnostics button,
+  .preview-package-source .ui-button {
+    min-height: 44px;
+  }
   .editor-layout[data-mode="split"] > .editor-source-pane {
     display: none;
   }

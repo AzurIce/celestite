@@ -1,4 +1,5 @@
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
+import { fileAction } from "./editor-actions";
 import { expect, test as base, type Page } from "@playwright/test";
 type VaultModule = typeof import("../src/lib/vault");
 
@@ -20,6 +21,10 @@ const test = base.extend<{ runtimeErrors: string[] }>({
 test.beforeEach(async ({ page }) => {
   await installWorkerHarness(page);
   await page.goto("/");
+  await expect(page.getByRole("tree", { name: "文件树" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
   await page.evaluate(async () => {
     const url = "/src/lib/vault/index.ts";
     const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;
@@ -76,6 +81,43 @@ test("Ctrl/Shift selection and context menus preserve multi-selection and target
   await expect(item("a.md")).toHaveAttribute("aria-selected", "false");
 });
 
+test("context menu keeps leading icons in one column", async ({ page }) => {
+  const menu = page.getByRole("menu");
+  await page
+    .getByRole("treeitem", { name: "a.md", exact: true })
+    .click({ button: "right" });
+  const iconX = async (name: string) => {
+    const box = await menu
+      .getByRole("menuitem", { name })
+      .locator("svg")
+      .first()
+      .boundingBox();
+    return Math.round(box!.x);
+  };
+  const baseline = await iconX("新建文件");
+  expect(await iconX("打开")).toBe(baseline);
+  expect(await iconX("复制相对路径")).toBe(baseline);
+  expect(await iconX("下载")).toBe(baseline);
+  expect(await iconX("刷新")).toBe(baseline);
+});
+
+test("copy relative path copies every selected Vault path", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const item = (name: string) =>
+    page.getByRole("treeitem", { name, exact: true });
+  await item("a.md").click();
+  await item("b.md").click({ modifiers: ["Control"] });
+  await item("b.md").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "复制相对路径" }).click();
+  await expect(treeStatus(page)).toHaveText("已复制 2 个路径");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    "a.md\nb.md",
+  );
+});
+
 test("keyboard navigation expands lazily, supports focus-only movement and opens a keyboard context menu", async ({
   page,
 }) => {
@@ -112,13 +154,13 @@ test("keyboard navigation expands lazily, supports focus-only movement and opens
 test("create, F2 rename, invalid names and duplicate conflicts update real OPFS and survive reload", async ({
   page,
 }) => {
-  await page.getByRole("button", { name: "新建文件夹", exact: true }).click();
+  await fileAction(page, "新建文件夹");
   await page.getByRole("textbox", { name: "名称", exact: true }).fill("Work");
   await page.getByRole("button", { name: "确认", exact: true }).click();
   await expect(
     page.getByRole("treeitem", { name: "Work", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "新建文件", exact: true }).click();
+  await fileAction(page, "新建文件");
   await page
     .getByRole("textbox", { name: "名称", exact: true })
     .fill("draft.md");
@@ -221,7 +263,7 @@ test("a click that follows a pointer drag does not open or expand", async ({
   );
   await page.mouse.up();
   await expect(row("a.md")).toHaveAttribute("data-path", "Archive/a.md");
-  await expect(pane).toContainText("打开一份文件");
+  await expect(pane).toContainText("开始一份笔记");
 
   // 浏览器可能在拖动后补发 click；坐标已偏移时按拖动处理，原位点击仍然展开。
   await row("Inbox").dispatchEvent("pointerdown", {
@@ -359,7 +401,7 @@ test("dragging highlights only the destination subtree and clears it on exit", a
     await expect(root).toHaveAttribute("data-drop", "true");
     await expect(item("b.md")).toHaveAttribute("data-drop", "false");
     await page
-      .locator(".tree-toolbar")
+      .locator(".tree-navigation-actions")
       .dispatchEvent("dragover", { dataTransfer });
     await expect(root).toHaveAttribute("data-drop", "false");
     await row("b.md").dispatchEvent("dragover", { dataTransfer });
@@ -543,6 +585,7 @@ test("mobile tree fits the viewport and theme applies to rows and operation dial
   page,
 }) => {
   await page.setViewportSize({ width: 360, height: 720 });
+  await page.getByRole("button", { name: "切换文件导航", exact: true }).click();
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(360);
@@ -550,9 +593,430 @@ test("mobile tree fits the viewport and theme applies to rows and operation dial
   await page.getByRole("button", { name: "主题", exact: true }).click();
   await page.getByRole("menuitem", { name: "深色", exact: true }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.getByRole("button", { name: "新建文件", exact: true }).click();
+  await page
+    .locator(".file-tree")
+    .getByRole("button", { name: "新建笔记", exact: true })
+    .click();
   const surface = await page
     .locator(".vault-editor")
     .evaluate((element) => getComputedStyle(element).backgroundColor);
   await expect(page.getByRole("dialog")).toHaveCSS("background-color", surface);
+});
+
+test("filename lookup reaches collapsed descendants beyond the result cap without reading metadata or file contents", async ({
+  page,
+}) => {
+  await page.evaluate(async () => {
+    const url = "/src/lib/vault/index.ts";
+    const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;
+    const backend = await openOpfsVault();
+    for (const directory of [".celestite", ".git"])
+      await backend.mkdir(vaultPath(directory));
+    for (const path of [
+      ...Array.from({ length: 65 }, (_, index) => `lookup-${index}.md`),
+      "Inbox/Nested/needle-deep.md",
+      ".celestite/needle-private.md",
+      ".git/needle-private.md",
+    ])
+      await backend.writeFile(
+        vaultPath(path),
+        new TextEncoder().encode("# deep note"),
+        { mode: "create" },
+      );
+    await backend.close();
+  });
+  await page.reload();
+  await expect(page.getByRole("tree", { name: "文件树" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await workerEvaluate(page, () => {
+    const originalEntries = FileSystemDirectoryHandle.prototype.entries;
+    const originalFile = FileSystemFileHandle.prototype.getFile;
+    const probe = { directories: [] as string[], files: 0 };
+    (self as unknown as { lookupProbe: typeof probe }).lookupProbe = probe;
+    FileSystemDirectoryHandle.prototype.entries = function () {
+      probe.directories.push(this.name);
+      return originalEntries.call(this);
+    };
+    FileSystemFileHandle.prototype.getFile = function () {
+      probe.files++;
+      return originalFile.call(this);
+    };
+  });
+  await page.keyboard.press("Control+k");
+  const dialog = page.getByRole("dialog", { name: "查找文件", exact: true });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("status")).toHaveText(
+    /\d+ 个匹配 · 已显示 50 项/,
+  );
+  await expect(dialog.getByRole("option")).toHaveCount(50);
+  const probe = await workerEvaluate(
+    page,
+    () =>
+      (
+        self as unknown as {
+          lookupProbe: { directories: string[]; files: number };
+        }
+      ).lookupProbe,
+  );
+  expect(probe.directories).toContain("Nested");
+  expect(probe.directories).not.toContain(".celestite");
+  expect(probe.directories).not.toContain(".git");
+  expect(probe.files).toBe(0);
+  await dialog
+    .getByRole("combobox", { name: "文件名或路径", exact: true })
+    .fill("needle");
+  await expect(dialog.getByRole("option")).toHaveCount(1);
+  await expect(dialog.getByRole("option")).toContainText("needle-deep.md");
+  await expect(
+    page.getByRole("treeitem", {
+      name: "Inbox",
+      exact: true,
+      includeHidden: true,
+    }),
+  ).toHaveAttribute("aria-expanded", "false");
+  await dialog
+    .getByRole("combobox", { name: "文件名或路径", exact: true })
+    .press("Enter");
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toContainText(
+    "# deep note",
+  );
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeFocused();
+});
+
+test("new-note titles preserve Markdown and open ready for typing", async ({
+  page,
+}) => {
+  await page
+    .locator(".file-tree")
+    .getByRole("button", { name: "新建笔记", exact: true })
+    .click();
+  await page
+    .getByRole("textbox", { name: "笔记标题", exact: true })
+    .fill("今日随记");
+  await page.getByRole("button", { name: "确认", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "代码编辑器", exact: true });
+  await expect(editor).toBeFocused();
+  await page.keyboard.insertText("开始记录。");
+  await page.keyboard.press("Control+s");
+  await expect(
+    page.getByRole("status", { name: "保存状态", exact: true }),
+  ).toHaveText("已保存");
+  const text = await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const vaults = await root.getDirectoryHandle("vaults");
+    const vault = await vaults.getDirectoryHandle("default");
+    const file = await vault.getFileHandle("今日随记.md");
+    return (await file.getFile()).text();
+  });
+  expect(text).toBe("开始记录。");
+});
+
+test("new notes accept an existing Markdown extension and ordinary files keep their exact names", async ({
+  page,
+}) => {
+  await page
+    .locator(".file-tree")
+    .getByRole("button", { name: "新建笔记", exact: true })
+    .click();
+  await page
+    .getByRole("textbox", { name: "笔记标题", exact: true })
+    .fill("already.md");
+  await page.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(
+    page.getByRole("textbox", { name: "代码编辑器", exact: true }),
+  ).toBeFocused();
+  await expect(
+    page.getByRole("treeitem", { name: "already.md", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("treeitem", { name: "already.md.md", exact: true }),
+  ).toHaveCount(0);
+
+  await fileAction(page, "新建文件");
+  await page
+    .getByRole("textbox", { name: "名称", exact: true })
+    .fill("LICENSE");
+  await page.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(
+    page.getByRole("treeitem", { name: "LICENSE", exact: true }),
+  ).toBeVisible();
+  const names = await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const vaults = await root.getDirectoryHandle("vaults");
+    const vault = await vaults.getDirectoryHandle("default");
+    const names: string[] = [];
+    for await (const [name] of vault.entries()) names.push(name);
+    return names;
+  });
+  expect(names).toContain("already.md");
+  expect(names).toContain("LICENSE");
+  expect(names).not.toContain("LICENSE.md");
+});
+
+test("a blank note title stays editable and cancelling restores the visible mobile trigger", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const create = page.getByRole("button", { name: "创建笔记", exact: true });
+  await create.click();
+  const dialog = page.getByRole("dialog", { name: "新建笔记", exact: true });
+  const title = dialog.getByRole("textbox", { name: "笔记标题", exact: true });
+  await title.fill("   ");
+  await dialog.getByRole("button", { name: "确认", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toHaveText("请输入笔记标题。");
+  await expect(title).toBeFocused();
+  await title.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(create).toBeFocused();
+  await create.press("Enter");
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(create).toBeFocused();
+});
+
+test("lookup opens duplicate filenames beyond the first page and narrows them by path", async ({
+  page,
+}) => {
+  await page.evaluate(async () => {
+    const url = "/src/lib/vault/index.ts";
+    const { openOpfsVault, vaultPath } = (await import(url)) as VaultModule;
+    const backend = await openOpfsVault();
+    try {
+      for (let index = 0; index < 60; index++) {
+        const directory = `Projects/${String(index).padStart(2, "0")}`;
+        await backend.mkdir(vaultPath(directory), { recursive: true });
+        await backend.writeFile(
+          vaultPath(`${directory}/README.md`),
+          new TextEncoder().encode(`# Project ${index}`),
+          { mode: "create" },
+        );
+      }
+    } finally {
+      await backend.close();
+    }
+  });
+  await page.reload();
+  await expect(page.getByRole("tree", { name: "文件树" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await page.keyboard.press("Control+k");
+  const dialog = page.getByRole("dialog", { name: "查找文件", exact: true });
+  const query = dialog.getByRole("combobox", {
+    name: "文件名或路径",
+    exact: true,
+  });
+  await query.fill("README");
+  await expect(dialog.getByRole("status")).toHaveText(
+    "60 个匹配 · 已显示 50 项",
+  );
+  await expect(dialog.getByRole("option")).toHaveCount(50);
+  for (let index = 0; index < 50; index++) await query.press("ArrowDown");
+  await expect(dialog.getByRole("option", { selected: true })).toContainText(
+    "Projects/50",
+  );
+  await query.press("Enter");
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toContainText(
+    "# Project 50",
+  );
+
+  await page.keyboard.press("Control+k");
+  await query.fill("Projects/59 readme");
+  await expect(dialog.getByRole("option")).toHaveCount(1);
+  await expect(dialog.getByRole("option")).toContainText("Projects/59");
+  await query.press("Enter");
+  await expect(page.getByRole("textbox", { name: "代码编辑器" })).toContainText(
+    "# Project 59",
+  );
+
+  await page.keyboard.press("Control+k");
+  await query.fill("readme");
+  await expect(dialog.getByRole("status")).toHaveText(
+    "60 个匹配 · 已显示 50 项",
+  );
+  await dialog
+    .getByRole("button", { name: "显示更多（剩余 10 项）", exact: true })
+    .click();
+  await expect(dialog.getByRole("option")).toHaveCount(60);
+  await expect(query).toBeFocused();
+  await expect(dialog.getByRole("option", { selected: true })).toContainText(
+    "Projects/50",
+  );
+  await expect(dialog.getByRole("status")).toHaveText("60 个匹配");
+});
+
+test("lookup failures stay actionable across query changes and retry the real directory read", async ({
+  page,
+}) => {
+  await workerEvaluate(page, () => {
+    const original = FileSystemDirectoryHandle.prototype.entries;
+    (self as unknown as { restoreLookup: () => void }).restoreLookup = () => {
+      FileSystemDirectoryHandle.prototype.entries = original;
+    };
+    FileSystemDirectoryHandle.prototype.entries = function () {
+      if (this.name === "Inbox")
+        throw new DOMException("Injected denial", "NotAllowedError");
+      return original.call(this);
+    };
+  });
+  try {
+    await page.keyboard.press("Control+k");
+    const dialog = page.getByRole("dialog", { name: "查找文件", exact: true });
+    await expect(dialog.getByRole("alert")).toContainText("Inbox");
+    await dialog
+      .getByRole("combobox", { name: "文件名或路径", exact: true })
+      .fill("alpha");
+    await expect(dialog.getByRole("status")).toHaveText("0 个匹配");
+    await expect(dialog.getByRole("alert")).toContainText("结果可能不完整");
+    await workerEvaluate(page, () =>
+      (self as unknown as { restoreLookup: () => void }).restoreLookup(),
+    );
+    await dialog.getByRole("button", { name: "重新查找", exact: true }).click();
+    await expect(dialog.getByRole("option")).toContainText("alpha.md");
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+  } finally {
+    await workerEvaluate(page, () =>
+      (self as unknown as { restoreLookup: () => void }).restoreLookup(),
+    );
+  }
+});
+
+test("closing a pending lookup stops later directories and reopening starts a fresh generation", async ({
+  page,
+}) => {
+  await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const vaults = await root.getDirectoryHandle("vaults");
+    const vault = await vaults.getDirectoryHandle("default");
+    const slow = await vault.getDirectoryHandle("Slow", { create: true });
+    await slow.getFileHandle("stale-only.md", { create: true });
+    await slow.getDirectoryHandle("Tail", { create: true });
+  });
+  await page.reload();
+  await expect(page.getByRole("tree", { name: "文件树" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await workerEvaluate(page, () => {
+    const original = FileSystemDirectoryHandle.prototype.entries;
+    const probe = {
+      reads: [] as string[],
+      waiting: false,
+      finished: false,
+      block: true,
+      release: undefined as (() => void) | undefined,
+      restore: () => {
+        FileSystemDirectoryHandle.prototype.entries = original;
+        probe.release?.();
+      },
+    };
+    (
+      self as unknown as { lookupCancellation: typeof probe }
+    ).lookupCancellation = probe;
+    FileSystemDirectoryHandle.prototype.entries = async function* () {
+      probe.reads.push(this.name);
+      if (this.name === "Slow" && probe.block) {
+        probe.waiting = true;
+        await new Promise<void>((resolve) => {
+          probe.release = resolve;
+        });
+      }
+      try {
+        yield* original.call(this);
+      } finally {
+        if (this.name === "Slow") probe.finished = true;
+      }
+      return undefined;
+    };
+  });
+  try {
+    const trigger = page.getByRole("button", { name: "查找文件", exact: true });
+    await trigger.click();
+    const dialog = page.getByRole("dialog", { name: "查找文件", exact: true });
+    await expect
+      .poll(() =>
+        workerEvaluate(
+          page,
+          () =>
+            (
+              self as unknown as {
+                lookupCancellation: { waiting: boolean };
+              }
+            ).lookupCancellation.waiting,
+        ),
+      )
+      .toBe(true);
+    await dialog
+      .getByRole("combobox", { name: "文件名或路径", exact: true })
+      .fill("stale-only");
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(trigger).toBeFocused();
+    await page.evaluate(async () => {
+      const root = await navigator.storage.getDirectory();
+      const vaults = await root.getDirectoryHandle("vaults");
+      const vault = await vaults.getDirectoryHandle("default");
+      const slow = await vault.getDirectoryHandle("Slow");
+      await slow.removeEntry("stale-only.md");
+      await slow.getFileHandle("fresh-only.md", { create: true });
+    });
+    await workerEvaluate(page, () => {
+      const probe = (
+        self as unknown as {
+          lookupCancellation: { block: boolean; release?: () => void };
+        }
+      ).lookupCancellation;
+      probe.block = false;
+      probe.release?.();
+    });
+    await expect
+      .poll(() =>
+        workerEvaluate(
+          page,
+          () =>
+            (
+              self as unknown as {
+                lookupCancellation: { finished: boolean };
+              }
+            ).lookupCancellation.finished,
+        ),
+      )
+      .toBe(true);
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    expect(
+      await workerEvaluate(
+        page,
+        () =>
+          (
+            self as unknown as {
+              lookupCancellation: { reads: string[] };
+            }
+          ).lookupCancellation.reads,
+      ),
+    ).not.toContain("Tail");
+    await trigger.click();
+    const query = dialog.getByRole("combobox", {
+      name: "文件名或路径",
+      exact: true,
+    });
+    await expect(query).toHaveValue("");
+    await query.fill("only");
+    await expect(dialog.getByRole("status")).toHaveText("1 个匹配");
+    await expect(dialog.getByRole("option")).toContainText("fresh-only.md");
+    await expect(dialog).not.toContainText("stale-only.md");
+  } finally {
+    await workerEvaluate(page, () =>
+      (
+        self as unknown as { lookupCancellation: { restore: () => void } }
+      ).lookupCancellation.restore(),
+    );
+  }
 });

@@ -49,7 +49,7 @@ const themeEntry: SettingDefinition<ThemeModeSetting> = {
 
 const sidebarRange = { min: 200, max: 560 };
 const sidebarEntry: SettingDefinition<number> = {
-  default: 300 as number,
+  default: 248 as number,
   range: sidebarRange,
   parse: parseInteger(sidebarRange),
   describe: "侧边栏宽度（像素）",
@@ -58,7 +58,7 @@ const sidebarEntry: SettingDefinition<number> = {
 const wrapEntry: SettingDefinition<boolean> = {
   default: false as boolean,
   parse: parseBoolean(),
-  describe: "编辑器自动换行",
+  describe: "源码编辑器自动换行；实时渲染始终按阅读列换行",
 };
 
 const vimEntry: SettingDefinition<boolean> = {
@@ -67,14 +67,14 @@ const vimEntry: SettingDefinition<boolean> = {
   describe: "编辑器 Vim 模式",
 };
 
-const previewModes = ["source", "split", "preview"] as const;
+const previewModes = ["source", "live", "split", "preview"] as const;
 export type PreviewModeSetting = (typeof previewModes)[number];
 const previewModeEntry: SettingDefinition<PreviewModeSetting> = {
   default: "source",
   choices: previewModes,
   parse: parseChoice(previewModes),
   projectOverride: false,
-  describe: "所有文档共用的源码 / 分栏 / 预览显示模式",
+  describe: "所有文档共用的源码 / 实时渲染 / 分栏 / 预览显示模式",
 };
 
 export const SETTINGS_SCHEMA = {

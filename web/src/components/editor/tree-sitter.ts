@@ -1,4 +1,9 @@
-import { StateEffect, StateField, type Extension } from "@codemirror/state";
+import {
+  StateEffect,
+  StateField,
+  type Extension,
+  type Text,
+} from "@codemirror/state";
 import { foldService } from "@codemirror/language";
 import {
   Decoration,
@@ -8,6 +13,12 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import type { GrammarName, HighlightResponse } from "../../lib/syntax/contract";
+import {
+  presentationGrammar,
+  setSyntaxPresentation,
+  syntaxPresentation,
+} from "./live-preview";
+import { compositionState } from "../../lib/editor/composition";
 
 export const syntaxFolds = StateEffect.define<{ from: number; to: number }[]>();
 const foldRanges = StateField.define<Map<number, { from: number; to: number }>>(
@@ -64,6 +75,8 @@ export function treeSitterHighlight(
   onError?: () => void,
 ): Extension {
   return [
+    presentationGrammar.of({ grammar }),
+    syntaxPresentation,
     foldRanges,
     foldService.of((state, start) => {
       return state.field(foldRanges).get(start) ?? null;
@@ -75,49 +88,32 @@ export function treeSitterHighlight(
         private version = 0;
         private timer: ReturnType<typeof setTimeout> | undefined;
         private destroyed = false;
+        private pending:
+          { doc: Text; response: HighlightResponse | null } | undefined;
         constructor(private view: EditorView) {
           this.worker = new Worker(
             new URL("../../lib/syntax/worker.ts", import.meta.url),
             { type: "module" },
           );
           this.worker.onmessage = (event: MessageEvent<HighlightResponse>) => {
-            const response = event.data;
-            if (this.destroyed || response.version !== this.version) return;
-            if ("error" in response) {
-              onError?.();
-              return;
-            }
-            const marks = response.spans.flatMap((span) => {
-              const className = tokenClass(span.capture);
-              return className &&
-                span.from < span.to &&
-                span.to <= this.view.state.doc.length
-                ? [
-                    Decoration.mark({
-                      class: className,
-                      attributes: { "data-syntax": span.capture },
-                    }).range(span.from, span.to),
-                  ]
-                : [];
-            });
-            this.decorations = Decoration.set(marks, true);
-            this.view.dispatch({ effects: syntaxFolds.of(response.folds) });
+            this.receive(event.data);
           };
-          this.worker.onerror = () => {
-            if (!this.destroyed) onError?.();
-          };
+          this.worker.onerror = () => this.receive(null);
           this.send();
         }
         update(update: ViewUpdate) {
-          if (!update.docChanged) return;
-          this.version++;
-          this.decorations = this.decorations.map(update.changes);
-          // Bound the delay during continuous typing; parse off the UI thread.
-          if (!this.timer)
-            this.timer = setTimeout(() => {
-              this.timer = undefined;
-              this.send();
-            }, 50);
+          if (update.docChanged) {
+            this.version++;
+            this.decorations = this.decorations.map(update.changes);
+            // Bound the delay during continuous typing; parse off the UI thread.
+            if (!this.timer)
+              this.timer = setTimeout(() => {
+                this.timer = undefined;
+                this.send();
+              }, 50);
+          }
+          if (this.pending && !update.state.field(compositionState, false))
+            queueMicrotask(() => this.applyPending());
         }
         private send() {
           this.worker.postMessage({
@@ -126,8 +122,73 @@ export function treeSitterHighlight(
             text: this.view.state.doc.toString(),
           });
         }
+        private receive(response: HighlightResponse | null) {
+          if (this.destroyed || (response && response.version !== this.version))
+            return;
+          this.pending = { doc: this.view.state.doc, response };
+          this.applyPending();
+        }
+        private applyPending() {
+          if (
+            this.destroyed ||
+            !this.pending ||
+            this.view.state.field(compositionState, false)
+          )
+            return;
+          const { doc, response } = this.pending;
+          this.pending = undefined;
+          if (
+            response &&
+            (response.version !== this.version || doc !== this.view.state.doc)
+          )
+            return;
+          // Any dispatch can clear pending browser DOM records. Keep syntax
+          // replies, including failures, out of the composition's final flush.
+          if (!response || "error" in response) {
+            this.clearPresentation();
+            onError?.();
+            return;
+          }
+          const marks = response.spans.flatMap((span) => {
+            const className = tokenClass(span.capture);
+            return className &&
+              span.from < span.to &&
+              span.to <= this.view.state.doc.length
+              ? [
+                  Decoration.mark({
+                    class: className,
+                    attributes: { "data-syntax": span.capture },
+                  }).range(span.from, span.to),
+                ]
+              : [];
+          });
+          this.decorations = Decoration.set(marks, true);
+          this.view.dispatch({
+            effects: [
+              syntaxFolds.of(response.folds),
+              setSyntaxPresentation.of({
+                doc,
+                ranges: response.presentation,
+              }),
+            ],
+          });
+        }
+        private clearPresentation() {
+          this.decorations = Decoration.none;
+          this.view.dispatch({
+            effects: [
+              syntaxFolds.of([]),
+              setSyntaxPresentation.of({
+                doc: this.view.state.doc,
+                ranges: [],
+                failed: true,
+              }),
+            ],
+          });
+        }
         destroy() {
           this.destroyed = true;
+          this.pending = undefined;
           clearTimeout(this.timer);
           this.worker.terminate();
         }

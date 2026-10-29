@@ -58,6 +58,40 @@ pub struct PreviewTask {
     pub resource_root: String,
 }
 
+/// Immutable source roots used to authorize the same import graph as the
+/// consumer. Relative overlays are other open Vault documents; absolute
+/// overlays may only supply configuration reached through that graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(missing_as_null, hashmap_as_object))]
+pub struct ResourceContext {
+    pub document_path: String,
+    pub source: String,
+    #[serde(default)]
+    pub overlays: BTreeMap<String, String>,
+}
+
+impl From<&PreviewTask> for ResourceContext {
+    fn from(task: &PreviewTask) -> Self {
+        let mut overlays = BTreeMap::new();
+        for (path, resource) in &task.resources {
+            if (path == "Notist.toml" || path.ends_with("/Notist.toml"))
+                && let Some(data) = &resource.data
+                && let Ok(source) = String::from_utf8(data.clone())
+            {
+                overlays.insert(path.clone(), source);
+            }
+        }
+        overlays.extend(task.overlays.clone());
+        Self {
+            document_path: task.ticket.path.clone(),
+            source: task.source.clone(),
+            overlays,
+        }
+    }
+}
+
 fn default_resource_root() -> String {
     "/vault".into()
 }
@@ -101,10 +135,10 @@ pub struct PreviewComponent {
     pub package_root: String,
 }
 
-#[cfg(feature = "preview")]
-mod manifests;
-#[cfg(feature = "preview")]
-mod paths;
+#[cfg(any(feature = "preview", feature = "language"))]
+pub(crate) mod manifests;
+#[cfg(any(feature = "preview", feature = "language"))]
+pub(crate) mod paths;
 #[cfg(feature = "preview")]
 pub mod project;
 
@@ -382,6 +416,19 @@ pub fn resolve_preview_target(path: &str, target: &str) -> EditorResult<PreviewL
 /// synchronously in an edit or save command. No IO or CRDT writes occur here.
 #[cfg(feature = "preview")]
 pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
+    compute_preview_with(task, false)
+}
+
+/// Native computation exposes real resource paths so Notist configuration
+/// extensions can run commands in their actual project directory. Browser
+/// hosts keep the executor namespace and therefore cannot spawn processes.
+#[cfg(all(feature = "native", feature = "preview", not(target_arch = "wasm32")))]
+pub fn compute_preview_native(task: &PreviewTask) -> PreviewCompletion {
+    compute_preview_with(task, true)
+}
+
+#[cfg(feature = "preview")]
+fn compute_preview_with(task: &PreviewTask, native: bool) -> PreviewCompletion {
     let mut environment_diagnostics = Vec::new();
     let computed = (|| -> EditorResult<PreviewOutput> {
         if task.source.len() > MAX_TEXT_BYTES || task.source.contains('\r') {
@@ -400,7 +447,17 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
         })?;
         // Frontend selection is case-sensitive; the logical path remains in
         // the ticket for resource resolution, while dispatch uses a canonical ext.
-        let resources = project::SnapshotResources::new(task);
+        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+        let resources = if native {
+            project::SnapshotResources::native(task)
+        } else {
+            project::SnapshotResources::new(task)
+        };
+        #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
+        let resources = {
+            let _ = native;
+            project::SnapshotResources::new(task)
+        };
         let mut vault = notist::Vault::new(&resources);
         let path = std::path::Path::new(&task.ticket.path).with_extension(extension);
         let computed = vault
@@ -424,28 +481,32 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
                 EditorError::new(ErrorCode::InvalidPreview, message, &task.ticket.path)
             })?;
         let analysis = computed.analysis;
-        let transformed = computed.transformed;
+        let evaluation = computed.evaluation;
         let rendered = computed.rendered;
-        let environment = vault.environment_for(&path).map_err(|error| {
-            EditorError::new(
-                ErrorCode::InvalidPreview,
-                error.to_string(),
-                &task.ticket.path,
-            )
-        })?;
+        let environment = vault
+            .environment_for(&path, &task.source)
+            .map_err(|error| {
+                EditorError::new(
+                    ErrorCode::InvalidPreview,
+                    error.to_string(),
+                    &task.ticket.path,
+                )
+            })?;
         let used_components = rendered
             .used_components
             .iter()
             .filter_map(|component| {
+                let module = environment.modules().get(&component.id.module)?;
+                let root = module.path.parent()?;
                 Some(PreviewComponent {
-                    package: component.id.package.clone(),
+                    package: project::resource_key(
+                        &task.resource_root,
+                        std::path::Path::new(&component.id.module),
+                    ),
                     name: component.id.name.clone(),
                     tag: component.tag.clone(),
                     path: project::resource_key(&task.resource_root, component.module.resource()?),
-                    package_root: project::resource_key(
-                        &task.resource_root,
-                        &environment.packages()[&component.id.package].root,
-                    ),
+                    package_root: project::resource_key(&task.resource_root, root),
                 })
             })
             .collect();
@@ -454,7 +515,7 @@ pub fn compute_preview(task: &PreviewTask) -> PreviewCompletion {
             .iter()
             .map(|diagnostic| (PreviewDiagnosticOrigin::Analysis, diagnostic))
             .chain(
-                transformed
+                evaluation
                     .diagnostics
                     .iter()
                     .map(|diagnostic| (PreviewDiagnosticOrigin::Transform, diagnostic)),

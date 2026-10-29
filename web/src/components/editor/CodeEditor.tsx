@@ -15,6 +15,7 @@ import {
   Transaction,
 } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
+import { diagnosticCount, setDiagnostics } from "@codemirror/lint";
 import { sourceExtensions } from "./source-extensions";
 import type {
   EditorDocument,
@@ -23,14 +24,25 @@ import type {
   ViewSelection,
 } from "@/lib/editor/contract";
 import { languageSupport } from "./languages";
+import { livePreview } from "./live-preview";
+import {
+  compositionState,
+  editorComposition,
+  setComposing,
+} from "../../lib/editor/composition";
+import { notistLanguageId } from "@/lib/language/client";
+import type { LSPClient } from "@codemirror/lsp-client";
 import { vimExtension, vimNormalMode, vimUserEvent, type VimMode } from "./vim";
 import "./editor.css";
+import "./live-preview.css";
 import { collaboratorField, setCollaborators } from "./collaborators";
 
 import type { EditorBuffer } from "./buffer";
 import type { PreviewSync } from "./preview-sync";
 interface CodeEditorProps {
+  activation: number;
   previewSync?: PreviewSync;
+  lspClient?: LSPClient;
   reveal?: { from: number; to: number; requestId: string };
   document: EditorDocument;
   onTransaction: (transaction: ViewEdit) => boolean;
@@ -43,6 +55,7 @@ interface CodeEditorProps {
   ) => void;
   onUndo: (context: SelectionContext, redo: boolean) => void;
   wrap: boolean;
+  live: boolean;
   vim: boolean;
   cached?: EditorBuffer;
   onSave: () => void;
@@ -71,6 +84,12 @@ export default function CodeEditor(props: CodeEditorProps) {
   let languageRequest = 0;
   let languagePath: string | undefined;
   let selectionRevision = 0;
+  let configuredLsp:
+    | { client: LSPClient | undefined; path: string; languageId: string | null }
+    | undefined;
+  let configuredLive: boolean | undefined;
+  let configuredWrap: boolean | undefined;
+  let lastActivation = untrack(() => props.activation);
   let observer: MutationObserver | undefined;
   const [languageError, setLanguageError] = createSignal(false);
   const darkTheme = () =>
@@ -97,6 +116,18 @@ export default function CodeEditor(props: CodeEditorProps) {
       props.onUndo(selectionContext(editor.state), redo);
     return true;
   };
+  const applyCollaborators = () => {
+    if (
+      !view ||
+      disposed ||
+      view.state.field(compositionState, false) ||
+      projectionContent !== props.document.content
+    )
+      return;
+    view.dispatch({
+      effects: setCollaborators.of(props.document.collaborators ?? []),
+    });
+  };
   const bindings = () => [
     collaboratorField,
     Prec.highest(
@@ -122,13 +153,9 @@ export default function CodeEditor(props: CodeEditorProps) {
         ? []
         : transaction,
     ),
-    EditorView.domEventHandlers({
-      compositionstart: () => {
-        props.onComposition?.(true);
-      },
-      compositionend: () => {
-        setTimeout(() => props.onComposition?.(false), 0);
-      },
+    editorComposition((active) => {
+      props.onComposition?.(active);
+      if (!active) queueMicrotask(applyCollaborators);
     }),
     EditorView.contentAttributes.of({
       "aria-label": "代码编辑器",
@@ -187,15 +214,15 @@ export default function CodeEditor(props: CodeEditorProps) {
         reportView();
     }),
   ];
+  const readOnly = () =>
+    props.document.locked || !!props.document.readOnlyReason;
+  const acceptsInput = () =>
+    (!props.document.locked || !!props.document.core) &&
+    !props.document.inputFailure &&
+    !props.document.readOnlyReason;
   const editable = () => [
-    EditorState.readOnly.of(
-      props.document.locked || !!props.document.readOnlyReason,
-    ),
-    EditorView.editable.of(
-      (!props.document.locked || !!props.document.core) &&
-        !props.document.inputFailure &&
-        !props.document.readOnlyReason,
-    ),
+    EditorState.readOnly.of(readOnly()),
+    EditorView.editable.of(acceptsInput()),
   ];
   const vimBindings = () =>
     props.vim
@@ -232,6 +259,28 @@ export default function CodeEditor(props: CodeEditorProps) {
       if (!disposed && request === languageRequest) setLanguageError(true);
     }
   }
+  function configureLsp(path: string) {
+    if (!view || disposed) return;
+    const client = props.lspClient;
+    const languageId =
+      client && !props.document.deleted ? notistLanguageId(path) : null;
+    if (
+      configuredLsp?.client === client &&
+      configuredLsp?.path === path &&
+      configuredLsp?.languageId === languageId
+    )
+      return;
+    configuredLsp = { client, path, languageId };
+    if (diagnosticCount(view.state))
+      view.dispatch(setDiagnostics(view.state, []));
+    view.dispatch({
+      effects: buffer.lsp.reconfigure(
+        client && languageId
+          ? client.plugin(`file:///vault/${path}`, languageId)
+          : [],
+      ),
+    });
+  }
   /**
    * 打开文件时把焦点交给编辑器（与 Zed 一致）。读取是异步的，视图挂载可能
    * 晚于用户已经开始的下一步操作；只有焦点仍留在文件树、编辑器内或文档
@@ -239,11 +288,14 @@ export default function CodeEditor(props: CodeEditorProps) {
    */
   function focusIfIdle() {
     const active = document.activeElement;
+    // A lazy mount may finish after the user has moved to a toolbar or menu.
+    // Only document navigation and the editor itself hand focus to this view.
     if (
       active &&
       active !== document.body &&
-      !active.closest('[role="tree"]') &&
-      !active.closest('[aria-label="文件编辑器"]')
+      !active.closest(
+        '[role="tree"], [role="tab"], .editor-open-documents-trigger, .cm-content',
+      )
     )
       return;
     view?.focus();
@@ -259,6 +311,8 @@ export default function CodeEditor(props: CodeEditorProps) {
       reloadVersion: props.document.reloadVersion,
       state: EditorState.create({ doc: props.document.content }),
       language: new Compartment(),
+      presentation: new Compartment(),
+      lsp: new Compartment(),
       theme: new Compartment(),
       bindings: new Compartment(),
       editable: new Compartment(),
@@ -271,6 +325,8 @@ export default function CodeEditor(props: CodeEditorProps) {
     const state = cached
       ? buffer.state.update({
           effects: [
+            buffer.presentation.reconfigure(props.live ? livePreview() : []),
+            buffer.lsp.reconfigure([]),
             buffer.bindings.reconfigure(bindings()),
             buffer.theme.reconfigure(darkTheme()),
             buffer.editable.reconfigure(editable()),
@@ -284,6 +340,8 @@ export default function CodeEditor(props: CodeEditorProps) {
             buffer.vim.of(vimBindings()),
             sourceExtensions,
             buffer.language.of([]),
+            buffer.presentation.of(props.live ? livePreview() : []),
+            buffer.lsp.of([]),
             buffer.theme.of(darkTheme()),
             buffer.bindings.of(bindings()),
             buffer.editable.of(editable()),
@@ -292,10 +350,11 @@ export default function CodeEditor(props: CodeEditorProps) {
         });
     props.onView?.(viewId, documentId, false);
     view = new EditorView({ parent: host, state });
+    lastActivation = props.activation;
+    configuredLive = props.live;
+    configuredWrap = props.wrap;
     projectionContent = state.doc.toString();
-    view.dispatch({
-      effects: setCollaborators.of(props.document.collaborators ?? []),
-    });
+    applyCollaborators();
     reportView();
     window.addEventListener("focus", reportView);
     window.addEventListener("blur", reportView);
@@ -305,6 +364,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     detachPreviewSync = previewSync?.mountEditor(documentId, view);
     cursor(view.state);
     void configureLanguage(props.document.path);
+    configureLsp(props.document.path);
     observer = new MutationObserver(() => {
       if (view)
         view.dispatch({ effects: buffer.theme.reconfigure(darkTheme()) });
@@ -316,9 +376,39 @@ export default function CodeEditor(props: CodeEditorProps) {
     focusIfIdle();
   });
   createEffect(
+    () => props.activation,
+    (activation) => {
+      // Reopening the current document does not mount another view. Honor that
+      // explicit activation through EditorView so its cached selection is also
+      // written back to the DOM. Presence and save updates do not change it.
+      // Solid effects also apply when a snapshot changes but this number does
+      // not. Focusing then would overwrite an IME's unflushed DOM selection.
+      if (lastActivation === activation) return;
+      lastActivation = activation;
+      const target = view;
+      if (!target) return;
+      onSettled(() => {
+        if (
+          !disposed &&
+          view === target &&
+          props.document.id === documentId &&
+          props.activation === activation
+        )
+          focusIfIdle();
+      });
+    },
+  );
+  createEffect(
     () => props.document.path,
     (path) => {
       if (view) void configureLanguage(path);
+    },
+  );
+  createEffect(
+    () =>
+      [props.document.path, props.document.deleted, props.lspClient] as const,
+    ([path]) => {
+      configureLsp(path);
     },
   );
   createEffect(
@@ -327,8 +417,25 @@ export default function CodeEditor(props: CodeEditorProps) {
       !!props.document.inputFailure ||
       !!props.document.readOnlyReason,
     () => {
-      if (view)
+      if (
+        view &&
+        (view.state.facet(EditorState.readOnly) !== readOnly() ||
+          view.state.facet(EditorView.editable) !== acceptsInput())
+      )
         view.dispatch({ effects: buffer.editable.reconfigure(editable()) });
+    },
+  );
+  createEffect(
+    () => props.live,
+    (enabled) => {
+      if (view && configuredLive !== enabled) {
+        configuredLive = enabled;
+        view.dispatch({
+          effects: buffer.presentation.reconfigure(
+            enabled ? livePreview() : [],
+          ),
+        });
+      }
     },
   );
   createEffect(
@@ -342,10 +449,12 @@ export default function CodeEditor(props: CodeEditorProps) {
   createEffect(
     () => props.wrap,
     (wrap) => {
-      if (view)
+      if (view && configuredWrap !== wrap) {
+        configuredWrap = wrap;
         view.dispatch({
           effects: buffer.wrap.reconfigure(wrap ? EditorView.lineWrapping : []),
         });
+      }
     },
   );
   createEffect(
@@ -423,10 +532,7 @@ export default function CodeEditor(props: CodeEditorProps) {
       collaborators: props.document.collaborators,
       content: props.document.content,
     }),
-    ({ collaborators, content }) => {
-      if (view && projectionContent === content)
-        view.dispatch({ effects: setCollaborators.of(collaborators ?? []) });
-    },
+    applyCollaborators,
   );
   onCleanup(() => {
     props.onView?.(viewId, null, false);
@@ -437,9 +543,14 @@ export default function CodeEditor(props: CodeEditorProps) {
     document.removeEventListener("visibilitychange", reportView);
     observer?.disconnect();
     if (view) {
+      let state = view.state;
+      if (state.field(compositionState)) {
+        state = state.update({ effects: setComposing.of(false) }).state;
+        props.onComposition?.(false);
+      }
       props.onCache({
         ...buffer,
-        state: view.state,
+        state,
         scrollTop: view.scrollDOM.scrollTop,
         scrollLeft: view.scrollDOM.scrollLeft,
       });

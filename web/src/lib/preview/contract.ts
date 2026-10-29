@@ -7,6 +7,7 @@ import type {
   PreviewState,
   PreviewTask,
   PreviewBinding,
+  ResourceContext,
 } from "../editor/generated/celestite_core";
 export type {
   PreviewCompletion,
@@ -24,6 +25,7 @@ export type {
   PreviewTask,
   PreviewBinding,
   PreviewTicket,
+  ResourceContext,
 } from "../editor/generated/celestite_core";
 
 /** An owned readonly capture, independent of Editor and UI. */
@@ -37,11 +39,11 @@ export interface PackageResourceProvider {
   root: string;
   read(
     request: PreviewResourceRequest,
-    task: PreviewTask,
+    context: ResourceContext,
   ): Promise<PreviewResource>;
   readDir(
     path: string,
-    task: PreviewTask,
+    context: ResourceContext,
   ): Promise<{ path: string; kind: string }[]>;
 }
 export interface PreviewAssets {

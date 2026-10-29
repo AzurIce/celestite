@@ -22,14 +22,48 @@ pub(super) struct SnapshotResources<'a> {
     namespace: ResourceNamespace,
     manifests: RefCell<BTreeMap<PathBuf, ManifestSource>>,
     requests: RefCell<BTreeMap<String, bool>>,
+    allow_commands: bool,
 }
 impl<'a> SnapshotResources<'a> {
     pub(super) fn new(task: &'a PreviewTask) -> Self {
+        // Browser hosts let Notist report that process extensions are
+        // unavailable. Native logical execution is also used for remote
+        // replicas, whose configuration must never execute local processes.
+        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+        let allow_commands = false;
+        #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
+        let allow_commands = true;
+        Self::with_mode(task, false, allow_commands)
+    }
+
+    /// Native execution maps logical paths to real paths so process extensions
+    /// receive the real configuration directory as their working directory.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    pub(super) fn native(task: &'a PreviewTask) -> Self {
+        Self::with_mode(task, true, true)
+    }
+
+    /// Discovery must stay free of user processes while still walking the
+    /// replace/module graph for resource preparation.
+    pub(super) fn discovery(task: &'a PreviewTask) -> Self {
+        Self::with_mode(task, false, false)
+    }
+
+    fn with_mode(task: &'a PreviewTask, _native: bool, allow_commands: bool) -> Self {
+        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+        let namespace = if _native {
+            ResourceNamespace::native(&task.resource_root)
+        } else {
+            ResourceNamespace::new(&task.resource_root)
+        };
+        #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
+        let namespace = ResourceNamespace::new(&task.resource_root);
         Self {
             task,
-            namespace: ResourceNamespace::new(&task.resource_root),
+            namespace,
             manifests: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
+            allow_commands,
         }
     }
     fn request(&self, path: &str, read: bool) {
@@ -70,10 +104,8 @@ impl<'a> SnapshotResources<'a> {
             .filter(|prepared| prepared.analysis == error.source);
         let from = usize::from(error.diagnostic.span.start());
         let to = usize::from(error.diagnostic.span.end());
-        let (source, range) = match prepared {
-            Some(prepared) => (&prepared.original, prepared.range(from, to)),
-            None => (&error.source, from..to),
-        };
+        let source = prepared.map_or(&error.source, |prepared| &prepared.original);
+        let range = from..to;
         PreviewDiagnostic {
             from: source[..range.start].encode_utf16().count(),
             to: source[..range.end].encode_utf16().count(),
@@ -173,7 +205,7 @@ impl Resources for SnapshotResources<'_> {
             .file_name()
             .is_some_and(|name| name == "Notist.toml")
         {
-            let prepared = ManifestSource::new(&self.namespace.path(&resolved), source);
+            let prepared = ManifestSource::new(source, !self.allow_commands);
             let analysis = prepared.analysis.clone();
             self.manifests.borrow_mut().insert(resolved, prepared);
             Ok(analysis)
@@ -189,9 +221,14 @@ impl Resources for SnapshotResources<'_> {
 
 /// Missing probes are part of the preparation, including absent nearer configs.
 pub fn preview_resource_requests(task: &PreviewTask) -> Vec<PreviewResourceRequest> {
-    let resources = SnapshotResources::new(task);
+    let resources = SnapshotResources::discovery(task);
     let mut vault = notist::Vault::new(&resources);
-    let _ = vault.html_registry(&task.ticket.path);
+    let _ = (|| -> Result<(), notist::VaultError> {
+        let analysis = vault.analyze(&task.ticket.path, &task.source)?;
+        let evaluation = vault.evaluate(&task.ticket.path, &analysis)?;
+        vault.html_registry(&task.ticket.path, &task.source, &evaluation.root)?;
+        Ok(())
+    })();
     resources
         .requests
         .into_inner()

@@ -1,6 +1,7 @@
 import { VaultError } from "../../vault/errors";
 import { vaultPath, type VaultPath } from "../../vault/path";
 import type { VaultBackend } from "../../vault/types";
+import type { GitStatusSource } from "../../git/status";
 import { fileBackend, type FileMethod, type FileParams } from "../files";
 import type { DocumentsSnapshot } from "../contract";
 import { EditorClient } from "../rpc";
@@ -45,6 +46,14 @@ export class ClientDocuments {
       this.client.request("preview_assets", { id, taskId }),
   };
   reconnect?: (discardUnconfirmed?: boolean) => Promise<void>;
+  /** Fire-and-forget LSP channel; a closing vault swallows stale replies. */
+  readonly language = {
+    send: (message: string) => {
+      void this.client.request("language_message", { message }).catch(() => {});
+    },
+    subscribe: (handler: (message: string) => void) =>
+      this.client.subscribeLanguage(handler),
+  };
   private connection?: ConnectionState;
   private members?: CollaborationSnapshot;
   private replacingSession = false;
@@ -916,6 +925,7 @@ export async function openRemoteEditor(
   identity: InstanceIdentity;
   documents: import("../contract").EditorDocuments;
   backend: VaultBackend;
+  git?: GitStatusSource;
 }> {
   if (isDesktop())
     return (await import("../../desktop/editor")).openNativeRemoteEditor(

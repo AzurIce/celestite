@@ -1,6 +1,7 @@
 //! External wire codecs and adapters. Native owners use byte coordinates.
 pub mod buffer;
 pub mod editor;
+pub mod git;
 use celestite_buffer::types::BufferError;
 
 pub fn byte_to_utf16(text: &str, offset: usize) -> Result<usize, BufferError> {

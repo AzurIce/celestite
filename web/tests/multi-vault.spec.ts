@@ -1,3 +1,9 @@
+import {
+  chooseEditorMode,
+  expectEditorMode,
+  openDocumentOptions,
+  fileAction,
+} from "./editor-actions";
 import { expect, test as base, type Page } from "@playwright/test";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -9,6 +15,13 @@ import { createServer } from "node:net";
 
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
 import { packageFixture } from "./package-fixture";
+import {
+  expectActiveVault,
+  openVaultManager,
+  openVaultMenu,
+  selectVault,
+  vaultSwitcher,
+} from "./vault-actions";
 
 type Api = { url: string; root: string; urls: Record<string, string> };
 const binary =
@@ -105,12 +118,28 @@ const test = base.extend<{ runtimeErrors: string[] }, { api: Api }>({
     { scope: "worker" },
   ],
 });
+async function openNavigation(page: Page) {
+  const switcher = vaultSwitcher(page);
+  const toggle = page.getByRole("button", {
+    name: "切换文件导航",
+    exact: true,
+  });
+  await expect(switcher.or(toggle).first()).toBeVisible();
+  // Recovery and startup failures expose connection controls directly.
+  if (!(await switcher.isVisible())) {
+    await toggle.click();
+    await expect(
+      page.getByRole("tree", { name: "文件树", exact: true }),
+    ).toBeVisible();
+  }
+}
 async function connect(page: Page, url: string) {
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "管理 Vault", exact: true });
+  await openNavigation(page);
+  const dialog = await openVaultManager(page);
   await dialog.getByLabel("连接远端 Vault", { exact: true }).fill(url);
   await dialog.getByRole("button", { name: "连接", exact: true }).click();
   await expect(dialog).not.toBeVisible();
+  await openNavigation(page);
 }
 async function seedLocal(page: Page) {
   await page.goto("/");
@@ -135,6 +164,95 @@ async function seedLocal(page: Page) {
 }
 const editor = (page: Page) => page.locator(".cm-content");
 
+test("remote language analysis uses unsaved imports and refreshes external module diagnostics", async ({
+  page,
+  api,
+}) => {
+  const moduleRoot = join(api.root, "packages", "language");
+  await mkdir(moduleRoot, { recursive: true });
+  const declaration = "fn greet() -> BlockContent;";
+  await writeFile(join(moduleRoot, "lib.notc"), declaration);
+  await writeFile(
+    join(api.root, "notes", "language.not"),
+    "= Remote language\n",
+  );
+  await installWorkerHarness(page);
+  const reads: {
+    context: { documentPath: string; source: string };
+    request: { path: string };
+  }[] = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith("/preview/resources"))
+      reads.push(request.postDataJSON());
+  });
+  await page.goto("/");
+  await connect(page, api.url);
+  await page
+    .getByRole("treeitem", { name: "language.not", exact: true })
+    .click();
+  const source =
+    '= Remote language\n\n#import "../packages/language/lib.notc" as library;\n\n#library.greet()\n';
+  await editor(page).fill(source);
+  const call = await editor(page).evaluate((element) => {
+    const view = (element as any).cmTile.root.view;
+    const offset = view.state.doc.toString().indexOf("greet()") + 1;
+    return view.coordsAtPos(offset);
+  });
+  expect(call).not.toBeNull();
+  await page.mouse.move(
+    (call!.left + call!.right) / 2,
+    (call!.top + call!.bottom) / 2,
+  );
+  await expect(page.locator(".cm-tooltip").first()).toContainText("greet");
+  await expect
+    .poll(() =>
+      reads.some(
+        (read) =>
+          read.context.documentPath === "language.not" &&
+          read.context.source === source &&
+          read.request.path === join(moduleRoot, "lib.notc"),
+      ),
+    )
+    .toBe(true);
+  expect(await readFile(join(api.root, "notes", "language.not"), "utf8")).toBe(
+    "= Remote language\n",
+  );
+  const diagnostics = () =>
+    page.evaluate(() => {
+      const messages = (
+        window as unknown as {
+          editorMessages: { kind: string; message?: string }[];
+        }
+      ).editorMessages;
+      return (
+        messages
+          .filter((message) => message.kind === "language")
+          .map((message) => JSON.parse(message.message!))
+          .filter(
+            (message) =>
+              message.method === "textDocument/publishDiagnostics" &&
+              message.params.uri === "file:///vault/language.not",
+          )
+          .at(-1)
+          ?.params.diagnostics.map(
+            (diagnostic: { message: string }) => diagnostic.message,
+          ) ?? null
+      );
+    });
+  await expect.poll(diagnostics).toEqual([]);
+  await writeFile(
+    join(moduleRoot, "lib.notc"),
+    "fn renamed() -> BlockContent;",
+  );
+  await expect
+    .poll(diagnostics)
+    .toEqual(
+      expect.arrayContaining([expect.stringContaining("library.greet")]),
+    );
+  await writeFile(join(moduleRoot, "lib.notc"), declaration);
+  await expect.poll(diagnostics).toEqual([]);
+});
+
 test("external diff failures stay online, pause saving and can be retried", async ({
   page,
   api,
@@ -157,9 +275,11 @@ test("external diff failures stay online, pause saving and can be retried", asyn
   await expect(page.getByText(/外部修改尚未同步，自动写回已暂停/)).toBeVisible({
     timeout: 12_000,
   });
+  await openDocumentOptions(page);
   await expect(
-    page.getByRole("button", { name: "保存", exact: true }),
+    page.getByRole("menuitem", { name: "保存", exact: true }),
   ).toBeDisabled();
+  await page.keyboard.press("Escape");
   await expect(
     page.getByRole("button", { name: "尝试重新连接", exact: true }),
   ).not.toBeVisible();
@@ -297,9 +417,7 @@ test("remote editing persists to disk; switching preserves independent undo and 
   expect(await readFile(join(api.root, "notes", "a.md"), "utf8")).toBe(
     "# remote edited 中文",
   );
-  await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .selectOption("opfs:default");
+  await selectVault(page, "我的 Vault");
   await expect(editor(page)).toContainText("local edited");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect(
@@ -312,9 +430,7 @@ test("remote editing persists to disk; switching preserves independent undo and 
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
-  await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .selectOption({ label: "notes" });
+  await selectVault(page, "notes");
   await expect(editor(page)).toContainText("remote edited");
   await editor(page).focus();
   await page.keyboard.press("Control+z");
@@ -344,12 +460,12 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   await writeFile(join(api.root, "notes", name), source);
   await writeFile(
     join(api.root, "notes", "remote-note.not"),
-    '@(id: "dest")\n= 远端 Notist\n\n😀中文 #unknown[ok]',
+    '@(id: "dest")\n= 远端 Notist\n\n😀中文 *ok*',
   );
   await page.goto("/");
   await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h1")).toHaveText("Remote initial");
   await workerEvaluate(
@@ -386,9 +502,7 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
     await expect
       .poll(() => page.evaluate(() => window.getSelection()?.toString()))
       .toContain("Remote Section 0");
-    await expect(
-      page.getByRole("button", { name: "分栏", exact: true }),
-    ).toHaveAttribute("aria-pressed", "true");
+    await expectEditorMode(page, "分栏");
     await page
       .locator(".cm-line")
       .filter({ hasText: /^## Remote Section 0$/ })
@@ -441,7 +555,7 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
   expect(await readFile(join(api.root, "notes", name), "utf8")).toContain(
     "# Remote draft",
   );
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览已更新",
   );
   // Saving invalidates project resources; a displayed ticket can expire while
@@ -459,12 +573,12 @@ test("remote core previews unsaved Markdown and Notist with split mapping, scrol
     ).toBeVisible({ timeout: 500 });
   }).toPass();
   await expect(preview.locator("h1")).toHaveText("远端 Notist");
-  await expect(preview.locator(".notist-custom")).toContainText("ok");
-  await preview.locator(".notist-custom").click();
+  await expect(preview.locator("strong")).toHaveText("ok");
+  await preview.locator("strong").click();
   await expect(editor(page)).toBeFocused();
   await expect
     .poll(() => page.evaluate(() => window.getSelection()?.toString()))
-    .toContain("ok");
+    .toBe("ok");
 });
 
 test("remote packages load JS and WASM and invalidate on declaration changes without editing the document", async ({
@@ -476,6 +590,10 @@ test("remote packages load JS and WASM and invalidate on declaration changes wit
     await mkdir(target.slice(0, target.lastIndexOf("/")), { recursive: true });
     await writeFile(target, data);
   }
+  const source = await readFile(
+    join(api.root, "notes", "packaged/package.not"),
+    "utf8",
+  );
   await page.goto("/");
   await connect(page, api.url);
   await page
@@ -485,11 +603,13 @@ test("remote packages load JS and WASM and invalidate on declaration changes wit
   await page
     .getByRole("treeitem", { name: "package.not", exact: true })
     .click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
   await expect(
-    preview.locator("demo-card p").filter({ hasText: "WASM" }),
+    preview.locator("[notist-protocol] p").filter({ hasText: "WASM" }),
   ).toHaveText("相对 JS / WASM 42");
   const declaration = join(
     api.root,
@@ -498,14 +618,18 @@ test("remote packages load JS and WASM and invalidate on declaration changes wit
   );
   await writeFile(
     declaration,
-    'fn card(title: String = "远端声明更新")[children: Content] -> Content;',
+    'fn card(title: String = "远端声明更新")[children: BlockContent] -> BlockContent;',
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("远端声明更新");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "远端声明更新",
+  );
   await writeFile(declaration, "fn card(");
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("远端声明更新");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "远端声明更新",
+  );
   await preview.locator("summary").click();
   await preview
     .getByRole("button")
@@ -519,6 +643,11 @@ test("remote packages load JS and WASM and invalidate on declaration changes wit
     }),
   ).toHaveAttribute("aria-selected", "true");
   await expect(editor(page)).toHaveText("fn card(");
+  expect(
+    (await hostDocuments(api)).find(
+      (document) => document.path === "packaged/package.not",
+    )?.snapshot.text,
+  ).toBe(source);
 });
 
 test("recursive external packages remain outside the Vault and update the preview without entering history", async ({
@@ -532,28 +661,38 @@ test("recursive external packages remain outside the Vault and update the previe
     await mkdir(target.slice(0, target.lastIndexOf("/")), { recursive: true });
     await writeFile(
       target,
-      path === "Notist.toml"
-        ? '[dependencies]\nbridge = {path = "../external-packages/bridge"}\n'
+      path === "package.not"
+        ? new TextDecoder()
+            .decode(data)
+            .replace(
+              "./packages/demo/lib.notc",
+              "../external-packages/demo/lib.notc",
+            )
         : data,
     );
   }
   const bridge = join(api.root, "external-packages/bridge");
   await mkdir(bridge, { recursive: true });
+  await writeFile(join(bridge, "lib.notc"), "fn unused() -> BlockContent;");
+  const declaration = join(api.root, "external-packages/demo/lib.notc");
+  const transitiveImport = 'import "../bridge/lib.notc" as bridge;\n';
   await writeFile(
-    join(bridge, "Notist.toml"),
-    '[package]\nname = "bridge"\n[dependencies]\ndemo = {path = "../demo"}\n',
+    declaration,
+    transitiveImport + (await readFile(declaration, "utf8")),
   );
-  await writeFile(join(bridge, "lib.notc"), "fn unused() -> Content;");
+  const source = await readFile(join(api.root, "work/external.not"), "utf8");
   await page.goto("/");
   await connect(page, api.urls.work);
   await page
     .getByRole("treeitem", { name: "external.not", exact: true })
     .click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
   await expect(
-    preview.locator("demo-card p").filter({ hasText: "WASM" }),
+    preview.locator("[notist-protocol] p").filter({ hasText: "WASM" }),
   ).toHaveText("相对 JS / WASM 42");
   expect(
     (await hostDocuments(api, "work")).some(
@@ -564,17 +703,21 @@ test("recursive external packages remain outside the Vault and update the previe
   await expect(
     page.getByRole("treeitem", { name: "external-packages", exact: true }),
   ).toHaveCount(0);
-  const declaration = join(api.root, "external-packages/demo/lib.notc");
   await writeFile(
     declaration,
-    'fn card(title: String = "外部声明更新")[children: Content] -> Content;',
+    transitiveImport +
+      'fn card(title: String = "外部声明更新")[children: BlockContent] -> BlockContent;',
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("外部声明更新");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "外部声明更新",
+  );
   await writeFile(declaration, "fn card(");
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("外部声明更新");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "外部声明更新",
+  );
   await preview.locator("summary").click();
   await preview
     .getByRole("button")
@@ -589,26 +732,43 @@ test("recursive external packages remain outside the Vault and update the previe
   ).toHaveAttribute("aria-selected", "true");
   await writeFile(
     declaration,
-    'fn card(title: String = "声明恢复")[children: Content] -> Content;',
+    transitiveImport +
+      'fn card(title: String = "声明恢复")[children: BlockContent] -> BlockContent;',
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("声明恢复");
-  await writeFile(
-    join(api.root, "external-packages/demo/Notist.toml"),
-    "[package",
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "声明恢复",
   );
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await writeFile(join(bridge, "lib.notc"), "fn bridge(");
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("声明恢复");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "声明恢复",
+  );
   await preview.locator("summary").click();
   await preview
     .getByRole("button")
-    .filter({ hasText: "/external-packages/demo/Notist.toml:" })
+    .filter({ hasText: "/external-packages/bridge/lib.notc:" })
     .first()
     .click();
   await expect(
     preview.getByRole("region", { name: "package 诊断源码" }),
-  ).toContainText("[package");
+  ).toContainText("fn bridge(");
+  await expect(
+    page.getByRole("tab", { name: "external.not", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  const documents = await hostDocuments(api, "work");
+  expect(
+    documents.some(
+      (document) =>
+        document.path.includes("external-packages") ||
+        document.path.endsWith("lib.notc"),
+    ),
+  ).toBe(false);
+  expect(
+    documents.find((document) => document.path === "external.not")?.snapshot
+      .text,
+  ).toBe(source);
 });
 
 test("connection records restore share credentials on reload; removing a connection keeps server files", async ({
@@ -618,9 +778,10 @@ test("connection records restore share credentials on reload; removing a connect
   await page.goto("/");
   await connect(page, api.url);
   await connect(page, api.url + "/");
-  await expect(
-    page.getByRole("combobox", { name: "当前 Vault" }).locator("option"),
-  ).toHaveCount(2);
+  let menu = await openVaultMenu(page);
+  await expect(menu.getByRole("menuitemradio")).toHaveCount(2);
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
   const stored = await page.evaluate(async () => {
     const root = await navigator.storage.getDirectory();
     const directory = await root.getDirectoryHandle("celestite");
@@ -631,27 +792,32 @@ test("connection records restore share credentials on reload; removing a connect
   expect(JSON.parse(stored).version).toBe(2);
   expect(JSON.parse(stored).connections[0].id).not.toContain(api.url);
   await page.reload();
-  await expect(page.getByRole("combobox", { name: "当前 Vault" })).toHaveValue(
+  await expect(vaultSwitcher(page)).toHaveAttribute(
+    "data-vault-id",
     "opfs:default",
   );
-  await expect(
-    page.getByRole("combobox", { name: "当前 Vault" }).locator("option"),
-  ).toHaveCount(2);
-  await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .selectOption({ label: "notes" });
+  menu = await openVaultMenu(page);
+  await expect(menu.getByRole("menuitemradio")).toHaveCount(2);
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await selectVault(page, "notes");
   await expect(
     page.getByRole("treeitem", { name: "a.md", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "管理 Vault" });
+  const dialog = await openVaultManager(page);
+  await expect(dialog).toContainText("保存在此浏览器");
   await expect(
     dialog.getByRole("button", { name: "移除连接 我的 Vault" }),
   ).toHaveCount(0);
   await dialog.getByRole("button", { name: "移除连接 notes" }).click();
+  await expect(dialog).toContainText("会确认编辑已发送并关闭当前会话");
+  await expect(dialog).toContainText("不会将更改保存到服务器磁盘");
+  await expect(dialog).not.toContainText("会先保存已打开的文件");
   await dialog
     .getByRole("button", { name: "确认移除连接", exact: true })
     .click();
+  await expect(dialog).toBeHidden();
+  await openVaultManager(page);
   await expect(dialog.getByRole("listitem")).toHaveCount(1);
   expect(await readFile(join(api.root, "notes", "a.md"), "utf8")).toContain(
     "notes",
@@ -753,16 +919,100 @@ test("watch refreshes the tree after an external disk change, and read-only Vaul
     page.getByRole("treeitem", { name: "external.md", exact: true }),
   ).toBeVisible();
   await connect(page, api.urls.readonly);
-  await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await expectActiveVault(page, "readonly · 只读");
+  await expect(
+    page.getByRole("button", { name: "新建笔记", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "文件操作", exact: true }).click();
+  for (const name of ["新建文件", "新建文件夹", "导入文件"])
+    await expect(
+      page.getByRole("menuitem", { name, exact: true }),
+    ).toHaveAttribute("aria-disabled", "true");
+  await expect(
+    page.getByRole("menuitem", { name: "刷新文件树", exact: true }),
+  ).not.toHaveAttribute("aria-disabled", "true");
+  await page.keyboard.press("Escape");
+  const file = page.getByRole("treeitem", { name: "a.md", exact: true });
+  await file.click({ button: "right" });
+  for (const name of ["重命名…", "剪切", "移动到…", "粘贴", "删除…"])
+    await expect(
+      page.getByRole("menuitem", { name, exact: false }),
+    ).toHaveAttribute("aria-disabled", "true");
+  await expect(
+    page.getByRole("menuitem", { name: "打开", exact: false }),
+  ).not.toHaveAttribute("aria-disabled", "true");
+  await expect(
+    page.getByRole("menuitem", { name: "下载", exact: true }),
+  ).not.toHaveAttribute("aria-disabled", "true");
+  await page.getByRole("menuitem", { name: "复制", exact: false }).click();
+  await expect(page.getByRole("status", { name: "文件树状态" })).toContainText(
+    "已复制 1 项",
+  );
+  const tree = page.getByRole("tree", { name: "文件树", exact: true });
+  await tree.focus();
+  for (const key of ["F2", "Delete", "Control+v", "Control+x"])
+    await page.keyboard.press(key);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await tree.evaluate((element) => {
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(
+      new File(["must not import"], "blocked-import.md", {
+        type: "text/markdown",
+      }),
+    );
+    element.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer }),
+    );
+  });
+  await file.click({ button: "right" });
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("menuitem", { name: "下载", exact: true }).click();
+  expect((await downloadPromise).suggestedFilename()).toBe("a.md");
+  await file.click();
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
   await expect(
     page.getByText("当前 Vault 只读。", { exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   await expect(
     page.getByRole("region", { name: "文档预览" }).locator("h1"),
   ).toHaveText("readonly original");
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
+  await expect(
+    page.getByRole("treeitem", { name: "blocked-import.md", exact: true }),
+  ).toHaveCount(0);
+  expect(await readFile(join(api.root, "readonly", "a.md"), "utf8")).toBe(
+    "# readonly original\n",
+  );
+});
+
+test("same-name Vault connections distinguish source and access in the switcher", async ({
+  page,
+  api,
+}) => {
+  await page.goto("/");
+  await connect(page, api.url);
+  await connect(page, api.urls.reader);
+  const host = new URL(api.url).host;
+  const menu = await openVaultMenu(page);
+  await expect(menu.getByRole("menuitemradio")).toHaveText([
+    "我的 Vault",
+    `notes · ${host} · 可编辑`,
+    `notes · ${host} · 只读`,
+  ]);
+  await expect(
+    menu.getByRole("menuitemradio", {
+      name: `notes · ${host} · 只读`,
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-checked", "true");
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  const dialog = await openVaultManager(page);
+  const readonly = dialog.getByRole("listitem").filter({ hasText: "只读" });
+  await readonly.getByRole("button", { name: "移除连接 notes" }).click();
+  await expect(dialog).toContainText("会关闭当前会话，服务器上的文件仍保留");
+  await expect(dialog).not.toContainText("会先保存已打开的文件");
 });
 
 test("startup readonly and edit links to one Vault synchronize with separate permissions", async ({
@@ -781,7 +1031,7 @@ test("startup readonly and edit links to one Vault synchronize with separate per
     await connect(reader, readerUrl);
     await reader.getByRole("treeitem", { name, exact: true }).click();
     await expect(editor(reader)).toHaveAttribute("contenteditable", "false");
-    await reader.getByRole("button", { name: "分栏", exact: true }).click();
+    await chooseEditorMode(reader, "分栏");
     await expect(
       reader.getByRole("region", { name: "文档预览" }).locator("h1"),
     ).toHaveText("Initial");
@@ -1011,7 +1261,7 @@ test("remote save failure retains the preview and draft, pauses editing and can 
   await page.goto("/");
   await connect(page, api.url);
   await page.getByRole("treeitem", { name, exact: true }).click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
   await expect(preview.locator("h1")).toHaveText("Original");
 
@@ -1111,8 +1361,7 @@ test("reauthentication rejects a changed host history and retains the client dra
     descriptor.vault.historyId = "another-host-history";
     await route.fulfill({ response, json: descriptor });
   });
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "管理 Vault", exact: true });
+  const dialog = await openVaultManager(page);
   await dialog.getByLabel("连接远端 Vault", { exact: true }).fill(api.url);
   await dialog.getByRole("button", { name: "连接", exact: true }).click();
   await expect(dialog).toContainText("远端 Vault 历史已改变");
@@ -1154,8 +1403,7 @@ test("unconfirmed input blocks removing the connection and remains copyable", as
   );
   await editor(page).fill("keep unsaved shared draft");
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "管理 Vault" });
+  const dialog = await openVaultManager(page);
   await dialog.getByRole("button", { name: "移除连接 notes" }).click();
   await dialog
     .getByRole("button", { name: "确认移除连接", exact: true })
@@ -1252,6 +1500,9 @@ test("rejected input stays exportable and can be withdrawn without reconnecting"
   });
   const overlay = page.getByRole("region", { name: "远端连接状态" });
   await expect(overlay).toContainText("输入未被接受");
+  await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
+    "编辑需要恢复",
+  );
   await expect(editor(page)).toHaveAttribute("contenteditable", "false");
   const exported = page.waitForEvent("download");
   await overlay.getByRole("button", { name: "导出当前正文" }).click();
@@ -1353,11 +1604,7 @@ test("removing a confirmed shared connection preserves unsaved host files includ
           .sort(),
       )
       .toEqual(["open shared draft", "unopened shared draft"]);
-    await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
-    const dialog = page.getByRole("dialog", {
-      name: "管理 Vault",
-      exact: true,
-    });
+    const dialog = await openVaultManager(page);
     await dialog.getByRole("button", { name: "移除连接 notes" }).click();
     await dialog
       .getByRole("button", { name: "确认移除连接", exact: true })
@@ -1369,7 +1616,7 @@ test("removing a confirmed shared connection preserves unsaved host files includ
       expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
         "disk",
       );
-    await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
+    await expect(dialog).toBeHidden();
     await connect(page, api.url);
     await page.getByRole("treeitem", { name: names[0], exact: true }).click();
     await expect(editor(page)).toHaveText("open shared draft");
@@ -1384,8 +1631,8 @@ test("mobile connection controls fit the viewport", async ({ page, api }) => {
   await connect(page, api.url);
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor(page)).toBeVisible();
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "管理 Vault" });
+  await openNavigation(page);
+  const dialog = await openVaultManager(page);
   const box = await dialog.boundingBox();
   expect(box!.x).toBeGreaterThanOrEqual(16);
   expect(box!.width).toBeLessThanOrEqual(328);
@@ -1402,13 +1649,13 @@ test("remote file-tree creation, folder rename and deletion coordinate editor bu
 }) => {
   await page.goto("/");
   await connect(page, api.url);
-  await page.getByRole("button", { name: "新建文件夹", exact: true }).click();
+  await fileAction(page, "新建文件夹");
   await page.getByRole("textbox", { name: "名称", exact: true }).fill("drafts");
   await page.getByRole("button", { name: "确认", exact: true }).click();
   await expect(
     page.getByRole("treeitem", { name: "drafts", exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "新建文件", exact: true }).click();
+  await fileAction(page, "新建文件");
   await page.getByRole("textbox", { name: "名称", exact: true }).fill("new.md");
   await page.getByRole("button", { name: "确认", exact: true }).click();
   await expect(
@@ -1900,8 +2147,11 @@ for (const surface of ["menu", "dialog", "mobile-editor"] as const) {
     const cover = (await overlay.boundingBox())!;
     const content = (await page.locator(".workspace-content").boundingBox())!;
     expect(cover).toEqual(content);
-    const sidebar = (await page.locator(".workspace-sidebar").boundingBox())!;
-    const point = { x: sidebar.x + 24, y: sidebar.y + 24 };
+    const sidebar = await page.locator(".workspace-sidebar").boundingBox();
+    const point = {
+      x: (sidebar ?? content).x + 24,
+      y: (sidebar ?? content).y + 24,
+    };
     expect(
       await page.evaluate(
         ({ x, y }) =>
@@ -1924,9 +2174,7 @@ for (const surface of ["menu", "dialog", "mobile-editor"] as const) {
       await expect(editor(page)).toHaveAttribute("contenteditable", "false");
       await expect(editor(page)).toHaveText("original");
     }
-    await expect(
-      page.getByRole("button", { name: "管理 Vault", exact: true }),
-    ).toBeVisible();
+    await expect(vaultSwitcher(page)).toBeVisible();
     await overlay
       .getByRole("button", { name: "尝试重新连接", exact: true })
       .click();
@@ -1936,7 +2184,7 @@ for (const surface of ["menu", "dialog", "mobile-editor"] as const) {
     if (surface === "mobile-editor") {
       await expect(editor(page)).toHaveAttribute("contenteditable", "true");
       await page
-        .getByRole("button", { name: "返回文件树", exact: true })
+        .getByRole("button", { name: "切换文件导航", exact: true })
         .click();
     }
     await expect(
@@ -2202,7 +2450,7 @@ test("document leases release presence, keep undo on reopen, and permit path reu
   );
   expect(removed.ok).toBe(true);
   await writeFile(join(api.root, "notes", a), "recreated");
-  await page.getByRole("button", { name: "刷新文件树", exact: true }).click();
+  await fileAction(page, "刷新文件树");
   await page.getByRole("treeitem", { name: a, exact: true }).click();
   await expect(editor(page)).toHaveText("recreated");
   await page.getByRole("button", { name: `关闭 ${a}`, exact: true }).click();
@@ -2301,3 +2549,726 @@ test("collaboration renders Unicode selections and read-only members, maps concu
     await readerContext.close();
   }
 });
+
+test("live presentation keeps concurrent remote source and reveals ranges containing collaborator cursors", async ({
+  page,
+  browser,
+  api,
+}, testInfo) => {
+  const name = `live-collaboration-${crypto.randomUUID()}.md`;
+  const original =
+    "# Shared 😀\n\n**bold** and *soft* [link](a.md)\n\nleft middle right";
+  await writeFile(join(api.root, "notes", name), original);
+  const context = await browser.newContext({
+    baseURL: String(testInfo.project.use.baseURL),
+  });
+  const other = await context.newPage();
+  let holdingReplies = false;
+  const errors: string[] = [];
+  other.on("pageerror", (error) => errors.push(error.message));
+  const documentText = (client: Page) =>
+    editor(client).evaluate(
+      (element) =>
+        (element as any).cmTile.root.view.state.doc.toString() as string,
+    );
+  const position = (client: Page, offset: number) =>
+    editor(client).evaluate((element, offset) => {
+      const view = (element as any).cmTile.root.view;
+      view.dispatch({ selection: { anchor: offset } });
+    }, offset);
+  try {
+    for (const client of [page, other]) {
+      await installWorkerHarness(client, true);
+      await client.goto("/");
+      await connect(client, api.url);
+      await client.getByRole("treeitem", { name, exact: true }).click();
+      await chooseEditorMode(client, "实时渲染");
+      await editor(client).focus();
+      await position(client, original.length);
+      await expect(client.locator(".cm-live-strong").first()).toHaveText(
+        "bold",
+      );
+    }
+    // A remote selection is still a source offset. Expose its delimiters rather
+    // than painting a collaborator cursor in an invisible source range.
+    const marker = original.indexOf("**bold**") + 1;
+    await other.bringToFront();
+    await editor(other).focus();
+    await position(other, marker);
+    await expect(page.locator(".cm-collaborator-cursor")).toHaveCount(1);
+    await expect(page.locator(".cm-collaborator-cursor")).toHaveAttribute(
+      "data-offset",
+      String(marker),
+    );
+    await expect(editor(page)).toContainText("**bold**");
+    await expect(
+      page.locator('.cm-live-marker-hidden[data-live-kind="strong"]'),
+    ).toHaveCount(0);
+    await position(other, original.length);
+    await expect(page.locator(".cm-live-strong").first()).toHaveText("bold");
+    holdingReplies = true;
+    for (const client of [page, other])
+      await workerEvaluate(
+        client,
+        () => {
+          (self as any).holdUpdateReplies = true;
+        },
+        undefined,
+        -1,
+      );
+    await editor(page).focus();
+    await position(page, original.indexOf("left middle right"));
+    await editor(other).focus();
+    await position(other, original.length);
+    await Promise.all([
+      page.keyboard.insertText("**A** "),
+      other.keyboard.insertText(" :B"),
+    ]);
+    const expected = original.replace(
+      "left middle right",
+      "**A** left middle right :B",
+    );
+    for (const client of [page, other])
+      await expect.poll(() => documentText(client)).toBe(expected);
+    await position(page, expected.length);
+    await expect(
+      page.locator(".cm-live-strong").filter({ hasText: /^A$/ }),
+    ).toHaveText("A");
+    await expect
+      .poll(() =>
+        workerEvaluate(
+          page,
+          () => (self as any).heldUpdateReplies?.length ?? 0,
+          undefined,
+          -1,
+        ),
+      )
+      .toBeGreaterThan(0);
+    expect(await readFile(join(api.root, "notes", name), "utf8")).toBe(
+      original,
+    );
+    for (const client of [page, other])
+      await workerEvaluate(
+        client,
+        () => {
+          (self as any).holdUpdateReplies = false;
+          for (const reply of (self as any).heldUpdateReplies ?? []) reply();
+          (self as any).heldUpdateReplies = [];
+        },
+        undefined,
+        -1,
+      );
+    await editor(page).focus();
+    await page.keyboard.press("Control+z");
+    for (const client of [page, other])
+      await expect.poll(() => documentText(client)).toBe(original + " :B");
+    await page.keyboard.press("Control+y");
+    for (const client of [page, other])
+      await expect.poll(() => documentText(client)).toBe(expected);
+    await page.keyboard.press("Control+s");
+    await expect
+      .poll(() => readFile(join(api.root, "notes", name), "utf8"))
+      .toBe(expected);
+    expect(errors).toEqual([]);
+  } finally {
+    if (holdingReplies)
+      await Promise.allSettled(
+        [page, other].map((client) =>
+          workerEvaluate(
+            client,
+            () => {
+              (self as any).holdUpdateReplies = false;
+              for (const reply of (self as any).heldUpdateReplies ?? [])
+                reply();
+              (self as any).heldUpdateReplies = [];
+            },
+            undefined,
+            -1,
+          ),
+        ),
+      );
+    await context.close();
+  }
+});
+
+test("Android EditContext composition freezes live rendering and defers remote imports through the final input", async ({
+  browser,
+  api,
+}, testInfo) => {
+  const name = `edit-context-ime-${crypto.randomUUID()}.md`;
+  const original = "# EditContext 😀\n\n**原有粗体**\n\n输入：";
+  const composed = "中文 **组合内容**\n\n继续";
+  const disk = join(api.root, "notes", name);
+  await writeFile(disk, original);
+  const context = await browser.newContext({
+    baseURL: String(testInfo.project.use.baseURL),
+    userAgent: `Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Mobile Safari/537.36`,
+    viewport: { width: 900, height: 800 },
+    isMobile: true,
+    hasTouch: true,
+  });
+  const android = await context.newPage();
+  const errors: string[] = [];
+  android.on("pageerror", (error) => errors.push(error.message));
+  type PublicEditContext = EventTarget & {
+    text: string;
+    selectionStart: number;
+    selectionEnd: number;
+    updateText(from: number, to: number, text: string): void;
+    updateSelection(from: number, to: number): void;
+  };
+  type PublicTextUpdateConstructor = new (
+    type: string,
+    init: {
+      updateRangeStart: number;
+      updateRangeEnd: number;
+      text: string;
+      selectionStart: number;
+      selectionEnd: number;
+    },
+  ) => Event;
+  const documentText = () =>
+    editor(android).evaluate(
+      (element) =>
+        (element as any).cmTile.root.view.state.doc.toString() as string,
+    );
+  try {
+    await android.goto("/");
+    await connect(android, api.url);
+    await android.getByRole("treeitem", { name, exact: true }).click();
+    await chooseEditorMode(android, "实时渲染");
+    await editor(android).focus();
+    await viewCommand(android, "end");
+    await expect(android.locator(".cm-live-strong").first()).toHaveText(
+      "原有粗体",
+    );
+    const capabilities = await editor(android).evaluate((element) => {
+      const runtime = window as unknown as {
+        EditContext?: unknown;
+        TextUpdateEvent?: unknown;
+      };
+      const editContext = (
+        element as HTMLElement & { editContext?: PublicEditContext }
+      ).editContext;
+      return {
+        android: /Android/.test(navigator.userAgent),
+        editContext: typeof runtime.EditContext === "function",
+        textUpdateEvent: typeof runtime.TextUpdateEvent === "function",
+        attached: editContext?.constructor.name === "EditContext",
+        text: editContext?.text,
+        selection: editContext?.selectionEnd,
+      };
+    });
+    expect(
+      capabilities,
+      "This Chromium must expose and CodeMirror must attach the real Android EditContext API",
+    ).toEqual({
+      android: true,
+      editContext: true,
+      textUpdateEvent: true,
+      attached: true,
+      text: original,
+      selection: original.length,
+    });
+    await editor(android).evaluate((element) => {
+      const control = window as unknown as {
+        editContextDomCompositionEvents: number;
+      };
+      control.editContextDomCompositionEvents = 0;
+      element.addEventListener(
+        "compositionstart",
+        () => control.editContextDomCompositionEvents++,
+      );
+      element.addEventListener(
+        "compositionend",
+        () => control.editContextDomCompositionEvents++,
+      );
+      const editContext = (
+        element as HTMLElement & { editContext: PublicEditContext }
+      ).editContext;
+      editContext.dispatchEvent(new CompositionEvent("compositionstart"));
+    });
+    // Public updateText/updateSelection mimic the browser's context buffer
+    // update, then a real TextUpdateEvent goes through CodeMirror's adapter.
+    await editor(android).evaluate(
+      (element, { from, text }) => {
+        const editContext = (
+          element as HTMLElement & { editContext: PublicEditContext }
+        ).editContext;
+        const { TextUpdateEvent } = window as unknown as {
+          TextUpdateEvent: PublicTextUpdateConstructor;
+        };
+        editContext.updateText(from, from, text);
+        editContext.updateSelection(from + text.length, from + text.length);
+        editContext.dispatchEvent(
+          new TextUpdateEvent("textupdate", {
+            updateRangeStart: from,
+            updateRangeEnd: from,
+            text,
+            selectionStart: from + text.length,
+            selectionEnd: from + text.length,
+          }),
+        );
+      },
+      { from: original.length, text: "中" },
+    );
+    await expect.poll(documentText).toBe(original + "中");
+    await editor(android).evaluate(
+      (element, { from, text }) => {
+        const editContext = (
+          element as HTMLElement & { editContext: PublicEditContext }
+        ).editContext;
+        const { TextUpdateEvent } = window as unknown as {
+          TextUpdateEvent: PublicTextUpdateConstructor;
+        };
+        editContext.updateText(from, from + 1, text);
+        editContext.updateSelection(from + text.length, from + text.length);
+        editContext.dispatchEvent(
+          new TextUpdateEvent("textupdate", {
+            updateRangeStart: from,
+            updateRangeEnd: from + 1,
+            text,
+            selectionStart: from + text.length,
+            selectionEnd: from + text.length,
+          }),
+        );
+      },
+      { from: original.length, text: composed },
+    );
+    await expect.poll(documentText).toBe(original + composed);
+    await expect
+      .poll(
+        async () =>
+          (await hostDocuments(api)).find((document) => document.path === name)
+            ?.snapshot.text,
+      )
+      .toBe(original + composed);
+    await android.waitForTimeout(150);
+    await expect(
+      android.locator(".cm-line").filter({ hasText: "中文" }),
+    ).toHaveText("输入：中文 **组合内容**");
+    await expect(
+      android.locator(".cm-live-strong").filter({ hasText: "组合内容" }),
+    ).toHaveCount(0);
+    await writeFile(disk, "外部 " + original);
+    await expect
+      .poll(
+        async () =>
+          (await hostDocuments(api)).find((document) => document.path === name)
+            ?.snapshot.text,
+      )
+      .toBe("外部 " + original + composed);
+    expect(await documentText()).toBe(original + composed);
+    await editor(android).evaluate((element, composed) => {
+      const editContext = (
+        element as HTMLElement & { editContext: PublicEditContext }
+      ).editContext;
+      const { TextUpdateEvent } = window as unknown as {
+        TextUpdateEvent: PublicTextUpdateConstructor;
+      };
+      editContext.dispatchEvent(
+        new CompositionEvent("compositionend", { data: composed }),
+      );
+      // Some input methods deliver their final text immediately after end.
+      const from = editContext.selectionEnd;
+      editContext.updateText(from, from, "！");
+      editContext.updateSelection(from + 1, from + 1);
+      editContext.dispatchEvent(
+        new TextUpdateEvent("textupdate", {
+          updateRangeStart: from,
+          updateRangeEnd: from,
+          text: "！",
+          selectionStart: from + 1,
+          selectionEnd: from + 1,
+        }),
+      );
+    }, composed);
+    const expected = "外部 " + original + composed + "！";
+    await expect.poll(documentText).toBe(expected);
+    await expect(
+      android.locator(".cm-live-strong").filter({ hasText: "组合内容" }),
+    ).toHaveText("组合内容");
+    expect(
+      await editor(android).evaluate(
+        (element) =>
+          (element as HTMLElement & { editContext: PublicEditContext })
+            .editContext.text,
+      ),
+    ).toBe(expected);
+    expect(
+      await android.evaluate(
+        () =>
+          (window as unknown as { editContextDomCompositionEvents: number })
+            .editContextDomCompositionEvents,
+      ),
+    ).toBe(0);
+    await android.keyboard.press("Control+s");
+    await expect.poll(() => readFile(disk, "utf8")).toBe(expected);
+    expect(errors).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
+for (const heldReply of ["none", "syntax", "presence"] as const)
+  test(`Android DOM composition retains a final post-end mutation before releasing remote imports${heldReply !== "none" ? ` when a held ${heldReply} reply arrives` : ""}`, async ({
+    browser,
+    api,
+  }, testInfo) => {
+    const name = `dom-ime-${crypto.randomUUID()}.md`;
+    const original = "# DOM composition 😀\n\n**原有粗体**\n\n输入：";
+    const composed = "中文 **末尾输入**\n\n继续";
+    const disk = join(api.root, "notes", name);
+    await writeFile(disk, original);
+    const context = await browser.newContext({
+      baseURL: String(testInfo.project.use.baseURL),
+      userAgent: `Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Mobile Safari/537.36`,
+      viewport: { width: 900, height: 800 },
+      isMobile: true,
+      hasTouch: true,
+    });
+    const android = await context.newPage();
+    if (heldReply !== "none")
+      await android.addInitScript((mode) => {
+        const NativeWorker = window.Worker;
+        const control = {
+          hold: false,
+          replies: [] as (() => void)[],
+          peerId: "",
+          closedView: false,
+          sequences: [] as {
+            stage: "received" | "held" | "delivered";
+            sequence: number;
+            kind: string;
+          }[],
+        };
+        (
+          window as unknown as {
+            compositionReplies: typeof control;
+          }
+        ).compositionReplies = control;
+        window.Worker = class extends NativeWorker {
+          private syntax: boolean;
+          constructor(url: string | URL, options?: WorkerOptions) {
+            super(url, options);
+            this.syntax = /\/lib\/syntax\/worker\.ts(?:\?|$)/.test(String(url));
+            if (
+              mode === "presence" &&
+              /\/lib\/editor\/remote\/worker\.ts(?:\?|$)/.test(String(url))
+            ) {
+              const subscribe = this.addEventListener.bind(this);
+              const unsubscribe = this.removeEventListener.bind(this);
+              const listeners = new Map<
+                EventListenerOrEventListenerObject,
+                EventListener
+              >();
+              this.addEventListener = ((
+                type: string,
+                handler: EventListenerOrEventListenerObject,
+                options?: boolean | AddEventListenerOptions,
+              ) => {
+                if (type !== "message")
+                  return subscribe(type, handler, options);
+                let wrapped = listeners.get(handler);
+                if (!wrapped) {
+                  wrapped = (event) => {
+                    const message = (event as MessageEvent).data;
+                    const sequenced = typeof message?.sequence === "number";
+                    const log = (stage: "received" | "held" | "delivered") => {
+                      if (sequenced)
+                        control.sequences.push({
+                          stage,
+                          sequence: message.sequence,
+                          kind: message.kind,
+                        });
+                    };
+                    log("received");
+                    const deliver = () => {
+                      log("delivered");
+                      if (typeof handler === "function")
+                        handler.call(this, event);
+                      else handler.handleEvent(event);
+                    };
+                    // Preserve the shared notification FIFO after members;
+                    // request replies continue to their real callback at once.
+                    if (
+                      !control.hold ||
+                      !sequenced ||
+                      (!control.replies.length && message.kind !== "members")
+                    )
+                      return deliver();
+                    log("held");
+                    if (message.kind === "members")
+                      control.closedView ||= !!message.state?.members.some(
+                        (member: { sessionId: string; views: unknown[] }) =>
+                          member.sessionId === control.peerId &&
+                          !member.views.length,
+                      );
+                    control.replies.push(deliver);
+                  };
+                  listeners.set(handler, wrapped);
+                }
+                subscribe(type, wrapped, options);
+              }) as Worker["addEventListener"];
+              this.removeEventListener = ((
+                type: string,
+                handler: EventListenerOrEventListenerObject,
+                options?: boolean | EventListenerOptions,
+              ) => {
+                unsubscribe(
+                  type,
+                  type === "message"
+                    ? (listeners.get(handler) ?? handler)
+                    : handler,
+                  options,
+                );
+                if (type === "message") listeners.delete(handler);
+              }) as Worker["removeEventListener"];
+            }
+          }
+          set onmessage(
+            handler: ((this: Worker, event: MessageEvent) => void) | null,
+          ) {
+            if (mode !== "syntax" || !this.syntax) {
+              super.onmessage = handler;
+              return;
+            }
+            // Queue the actual browser MessageEvent and application callback;
+            // parsing and the worker's response remain entirely real.
+            super.onmessage = (event) => {
+              if (!handler) return;
+              const deliver = () => handler.call(this, event);
+              if (control.hold) control.replies.push(deliver);
+              else deliver();
+            };
+          }
+        };
+      }, heldReply);
+    const peerContext =
+      heldReply === "presence"
+        ? await browser.newContext({
+            baseURL: String(testInfo.project.use.baseURL),
+          })
+        : undefined;
+    const peer = await peerContext?.newPage();
+    const errors: string[] = [];
+    android.on("pageerror", (error) => errors.push(error.message));
+    const documentText = () =>
+      editor(android).evaluate(
+        (element) =>
+          (element as any).cmTile.root.view.state.doc.toString() as string,
+      );
+    try {
+      await android.goto("/");
+      await connect(android, api.url);
+      // Configure the public constructor before creating the tested view. The
+      // warm-up document gives us the application's exact CodeMirror instance.
+      await android
+        .getByRole("treeitem", { name: "a.md", exact: true })
+        .click();
+      await editor(android).evaluate((element) => {
+        const view = (element as any).cmTile.root.view;
+        (view.constructor as { EDIT_CONTEXT?: boolean }).EDIT_CONTEXT = false;
+      });
+      await android.getByRole("treeitem", { name, exact: true }).click();
+      await chooseEditorMode(android, "实时渲染");
+      await editor(android).focus();
+      await viewCommand(android, "end");
+      expect(
+        await editor(android).evaluate(
+          (element) =>
+            (element as HTMLElement & { editContext?: EventTarget | null })
+              .editContext ?? null,
+        ),
+      ).toBeNull();
+      await expect(android.locator(".cm-live-strong").first()).toHaveText(
+        "原有粗体",
+      );
+      if (peer) {
+        peer.on("pageerror", (error) => errors.push(error.message));
+        await peer.goto("/");
+        await connect(peer, api.url);
+        await peer.getByRole("treeitem", { name, exact: true }).click();
+        await editor(peer).focus();
+        await viewCommand(peer, "start");
+        await android.bringToFront();
+        await editor(android).focus();
+        const remoteCursor = android.locator(".cm-collaborator-cursor");
+        await expect(remoteCursor).toHaveCount(1);
+        const peerId = await remoteCursor.getAttribute("data-member-id");
+        expect(peerId).toBeTruthy();
+        await android.evaluate((peerId) => {
+          (
+            window as unknown as {
+              compositionReplies: { peerId: string };
+            }
+          ).compositionReplies.peerId = peerId!;
+        }, peerId);
+      }
+      if (heldReply === "syntax")
+        await android.evaluate(() => {
+          (
+            window as unknown as {
+              compositionReplies: { hold: boolean };
+            }
+          ).compositionReplies.hold = true;
+        });
+      await editor(android).dispatchEvent("compositionstart");
+      await android.keyboard.insertText(composed);
+      await expect.poll(documentText).toBe(original + composed);
+      await expect
+        .poll(
+          async () =>
+            (await hostDocuments(api)).find(
+              (document) => document.path === name,
+            )?.snapshot.text,
+        )
+        .toBe(original + composed);
+      if (heldReply === "syntax")
+        await expect
+          .poll(() =>
+            android.evaluate(
+              () =>
+                (
+                  window as unknown as {
+                    compositionReplies: { replies: (() => void)[] };
+                  }
+                ).compositionReplies.replies.length,
+            ),
+          )
+          .toBeGreaterThan(0);
+      else await android.waitForTimeout(150);
+      await expect(
+        android.locator(".cm-live-strong").filter({ hasText: "末尾输入" }),
+      ).toHaveCount(0);
+      await writeFile(disk, "外部 " + original);
+      await expect
+        .poll(
+          async () =>
+            (await hostDocuments(api)).find(
+              (document) => document.path === name,
+            )?.snapshot.text,
+        )
+        .toBe("外部 " + original + composed);
+      expect(await documentText()).toBe(original + composed);
+      if (peer) {
+        await android.evaluate(() => {
+          (
+            window as unknown as {
+              compositionReplies: { hold: boolean };
+            }
+          ).compositionReplies.hold = true;
+        });
+        // Closing a real peer view clears an already displayed cursor directly
+        // from members, avoiding an extra asynchronous anchor-resolution hop.
+        await peer
+          .getByRole("button", { name: `关闭 ${name}`, exact: true })
+          .click();
+        await android.bringToFront();
+        await editor(android).focus();
+        await expect
+          .poll(() =>
+            android.evaluate(
+              () =>
+                (
+                  window as unknown as {
+                    compositionReplies: { closedView: boolean };
+                  }
+                ).compositionReplies.closedView,
+            ),
+          )
+          .toBe(true);
+      }
+      const released = await editor(android).evaluate(
+        async (element, { text, releaseReply }) => {
+          // Start just after a real frame, so CodeMirror's Android end flush is
+          // scheduled for the next frame rather than racing a frame already due.
+          await new Promise<void>((resolve) =>
+            requestAnimationFrame(() => resolve()),
+          );
+          element.dispatchEvent(
+            new CompositionEvent("compositionend", {
+              data: text,
+              bubbles: true,
+            }),
+          );
+          // The browser may commit its final DOM mutation after compositionend.
+          // Use DOM/InputEvent only; no EditorView transaction or private observer.
+          const line = element.querySelector(".cm-line:last-child")!;
+          const final = document.createTextNode("！");
+          line.appendChild(final);
+          window.getSelection()!.collapse(final, final.length);
+          element.dispatchEvent(
+            new InputEvent("input", {
+              inputType: "insertText",
+              data: "！",
+              bubbles: true,
+            }),
+          );
+          if (!releaseReply) return 0;
+          const control = (
+            window as unknown as {
+              compositionReplies: { hold: boolean; replies: (() => void)[] };
+            }
+          ).compositionReplies;
+          control.hold = false;
+          const replies = control.replies.splice(0);
+          // Deliver after the final DOM mutation but before the next animation
+          // frame, while CodeMirror still holds the pre-commit document version.
+          for (const deliver of replies) deliver();
+          return replies.length;
+        },
+        { text: composed, releaseReply: heldReply !== "none" },
+      );
+      if (heldReply !== "none") expect(released).toBeGreaterThan(0);
+      if (peer) {
+        const sequences = await android.evaluate(
+          () =>
+            (
+              window as unknown as {
+                compositionReplies: {
+                  sequences: {
+                    stage: string;
+                    sequence: number;
+                    kind: string;
+                  }[];
+                };
+              }
+            ).compositionReplies.sequences,
+        );
+        await testInfo.attach("presence-worker-sequences", {
+          body: JSON.stringify(sequences, null, 2),
+          contentType: "application/json",
+        });
+        const received = sequences
+          .filter(({ stage }) => stage === "received")
+          .map(({ sequence }) => sequence);
+        const delivered = sequences
+          .filter(({ stage }) => stage === "delivered")
+          .map(({ sequence }) => sequence);
+        expect(delivered).toEqual(received);
+        expect(received).toEqual(
+          received.map((_, index) => received[0]! + index),
+        );
+      }
+      await expect(
+        android.getByRole("region", { name: "远端连接状态" }),
+      ).toHaveCount(0);
+      const expected = "外部 " + original + composed + "！";
+      await expect.poll(documentText).toBe(expected);
+      await expect(
+        android.locator(".cm-live-strong").filter({ hasText: "末尾输入" }),
+      ).toHaveText("末尾输入");
+      if (peer)
+        await expect(android.locator(".cm-collaborator-cursor")).toHaveCount(0);
+      await android.keyboard.press("Control+s");
+      await expect.poll(() => readFile(disk, "utf8")).toBe(expected);
+      await expect(
+        android.getByRole("region", { name: "远端连接状态" }),
+      ).toHaveCount(0);
+      expect(errors).toEqual([]);
+    } finally {
+      await peerContext?.close();
+      await context.close();
+    }
+  });

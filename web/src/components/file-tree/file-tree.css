@@ -2,16 +2,72 @@
   --uno: "flex min-h-0 min-w-0 flex-1 flex-col bg-background";
 }
 .tree-toolbar {
-  --uno: "flex min-h-12 shrink-0 items-center gap-0 px-2 text-secondary";
+  display: flex;
+  flex: none;
+  align-items: center;
+  min-height: 34px;
+  gap: 8px;
+  color: var(--color-secondary);
+}
+.tree-navigation-actions {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 14px 16px;
+}
+.tree-navigation-actions .ui-button {
+  justify-content: flex-start;
+  height: 34px;
+  min-width: 0;
+  gap: 9px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 400;
+  border-radius: 6px;
+}
+.tree-navigation-actions .tree-file-finder {
+  color: var(--color-secondary);
+  border-color: transparent;
+}
+.tree-file-finder > span {
+  flex: 1;
+  text-align: left;
+}
+.tree-file-finder kbd {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  opacity: 0.75;
+}
+.tree-navigation-actions .tree-new-note {
+  border-color: var(--color-border);
+  color: var(--color-foreground);
+  background: var(--color-surface);
+}
+.tree-heading-label {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+.tree-root-count {
+  flex: 1;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.tree-readonly {
+  font-size: 12px;
+  color: var(--color-secondary);
 }
 .tree-region {
   --uno: "flex min-h-0 flex-1 flex-col";
 }
 .tree-root {
-  --uno: "mx-2 mb-1 flex min-h-9 items-center gap-2 rounded-control px-2 py-2 text-ui-sm";
+  margin: 0 14px 4px;
+  padding-left: 8px;
+  border-radius: var(--radius-control);
 }
 .tree-body {
-  --uno: "min-h-36 flex-1 overflow-auto px-2 pb-3 outline-none";
+  --uno: "min-h-0 flex-1 overflow-auto px-3 pb-3 outline-none";
 }
 .tree-body:focus-visible {
   outline: none;
@@ -33,6 +89,20 @@
 }
 .tree-row[data-cut="true"] {
   opacity: 0.5;
+}
+.tree-row[data-git="added"] .tree-name,
+.tree-row[data-git="untracked"] .tree-name {
+  color: var(--color-success);
+}
+.tree-row[data-git="modified"] .tree-name {
+  color: var(--color-warning);
+}
+.tree-row[data-git="deleted"] .tree-name,
+.tree-row[data-git="conflict"] .tree-name {
+  color: var(--color-danger);
+}
+.tree-row[data-git="conflict"] .tree-name {
+  font-weight: 600;
 }
 .tree-region[data-drop="true"],
 .tree-body [role="treeitem"][data-drop="true"] {
@@ -60,9 +130,149 @@
   .tree-row:not([data-selected="true"]) {
   background: transparent;
 }
+.tree-chevron-spacer {
+  width: 20px;
+  flex-shrink: 0;
+}
 .tree-chevron {
   --uno: "flex h-5 w-5 shrink-0 items-center justify-center rounded border-0 bg-transparent p-0 text-secondary hover:bg-background";
 }
 .tree-footer {
   --uno: "flex min-h-8 shrink-0 items-center px-3 text-ui-sm text-secondary";
+}
+
+.ui-dialog.file-quick-open {
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100dvh - 64px);
+  padding: 0;
+  overflow-y: auto;
+}
+.quick-open-search {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 62px;
+  padding: 0 54px 0 20px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-secondary);
+}
+.quick-open-search input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--color-foreground);
+  font-family: var(--font-ui);
+  font-size: 15px;
+}
+.quick-open-search input::placeholder {
+  color: var(--color-secondary);
+}
+.quick-open-search kbd {
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+.quick-open-results {
+  min-height: 88px;
+  max-height: min(380px, 45dvh);
+  padding: 6px;
+  overflow-y: auto;
+}
+.quick-open-option {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 56px;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--color-secondary);
+  cursor: pointer;
+  text-align: left;
+}
+.quick-open-option[aria-selected="true"] {
+  background: var(--color-selected);
+}
+.quick-open-option > span {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  gap: 3px;
+}
+.quick-open-option strong,
+.quick-open-option small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quick-open-option strong {
+  color: var(--color-foreground);
+  font-size: 13px;
+  font-weight: 500;
+}
+.quick-open-option small {
+  font-size: 12px;
+}
+.ui-button.quick-open-more {
+  display: flex;
+  width: calc(100% - 12px);
+  min-height: 36px;
+  margin: 0 6px 6px;
+  font-size: 12px;
+}
+.quick-open-empty {
+  margin: 0;
+  padding: 28px 16px;
+  color: var(--color-secondary);
+  font-size: 13px;
+  text-align: center;
+}
+.quick-open-errors {
+  max-height: 132px;
+  padding: 12px 18px;
+  overflow: auto;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-danger);
+  font-size: 12px;
+}
+.quick-open-errors p {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+.quick-open-footer {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-secondary);
+  font-size: 12px;
+}
+@media (max-width: 700px) {
+  .tree-navigation-actions .ui-button,
+  .tree-navigation-actions .ui-icon-button {
+    min-width: 44px;
+    height: 44px;
+  }
+  .tree-row {
+    height: 44px;
+  }
+  .tree-chevron-spacer {
+    width: 44px;
+  }
+  .tree-toolbar .ui-icon-button,
+  .tree-chevron {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .ui-button.quick-open-more {
+    min-height: 44px;
+  }
 }

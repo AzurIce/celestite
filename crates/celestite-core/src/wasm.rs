@@ -58,6 +58,44 @@ pub fn render_preview(task: Ts<PreviewTask>) -> Result<Ts<PreviewCompletion>, Js
     compute_preview(&task).into_ts().map_err(invalid_request)
 }
 
+/// Stateful Notist language endpoint for the dedicated language Worker.
+/// Speaks headerless JSON-RPC; resource gaps pause work until `provide`.
+#[cfg(feature = "language")]
+#[wasm_bindgen]
+pub struct LanguageBinding {
+    service: crate::language::LanguageService,
+}
+
+#[cfg(feature = "language")]
+#[wasm_bindgen]
+impl LanguageBinding {
+    #[wasm_bindgen(constructor)]
+    pub fn new(root: Option<String>) -> LanguageBinding {
+        LanguageBinding {
+            service: crate::language::LanguageService::new(root.as_deref().unwrap_or("/vault")),
+        }
+    }
+    pub fn handle(&mut self, message: &str) -> Result<Ts<crate::language::LanguageStep>, JsValue> {
+        self.service
+            .handle(message)
+            .into_ts()
+            .map_err(invalid_request)
+    }
+    pub fn provide(
+        &mut self,
+        resources: Ts<crate::language::LanguageResources>,
+    ) -> Result<Ts<crate::language::LanguageStep>, JsValue> {
+        let resources = resources.to_rust().map_err(invalid_request)?;
+        self.service
+            .provide(resources)
+            .into_ts()
+            .map_err(invalid_request)
+    }
+    pub fn invalidate_resources(&mut self) {
+        self.service.invalidate_resources();
+    }
+}
+
 #[cfg(feature = "preview")]
 #[wasm_bindgen]
 pub fn preview_resource_requests(

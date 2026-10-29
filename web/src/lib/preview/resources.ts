@@ -9,6 +9,7 @@ import type {
   PreviewResourceRequest,
   PreviewTask,
   PackageResourceProvider,
+  ResourceContext,
 } from "./contract";
 
 import { assetDigest } from "./asset-digest";
@@ -16,6 +17,19 @@ import { assetDigest } from "./asset-digest";
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_ASSET_BYTES = 32 * 1024 * 1024;
 const MAX_FILES = 2048;
+
+/** The immutable text inputs that authorize this consumer's resource reads. */
+export function resourceContext(task: PreviewTask): ResourceContext {
+  const overlays: Record<string, string> = {};
+  for (const [path, resource] of Object.entries(task.resources ?? {}))
+    if (
+      (path === "Notist.toml" || path.endsWith("/Notist.toml")) &&
+      resource.data
+    )
+      overlays[path] = new TextDecoder().decode(new Uint8Array(resource.data));
+  Object.assign(overlays, task.overlays);
+  return { documentPath: task.ticket.path, source: task.source, overlays };
+}
 
 /** Reads immutable task inputs directly from IO; never uses editor download/save. */
 export class PreviewResources {
@@ -31,14 +45,14 @@ export class PreviewResources {
   }
   private async *entries(
     path: string,
-    task: PreviewTask,
+    context: ResourceContext,
     signal?: AbortSignal,
   ) {
     signal?.throwIfAborted();
     if (absoluteResourcePath(path)) {
       if (!this.packages)
         throw new Error("此存储后端没有外部 package 资源通道。");
-      for (const entry of await this.packages.readDir(path, task)) {
+      for (const entry of await this.packages.readDir(path, context)) {
         signal?.throwIfAborted();
         yield entry;
       }
@@ -52,7 +66,7 @@ export class PreviewResources {
   }
   async read(
     request: PreviewResourceRequest,
-    task: PreviewTask,
+    context: ResourceContext,
     signal?: AbortSignal,
   ): Promise<PreviewResource> {
     try {
@@ -60,7 +74,7 @@ export class PreviewResources {
       if (absoluteResourcePath(request.path)) {
         if (!this.packages)
           throw new Error("此存储后端没有外部 package 资源通道。");
-        const resource = await this.packages.read(request, task);
+        const resource = await this.packages.read(request, context);
         signal?.throwIfAborted();
         return resource;
       }
@@ -94,16 +108,20 @@ export class PreviewResources {
     signal?: AbortSignal,
   ): Promise<PreviewAssets> {
     signal?.throwIfAborted();
-    const roots = [
+    // Component resources live beside their module declaration: the entry is
+    // `<name>.js` or `<name>/index.js`, and a directory entry owns its subtree.
+    // The declaration itself stays out of the bundle so editing it does not
+    // churn the component digest.
+    const subtrees = [
       ...new Set(
-        components.map((component) =>
-          component.packageRoot
-            ? `${component.packageRoot}/components`
-            : "components",
-        ),
+        components
+          .map((component) => component.path)
+          .filter((path) => path.endsWith("/index.js"))
+          .map((path) => path.slice(0, -"/index.js".length)),
       ),
     ];
     const files = new Map<string, Uint8Array>();
+    const context = resourceContext(task);
     let bytes = 0;
     const insert = (path: string, data: Uint8Array) => {
       if (files.has(path)) return;
@@ -112,7 +130,25 @@ export class PreviewResources {
         throw new Error("组件资源超过容量，请缩小 package。");
       files.set(path, data);
     };
-    for (const root of roots) {
+    for (const component of components) {
+      signal?.throwIfAborted();
+      const overlay = task.overlays?.[component.path];
+      if (overlay !== undefined)
+        insert(component.path, new TextEncoder().encode(overlay));
+      else {
+        const resource = await this.read(
+          { path: component.path, read: true },
+          context,
+          signal,
+        );
+        if (resource.error || !resource.data)
+          throw new Error(
+            resource.error ?? `组件资源已消失：${component.path}`,
+          );
+        insert(component.path, new Uint8Array(resource.data));
+      }
+    }
+    for (const root of subtrees) {
       const pending = [root];
       const visited = new Set<string>();
       while (pending.length) {
@@ -122,7 +158,7 @@ export class PreviewResources {
         visited.add(directory);
         if (visited.size > MAX_FILES) throw new Error("组件目录超过容量。");
         try {
-          for await (const entry of this.entries(directory, task, signal)) {
+          for await (const entry of this.entries(directory, context, signal)) {
             signal?.throwIfAborted();
             // Backend entries must remain in the requested subtree.
             if (!entry.path.startsWith(directory + "/"))
@@ -138,7 +174,7 @@ export class PreviewResources {
                     path: entry.path,
                     read: true,
                   },
-                  task,
+                  context,
                   signal,
                 );
                 if (resource.error || !resource.data)

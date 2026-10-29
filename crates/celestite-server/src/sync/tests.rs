@@ -20,6 +20,7 @@ fn vault(root: &std::path::Path) -> Arc<HostedVault> {
     Arc::new(HostedVault {
         id: documents.identity.vault_id.clone(),
         name: "Notes".into(),
+        root: root.to_owned(),
         read_only: false,
         files: Mutex::new(documents.files.clone()),
         documents: Mutex::new(documents),

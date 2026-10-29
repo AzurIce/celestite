@@ -96,6 +96,7 @@ impl Default for VaultConfig {
 struct HostedVault {
     id: String,
     name: String,
+    root: PathBuf,
     read_only: bool,
     files: Mutex<Arc<FsVault>>,
     packages: package_resources::PackageResources,
@@ -333,6 +334,7 @@ pub fn build_server(
     let hosted = Arc::new(HostedVault {
         id: identity.clone(),
         name: vault.name,
+        root: root.clone(),
         read_only: vault.read_only,
         packages: package_resources::PackageResources::new(root.clone(), file_events.clone())?,
         files: Mutex::new(files),

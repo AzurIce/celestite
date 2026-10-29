@@ -31,6 +31,7 @@ pub(crate) fn routes() -> Router<Arc<ServerState>> {
         .route("/{id}/api/v5/file", get(read_file).put(write_file))
         .route("/{id}/api/v5/entry", axum::routing::delete(remove))
         .route("/{id}/api/v5/rename", post(rename))
+        .route("/{id}/api/v5/git/status", get(git_status))
         .route("/{id}/api/v5/events", get(events))
 }
 
@@ -52,8 +53,25 @@ async fn describe(
         .lock()
         .map_err(|_| failure(ErrorCode::Io, "Document lock failed"))?;
     Ok(Json(
-        serde_json::json!({ "protocol": "celestite-vault", "protocolVersion": crate::PROTOCOL_VERSION, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.resources.root, "vault": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "documentEvents": true, "websocketSync": true, "vaultCrdt": false } }),
+        serde_json::json!({ "protocol": "celestite-vault", "protocolVersion": crate::PROTOCOL_VERSION, "shareId": grant.id, "name": vault.name, "readOnly": grant.read_only(), "previewResourceRoot": vault.packages.resources.root, "vault": documents.identity, "capabilities": { "watch": true, "conditionalWrite": true, "documentEditing": true, "documentEvents": true, "websocketSync": true, "vaultCrdt": false, "gitStatus": true } }),
     ))
+}
+/// Read-only decoration for the project tree. A Vault outside a worktree or a
+/// host without Git returns `null` instead of making file browsing fail.
+async fn git_status(
+    Extension(access): Extension<RemoteAccess>,
+) -> Result<Json<Option<celestite_core::protocol::git::GitStatusSnapshot>>, ApiError> {
+    let root = access.grant.vault.root.clone();
+    let result = tokio::task::spawn_blocking(move || celestite_git::inspect(&root))
+        .await
+        .map_err(|_| failure(ErrorCode::Io, "Git status task failed"))?;
+    match result {
+        Ok(status) => Ok(Json(status)),
+        Err(error) => {
+            tracing::warn!(%error, "Git status unavailable");
+            Ok(Json(None))
+        }
+    }
 }
 async fn stat(
     Extension(access): Extension<RemoteAccess>,

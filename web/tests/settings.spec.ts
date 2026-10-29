@@ -1,3 +1,4 @@
+import { openDocumentOptions } from "./editor-actions";
 import { expect, test as base } from "@playwright/test";
 
 const test = base.extend<{ runtimeErrors: string[] }>({
@@ -131,9 +132,11 @@ test("project settings override the app file for the keys they set", async ({
     "false",
   );
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+  await openDocumentOptions(page);
   await expect(
-    page.getByRole("button", { name: "自动换行", exact: true }),
-  ).toHaveAttribute("aria-pressed", "true");
+    page.getByRole("menuitemcheckbox", { name: "自动换行", exact: true }),
+  ).toHaveAttribute("aria-checked", "true");
+  await page.keyboard.press("Escape");
   await expect(page.locator(".cm-content")).toHaveClass(/cm-lineWrapping/);
 });
 
@@ -157,10 +160,15 @@ test("the app never writes the project settings file", async ({ page }) => {
   await seedProjectSettings(page, { "editor.wordWrap": true });
   await page.reload();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
-  const wrap = page.getByRole("button", { name: "自动换行", exact: true });
+  await openDocumentOptions(page);
+  const wrap = page.getByRole("menuitemcheckbox", {
+    name: "自动换行",
+    exact: true,
+  });
   // 项目级提供的值只读：界面显示生效值，但不允许在全局层改写。
-  await expect(wrap).toHaveAttribute("aria-pressed", "true");
+  await expect(wrap).toHaveAttribute("aria-checked", "true");
   await expect(wrap).toBeDisabled();
+  await page.keyboard.press("Escape");
   await expect(page.locator(".cm-content")).toHaveClass(/cm-lineWrapping/);
   await page.getByRole("button", { name: "主题", exact: true }).click();
   await page.getByRole("menuitem", { name: "深色", exact: true }).click();
@@ -192,7 +200,7 @@ test("a broken project file falls back instead of blocking startup", async ({
   );
   // 坏值回退到全局文件，应用照常工作。
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await expect(page.locator(".workspace-sidebar")).toHaveCSS("width", "300px");
+  await expect(page.locator(".workspace-sidebar")).toHaveCSS("width", "248px");
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(page.getByRole("textbox", { name: "代码编辑器" })).toBeVisible();
 });

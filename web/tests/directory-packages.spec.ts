@@ -1,6 +1,12 @@
+import {
+  chooseEditorMode,
+  openDocumentOptions,
+  previewAction,
+} from "./editor-actions";
 import { expect, test, type Page } from "@playwright/test";
 import { packageFixture } from "./package-fixture";
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
+import { openVaultManager, selectVault, vaultSwitcher } from "./vault-actions";
 
 async function setup(page: Page) {
   await installWorkerHarness(page);
@@ -37,9 +43,9 @@ async function setup(page: Page) {
       [
         path.startsWith("packages/") ? path : `nested/Notes/${path}`,
         Array.from(
-          path === "Notist.toml"
+          path === "package.not"
             ? new TextEncoder().encode(
-                '[dependencies]\ndemo = { path = "../../packages/demo" }\n',
+                '= Package\n\n#import "../../packages/demo/lib.notc" as demo;\n\n#demo.card()[\n组件中的正文 😀\n]\n',
               )
             : data,
         ),
@@ -62,14 +68,14 @@ async function setup(page: Page) {
       await stream.close();
     }
   }, files);
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await openVaultManager(page);
   await page.getByRole("button", { name: "打开本机目录", exact: true }).click();
   await page
     .getByRole("treeitem", { name: "package.not", exact: true })
     .click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   const preview = page.getByRole("region", { name: "文档预览" });
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   await expect(
@@ -82,20 +88,16 @@ test("a wider read grant loads sibling packages and WASM, preserving the Vault r
   page,
 }) => {
   const preview = await setup(page);
-  const id = await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .inputValue();
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
-  await expect(
-    preview.locator("demo-card p").filter({ hasText: "WASM" }),
-  ).toHaveText("相对 JS / WASM 42");
-  await expect(page.getByRole("combobox", { name: "当前 Vault" })).toHaveValue(
-    id,
+  const id = await vaultSwitcher(page).getAttribute("data-vault-id");
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
   );
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await expect(
+    preview.locator("[notist-protocol] p").filter({ hasText: "WASM" }),
+  ).toHaveText("相对 JS / WASM 42");
+  await expect(vaultSwitcher(page)).toHaveAttribute("data-vault-id", id!);
+  await openVaultManager(page);
   await expect(
     page
       .getByRole("dialog")
@@ -112,9 +114,10 @@ test("a wider read grant loads sibling packages and WASM, preserving the Vault r
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await editor.click();
   await page.keyboard.press("Control+End");
-  await page.keyboard.insertText("\nSaved in original vault\n");
+  await page.keyboard.insertText("\n\nSaved in original vault\n");
   await expect(editor).toContainText("Saved in original vault");
-  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await openDocumentOptions(page);
+  await page.getByRole("menuitem", { name: "保存", exact: true }).click();
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
   );
@@ -133,22 +136,22 @@ test("a wider read grant loads sibling packages and WASM, preserving the Vault r
   expect(stored.id).toBe(id);
   expect(stored.relative).toEqual(["nested", "Notes"]);
   expect(stored.content).toContain("Saved in original vault");
-  expect(stored.entries.sort()).toEqual(["Notist.toml", "package.not"]);
+  expect(stored.entries.sort()).toEqual(["package.not"]);
   await page.reload();
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await openVaultManager(page);
   await expect(
     page
       .getByRole("dialog")
       .getByText("本机目录 · Resource Workspace/nested/Notes", { exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
-  await page.getByRole("combobox", { name: "当前 Vault" }).selectOption(id);
+  await selectVault(page, "Notes");
   await page
     .getByRole("treeitem", { name: "package.not", exact: true })
     .click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
+  await chooseEditorMode(page, "分栏");
   await expect(
-    preview.locator("demo-card p").filter({ hasText: "WASM" }),
+    preview.locator("[notist-protocol] p").filter({ hasText: "WASM" }),
   ).toHaveText("相对 JS / WASM 42");
   await expect(page.getByRole("textbox", { name: "代码编辑器" })).toContainText(
     "Saved in original vault",
@@ -162,41 +165,37 @@ test("cancelled and unrelated selections preserve the existing grant and current
   await page.evaluate(() =>
     Object.assign(window, { scopeChoice: "unrelated" }),
   );
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
+  await previewAction(page, "授权依赖目录");
   await expect(preview.getByRole("alert")).toContainText(
     "请选择包含当前 Vault 的目录",
   );
   await page.evaluate(() => Object.assign(window, { scopeChoice: "cancel" }));
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
+  await previewAction(page, "授权依赖目录");
   await expect(
     preview.getByRole("button", { name: "授权依赖目录", exact: true }),
   ).toBeEnabled();
   await page.evaluate(() =>
     Object.assign(window, { scopeChoice: "workspace" }),
   );
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
   await page.evaluate(() =>
     Object.assign(window, { scopeChoice: "unrelated" }),
   );
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
+  await previewAction(page, "授权依赖目录");
   await expect(preview.getByRole("alert")).toContainText(
     "请选择包含当前 Vault 的目录",
   );
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
   await page.evaluate(() => Object.assign(window, { scopeChoice: "cancel" }));
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
 });
 
 test("idle time never retries a failed preview; edits and explicit retry still dispatch", async ({
@@ -220,38 +219,38 @@ test("idle time never retries a failed preview; edits and explicit retry still d
   const initial = await taskId();
   // Idle time runs no background work; a failed preview is not retried.
   await page.waitForTimeout(500);
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   expect(await taskId()).toBe(initial);
   await preview.getByRole("button", { name: "重试预览", exact: true }).click();
   await expect.poll(taskId).not.toBe(initial);
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   const retried = await taskId();
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await editor.focus();
   await page.keyboard.press("Control+End");
-  await page.keyboard.insertText("\nChanged source\n");
+  await page.keyboard.insertText("\n\nChanged source\n");
   await expect.poll(taskId).not.toBe(retried);
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
 });
 
 test("external declarations refresh on demand and lost resource permission leaves editing available", async ({
   page,
 }) => {
   const preview = await setup(page);
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
   await page.evaluate(async () => {
     const workspace = await (
       await navigator.storage.getDirectory()
@@ -263,12 +262,12 @@ test("external declarations refresh on demand and lost resource permission leave
       await demo.getFileHandle("lib.notc")
     ).createWritable();
     await stream.write(
-      'fn card(title: String = "External declaration")[children: Content] -> Content;',
+      'fn card(title: String = "External declaration")[children: BlockContent] -> BlockContent;',
     );
     await stream.close();
   });
-  await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
-  await expect(preview.locator("demo-card strong")).toHaveText(
+  await previewAction(page, "刷新预览");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
     "External declaration",
   );
   await workerEvaluate(
@@ -287,15 +286,15 @@ test("external declarations refresh on demand and lost resource permission leave
     undefined,
     1,
   );
-  await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await previewAction(page, "刷新预览");
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   await expect(preview.getByRole("alert")).toContainText("读取权限已失效");
   const editor = page.getByRole("textbox", { name: "代码编辑器" });
   await editor.focus();
   await page.keyboard.press("Control+End");
-  await page.keyboard.insertText("\nStill editable\n");
+  await page.keyboard.insertText("\n\nStill editable\n");
   await page.keyboard.press("Control+s");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "已保存",
@@ -312,17 +311,15 @@ test("external declarations refresh on demand and lost resource permission leave
     undefined,
     1,
   );
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText(
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
     "External declaration",
   );
   await expect(editor).toContainText("Still editable");
   // The title is also present in the retained, stale preview. Wait for the new
   // source and its completed render before changing a component implementation.
   await expect(preview.locator("article")).toContainText("Still editable");
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览已更新",
   );
   await page.evaluate(async () => {
@@ -332,16 +329,14 @@ test("external declarations refresh on demand and lost resource permission leave
     const demo = await (
       await workspace.getDirectoryHandle("packages")
     ).getDirectoryHandle("demo");
-    const card = await (
-      await demo.getDirectoryHandle("components")
-    ).getDirectoryHandle("card");
+    const card = await demo.getDirectoryHandle("card");
     const stream = await (
       await card.getFileHandle("style.js")
     ).createWritable();
     await stream.write('export const suffix = "Updated implementation";');
     await stream.close();
   });
-  await preview.getByRole("button", { name: "刷新预览", exact: true }).click();
+  await previewAction(page, "刷新预览");
   await expect(preview.getByRole("alert")).toContainText("请刷新页面");
 });
 
@@ -423,13 +418,11 @@ test("a lost saved resource grant permits reopening the Vault and restores in it
   page,
 }) => {
   const preview = await setup(page);
-  const id = await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .inputValue();
-  await preview
-    .getByRole("button", { name: "授权依赖目录", exact: true })
-    .click();
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
+  const id = await vaultSwitcher(page).getAttribute("data-vault-id");
+  await previewAction(page, "授权依赖目录");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
+  );
   await page.route(
     "**/src/lib/editor/local/package-resources.ts*",
     async (route) => {
@@ -452,12 +445,12 @@ test("a lost saved resource grant permits reopening the Vault and restores in it
     },
   );
   await page.reload();
-  await page.getByRole("combobox", { name: "当前 Vault" }).selectOption(id);
+  await selectVault(page, "Notes");
   await page
     .getByRole("treeitem", { name: "package.not", exact: true })
     .click();
-  await page.getByRole("button", { name: "分栏", exact: true }).click();
-  await expect(preview.getByRole("status", { name: "预览状态" })).toHaveText(
+  await chooseEditorMode(page, "分栏");
+  await expect(page.getByRole("status", { name: "预览状态" })).toHaveText(
     "预览失败",
   );
   await expect(page.getByRole("textbox", { name: "代码编辑器" })).toContainText(
@@ -471,12 +464,10 @@ test("a lost saved resource grant permits reopening the Vault and restores in it
     undefined,
     1,
   );
-  await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .selectOption("opfs:default");
-  await page.getByRole("combobox", { name: "当前 Vault" }).selectOption(id);
-  await expect(preview.locator("demo-card strong")).toHaveText("默认标题");
-  await expect(page.getByRole("combobox", { name: "当前 Vault" })).toHaveValue(
-    id,
+  await selectVault(page, "我的 Vault");
+  await selectVault(page, "Notes");
+  await expect(preview.locator("[notist-protocol] strong")).toHaveText(
+    "默认标题",
   );
+  await expect(vaultSwitcher(page)).toHaveAttribute("data-vault-id", id!);
 });

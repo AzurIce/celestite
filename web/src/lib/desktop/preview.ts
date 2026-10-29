@@ -43,6 +43,7 @@ export function nativePreview(
 }
 
 export function nativePreviewExecutor(
+  handle: string,
   invoke: DesktopInvoke = desktopInvoke,
 ): PreviewExecutor {
   return {
@@ -56,7 +57,10 @@ export function nativePreviewExecutor(
               task,
             }),
           render: (task) =>
-            invoke<PreviewCompletion>("desktop_preview_render", { task }),
+            invoke<PreviewCompletion>("desktop_preview_render", {
+              handle,
+              task,
+            }),
         },
         readResources,
         signal,

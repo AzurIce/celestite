@@ -2,9 +2,11 @@
 
 原生编辑会话运行时位于根 `celestite` 应用库的 [`src/runtime`](../src/runtime/mod.rs)，作为应用内部模块实现和测试。它不直接依赖 WebView API；[`src/commands.rs`](../src/commands.rs) 在阻塞任务中调用它，每个会话独占 EditorCore、EditorAdapter 和独立 PreviewController；不同会话可以并行。本机实例分别注入普通目录与应用私有恢复目录的 FileSystem，远端会话只在内存持有 Buffer。原生文件能力由 core 提供，本机 package 授权位于 `preview::native`；`native` feature 只在非 Wasm 目标启用这些实现。server 复用文件与 package 能力，历史继续驻留内存。
 
-`DesktopRuntime::open(app_data)` 创建运行时，`open_session` 接收默认库、本机目录或远端实例身份。宿主从私有 profile 恢复稳定 instanceId / vaultId，每次运行生成新的 historyId，再将身份和两个文件空间交给 core；文档 ID 和默认时钟由 core 统一提供。默认库位于 `app_data/default/files`，明文草稿、磁盘基线和操作意图单独保存。私有恢复区不保存 CRDT 快照、增量或个人撤销；进程重启从明文建立新历史。同一本机目录重复接入复用 owner，WebView 代次切换通过 `reset_views` 清理旧预览与远端会话，保留仍存活的本机 Buffer 和个人撤销。
+`DesktopRuntime::open(app_data)` 创建运行时，`open_session` 接收默认库、本机目录或远端实例身份。宿主从私有 profile 恢复稳定 instanceId / vaultId，每次运行生成新的 historyId，再将身份和两个文件空间交给 core；文档 ID 和默认时钟由 core 统一提供。默认库位于 `app_data/default/files`，明文草稿、磁盘基线和操作意图单独保存。私有恢复区不保存 CRDT 快照、增量或个人撤销；进程重启从明文建立新历史。同一本机目录重复接入复用 owner，WebView 代次切换通过 `reset_views` 清理旧预览、语言服务与远端会话，保留仍存活的本机 Buffer 和个人撤销。
 
-前端 `CorePort` 传递对象参数与 `CoreReply`，Tauri 直接调用结构化 IPC，WASM 适配器独自处理字符串编解码。桌面以标准 `MessageChannel` 接入共享编辑服务。`core(handle, method, params)` 返回与 WASM 相同的命令与 mutation 批次；错误不会吞掉此前已接受的变化。`preview` 承载独立控制器方法，package 读取使用任务的不可变配置快照重新核对资源范围。读取资源不保存正文，也不占用编辑所有者的 IO 等待。
+前端 `CorePort` 传递对象参数与 `CoreReply`，Tauri 直接调用结构化 IPC，WASM 适配器独自处理字符串编解码。桌面以标准 `MessageChannel` 接入共享编辑服务。`core(handle, method, params)` 返回与 WASM 相同的命令与 mutation 批次；错误不会吞掉此前已接受的变化。`preview` 承载独立控制器方法，package 读取使用 `ResourceContext` 中的正文及依赖快照重新核对资源范围，不保存正文，也不占用编辑所有者的 IO 等待。
+
+本机会话的语言服务由 `language(handle, command)` 驻留，与 Web 共用服务、客户端及打开文档同步。查询 URI 保持 `file:///vault/…`；资源解析使用实际 Vault 根，完整保留相对父目录与绝对依赖身份。库内资源经 `LocalFiles` 的观察边界读取；外部资源复用 package 授权及观察，单独使用语言服务也能发现依赖变化。远端副本使用 WASM 语言 Worker，由 HTTP host 提供同一契约的只读依赖。WebView 重建清理旧语言状态，新客户端重新握手并同步文档。
 
 平台给普通文件 IO 添加观察边界，私有空间使用独立 FileSystem；明文恢复格式、checkpoint、编辑与保存策略均由 `EditorCore` 决定。`LocalFiles` 让编辑与预览读取共用目录监听屏障，并核对持有的 Vault 根句柄与当前路径是否仍对应同一目录；根被替换时保留草稿并明确报失联，不自动绑定新目录。
 

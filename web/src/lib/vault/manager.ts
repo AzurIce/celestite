@@ -1,6 +1,7 @@
 import { FileTreeModel } from "../file-tree/model";
 import { openAppDocument, type SettingsFile } from "../settings/app-file";
 import { openHttpVault, normalizeVaultUrl } from "./http";
+import type { HttpVaultBackend, RemoteVaultDescriptor } from "./http";
 import { openLocalEditor, openRemoteEditor } from "../editor/client/documents";
 import type { EditorDocuments, InstanceIdentity } from "../editor/contract";
 import { VaultError } from "./errors";
@@ -16,6 +17,8 @@ import {
 } from "./directory-registry";
 import { isDesktop, desktopInvoke } from "../desktop/platform";
 import { openNativeEditor } from "../desktop/editor";
+import { remoteGitStatus } from "../git/source";
+import type { GitStatusSource } from "../git/status";
 
 export const DEFAULT_VAULT_ID = "opfs:default";
 export interface VaultConnection {
@@ -32,9 +35,12 @@ export interface VaultInstance {
   name: string;
   backend: VaultBackend;
   documents: EditorDocuments;
+  git?: GitStatusSource;
   tree: FileTreeModel;
   treeView: { scrollTop: number };
   readOnly: boolean;
+  /** 本地 Vault 的绝对根目录；浏览器或远端 Vault 为 null。 */
+  root?: string | null;
 }
 export interface VaultManagerSnapshot {
   connections: readonly VaultConnection[];
@@ -231,12 +237,14 @@ export class VaultManager {
                   },
             );
         const { identity, backend, documents } = local;
+        const root = "root" in local ? local.root : null;
         const setResourceScope =
           "setResourceScope" in local
             ? (local.setResourceScope as
                 | ((scope: FileSystemDirectoryHandle) => Promise<void>)
                 | undefined)
             : undefined;
+        const git = "git" in local ? local.git : undefined;
         resourceSetter = setResourceScope;
         vault = {
           id: connection.id,
@@ -244,9 +252,11 @@ export class VaultManager {
           identity,
           backend,
           documents,
+          git,
           tree: new FileTreeModel(backend),
           treeView: { scrollTop: 0 },
           readOnly: false,
+          root,
           ...(setResourceScope
             ? {
                 authorizeResources: () =>
@@ -259,11 +269,7 @@ export class VaultManager {
           this.options.openRemote ?? openHttpVault
         )(connection.url!);
         connection.name = descriptor.name;
-        vault = await this.buildRemote(
-          connection,
-          backend,
-          descriptor.readOnly,
-        );
+        vault = await this.buildRemote(connection, backend, descriptor);
       }
       if (this.disposed || this.removals.has(connection.id)) {
         await vault.documents.close();
@@ -482,11 +488,7 @@ export class VaultManager {
         vault.name = descriptor.name;
         vault.readOnly = descriptor.readOnly;
       } else {
-        vault = await this.buildRemote(
-          connection,
-          backend,
-          descriptor.readOnly,
-        );
+        vault = await this.buildRemote(connection, backend, descriptor);
         this.runtimes.set(id, vault);
       }
       if (request === this.selection) this.active = vault;
@@ -537,8 +539,8 @@ export class VaultManager {
   }
   private async buildRemote(
     connection: VaultConnection,
-    http: VaultBackend,
-    readOnly: boolean,
+    http: HttpVaultBackend,
+    descriptor: RemoteVaultDescriptor,
   ): Promise<VaultInstance> {
     const editor = await (this.options.openRemoteEditor ?? openRemoteEditor)(
       connection.url!,
@@ -548,9 +550,12 @@ export class VaultManager {
       id: connection.id,
       name: connection.name,
       ...editor,
+      git: descriptor.capabilities.gitStatus
+        ? remoteGitStatus(http)
+        : undefined,
       tree: new FileTreeModel(editor.backend),
       treeView: { scrollTop: 0 },
-      readOnly,
+      readOnly: descriptor.readOnly,
     };
   }
   /** Removing a connection never calls backend.remove(). The default entry is structural. */

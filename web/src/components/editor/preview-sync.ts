@@ -170,11 +170,18 @@ export class PreviewSync {
     if (!(target instanceof Element) || !target.closest(".cm-content")) return;
     const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
     if (pos === null) return;
+    this.revealPreview(pos);
+  }
+  /** Navigate a document outline without changing the source selection or mode. */
+  revealPreview(pos: number) {
+    if (!this.usable()) return;
     const candidates = this.elements.filter(
       ({ mapping, element }) =>
         (mapping.kind !== "container" || element.tagName.includes("-")) &&
         mapping.from <= pos &&
-        pos <= mapping.to &&
+        // Source ranges are half-open. At a heading boundary, the preceding
+        // paragraph's end must not win over the heading that starts here.
+        (pos < mapping.to || pos === mapping.from) &&
         element.getClientRects().length,
     );
     candidates.sort(

@@ -60,7 +60,7 @@ const component: PreviewComponent = {
   name: "panel",
   tag: "pkg-panel",
   packageRoot: "/pkg",
-  path: "/pkg/components/panel.js",
+  path: "/pkg/panel/index.js",
 };
 const success = (
   task: PreviewTask,
@@ -168,7 +168,7 @@ function pendingAssets() {
     },
     release() {
       entries.resolve([
-        { path: "/pkg/components/nested", kind: "directory" },
+        { path: "/pkg/panel/nested", kind: "directory" },
         { path: component.path, kind: "file" },
       ]);
     },
@@ -240,9 +240,10 @@ for (const cancellation of ["retry", "close"] as const) {
     const fixture = await openHost(assets.resources);
     try {
       const executor = fixture.executors[0];
+      executor.task.overlays = { [component.path]: "// captured entry" };
       executor.result.resolve(success(executor.task, [component]));
       await assets.entered.promise;
-      assert.deepEqual(assets.directories, ["/pkg/components"]);
+      assert.deepEqual(assets.directories, ["/pkg/panel"]);
       if (cancellation === "retry") await fixture.host.retry("doc");
       else await fixture.host.close();
       assert.equal(executor.signal.aborted, true);
@@ -252,7 +253,7 @@ for (const cancellation of ["retry", "close"] as const) {
       assets.release();
       await fixture.flush();
       assert.equal(assets.fileReads, 0);
-      assert.deepEqual(assets.directories, ["/pkg/components"]);
+      assert.deepEqual(assets.directories, ["/pkg/panel"]);
       assert.equal(fixture.completions.length, completed);
       assert.equal(fixture.events.length, emitted);
       if (cancellation === "retry") {
@@ -296,6 +297,7 @@ test("host timeout wins over success while component IO is pending", async () =>
   try {
     assert.equal(typeof timeout, "function");
     const executor = fixture.executors[0];
+    executor.task.overlays = { [component.path]: "// captured entry" };
     executor.result.resolve(success(executor.task, [component]));
     await assets.entered.promise;
     timeout();
@@ -312,7 +314,7 @@ test("host timeout wins over success while component IO is pending", async () =>
     assets.release();
     await fixture.flush();
     assert.equal(assets.fileReads, 0);
-    assert.deepEqual(assets.directories, ["/pkg/components"]);
+    assert.deepEqual(assets.directories, ["/pkg/panel"]);
     assert.equal(fixture.completions.length, 1);
     assert.equal(fixture.events.length, emitted);
     assert.equal(fixture.binding.state("doc").status, "failed");

@@ -123,6 +123,10 @@ class Browser:
         return self.async_js("return await window.__TAURI_INTERNALS__.invoke(args[0], args[1]);", command, params)
 
     def screenshot(self, output, name):
+        self.async_js("""
+          await document.fonts.ready;
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        """)
         path = output / name
         path.write_bytes(base64.b64decode(self.call("screenshot")))
         return str(path)
@@ -168,9 +172,35 @@ class Browser:
           view.dispatch({changes: {from: view.state.doc.length, insert: arguments[0]}});
         """, text)
 
-    def button(self, label):
-        eventually(lambda: self.js("return [...document.querySelectorAll('button')].some(button => button.textContent.trim() === arguments[0] && !button.disabled);", label), f"enabled button {label}")
-        self.js("[...document.querySelectorAll('button')].find(button => button.textContent.trim() === arguments[0] && !button.disabled).click();", label)
+    def activate(self, element):
+        # WebKitGTK's element click coordinates can include a window-decoration
+        # offset under Xvfb. Keyboard activation exercises the same UI handlers
+        # without depending on those screen coordinates.
+        self.js("arguments[0].focus();", element)
+        self.call("actions", "POST", {"actions": [{"type": "key", "id": "keyboard", "actions": [
+            {"type": "keyDown", "value": "\ue007"},
+            {"type": "keyUp", "value": "\ue007"},
+        ]}]})
+        self.call("actions", "DELETE")
+
+    def activate_selector(self, selector):
+        eventually(lambda: self.js("return !!document.querySelector(arguments[0]);", selector), f"control {selector}")
+        self.activate(self.js("return document.querySelector(arguments[0]);", selector))
+
+    def menu_item(self, label, role="menuitem"):
+        eventually(lambda: self.js("return [...document.querySelectorAll('[role=' + arguments[1] + ']')].some(item => (item.getAttribute('aria-label') || item.textContent.trim()) === arguments[0] && item.getAttribute('aria-disabled') !== 'true');", label, role), f"enabled menu item {label}")
+        item = self.js("return [...document.querySelectorAll('[role=' + arguments[1] + ']')].find(item => (item.getAttribute('aria-label') || item.textContent.trim()) === arguments[0]);", label, role)
+        self.activate(item)
+
+    def mode(self, label):
+        self.activate_selector('button[aria-label="编辑器视图"]')
+        self.menu_item(label, "menuitemradio")
+        eventually(lambda: self.js("return !document.querySelector('[role=menu]') && document.activeElement === document.querySelector('button[aria-label=\"编辑器视图\"]') && document.activeElement.textContent.trim() === arguments[0];", label), f"selected editor mode {label}")
+
+    def save(self):
+        self.activate_selector('button[aria-label="文档选项"]')
+        self.menu_item("保存")
+        eventually(lambda: self.js("return !document.querySelector('[role=menu]') && document.activeElement === document.querySelector('button[aria-label=\"文档选项\"]');"), "save menu closed and focus restored")
 
     def undo(self):
         self.js("document.querySelector('.cm-content').cmTile.root.view.focus();")
@@ -258,6 +288,20 @@ def request_native_close(display):
     class Event(ctypes.Union):
         _fields_ = [("client", ClientMessage), ("padding", ctypes.c_long * 24)]
 
+    class WindowAttributes(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int),
+                    ("width", ctypes.c_int), ("height", ctypes.c_int),
+                    ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+                    ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+                    ("window_class", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+                    ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+                    ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+                    ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+                    ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+                    ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+                    ("do_not_propagate_mask", ctypes.c_long), ("override_redirect", ctypes.c_int),
+                    ("screen", ctypes.c_void_p)]
+
     library.XOpenDisplay.argtypes = [ctypes.c_char_p]
     library.XOpenDisplay.restype = ctypes.c_void_p
     library.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
@@ -266,6 +310,9 @@ def request_native_close(display):
                                   ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
                                   ctypes.POINTER(ctypes.c_uint)]
     library.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
+    library.XGetWMProtocols.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                       ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_int)]
+    library.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(WindowAttributes)]
     library.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
     library.XInternAtom.restype = ctypes.c_ulong
     library.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.POINTER(Event)]
@@ -276,6 +323,7 @@ def request_native_close(display):
     if not connection:
         raise RuntimeError(f"Cannot open X11 display {display}")
     try:
+        delete_window = library.XInternAtom(connection, b"WM_DELETE_WINDOW", 0)
         pending = [library.XDefaultRootWindow(connection)]
         found = None
         for _ in range(512):
@@ -287,8 +335,22 @@ def request_native_close(display):
                 name = ctypes.string_at(title).decode(errors="replace")
                 library.XFree(title)
                 if name.lower() == "celestite":
-                    found = window
-                    break
+                    # GTK leaves same-named hidden helper windows after pointer
+                    # interactions, including ones advertising WM_DELETE_WINDOW.
+                    # Select the viewable client rather than these auxiliaries.
+                    attributes = WindowAttributes()
+                    viewable = library.XGetWindowAttributes(connection, window, ctypes.byref(attributes))
+                    protocols = ctypes.POINTER(ctypes.c_ulong)()
+                    protocol_count = ctypes.c_int()
+                    try:
+                        if (viewable and attributes.map_state == 2 and not attributes.override_redirect
+                                and library.XGetWMProtocols(connection, window, ctypes.byref(protocols), ctypes.byref(protocol_count))):
+                            if any(protocols[index] == delete_window for index in range(protocol_count.value)):
+                                found = window
+                                break
+                    finally:
+                        if protocols:
+                            library.XFree(protocols)
             root, parent = ctypes.c_ulong(), ctypes.c_ulong()
             children = ctypes.POINTER(ctypes.c_ulong)()
             count = ctypes.c_uint()
@@ -297,7 +359,7 @@ def request_native_close(display):
                 if children:
                     library.XFree(children)
         if found is None:
-            raise RuntimeError("Cannot find the native Celestite toplevel window")
+            raise RuntimeError("Cannot find the viewable Celestite toplevel accepting WM_DELETE_WINDOW")
         event = Event()
         event.client.type = 33  # ClientMessage
         event.client.send_event = 1
@@ -305,7 +367,7 @@ def request_native_close(display):
         event.client.window = found
         event.client.message_type = library.XInternAtom(connection, b"WM_PROTOCOLS", 0)
         event.client.format = 32
-        event.client.data.longs[0] = library.XInternAtom(connection, b"WM_DELETE_WINDOW", 0)
+        event.client.data.longs[0] = delete_window
         if not library.XSendEvent(connection, found, 0, 0, ctypes.byref(event)):
             raise RuntimeError("X11 rejected WM_DELETE_WINDOW")
         library.XFlush(connection)
@@ -448,14 +510,14 @@ def main():
         browser.open_file("smoke.md")
         assert browser.text() == INITIAL
         browser.append(SAVED)
-        browser.button("保存")
+        browser.save()
         eventually(lambda: smoke.read_text() == INITIAL + SAVED, "native file save")
         browser.undo()
         eventually(lambda: browser.text() == INITIAL, "native undo reflected in CodeMirror")
         eventually(lambda: browser.document("smoke.md"), "native editor handle")
         handle, document = browser.document("smoke.md")
         document_id = document["id"]
-        browser.button("保存")
+        browser.save()
         eventually(lambda: smoke.read_text() == INITIAL, "saved undo checkpoint")
         eventually(lambda: browser.js("""
           return [...document.querySelectorAll('.preview-scroller *')].some(element =>
@@ -463,6 +525,50 @@ def main():
         """), "native preview output mounted in its shadow root")
         report["checks"].append("default UI open, CodeMirror edit, native save/undo, native preview")
         report["screenshots"].append(browser.screenshot(output, "01-native-editor-preview.png"))
+
+        print("Checking language symbols through the native service and editor UI…", flush=True)
+        browser.activate_selector('button[aria-label="文档大纲"]')
+        eventually(lambda: browser.js("""
+          return [...document.querySelectorAll('.editor-outline-item')].some(item =>
+            item.textContent.trim() === 'Desktop smoke');
+        """), "native language document symbols")
+        symbol_item = browser.js("""
+          return [...document.querySelectorAll('.editor-outline-item')].find(item =>
+            item.textContent.trim() === 'Desktop smoke');
+        """)
+        browser.activate(symbol_item)
+        eventually(lambda: browser.js("""
+          return document.activeElement === document.querySelector('.cm-content') &&
+            window.getSelection()?.toString().includes('Desktop smoke');
+        """), "language symbol selection and editor focus")
+        assert browser.js("return window.desktopSmoke.calls.some(call => call.command === 'desktop_language');")
+        report["checks"].append("native LSP document symbols, UI selection, and focus through real IPC")
+
+        print("Checking the live rendering mode in the actual editor…", flush=True)
+        browser.js("""
+          const view = document.querySelector('.cm-content').cmTile.root.view;
+          window.desktopLiveView = view;
+          view.dispatch({selection: {anchor: view.state.doc.length}});
+        """)
+        browser.mode("实时渲染")
+        eventually(lambda: browser.js("""
+          return !!document.querySelector('.cm-live-preview .cm-live-heading') &&
+            !document.querySelector('.document-preview') &&
+            document.querySelector('button[aria-label="编辑器视图"]')?.textContent.trim() === '实时渲染';
+        """), "live heading presentation without a separate preview")
+        assert browser.text() == INITIAL
+        assert browser.js("return window.desktopLiveView === document.querySelector('.cm-content').cmTile.root.view;")
+        report["screenshots"].append(browser.screenshot(output, "01-live-editor.png"))
+        browser.mode("源码")
+        eventually(lambda: browser.js("""
+          return !document.querySelector('.cm-live-preview') &&
+            document.querySelector('button[aria-label="编辑器视图"]')?.textContent.trim() === '源码';
+        """), "source mode restored")
+        assert browser.text() == INITIAL
+        assert browser.js("return window.desktopLiveView === document.querySelector('.cm-content').cmTile.root.view && window.desktopLiveView.state.selection.main.head === window.desktopLiveView.state.doc.length;")
+        browser.js("delete window.desktopLiveView;")
+        report["checks"].append("live rendering and source modes share the editor, text, and native history")
+        browser.mode("分栏")
 
         print("Checking custom-scheme relative ESM, Unicode URLs, and streaming WASM…", flush=True)
         report["componentProtocol"] = check_component_protocol(browser)
@@ -518,7 +624,7 @@ def main():
         report["checks"].append("process crash/restart restores plaintext draft and stable instance metadata with a new CRDT identity")
         report["screenshots"].append(browser.screenshot(output, "03-recovered-native-draft.png"))
         files.chmod(0o700)
-        browser.button("保存")
+        browser.save()
         eventually(lambda: smoke.read_text() == INITIAL + DRAFT, "recovered draft saved after permissions recover")
 
         print("Reloading the WebView while retaining the native owner…", flush=True)
@@ -540,7 +646,7 @@ def main():
         browser.select_vault(local_id)
         browser.open_file("local.md")
         browser.append("\nSaved to the linked native directory.\n")
-        browser.button("保存")
+        browser.save()
         eventually(lambda: "Saved to the linked native directory." in (local / "local.md").read_text(), "linked directory save")
         report["checks"].append("persisted native directory connection selected in UI and saved to its actual directory")
         report["screenshots"].append(browser.screenshot(output, "04-native-directory.png"))
@@ -554,7 +660,7 @@ def main():
             browser.select_vault(remote_id)
             browser.open_file("remote.md")
             browser.append("\nSaved through the native remote replica.\n")
-            browser.button("保存")
+            browser.save()
             eventually(lambda: "Saved through the native remote replica." in (remote_root / "remote.md").read_text(), "remote server save")
             eventually(lambda: browser.js("""
               return [...document.querySelectorAll('.preview-scroller *')].some(element =>

@@ -15,13 +15,13 @@ enum Anchor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ResourcePath {
+pub(crate) struct ResourcePath {
     anchor: Anchor,
     segments: Vec<String>,
 }
 
 impl ResourcePath {
-    pub(super) fn absolute(value: &str) -> Option<Self> {
+    pub(crate) fn absolute(value: &str) -> Option<Self> {
         let windows = value.starts_with("\\\\")
             || value.starts_with("//")
             || (value.as_bytes().get(1) == Some(&b':')
@@ -76,7 +76,7 @@ impl ResourcePath {
         }
     }
 
-    pub(super) fn resolve(&self, value: &str) -> Self {
+    pub(crate) fn resolve(&self, value: &str) -> Self {
         if let Some(absolute) = Self::absolute(value) {
             return absolute;
         }
@@ -86,7 +86,8 @@ impl ResourcePath {
         path
     }
 
-    pub(super) fn parent(&self) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn parent(&self) -> Self {
         let mut parent = self.clone();
         parent.segments.pop();
         parent
@@ -97,7 +98,7 @@ impl ResourcePath {
             .then(|| self.segments[root.segments.len()..].join("/"))
     }
 
-    pub(super) fn wire(&self) -> String {
+    pub(crate) fn wire(&self) -> String {
         let root = match &self.anchor {
             Anchor::Posix => String::new(),
             Anchor::Drive(drive) => format!("{drive}:"),
@@ -110,7 +111,7 @@ impl ResourcePath {
         }
     }
 
-    pub(super) fn engine(&self) -> PathBuf {
+    pub(crate) fn engine(&self) -> PathBuf {
         let mut path = PathBuf::from(NAMESPACE);
         match &self.anchor {
             Anchor::Posix => path.push("posix"),
@@ -145,40 +146,66 @@ impl ResourcePath {
     }
 }
 
-pub(super) struct ResourceNamespace {
+pub(crate) struct ResourceNamespace {
     root: ResourcePath,
-    engine_root: PathBuf,
+    base: PathBuf,
+    native: bool,
 }
 
 impl ResourceNamespace {
-    pub(super) fn new(root: &str) -> Self {
+    pub(crate) fn new(root: &str) -> Self {
         // Invalid roots remain isolated from IO. The task boundary ordinarily
         // supplies /vault or an absolute native root from a trusted descriptor.
+        Self::with_mode(root, false)
+    }
+
+    /// Native hosts expose real paths so process extensions receive a real
+    /// configuration directory. Browser hosts keep the executor namespace.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    pub(crate) fn native(root: &str) -> Self {
+        Self::with_mode(root, true)
+    }
+
+    fn with_mode(root: &str, native: bool) -> Self {
         let root = ResourcePath::absolute(root)
             .unwrap_or_else(|| ResourcePath::absolute("/vault").unwrap());
-        let engine_root = root.engine();
-        Self { root, engine_root }
+        let base = if native {
+            PathBuf::from(root.wire())
+        } else {
+            root.engine()
+        };
+        Self { root, base, native }
     }
 
-    pub(super) fn root(&self) -> &Path {
-        &self.engine_root
+    pub(crate) fn root(&self) -> &Path {
+        &self.base
     }
 
-    pub(super) fn path(&self, path: &Path) -> ResourcePath {
-        ResourcePath::from_engine(path)
-            .unwrap_or_else(|| self.root.resolve(&path.to_string_lossy()))
+    pub(crate) fn path(&self, path: &Path) -> ResourcePath {
+        if self.native {
+            let text = path.to_string_lossy();
+            ResourcePath::absolute(&text).unwrap_or_else(|| self.root.resolve(&text))
+        } else {
+            ResourcePath::from_engine(path)
+                .unwrap_or_else(|| self.root.resolve(&path.to_string_lossy()))
+        }
     }
 
-    pub(super) fn key(&self, path: &Path) -> String {
+    pub(crate) fn key(&self, path: &Path) -> String {
         let path = self.path(path);
         path.relative_to(&self.root).unwrap_or_else(|| path.wire())
     }
 
-    pub(super) fn resolve(&self, path: &Path) -> PathBuf {
-        self.path(path).engine()
+    pub(crate) fn resolve(&self, path: &Path) -> PathBuf {
+        let path = self.path(path);
+        if self.native {
+            PathBuf::from(path.wire())
+        } else {
+            path.engine()
+        }
     }
 
-    pub(super) fn message(&self, message: &str) -> String {
+    pub(crate) fn message(&self, message: &str) -> String {
         message
             .split('`')
             .enumerate()

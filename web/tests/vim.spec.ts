@@ -18,7 +18,11 @@ const test = base.extend<{ runtimeErrors: string[] }>({
 test.beforeEach(async ({ page }) => {
   await installWorkerHarness(page);
   await page.goto("/");
-  await expect(page.getByLabel("工作区状态栏")).toBeVisible();
+  // Finish the first instance identity write before the seed reloads its worker.
+  await expect(page.getByRole("tree", { name: "文件树" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
   await page.evaluate(async (content) => {
     const root = await navigator.storage.getDirectory();
     const app = await root.getDirectoryHandle("celestite", { create: true });

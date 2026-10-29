@@ -65,7 +65,9 @@ EditorCore 拥有活动 Buffer，提供同步 `edit`、`replace_text`、`undo`�
 
 ## 预览计算与会话
 
-`preview` feature 提供纯 Rust 的 `compute_preview(&PreviewTask)`，通过 Notist `Vault` 的资源接口加载配置与 package，执行配置中的 IR transforms，输出 HTML、源码映射、组件描述和跨文件诊断。工作区 `Cargo.toml` 中的两个 crate 使用 `https://github.com/AzurIce/notist.git` 的同一固定提交，由 Cargo 获取并通过 `Cargo.lock` 锁定；无需同级源码目录。默认编译不启用预览计算依赖，core 的会话和任务契约始终可用。Web 构建启用 `wasm,preview`，额外导出 `preview_resource_requests(task)` 与 `render_preview(task)`；两者直接接收普通 JS 对象并返回资源请求数组或 `PreviewCompletion`，不创建 EditorCore、不打开 OPFS。
+`preview` feature 提供纯 Rust 的 `compute_preview(&PreviewTask)`，通过 Notist `Vault` 的资源接口加载配置与导入模块，执行配置中的文档扩展，输出 HTML、源码映射、组件描述和跨文件诊断。Web / WASM 宿主只启用内置 `replace` 扩展；native 使用 `compute_preview_native` 暴露真实配置路径，因此配置中的 `command` 扩展可在真实项目目录运行。资源发现和 package 授权会移除 `command` 扩展，避免准备只读快照时启动用户进程。工作区 `Cargo.toml` 中的两个 crate 使用 `https://github.com/AzurIce/notist.git` 的同一固定提交，由 Cargo 获取并通过 `Cargo.lock` 锁定；无需同级源码目录。默认编译不启用预览计算依赖，core 的会话和任务契约始终可用。Web 构建启用 `wasm,preview,language`，导出对象式预览入口与 `LanguageBinding`；不创建 EditorCore、不打开 OPFS。
+
+`language` feature 提供独立的 `LanguageService`，接受无头 LSP JSON-RPC 消息，覆盖诊断、悬停、定义与文档符号。宿主用 `handle` / `provide` 驱动资源回填，并在资源变化时失效缓存；`ResourceContext` 同时供预览与语言读取使用，携带已接受正文和打开文档覆盖。文档查询使用稳定的 `file:///vault/…` URI，真实资源根由宿主传入；外部读取复用 native / HTTP 的授权和观察边界。语言端点不拥有编辑状态，补全与格式化待上游提供能力。
 
 `wasm` feature 使用 `tsify 0.5.8` 生成预览值、`DocumentIdentity` 和版本协议形状的 TypeScript 声明，构建时随 wasm-bindgen 一起输出。`Ts<T>` 只传递 JS 数据句柄，函数内部显式反序列化并报告失败；不采用已弃用的隐式 ABI 转换。map 为普通对象，缺失的 Option 输出 `null`，字节保持 `number[]`；Serde 缺省字段在生成声明中可选。原生 Version 仍是不透明共享向量，协议结构不暴露 Loro 内部表示。
 
@@ -76,7 +78,7 @@ EditorCore 拥有活动 Buffer，提供同步 `edit`、`replace_text`、`undo`�
 1. 创建独立的 `PreviewController`，同步 `editor.document_source(&[])` 的活动目录。源只含身份、路径、版本与会话 `epoch`，不读取或保留另一份正文。
 2. `subscribe(document_id, client_session, now)` 返回订阅标识和状态；多个视图共享一个文档会话。控制器的 `take_events()` 提供合并、连续编号的状态。平台按 `dueAt` 设置计时器；首次立即就绪，后续 120 ms 防抖、500 ms 最长等待。
 3. 到期用 `required_snapshots(id)` 选择目标与声明 ID，通过 `editor.document_source(&ids)` 原子捕获目录及不可变正文，再调用 `take_task(id, &source, now)`。捕获与目录不符则拒绝为 `StaleVersion`，不占用计算槽；尚未到期或已有任务时返回 `None`。源也可以直接由 standalone Buffer 或其他只读文档提供者构造。
-4. `preview_resource_requests` 驱动只读资源补齐，再由独立执行器调用 `compute_preview` / `render_preview`。回报前先同步最新源，再调用控制器的 `complete`；旧任务返回 false。Web 的同步消费回调与源读取共用 core 队列边界，不能在读取与接受之间插入整批替换。计算及资源 IO 不持有这个边界。
+4. `preview_resource_requests` 驱动只读资源补齐，再由独立执行器调用 `compute_preview` / `compute_preview_native`。回报前先同步最新源，再调用控制器的 `complete`；旧任务返回 false。Web 的同步消费回调与源读取共用 core 队列边界，不能在读取与接受之间插入整批替换。计算及资源 IO 不持有这个边界。
 5. 视图关闭用 `unsubscribe`，客户端断开用 `release_client`；消费者退出时 `clear` / 释放绑定。Editor 的 `close` 只完成明文恢复 checkpoint，不管理消费者。
 
 控制器根据只读目录变化协调正文、路径和未保存声明版本；资源写入或通知由组合层调用 `invalidate_project`。整批源替换推进 `epoch`，即使版本与路径相同也撤销旧任务，同时保留当前订阅与待更新的旧结果。Editor 对象重开时，组合所有者重建或显式重置消费者。诊断区间仍为任务正文的 UTF-16 范围，定位前确认结果适用。
@@ -89,7 +91,7 @@ EditorCore 拥有活动 Buffer，提供同步 `edit`、`replace_text`、`undo`�
 
 控制器的 `link(document_id, task_id, target)` 只接受当前就绪结果的链接，返回同文档片段、规范化的 Vault 内路径或允许的外部 URL。相对路径从任务中的文档目录出发，拒绝越出 Vault、无效编码及不允许的 URL scheme。
 
-WASM `PreviewBinding` 独立持有上述控制器，直接使用生成的类型化对象；`EditorAdapter` 不再提供 `preview_*` 分发。Web `lib/preview` 在工作区组合层消费只读源与资源能力。Notist 原始分析及语义环境是未来语言查询的共享边界，预览转换与 HTML 渲染是派生分支；本轮不建立增量分析器或完整 IR 的跨 Worker 缓存。后续阶段见 [路线图](../../docs/roadmap.md)。
+WASM `PreviewBinding` 独立持有上述控制器，直接使用生成的类型化对象；`EditorAdapter` 不再提供 `preview_*` 分发。Web `lib/preview` 在工作区组合层消费只读源与资源能力。Notist 原始分析及语义环境供语言查询使用，预览转换与 HTML 渲染从原始分析分叉，不从转换后的树反推语言语义。后续阶段见 [路线图](../../docs/roadmap.md)。
 
 ```sh
 cargo test -p celestite-core --features preview

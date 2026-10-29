@@ -147,6 +147,11 @@ export interface EditorDocuments {
   retryObservation?(id: string): Promise<boolean>;
   reconnect?(discardUnconfirmed?: boolean): Promise<void>;
   readonly previews?: DocumentPreviews;
+  /** Headerless LSP JSON-RPC channel to the vault's Notist language service. */
+  readonly language?: {
+    send(message: string): void;
+    subscribe(handler: (message: string) => void): () => void;
+  };
   anchorsAt?(
     id: string,
     version: Version,
@@ -213,6 +218,7 @@ export type ServiceMessage =
   | { kind: "reply"; requestId: number; result?: unknown; error?: RpcError }
   | { kind: "fatal"; error: RpcError }
   | { kind: "preview"; event: PreviewEvent }
+  | { kind: "language"; message: string }
   | ServiceEvent;
 export interface ServiceRequest {
   kind: "request";
@@ -254,6 +260,7 @@ export interface ServiceMethods {
   composition: { params: { id: string; active: boolean }; result: void };
   reconnect: { params: Record<string, never>; result: SessionReplacement };
   preview_subscribe: { params: { id: string }; result: PreviewSubscription };
+  language_message: { params: { message: string }; result: void };
   preview_unsubscribe: { params: { subscriptionId: string }; result: boolean };
   preview_retry: { params: { id: string }; result: PreviewState };
   preview_link: {

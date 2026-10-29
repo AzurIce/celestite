@@ -179,6 +179,7 @@ mod tests {
         let vault = Arc::new(HostedVault {
             id: documents.identity.vault_id.clone(),
             name: "Notes".into(),
+            root: root.path().to_owned(),
             read_only: false,
             files: Mutex::new(documents.files.clone()),
             documents: Mutex::new(documents),
@@ -372,6 +373,7 @@ mod tests {
         let vault = Arc::new(HostedVault {
             id: documents.identity.vault_id.clone(),
             name: "Notes".into(),
+            root: root.path().to_owned(),
             read_only: false,
             packages: crate::package_resources::PackageResources::new(
                 root.path().to_owned(),

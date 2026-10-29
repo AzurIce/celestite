@@ -7,7 +7,13 @@ import {
   type Range,
   type Tree,
 } from "web-tree-sitter";
-import type { GrammarName, GrammarSource, HighlightSpan } from "./contract";
+import type {
+  GrammarName,
+  GrammarSource,
+  HighlightSpan,
+  PresentationRange,
+} from "./contract";
+import { isOpaque, presentationRanges } from "./presentation";
 
 interface Grammar {
   parser: Parser;
@@ -108,14 +114,29 @@ export class SyntaxEngine {
     this.root = { grammar: name, tree, text };
     const spans: HighlightSpan[] = [];
     const folds: { from: number; to: number }[] = [];
+    const presentation: PresentationRange[] = [];
+    const sourceOnly: { from: number; to: number }[] = [];
     const visited = new Set<string>();
     const visit = (
       name: GrammarName,
       tree: Tree,
       ranges: Range[],
       depth: number,
+      present: boolean,
+      sourceEnd: number,
     ) => {
       const grammar = this.grammars.get(name)!;
+      if (present)
+        presentation.push(
+          ...presentationRanges(
+            name,
+            tree,
+            text,
+            ranges,
+            sourceOnly,
+            sourceEnd,
+          ),
+        );
       for (const { node } of grammar.folds.captures(tree.rootNode)) {
         if (node.endPosition.row > node.startPosition.row) {
           let to = node.endIndex;
@@ -208,14 +229,47 @@ export class SyntaxEngine {
           .parser.parse(text, undefined, { includedRanges: clipped });
         if (!child) continue;
         try {
-          visit(language as GrammarName, child, clipped, depth + 1);
+          visit(
+            language as GrammarName,
+            child,
+            clipped,
+            depth + 1,
+            present &&
+              match.captures
+                .filter((capture) => capture.name === "injection.content")
+                .every((capture) => !isOpaque(capture.node)),
+            match.captures.reduce(
+              (end, capture) =>
+                capture.name === "injection.content" &&
+                (capture.node.type === "markdown_block_content" ||
+                  capture.node.type === "markdown_inline_content")
+                  ? Math.min(end, capture.node.endIndex)
+                  : end,
+              sourceEnd,
+            ),
+          );
         } finally {
           child.delete();
         }
       }
     };
-    visit(name, tree, [], 0);
-    return { spans, folds };
+    visit(name, tree, [], 0, true, text.length);
+    return {
+      spans,
+      folds,
+      presentation: [
+        ...new Map(
+          presentation
+            .filter(
+              (range) =>
+                !sourceOnly.some(
+                  (source) => range.from < source.to && range.to > source.from,
+                ),
+            )
+            .map((range) => [`${range.kind}:${range.from}:${range.to}`, range]),
+        ).values(),
+      ].sort((a, b) => a.from - b.from || b.to - a.to),
+    };
   }
 
   destroy() {

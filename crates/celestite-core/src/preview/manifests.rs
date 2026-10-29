@@ -1,124 +1,67 @@
-//! Rewrite only dependency path literals in the immutable analysis snapshot.
-//! Source positions and text exposed to the editor remain the original input.
-use super::paths::ResourcePath;
-use serde::Deserialize;
-use std::{collections::BTreeMap, ops::Range};
-
-#[derive(Deserialize)]
-struct Dependency {
-    path: toml::Spanned<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct Manifest {
-    #[serde(default)]
-    dependencies: BTreeMap<String, Dependency>,
-    #[serde(default, rename = "dev-dependencies")]
-    dev_dependencies: BTreeMap<String, Dependency>,
-}
-
-struct Replacement {
-    original: Range<usize>,
-    analysis: Range<usize>,
-}
-
-pub(super) struct ManifestSource {
-    pub(super) original: String,
-    pub(super) analysis: String,
-    replacements: Vec<Replacement>,
+//! Immutable configuration snapshots. Document imports are relative to the
+//! configuration and resolved by Notist's resource host, so the source is
+//! normally passed through unchanged. Native resource discovery removes
+//! process extensions: discovery must not run user code or spawn processes,
+//! and a later replace rule still needs its module graph.
+pub(crate) struct ManifestSource {
+    pub(crate) original: String,
+    pub(crate) analysis: String,
 }
 
 impl ManifestSource {
-    pub(super) fn new(path: &ResourcePath, original: String) -> Self {
-        let mut source = Self {
-            analysis: original.clone(),
-            original,
-            replacements: Vec::new(),
+    pub(crate) fn new(original: String, strip_commands: bool) -> Self {
+        let analysis = if strip_commands {
+            without_commands(&original).unwrap_or_else(|| original.clone())
+        } else {
+            original.clone()
         };
-        let Ok(manifest) = toml::from_str::<Manifest>(&source.original) else {
-            // Notist owns syntax/semantic diagnostics. Invalid input reaches it
-            // unchanged, retaining its original diagnostics and byte spans.
-            return source;
-        };
-        let owner = path.parent();
-        let mut paths = manifest
-            .dependencies
-            .into_values()
-            .chain(manifest.dev_dependencies.into_values())
-            .map(|dependency| dependency.path)
-            .filter(|path| !path.get_ref().is_empty())
-            .collect::<Vec<_>>();
-        paths.sort_by_key(|path| path.span().start);
-        source.analysis.clear();
-        let mut position = 0;
-        for path in paths {
-            let original = path.span();
-            source
-                .analysis
-                .push_str(&source.original[position..original.start]);
-            let start = source.analysis.len();
-            // JSON string escaping is valid for these TOML basic strings.
-            source.analysis.push_str(
-                &serde_json::to_string(&owner.resolve(path.get_ref()).engine().to_string_lossy())
-                    .expect("path strings serialize"),
-            );
-            source.replacements.push(Replacement {
-                original: original.clone(),
-                analysis: start..source.analysis.len(),
-            });
-            position = original.end;
-        }
-        source.analysis.push_str(&source.original[position..]);
-        source
+        Self { original, analysis }
     }
+}
 
-    fn original_offset(&self, offset: usize, end: bool) -> usize {
-        let mut previous_analysis = 0;
-        let mut previous_original = 0;
-        for replacement in &self.replacements {
-            if offset < replacement.analysis.start {
-                return previous_original + offset.saturating_sub(previous_analysis);
-            }
-            if offset <= replacement.analysis.end {
-                return if end || offset == replacement.analysis.end {
-                    replacement.original.end
-                } else {
-                    replacement.original.start
-                };
-            }
-            previous_analysis = replacement.analysis.end;
-            previous_original = replacement.original.end;
-        }
-        previous_original + offset.saturating_sub(previous_analysis)
+fn without_commands(source: &str) -> Option<String> {
+    let mut value = source.parse::<toml::Value>().ok()?;
+    let extensions = value.get_mut("extensions")?.as_array_mut()?;
+    let before = extensions.len();
+    extensions
+        .retain(|extension| extension.get("kind").and_then(toml::Value::as_str) != Some("command"));
+    if extensions.len() == before {
+        return None;
     }
-
-    pub(super) fn range(&self, from: usize, to: usize) -> Range<usize> {
-        self.original_offset(from, false)..self.original_offset(to, true)
+    if extensions.is_empty() {
+        value.as_table_mut()?.remove("extensions");
     }
+    toml::to_string(&value).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ManifestSource;
-    use crate::preview::paths::ResourcePath;
+    use super::{ManifestSource, without_commands};
+
+    const REPLACE: &str = "[[extensions]]\nkind = 'replace'\nimports = { katex = '../modules/katex/lib.notc' }\nfrom = 'notist.math'\nto = 'katex.math'\n";
 
     #[test]
-    fn rewritten_paths_keep_configuration_diagnostic_positions() {
-        let original = "[dependencies]\nwidgets = {path = '../widgets'}\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'widgets::math'\n";
-        let source = ManifestSource::new(
-            &ResourcePath::absolute("C:/repo/docs/Notist.toml").unwrap(),
-            original.into(),
-        );
-        assert_ne!(source.analysis, source.original);
-        let start = source.analysis.find("notist::math").unwrap();
-        let range = source.range(start, start + "notist::math".len());
-        assert_eq!(&source.original[range], "notist::math");
+    fn extension_imports_remain_relative_and_unchanged() {
+        let source = ManifestSource::new(REPLACE.into(), false);
+        assert_eq!(source.analysis, source.original);
         let parsed = notist::environment::parse_config(&source.analysis).unwrap();
-        let dependency = &parsed.dependencies[0];
-        let span = source.range(
-            usize::from(dependency.span.start()),
-            usize::from(dependency.span.end()),
+        let import = &parsed.extensions[0].imports()[0];
+        assert_eq!(
+            &source.analysis[usize::from(import.span.start())..usize::from(import.span.end())],
+            "'../modules/katex/lib.notc'"
         );
-        assert_eq!(&source.original[span], "{path = '../widgets'}");
+    }
+
+    #[test]
+    fn discovery_removes_only_command_extensions() {
+        let source = format!(
+            "{REPLACE}[[extensions]]\nkind = 'command'\ncommand = ['sh', 'check.sh']\nstages = ['after_check']\n"
+        );
+        let stripped = without_commands(&source).expect("command extension removed");
+        let parsed = notist::environment::parse_config(&stripped).unwrap();
+        assert_eq!(parsed.extensions.len(), 1);
+        assert!(stripped.contains("notist.math"));
+        assert!(!stripped.contains("command"));
+        assert!(without_commands(REPLACE).is_none());
     }
 }

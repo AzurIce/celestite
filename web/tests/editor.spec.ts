@@ -1,3 +1,4 @@
+import { openDocumentOptions } from "./editor-actions";
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
 import { expect, test as base, type Page } from "@playwright/test";
 type VaultModule = typeof import("../src/lib/vault");
@@ -114,6 +115,170 @@ async function openTestTabs(page: Page) {
   await expect(page.getByRole("tab")).toHaveCount(3);
 }
 
+test("a delayed editor mount preserves focus returned to the document menu", async ({
+  page,
+}) => {
+  let releaseModule!: () => void;
+  let modulePending = false;
+  const heldModule = new Promise<void>((resolve) => {
+    releaseModule = resolve;
+  });
+  await page.route(
+    /\/src\/components\/editor\/CodeEditor\.tsx(?:\?|$)/,
+    async (route) => {
+      modulePending = true;
+      await heldModule;
+      await route.continue();
+    },
+  );
+  try {
+    await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
+    await expect.poll(() => modulePending).toBe(true);
+    const trigger = page.getByRole("button", { name: "文档选项", exact: true });
+    await trigger.click();
+    await expect(page.getByRole("menu")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("menu")).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    releaseModule();
+    await expect(
+      page.getByRole("textbox", { name: "代码编辑器" }),
+    ).toBeVisible();
+    await expect(trigger).toBeFocused();
+  } finally {
+    releaseModule();
+  }
+});
+
+test("the active tab stays visible across twelve documents and workspace resizing", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await page.evaluate(async () => {
+    const { openOpfsVault, vaultPath } = (await import(
+      "/src/lib/vault/index.ts" as string
+    )) as VaultModule;
+    const vault = await openOpfsVault();
+    try {
+      const content = Array.from(
+        { length: 160 },
+        (_, index) => `Line ${index + 1}`,
+      ).join("\n");
+      for (let index = 1; index <= 12; index++) {
+        await vault.writeFile(
+          vaultPath(`note-${String(index).padStart(2, "0")}.md`),
+          new TextEncoder().encode(content),
+          { mode: "create" },
+        );
+      }
+    } finally {
+      await vault.close();
+    }
+  });
+  await page.reload();
+  for (let index = 1; index <= 12; index++) {
+    await page
+      .getByRole("treeitem", {
+        name: `note-${String(index).padStart(2, "0")}.md`,
+        exact: true,
+      })
+      .click();
+  }
+  await expect(page.getByRole("tab")).toHaveCount(12);
+  const expectActiveTabVisible = async () => {
+    await expect
+      .poll(() =>
+        page.locator('.editor-tab[data-active="true"]').evaluate((tab) => {
+          const bounds = tab.getBoundingClientRect();
+          const viewport = tab.closest(".editor-tabs")!.getBoundingClientRect();
+          return (
+            bounds.left >= viewport.left - 1 &&
+            bounds.right <= viewport.right + 1
+          );
+        }),
+      )
+      .toBe(true);
+  };
+  await expectActiveTabVisible();
+  const editor = page.getByRole("textbox", { name: "代码编辑器" });
+  await editor.focus();
+  await page.locator(".cm-scroller").evaluate((element) => {
+    element.scrollTop = 240;
+  });
+  const scrollTop = await page
+    .locator(".cm-scroller")
+    .evaluate((element) => element.scrollTop);
+  await page.setViewportSize({ width: 900, height: 768 });
+  await expectActiveTabVisible();
+  await expect(editor).toBeFocused();
+  expect(
+    await page.locator(".cm-scroller").evaluate((element) => element.scrollTop),
+  ).toBe(scrollTop);
+
+  await page.getByRole("treeitem", { name: "note-01.md", exact: true }).click();
+  await expectActiveTabVisible();
+  await page.getByRole("treeitem", { name: "note-12.md", exact: true }).click();
+  await expectActiveTabVisible();
+  await page.getByRole("separator", { name: "调整侧边栏宽度" }).focus();
+  await page.keyboard.press("End");
+  await expectActiveTabVisible();
+  await page.getByRole("button", { name: "已打开文档", exact: true }).click();
+  await expect(
+    page.getByRole("menu", { name: "已打开文档" }).getByRole("menuitem"),
+  ).toHaveCount(24);
+  await page.getByRole("menuitem", { name: "note-01.md", exact: true }).click();
+  await expectActiveTabVisible();
+  await expect(
+    page.getByRole("tab", { name: "note-01.md", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(editor).toBeFocused();
+});
+
+test("the mobile document title switches and closes files with paths and unsaved state", async ({
+  page,
+}) => {
+  await openTestTabs(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  const trigger = page.getByRole("button", { name: "已打开文档", exact: true });
+  await expect(trigger).toHaveText("binary.bin");
+  await trigger.click();
+  const menu = page.getByRole("menu", { name: "已打开文档" });
+  await expect(
+    menu.getByRole("menuitem", { name: "notes/b.ts", exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await menu.getByRole("menuitem", { name: "notes/b.ts", exact: true }).click();
+  await expect(menu).toBeHidden();
+  await expect(trigger).toHaveText("b.ts");
+  const editor = page.getByRole("textbox", { name: "代码编辑器" });
+  await expect(editor).toBeFocused();
+  await blockWorkerWrites(page, "b.ts");
+  await editor.fill("const savedFromMobile = true;");
+  await trigger.click();
+  await expect(
+    menu.getByRole("menuitem", { name: "notes/b.ts，未保存", exact: true }),
+  ).toBeVisible();
+  await workerEvaluate(page, () => {
+    (self as unknown as { restoreWriter: () => void }).restoreWriter();
+  });
+  await menu
+    .getByRole("menuitem", { name: "关闭 notes/b.ts", exact: true })
+    .click();
+  await expect(page.getByRole("tab", { includeHidden: true })).toHaveCount(2);
+  expect(await readOpfsText(page, "notes/b.ts")).toBe(
+    "const savedFromMobile = true;",
+  );
+  await trigger.click();
+  await expect(
+    menu.getByRole("menuitem", { name: "notes/b.ts", exact: true }),
+  ).toHaveCount(0);
+  await menu.getByRole("menuitem", { name: "a.md", exact: true }).click();
+  await expect(trigger).toHaveText("a.md");
+  await expect(editor).toBeFocused();
+});
+
 for (const { action, remaining } of [
   { action: "关闭标签页", remaining: ["a.md", "binary.bin"] },
   { action: "关闭其他标签页", remaining: ["notes/b.ts"] },
@@ -149,7 +314,7 @@ for (const { action, remaining } of [
       ).toHaveCount(1);
     } else {
       await expect(
-        page.getByRole("heading", { name: "打开一份文件" }),
+        page.getByRole("heading", { name: "开始一份笔记" }),
       ).toBeVisible();
     }
   });
@@ -380,7 +545,10 @@ test("autosave, search, theme and word wrap work in the editor", async ({
     pane.getByRole("textbox", { name: "查找", exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
-  await pane.getByRole("button", { name: "自动换行", exact: true }).click();
+  await openDocumentOptions(page);
+  await page
+    .getByRole("menuitemcheckbox", { name: "自动换行", exact: true })
+    .click();
   await expect(page.locator(".cm-content")).toHaveClass(/cm-lineWrapping/);
   await page.getByRole("button", { name: "主题", exact: true }).click();
   await page.getByRole("menuitem", { name: "深色", exact: true }).click();
@@ -401,19 +569,24 @@ test("binary files cannot be edited, and mobile can return to the tree and reope
   const pane = page.getByRole("region", { name: "文件编辑器" });
   await expect(pane).toContainText("不是 UTF-8 文本");
   await expect(pane.getByRole("textbox", { name: "代码编辑器" })).toBeHidden();
+  await openDocumentOptions(page);
   await expect(
-    pane.getByRole("button", { name: "保存", exact: true }),
+    page.getByRole("menuitem", { name: "保存", exact: true }),
   ).toBeDisabled();
+  await page.keyboard.press("Escape");
   await page.setViewportSize({ width: 360, height: 720 });
-  await pane.getByRole("button", { name: "返回文件树", exact: true }).click();
+  await pane.getByRole("button", { name: "切换文件导航", exact: true }).click();
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   const editor = pane.getByRole("textbox", { name: "代码编辑器" });
   await editor.fill("mobile draft");
   await expect(page.getByRole("status", { name: "保存状态" })).toHaveText(
     "未保存",
   );
-  await pane.getByRole("button", { name: "返回文件树", exact: true }).click();
-  await expect(pane).toBeHidden();
+  await pane.getByRole("button", { name: "切换文件导航", exact: true }).click();
+  await expect(page.locator(".workspace-editor-pane")).toHaveAttribute(
+    "inert",
+    "",
+  );
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("mobile draft");

@@ -260,15 +260,17 @@ test("preview bindings accept cloneable objects and defaults, and reject malform
   );
 });
 
-test("preview Worker applies package default transforms and retains Unicode diagnostic ranges", async ({
+test("preview Worker applies configured document extensions and retains Unicode diagnostic ranges", async ({
   page,
 }) => {
   await page.goto("/");
-  const completion = await page.evaluate(async () => {
+  const result = await page.evaluate(async () => {
     const worker = new Worker(
       new URL("/src/lib/preview/worker.ts", location.href),
       { type: "module" },
     );
+    const config =
+      "# 配置 😀\n[[extensions]]\nkind = 'replace'\nimports = { katex = 'packages/katex/lib.notc' }\nfrom = 'notist.math'\nto = 'katex.math'\n";
     const task: PreviewTask = {
       ticket: {
         taskId: "transform-task",
@@ -284,47 +286,66 @@ test("preview Worker applies package default transforms and retains Unicode diag
       resourceRoot: "/vault",
       source: "😀 $x$ #math(false)",
       overlays: {
-        "Notist.toml":
-          "future_option = true\n[dependencies]\nkatex = {path = 'packages/katex'}\n",
-        "packages/katex/Notist.toml":
-          "[package]\nname = 'katex'\n[[transforms]]\nkind = 'replace'\nfrom = 'notist::math'\nto = 'katex::math'\n",
+        "Notist.toml": config,
         "packages/katex/lib.notc":
-          "fn math(text: String, block?: Bool) -> Content<block>;",
-        "packages/katex/components/math.js":
-          "export default class extends HTMLElement {}",
+          "fn math<C: Type = InlineContent>(text: String) -> C;",
+        "packages/katex/math.js": "export default class extends HTMLElement {}",
       },
       resources: {
-        "packages/katex/components/math/index.js": {
+        "packages/katex/math/index.js": {
           kind: null,
           data: null,
           error: null,
         },
       },
     };
-    try {
-      return await new Promise<PreviewCompletion>((resolve, reject) => {
-        worker.addEventListener("message", (event) => {
-          if (event.data.kind === "resources") {
-            reject(new Error("unexpected resource request"));
-            return;
-          }
-          resolve(event.data.completion);
-        });
+    const execute = (input: PreviewTask) =>
+      new Promise<PreviewCompletion>((resolve, reject) => {
+        worker.addEventListener(
+          "message",
+          (event) => {
+            if (event.data.kind === "resources") {
+              reject(new Error("unexpected resource request"));
+              return;
+            }
+            resolve(event.data.completion);
+          },
+          { once: true },
+        );
         worker.addEventListener("error", (event) =>
           reject(new Error(event.message)),
         );
-        worker.postMessage({ kind: "execute", task });
+        worker.postMessage({ kind: "execute", task: input });
       });
+    try {
+      const completion = await execute(task);
+      const invalidConfig = config.replace(
+        "to = 'katex.math'",
+        "to = 'missing.math'",
+      );
+      const invalid = await execute({
+        ...task,
+        ticket: { ...task.ticket, taskId: "invalid-transform-task" },
+        overlays: { ...task.overlays, "Notist.toml": invalidConfig },
+      });
+      return { completion, invalid, invalidConfig };
     } finally {
       worker.terminate();
     }
   });
+  const { completion, invalid, invalidConfig } = result;
   expect(completion.outcome.kind).toBe("success");
   if (completion.outcome.kind !== "success")
     throw new Error(completion.outcome.message);
   const output = completion.outcome.output;
-  expect(output.html).toContain("<katex-math");
-  expect(output.usedComponents?.[0]?.package).toBe("katex");
+  const component = output.usedComponents?.[0];
+  expect(component).toMatchObject({
+    package: "packages/katex/lib.notc",
+    packageRoot: "packages/katex",
+    path: "packages/katex/math.js",
+  });
+  expect(component?.tag).toMatch(/^notist-/);
+  expect(output.html).toContain(`<${component?.tag}`);
   expect(
     output.sourceMap?.some((mapping) => mapping.from === 3 && mapping.to === 6),
   ).toBe(true);
@@ -337,4 +358,78 @@ test("preview Worker applies package default transforms and retains Unicode diag
       source: null,
     }),
   );
+  expect(invalid.outcome.kind).toBe("failure");
+  if (invalid.outcome.kind !== "failure")
+    throw new Error("invalid extension configuration was accepted");
+  const diagnostic = (invalid.outcome.diagnostics ?? []).find(
+    (item) => item.path === "Notist.toml",
+  );
+  expect(diagnostic?.source).toBe(invalidConfig);
+  expect(invalidConfig.slice(diagnostic!.from, diagnostic!.to)).toContain(
+    "missing.math",
+  );
+});
+
+test("WASM preview rejects command extensions while keeping built-in replacements", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const completion = await page.evaluate(async () => {
+    const worker = new Worker(
+      new URL("/src/lib/preview/worker.ts", location.href),
+      { type: "module" },
+    );
+    const config =
+      "[[extensions]]\nkind = 'command'\ncommand = ['sh', '-c', ': > should-not-run']\nstages = ['after_check']\n";
+    const task: PreviewTask = {
+      ticket: {
+        taskId: "command-task",
+        sessionId: "command-session",
+        documentId: "doc",
+        path: "a.not",
+        renderGeneration: "command-test",
+        version: {
+          identity: { document_id: "doc", history_id: "history" },
+          clocks: {},
+        },
+      },
+      resourceRoot: "/vault",
+      source: "正文",
+      overlays: { "Notist.toml": config },
+      resources: {},
+    };
+    const execute = (input: PreviewTask) =>
+      new Promise<PreviewCompletion>((resolve, reject) => {
+        worker.addEventListener(
+          "message",
+          (event) => {
+            if (event.data.kind === "resources") {
+              reject(new Error("unexpected resource request"));
+              return;
+            }
+            resolve(event.data.completion);
+          },
+          { once: true },
+        );
+        worker.addEventListener("error", (event) =>
+          reject(new Error(event.message)),
+        );
+        worker.postMessage({ kind: "execute", task: input });
+      });
+    try {
+      return await execute(task);
+    } finally {
+      worker.terminate();
+    }
+  });
+  expect(completion.outcome.kind).toBe("failure");
+  if (completion.outcome.kind !== "failure")
+    throw new Error("browser host accepted a command extension");
+  expect(
+    (completion.outcome.diagnostics ?? []).some(
+      (diagnostic) =>
+        diagnostic.path === "Notist.toml" &&
+        diagnostic.message.includes("unavailable in this host"),
+    ),
+  ).toBe(true);
 });

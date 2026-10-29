@@ -65,7 +65,7 @@ let
     common
     // {
       pname = "celestite-wasm-deps";
-      cargoExtraArgs = "--locked -p celestite-core --features wasm,preview --target wasm32-unknown-unknown";
+      cargoExtraArgs = "--locked -p celestite-core --features wasm,preview,language --target wasm32-unknown-unknown";
     }
   );
   frontend = craneLib.mkCargoDerivation (

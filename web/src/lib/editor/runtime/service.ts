@@ -4,6 +4,7 @@ import { encodeError } from "../rpc";
 import { PreviewHost } from "../../preview/host";
 import type { PreviewResources } from "../../preview/resources";
 import type { PreviewPort, PreviewExecutor } from "../../preview/contract";
+import { LanguageHost, type LanguageWorker } from "../../language/host";
 import { fileMutation } from "../files";
 import { TaskQueue } from "../queue";
 import type {
@@ -90,6 +91,7 @@ export async function serveEditor(
     previewBinding: PreviewPort;
     createPreviewExecutor?: () => PreviewExecutor;
     previewResources: PreviewResources;
+    createLanguageWorker?: () => LanguageWorker;
     invalidateResourcesOnTree?: boolean;
     setResourceScope?: (
       scope: import("../../vault/file-system-access").LocalDirectoryHandle,
@@ -102,6 +104,7 @@ export async function serveEditor(
   const sessionId = crypto.randomUUID();
   let host: EditorServiceHost;
   let previews: PreviewHost;
+  let language: LanguageHost;
   let invalidateResourcesOnTree = false;
   const queue = new TaskQueue();
   let closing = false;
@@ -167,6 +170,7 @@ export async function serveEditor(
       await runtime.setResourceScope(
         scope as import("../../vault/file-system-access").LocalDirectoryHandle,
       );
+      language.invalidate();
       return previews.invalidateProject();
     },
     reconnect: () => {
@@ -175,6 +179,8 @@ export async function serveEditor(
       return host.reconnect();
     },
     preview_subscribe: ({ id }) => previews.subscribe(id, sessionId),
+    // Enqueue-only: language work never blocks the editor command queue.
+    language_message: ({ message }) => language.handle(message),
     preview_unsubscribe: ({ subscriptionId }) =>
       previews.unsubscribe(subscriptionId, sessionId),
     preview_retry: ({ id }) => previews.retry(id),
@@ -193,8 +199,10 @@ export async function serveEditor(
       try {
         return await host.fileOperation(params.method, params);
       } finally {
-        if (fileMutation(params.method))
+        if (fileMutation(params.method)) {
+          language.invalidate();
           await previews.invalidateProject().catch(() => {});
+        }
       }
     },
     close: async () => {
@@ -210,6 +218,7 @@ export async function serveEditor(
           deferred.length = 0;
           host.dispose();
           previews.dispose();
+          language.dispose();
         } else {
           // Closing remains reversible until the core's final checkpoint and
           // backend close succeed. Timers admitted meanwhile must survive a
@@ -218,6 +227,7 @@ export async function serveEditor(
           await host.close();
           closing = true;
           deferred.length = 0;
+          language.dispose();
           await previews.close();
         }
         await runtime.dispose();
@@ -293,7 +303,10 @@ export async function serveEditor(
       previews &&
       !closing
     )
-      schedule(() => previews.invalidateProject());
+      schedule(() => {
+        language.invalidate();
+        return previews.invalidateProject();
+      });
   }, schedule);
   host = runtime.host;
   invalidateResourcesOnTree = runtime.invalidateResourcesOnTree ?? false;
@@ -305,6 +318,11 @@ export async function serveEditor(
     runtime.previewResources,
     runtime.createPreviewExecutor,
   );
+  language = new LanguageHost(
+    runtime.previewResources,
+    (message) => port.postMessage({ kind: "language", message }),
+    runtime.createLanguageWorker,
+  );
   const lifetime = new Promise<void>((resolve) => {
     release = resolve;
   });
@@ -313,6 +331,7 @@ export async function serveEditor(
     deferred.length = 0;
     host.dispose();
     previews.dispose();
+    language.dispose();
     release();
   });
   port.postMessage({ kind: "ready", identity: runtime.identity, sessionId });

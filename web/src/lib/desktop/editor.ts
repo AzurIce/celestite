@@ -12,7 +12,10 @@ import { openHttpVault } from "../vault/http";
 import type { InstanceIdentity } from "../editor/contract";
 import { desktopInvoke, type DesktopInvoke } from "./platform";
 import { nativePreview, nativePreviewExecutor } from "./preview";
+import { nativeLanguageWorker } from "./language";
 import { NativeObservation } from "./observation";
+import { nativeGitStatus, remoteGitStatus } from "../git/source";
+import type { GitStatusSource } from "../git/status";
 
 const nativeClientId = crypto.randomUUID();
 interface NativeEditor {
@@ -20,6 +23,7 @@ interface NativeEditor {
   documents: ClientDocuments;
   backend: VaultBackend;
   root: string | null;
+  git?: GitStatusSource;
 }
 const nativeEditors = new Map<string, Promise<NativeEditor>>();
 
@@ -201,19 +205,19 @@ async function startNativeEditor(
               root: descriptor.root,
               read: (
                 request: import("../preview/contract").PreviewResourceRequest,
-                task: import("../preview/contract").PreviewTask,
+                context: import("../preview/contract").ResourceContext,
               ) =>
                 invoke<import("../preview/contract").PreviewResource>(
                   "desktop_package_read",
-                  { handle: descriptor.handle, task, request },
+                  { handle: descriptor.handle, context, request },
                 ),
               readDir: (
                 path: string,
-                task: import("../preview/contract").PreviewTask,
+                context: import("../preview/contract").ResourceContext,
               ) =>
                 invoke<Entry[]>("desktop_package_directory", {
                   handle: descriptor.handle,
-                  task,
+                  context,
                   path,
                 }),
             }
@@ -223,7 +227,13 @@ async function startNativeEditor(
         host,
         previewBinding: nativePreview(descriptor.handle, invoke),
         previewResources: new PreviewResources(backend, packages),
-        createPreviewExecutor: () => nativePreviewExecutor(invoke),
+        createPreviewExecutor: () =>
+          nativePreviewExecutor(descriptor.handle, invoke),
+        // Local sessions run the language service natively; remote replicas
+        // keep the WASM worker, whose resource loop reads over HTTP.
+        createLanguageWorker: descriptor.root
+          ? () => nativeLanguageWorker(descriptor.handle, invoke)
+          : undefined,
         invalidateResourcesOnTree: true,
         releaseOwner: () =>
           invoke<void>("desktop_close", { handle: descriptor.handle }),
@@ -256,6 +266,13 @@ async function startNativeEditor(
       documents,
       backend: documents.treeBackend,
       root: descriptor.root,
+      git: remote
+        ? remote.descriptor.capabilities.gitStatus
+          ? remoteGitStatus(remote.backend)
+          : undefined
+        : descriptor.root
+          ? nativeGitStatus(descriptor.handle, invoke)
+          : undefined,
     };
   } catch (error) {
     client.dispose();

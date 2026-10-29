@@ -8,6 +8,7 @@ import type { EditorDocuments } from "@/lib/editor/contract";
 export function VaultConnectionBoundary(props: {
   documents: EditorDocuments;
   children: (disabled: () => boolean) => JSX.Element;
+  recoveryControls: () => JSX.Element;
 }) {
   const [state, setState] = createSignal(props.documents.snapshot());
   const unsubscribe = props.documents.subscribe(setState);
@@ -72,6 +73,9 @@ export function VaultConnectionBoundary(props: {
           aria-label="远端连接状态"
         >
           <div class="vault-connection-card">
+            <div class="vault-recovery-controls">
+              {props.recoveryControls()}
+            </div>
             <h2 class="text-ui-heading font-medium">
               {state().connection?.status === "reconnecting"
                 ? "正在重新连接…"

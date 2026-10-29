@@ -3,7 +3,8 @@ use celestite_core::{
     error::ErrorCode,
     instance::{InstanceIdentity, Vault},
     preview::{
-        PreviewResourceRequest, PreviewTask, compute_preview, project::preview_resource_requests,
+        PreviewResourceRequest, PreviewTask, ResourceContext, compute_preview_native,
+        project::preview_resource_requests,
     },
 };
 use serde_json::{Value, json};
@@ -387,13 +388,13 @@ fn preview_executes_native_snapshots_and_revokes_superseded_results() {
         for request in requests {
             let key = request.path.clone();
             let resource = runtime
-                .package_read(&session.handle, task.clone(), request)
+                .package_read(&session.handle, ResourceContext::from(&task), request)
                 .unwrap();
             task.resources.insert(key, resource);
         }
     }
     assert!(preview_resource_requests(&task).is_empty());
-    let completion = compute_preview(&task);
+    let completion = compute_preview_native(&task);
     assert_eq!(
         runtime
             .preview(
@@ -492,21 +493,20 @@ fn package_grants_follow_snapshot_dependencies_and_watch_external_components() {
     let docs = root.join("docs");
     let package = root.join("widgets");
     std::fs::create_dir_all(&docs).unwrap();
-    std::fs::create_dir_all(package.join("components/panel")).unwrap();
+    std::fs::create_dir_all(package.join("panel")).unwrap();
     std::fs::write(
-        docs.join("Notist.toml"),
-        "[dependencies]\nwidgets = {path = '../widgets'}\n",
+        docs.join("a.not"),
+        "#import \"../widgets/lib.notc\" as widgets;\n\n#widgets.panel()[body]",
     )
     .unwrap();
-    std::fs::write(docs.join("a.not"), "#widgets::panel()[body]").unwrap();
-    std::fs::write(package.join("Notist.toml"), "[package]\nname = 'widgets'\n").unwrap();
+    std::fs::write(docs.join("b.not"), "plain\n").unwrap();
     std::fs::write(
         package.join("lib.notc"),
-        "fn panel()[children: Content] -> Content;",
+        "fn panel()[children: BlockContent] -> BlockContent;",
     )
     .unwrap();
     std::fs::write(package.join("private.txt"), "private").unwrap();
-    let component = package.join("components/panel/index.js");
+    let component = package.join("panel/index.js");
     std::fs::write(&component, "export default class extends HTMLElement {}").unwrap();
     let runtime = DesktopRuntime::open(storage.path()).unwrap();
     let session = runtime
@@ -520,7 +520,7 @@ fn package_grants_follow_snapshot_dependencies_and_watch_external_components() {
     let resource = runtime
         .package_read(
             &session.handle,
-            task.clone(),
+            ResourceContext::from(&task),
             PreviewResourceRequest {
                 path: declaration.clone(),
                 read: true,
@@ -531,8 +531,8 @@ fn package_grants_follow_snapshot_dependencies_and_watch_external_components() {
     let entries = runtime
         .package_directory(
             &session.handle,
-            task.clone(),
-            &super::display_directory(&package.join("components/panel")),
+            ResourceContext::from(&task),
+            &super::display_directory(&package.join("panel")),
         )
         .unwrap();
     assert_eq!(entries.len(), 1);
@@ -545,7 +545,7 @@ fn package_grants_follow_snapshot_dependencies_and_watch_external_components() {
         let error = runtime
             .package_read(
                 &session.handle,
-                task.clone(),
+                ResourceContext::from(&task),
                 PreviewResourceRequest { path, read: true },
             )
             .unwrap_err();
@@ -555,14 +555,14 @@ fn package_grants_follow_snapshot_dependencies_and_watch_external_components() {
         ));
     }
     let mut revoked = task.clone();
-    revoked
-        .overlays
-        .insert("Notist.toml".into(), "[dependencies]\n".into());
+    // A document without imports grants nothing.
+    revoked.ticket.path = "b.not".into();
+    revoked.source = "plain\n".into();
     assert_eq!(
         runtime
             .package_read(
                 &session.handle,
-                revoked,
+                ResourceContext::from(&revoked),
                 PreviewResourceRequest {
                     path: declaration,
                     read: true
@@ -583,7 +583,7 @@ fn package_grants_follow_snapshot_dependencies_and_watch_external_components() {
     let remote = runtime.open_session(remote_source()).unwrap();
     assert_eq!(
         runtime
-            .package_directory(&remote.handle, task, "")
+            .package_directory(&remote.handle, ResourceContext::from(&task), "")
             .unwrap_err()
             .code,
         ErrorCode::Unsupported
@@ -602,22 +602,23 @@ fn retargeting_an_explicit_package_symlink_invalidates_its_resource_snapshot() {
     std::fs::create_dir_all(&docs).unwrap();
     std::fs::create_dir_all(&aliases).unwrap();
     for (name, source) in [
-        ("v1", "fn panel()[children: Content] -> Content;"),
-        ("v2", "fn updated()[children: Content] -> Content;"),
+        ("v1", "fn panel()[children: BlockContent] -> BlockContent;"),
+        (
+            "v2",
+            "fn updated()[children: BlockContent] -> BlockContent;",
+        ),
     ] {
         let package = root.join(name);
         std::fs::create_dir(&package).unwrap();
-        std::fs::write(package.join("Notist.toml"), "[package]\nname = 'widgets'\n").unwrap();
         std::fs::write(package.join("lib.notc"), source).unwrap();
     }
     let alias = aliases.join("widgets");
     std::os::unix::fs::symlink(root.join("v1"), &alias).unwrap();
     std::fs::write(
-        docs.join("Notist.toml"),
-        "[dependencies]\nwidgets = {path = '../aliases/widgets'}\n",
+        docs.join("a.not"),
+        "#import \"../aliases/widgets/lib.notc\" as widgets;\n\n#widgets.panel()[body]",
     )
     .unwrap();
-    std::fs::write(docs.join("a.not"), "#widgets::panel()[body]").unwrap();
     let runtime = DesktopRuntime::open(storage.path()).unwrap();
     let session = runtime
         .open_session(OpenSource::Directory {
@@ -631,7 +632,7 @@ fn retargeting_an_explicit_package_symlink_invalidates_its_resource_snapshot() {
         runtime
             .package_read(
                 &session.handle,
-                task.clone(),
+                ResourceContext::from(&task),
                 PreviewResourceRequest {
                     path: path.clone(),
                     read: true,
@@ -666,11 +667,10 @@ fn an_explicit_broken_package_link_observes_its_target_becoming_available() {
     let package = targets.join("widgets");
     std::os::unix::fs::symlink("../targets/widgets", &alias).unwrap();
     std::fs::write(
-        docs.join("Notist.toml"),
-        "[dependencies]\nwidgets = {path = '../aliases/widgets'}\n",
+        docs.join("a.not"),
+        "#import \"../aliases/widgets/lib.notc\" as widgets;\n\n#widgets.panel()[body]",
     )
     .unwrap();
-    std::fs::write(docs.join("a.not"), "#widgets::panel()[body]").unwrap();
     let runtime = DesktopRuntime::open(storage.path()).unwrap();
     let session = runtime
         .open_session(OpenSource::Directory {
@@ -685,23 +685,26 @@ fn an_explicit_broken_package_link_observes_its_target_becoming_available() {
     };
     assert!(
         runtime
-            .package_read(&session.handle, task.clone(), request.clone())
+            .package_read(
+                &session.handle,
+                ResourceContext::from(&task),
+                request.clone()
+            )
             .unwrap()
             .kind
             .is_none()
     );
     drain_watch_changes(&runtime, &session.handle);
     std::fs::create_dir(&package).unwrap();
-    std::fs::write(package.join("Notist.toml"), "[package]\nname = 'widgets'\n").unwrap();
     std::fs::write(
         package.join("lib.notc"),
-        "fn panel()[children: Content] -> Content;",
+        "fn panel()[children: BlockContent] -> BlockContent;",
     )
     .unwrap();
     await_change(&runtime, &session.handle);
     assert!(
         !runtime
-            .package_read(&session.handle, task, request)
+            .package_read(&session.handle, ResourceContext::from(&task), request)
             .unwrap()
             .data
             .unwrap()
@@ -756,7 +759,7 @@ fn replacement_webview_revokes_views_and_remote_owners_but_keeps_local_draft_and
             .preview(
                 &session.handle,
                 "complete",
-                json!({"completion":compute_preview(&task)})
+                json!({"completion":compute_preview_native(&task)})
             )
             .unwrap(),
         false
@@ -1133,6 +1136,123 @@ fn immediate_close_and_shutdown_do_not_deadlock_watch_registration_barriers() {
     runtime.shutdown().unwrap();
 }
 
+/// The native language host drives the service's resource rounds from real
+/// disk: Vault files by relative key, `..`-escaped modules beside the root.
+#[test]
+fn language_host_reads_modules_from_disk() {
+    let storage = tempfile::tempdir().unwrap();
+    let workspace = storage.path().join("workspace");
+    let root = workspace.join("project/vault");
+    let package = workspace.join("widgets");
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("lib.notc"),
+        "fn panel(title: String) -> BlockContent;\n",
+    )
+    .unwrap();
+    let runtime = DesktopRuntime::open(&storage.path().join("app")).unwrap();
+    let session = runtime
+        .open_session(OpenSource::Directory {
+            path: root.to_str().unwrap().into(),
+        })
+        .unwrap();
+    let say = |message: Value| {
+        runtime
+            .language(
+                &session.handle,
+                super::LanguageCommand::Message {
+                    message: message.to_string(),
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|message| serde_json::from_str::<Value>(&message).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let initialize = say(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    assert_eq!(
+        initialize[0]["result"]["serverInfo"]["name"],
+        "celestite-notist"
+    );
+    let uri = "file:///vault/docs/a.not";
+    let text = "#import \"../../../widgets/lib.notc\" as widgets;\n\n#widgets.panel(\"标题\")\n";
+    let opened = say(json!({
+        "jsonrpc":"2.0","method":"textDocument/didOpen",
+        "params":{"textDocument":{"uri":uri,"version":1,"text":text}}
+    }));
+    let diagnostics = opened
+        .iter()
+        .find_map(|message| {
+            (message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["uri"] == uri)
+                .then(|| message["params"]["diagnostics"].clone())
+        })
+        .expect("publish diagnostics");
+    assert_eq!(
+        diagnostics,
+        json!([]),
+        "declared calls analyze cleanly: {opened:?}"
+    );
+    let hover = say(json!({
+        "jsonrpc":"2.0","id":2,"method":"textDocument/hover",
+        "params":{"textDocument":{"uri":uri},"position":{"line":2,"character":10}}
+    }));
+    assert!(
+        hover[0]["result"]["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("panel"),
+        "hover reads the module declaration from disk: {hover:?}"
+    );
+    drain_watch_changes(&runtime, &session.handle);
+    std::fs::write(
+        package.join("lib.notc"),
+        "fn panel(changed: String) -> BlockContent;\n",
+    )
+    .unwrap();
+    await_change(&runtime, &session.handle);
+    assert!(
+        runtime
+            .language(&session.handle, super::LanguageCommand::Invalidate)
+            .unwrap()
+            .is_empty()
+    );
+    let refreshed = say(json!({
+        "jsonrpc":"2.0","id":3,"method":"textDocument/hover",
+        "params":{"textDocument":{"uri":uri},"position":{"line":2,"character":10}}
+    }));
+    assert!(
+        refreshed[0]["result"]["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("changed"),
+        "invalidated language resources must be read from the observed module"
+    );
+    runtime
+        .language(&session.handle, super::LanguageCommand::Reset)
+        .unwrap();
+    let reset =
+        say(json!({"id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":uri}}}));
+    assert_eq!(reset[0]["error"]["code"], -32002);
+    say(json!({"id":5,"method":"initialize"}));
+    let stale = say(
+        json!({"id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":uri},"position":{"line":2,"character":10}}}),
+    );
+    assert!(
+        stale[0]["result"].is_null(),
+        "restarted native endpoint must not retain documents"
+    );
+    runtime.close_session(&session.handle).unwrap();
+    assert!(
+        runtime
+            .language(&session.handle, super::LanguageCommand::Invalidate)
+            .unwrap_err()
+            .code
+            == ErrorCode::Closed
+    );
+}
+
 /// Measure a real directory using disposable private recovery; only enumerate Vault files.
 #[test]
 #[ignore = "requires CELESTITE_BENCH_VAULT and an isolated test process"]
@@ -1194,4 +1314,101 @@ fn native_watch_count() -> Option<usize> {
 #[cfg(not(target_os = "linux"))]
 fn native_watch_count() -> Option<usize> {
     None
+}
+
+#[cfg(unix)]
+#[test]
+fn language_resources_reject_external_module_file_symlinks() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = storage.path().join("workspace/vault");
+    let modules = storage.path().join("workspace/widgets");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&modules).unwrap();
+    let secret = storage.path().join("unrelated.notc");
+    std::fs::write(&secret, "fn panel() -> BlockContent;").unwrap();
+    std::os::unix::fs::symlink(&secret, modules.join("lib.notc")).unwrap();
+    let runtime = DesktopRuntime::open(&storage.path().join("app")).unwrap();
+    let session = runtime
+        .open_session(OpenSource::Directory {
+            path: root.to_str().unwrap().into(),
+        })
+        .unwrap();
+    let say = |message: Value| {
+        runtime
+            .language(
+                &session.handle,
+                super::LanguageCommand::Message {
+                    message: message.to_string(),
+                },
+            )
+            .unwrap()
+    };
+    say(json!({"id":1,"method":"initialize"}));
+    let messages = say(json!({
+        "method":"textDocument/didOpen",
+        "params":{"textDocument":{"uri":"file:///vault/a.not","version":1,"text":"#import \"../widgets/lib.notc\" as widgets;\n\n#widgets.panel()\n"}}
+    }));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("resource must be a file or directory")),
+        "language IO must share the no-follow preview capability: {messages:?}"
+    );
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn native_git_status_observes_the_vault_and_remote_sessions_have_none() {
+    let git = |root: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    if !std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let storage = tempfile::tempdir().unwrap();
+    let vault = tempfile::tempdir().unwrap();
+    let root = vault.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.email", "test@example.com"]);
+    git(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("a.md"), "base").unwrap();
+    git(&root, &["add", "a.md"]);
+    git(&root, &["commit", "-qm", "base"]);
+    std::fs::write(root.join("a.md"), "changed").unwrap();
+    std::fs::write(root.join("new.md"), "new").unwrap();
+
+    let runtime = DesktopRuntime::open(storage.path()).unwrap();
+    let session = runtime
+        .open_session(OpenSource::Directory {
+            path: root.to_str().unwrap().into(),
+        })
+        .unwrap();
+    let status = runtime.git_status(&session.handle).unwrap().unwrap();
+    assert!(status.entries.iter().any(|entry| {
+        entry.path == "a.md" && entry.worktree == celestite_core::protocol::git::GitChange::Modified
+    }));
+    assert!(
+        status
+            .entries
+            .iter()
+            .any(|entry| entry.path == "new.md" && entry.untracked)
+    );
+
+    let remote = runtime.open_session(remote_source()).unwrap();
+    assert_eq!(runtime.git_status(&remote.handle).unwrap(), None);
+    runtime.shutdown().unwrap();
 }

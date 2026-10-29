@@ -9,8 +9,9 @@ use celestite_core::{
     error::{EditorError, EditorResult},
     fs::FileEntry,
     preview::{
-        PreviewCompletion, PreviewResource, PreviewResourceRequest, PreviewTask, compute_preview,
+        PreviewCompletion, PreviewResource, PreviewResourceRequest, PreviewTask, ResourceContext,
     },
+    protocol::git::GitStatusSnapshot,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -72,6 +73,15 @@ pub async fn desktop_preview(
     blocking(move || runtime.preview(&handle, &method, params)).await
 }
 #[tauri::command]
+pub async fn desktop_language(
+    state: State<'_, DesktopState>,
+    handle: String,
+    command: crate::runtime::LanguageCommand,
+) -> EditorResult<Vec<String>> {
+    let runtime = state.runtime.clone();
+    blocking(move || runtime.language(&handle, command)).await
+}
+#[tauri::command]
 pub async fn desktop_preview_requests(
     task: PreviewTask,
 ) -> EditorResult<Vec<PreviewResourceRequest>> {
@@ -81,28 +91,37 @@ pub async fn desktop_preview_requests(
     .await
 }
 #[tauri::command]
-pub async fn desktop_preview_render(task: PreviewTask) -> EditorResult<PreviewCompletion> {
-    blocking(move || crate::analysis::run(|| compute_preview(&task))).await
+pub async fn desktop_preview_render(
+    state: State<'_, DesktopState>,
+    handle: String,
+    task: PreviewTask,
+) -> EditorResult<PreviewCompletion> {
+    let runtime = state.runtime.clone();
+    blocking(move || {
+        crate::analysis::run(|| runtime.preview_render(&handle, task))
+            .and_then(std::convert::identity)
+    })
+    .await
 }
 #[tauri::command]
 pub async fn desktop_package_read(
     state: State<'_, DesktopState>,
     handle: String,
-    task: PreviewTask,
+    context: ResourceContext,
     request: PreviewResourceRequest,
 ) -> EditorResult<PreviewResource> {
     let runtime = state.runtime.clone();
-    blocking(move || runtime.package_read(&handle, task, request)).await
+    blocking(move || runtime.package_read(&handle, context, request)).await
 }
 #[tauri::command]
 pub async fn desktop_package_directory(
     state: State<'_, DesktopState>,
     handle: String,
-    task: PreviewTask,
+    context: ResourceContext,
     path: String,
 ) -> EditorResult<Vec<FileEntry>> {
     let runtime = state.runtime.clone();
-    blocking(move || runtime.package_directory(&handle, task, &path)).await
+    blocking(move || runtime.package_directory(&handle, context, &path)).await
 }
 #[tauri::command]
 pub async fn desktop_close(state: State<'_, DesktopState>, handle: String) -> EditorResult<()> {
@@ -129,6 +148,14 @@ pub async fn desktop_shutdown(state: State<'_, DesktopState>) -> EditorResult<()
 pub async fn desktop_changes(state: State<'_, DesktopState>, handle: String) -> EditorResult<bool> {
     let runtime = state.runtime.clone();
     blocking(move || runtime.changes(&handle)).await
+}
+#[tauri::command]
+pub async fn desktop_git_status(
+    state: State<'_, DesktopState>,
+    handle: String,
+) -> EditorResult<Option<GitStatusSnapshot>> {
+    let runtime = state.runtime.clone();
+    blocking(move || runtime.git_status(&handle)).await
 }
 #[tauri::command]
 pub async fn desktop_app_read(

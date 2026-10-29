@@ -1,5 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 import { installWorkerHarness, workerEvaluate } from "./worker-harness";
+import {
+  openVaultManager,
+  openVaultMenu,
+  selectVault,
+  vaultSwitcher,
+} from "./vault-actions";
 
 // Only the native chooser is replaced. Handles, structured cloning, IndexedDB,
 // streams, Web Locks and the Worker/WASM editor are real browser implementations.
@@ -28,7 +34,7 @@ async function installPicker(page: Page, source = "one\ntwo\n") {
     await stream.write(source);
     await stream.close();
   }, source);
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await openVaultManager(page);
   await page.getByRole("button", { name: "打开本机目录", exact: true }).click();
   await expect(
     page.getByRole("treeitem", { name: "a.md", exact: true }),
@@ -234,9 +240,7 @@ test("a picked directory edits in the core, persists its handle and keeps histor
   page,
 }) => {
   await installPicker(page);
-  const id = await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .inputValue();
+  const id = await vaultSwitcher(page).getAttribute("data-vault-id");
   expect(id).toMatch(/^directory:/);
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor(page)).toContainText("one");
@@ -249,7 +253,7 @@ test("a picked directory edits in the core, persists its handle and keeps histor
   );
   expect(await diskText(page)).toBe("one\ntwo\nlocal\n");
   await page.reload();
-  await page.getByRole("combobox", { name: "当前 Vault" }).selectOption(id);
+  await selectVault(page, "Test Project");
   await page.getByRole("treeitem", { name: "a.md", exact: true }).click();
   await expect(editor(page)).toContainText("local");
   const entries = await page.evaluate(async () => {
@@ -263,15 +267,14 @@ test("a picked directory edits in the core, persists its handle and keeps histor
     return { entries, ids };
   });
   expect(entries.entries).toEqual(["a.md"]);
-  expect(entries.ids).toContain(`directory-${id.slice("directory:".length)}`);
-  await page.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  expect(entries.ids).toContain(`directory-${id!.slice("directory:".length)}`);
+  await openVaultManager(page);
   await page.getByRole("button", { name: "打开本机目录", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "当前 Vault" })).toHaveValue(
-    id,
-  );
-  await expect(
-    page.getByRole("combobox", { name: "当前 Vault" }).locator("option"),
-  ).toHaveCount(2);
+  await expect(vaultSwitcher(page)).toHaveAttribute("data-vault-id", id!);
+  const menu = await openVaultMenu(page);
+  await expect(menu.getByRole("menuitemradio")).toHaveCount(2);
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
 });
 
 test("external saves merge with unsaved input, preserve personal undo and redo", async ({
@@ -331,13 +334,11 @@ test("a second tab cannot open a directory whose private history is already owne
   context,
 }) => {
   await installPicker(page);
-  const id = await page
-    .getByRole("combobox", { name: "当前 Vault" })
-    .inputValue();
+  const id = await vaultSwitcher(page).getAttribute("data-vault-id");
   const other = await context.newPage();
   await other.goto("/");
   // Its default Vault may be busy; open the stored directory from the error view's management dialog.
-  await other.getByRole("button", { name: "管理 Vault", exact: true }).click();
+  await openVaultManager(other);
   await other
     .getByRole("dialog")
     .getByRole("button", { name: "打开", exact: true })
@@ -352,9 +353,9 @@ test("a second tab cannot open a directory whose private history is already owne
     .getByRole("button", { name: "打开", exact: true })
     .last()
     .click();
-  await expect(other.getByRole("combobox", { name: "当前 Vault" })).toHaveValue(
-    id,
-  );
+  await expect(
+    other.getByRole("button", { name: "当前 Vault" }),
+  ).toHaveAttribute("data-vault-id", id!);
 });
 
 test("permission failure keeps the draft and permits saving after permission is restored", async ({

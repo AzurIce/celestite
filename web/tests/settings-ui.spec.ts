@@ -19,7 +19,12 @@ async function seed(
   project?: Record<string, unknown>,
 ) {
   await page.goto("/");
-  await expect(page.getByLabel("工作区状态栏")).toBeVisible();
+  // The shell appears before the first editor instance has persisted its
+  // identity. Finish opening the Vault before the seed's reload kills its worker.
+  await expect(page.getByRole("tree", { name: "文件树" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
   await page.evaluate(
     async ({ app, project }) => {
       const root = await navigator.storage.getDirectory();
@@ -69,6 +74,19 @@ async function readApp(page: Page) {
 }
 
 async function open(page: Page) {
+  // Wait for the active Vault rather than the short-lived initialization shell.
+  // The tree can be hidden when the mobile navigation drawer is closed.
+  await expect(
+    page.getByRole("tree", { name: "文件树", includeHidden: true }),
+  ).toHaveAttribute("aria-busy", "false");
+  if (
+    !(await page
+      .getByRole("button", { name: "全局设置", exact: true })
+      .isVisible())
+  )
+    await page
+      .getByRole("button", { name: "切换文件导航", exact: true })
+      .click();
   await page.getByRole("button", { name: "全局设置", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "全局设置", exact: true });
   await expect(dialog).toBeVisible();
@@ -79,17 +97,33 @@ test("global controls update the workspace, preserve unknown preferences and sur
   page,
 }) => {
   await seed(page, { "future.preference": { keep: true } });
+  await expect(page.locator(".workspace")).toHaveCSS(
+    "background-color",
+    "rgb(252, 252, 250)",
+  );
+  await expect(page.locator(".workspace-sidebar")).toHaveCSS(
+    "background-color",
+    "rgb(240, 240, 237)",
+  );
   const dialog = await open(page);
   await expect(
     dialog.getByRole("combobox", { name: "主题", exact: true }),
   ).toHaveValue("system");
   await expect(
     dialog.getByRole("spinbutton", { name: "侧栏宽度", exact: true }),
-  ).toHaveValue("300");
+  ).toHaveValue("248");
   await dialog
     .getByRole("combobox", { name: "主题", exact: true })
     .selectOption("dark");
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.locator(".workspace")).toHaveCSS(
+    "background-color",
+    "rgb(33, 34, 32)",
+  );
+  await expect(page.locator(".workspace-sidebar")).toHaveCSS(
+    "background-color",
+    "rgb(28, 29, 27)",
+  );
   await dialog.getByRole("checkbox", { name: "自动换行", exact: true }).check();
   const width = dialog.getByRole("spinbutton", {
     name: "侧栏宽度",
@@ -147,7 +181,7 @@ test("invalid widths do not save, and each control can restore its default", asy
   await dialog
     .getByRole("button", { name: "恢复默认侧栏宽度", exact: true })
     .click();
-  await expect(width).toHaveValue("300");
+  await expect(width).toHaveValue("248");
   await expect(dialog.getByRole("alert")).toHaveCount(0);
   await width.fill("460");
   await width.press("Enter");
@@ -155,7 +189,7 @@ test("invalid widths do not save, and each control can restore its default", asy
   await dialog
     .getByRole("button", { name: "恢复默认侧栏宽度", exact: true })
     .click();
-  await expect(page.locator(".workspace-sidebar")).toHaveCSS("width", "300px");
+  await expect(page.locator(".workspace-sidebar")).toHaveCSS("width", "248px");
   await dialog
     .getByRole("combobox", { name: "主题", exact: true })
     .selectOption("dark");
@@ -175,7 +209,7 @@ test("invalid widths do not save, and each control can restore its default", asy
     "已保存",
   );
   expect(await readApp(page)).toEqual({
-    "sidebar.width": 300,
+    "sidebar.width": 248,
     "theme.mode": "system",
     "editor.wordWrap": false,
   });
@@ -344,6 +378,10 @@ test("mobile settings fit the viewport and Escape restores focus", async ({
 }) => {
   await seed(page);
   await page.setViewportSize({ width: 360, height: 640 });
+  await expect(page.locator(".workspace")).toHaveAttribute(
+    "data-sidebar-open",
+    "false",
+  );
   const dialog = await open(page);
   const box = (await dialog.boundingBox())!;
   expect(box.x).toBeGreaterThanOrEqual(16);
@@ -355,6 +393,32 @@ test("mobile settings fit the viewport and Escape restores focus", async ({
       (element) => element.scrollWidth <= element.clientWidth,
     ),
   ).toBe(true);
+  const wrap = dialog.getByRole("checkbox", { name: "自动换行", exact: true });
+  const toggle = dialog
+    .locator("label.settings-toggle")
+    .filter({ hasText: "自动换行" });
+  await toggle.scrollIntoViewIfNeeded();
+  const toggleBox = (await toggle.boundingBox())!;
+  const titleBox = (await toggle
+    .locator(".settings-toggle-title")
+    .boundingBox())!;
+  const checkboxBox = (await wrap.boundingBox())!;
+  expect(toggleBox.height).toBeGreaterThanOrEqual(44);
+  expect(checkboxBox.y + checkboxBox.height / 2).toBeGreaterThanOrEqual(
+    titleBox.y,
+  );
+  expect(checkboxBox.y + checkboxBox.height / 2).toBeLessThanOrEqual(
+    titleBox.y + titleBox.height,
+  );
+  await toggle.locator(".settings-help").click();
+  await expect(wrap).toBeChecked();
+  await wrap.focus();
+  await page.keyboard.press("Space");
+  await expect(wrap).not.toBeChecked();
+  await expect(dialog.getByRole("status", { name: "设置保存状态" })).toHaveText(
+    "已保存",
+  );
+  expect((await readApp(page))["editor.wordWrap"]).toBe(false);
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(
