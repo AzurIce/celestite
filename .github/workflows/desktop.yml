@@ -18,6 +18,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: "2"
+
 jobs:
   desktop:
     strategy:
@@ -40,6 +43,7 @@ jobs:
         with:
           bun-version: 1.4.2
       - uses: dtolnay/rust-toolchain@master
+        id: rust
         with:
           toolchain: nightly-2026-10-01
           targets: wasm32-unknown-unknown
@@ -58,9 +62,9 @@ jobs:
             ~/.cargo/git
             target
             web/.cache
-          key: ${{ runner.os }}-desktop-${{ hashFiles('Cargo.lock', 'web/scripts/build-core.ts') }}-${{ github.sha }}
+          key: ${{ runner.os }}-desktop-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'web/scripts/build-core.ts') }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-desktop-${{ hashFiles('Cargo.lock', 'web/scripts/build-core.ts') }}-
+            ${{ runner.os }}-desktop-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'web/scripts/build-core.ts') }}-
       - name: Clear restored Linux acceptance artifacts
         if: runner.os == 'Linux'
         run: rm -rf target/desktop-acceptance
@@ -79,7 +83,7 @@ jobs:
           cargo check --locked -p celestite-core --no-default-features
           cargo check --locked -p celestite-core --all-features --target wasm32-unknown-unknown
       - name: Native tests
-        run: cargo test --locked --workspace --features celestite-core/preview
+        run: cargo test --locked -j2 --workspace --features celestite-core/preview -- --test-threads=2
       - name: Build real remote server for Linux acceptance
         if: runner.os == 'Linux'
         run: cargo build --locked -p celestite-server

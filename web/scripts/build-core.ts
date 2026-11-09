@@ -32,6 +32,7 @@ if (!matches(bindgen)) {
     console.info(`Installing project-local wasm-bindgen ${version}…`);
     run("cargo", [
       "install",
+      "-j2",
       "wasm-bindgen-cli",
       "--version",
       version,
@@ -45,6 +46,7 @@ const out = resolve(web, "src/lib/editor/generated");
 mkdirSync(out, { recursive: true });
 run("cargo", [
   "build",
+  "-j2",
   "--locked",
   "-p",
   "celestite-core",

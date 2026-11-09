@@ -169,6 +169,33 @@ impl Resources for SnapshotResources<'_> {
         }
     }
     fn read(&self, path: &Path) -> Result<Vec<u8>, ResourceError> {
+        let bytes = self.read_snapshot(path)?;
+        let resolved = self.resolve(path);
+        if resolved
+            .file_name()
+            .is_some_and(|name| name == "Notist.toml")
+        {
+            if let Ok(source) = std::str::from_utf8(&bytes) {
+                let prepared = ManifestSource::new(source.to_owned(), !self.allow_commands);
+                let analysis = prepared.analysis.as_bytes().to_vec();
+                self.manifests.borrow_mut().insert(resolved, prepared);
+                return Ok(analysis);
+            }
+        }
+        Ok(bytes)
+    }
+    fn source(&self, path: &Path) -> Result<String, ResourceError> {
+        String::from_utf8(self.read(path)?)
+            .map_err(|_| ResourceError::InvalidUtf8(PathBuf::from(self.namespace.key(path))))
+    }
+
+    fn entries(&self, _path: &Path) -> Result<Vec<PathBuf>, ResourceError> {
+        Ok(vec![])
+    }
+}
+
+impl SnapshotResources<'_> {
+    fn read_snapshot(&self, path: &Path) -> Result<Vec<u8>, ResourceError> {
         let key = self.key(path)?;
         if let Some(source) = self.overlay(&key) {
             return Ok(source.as_bytes().to_vec());
@@ -192,30 +219,6 @@ impl Resources for SnapshotResources<'_> {
             path: PathBuf::from(&key),
             message: "resource snapshot is not prepared".into(),
         })
-    }
-    fn source(&self, path: &Path) -> Result<String, ResourceError> {
-        let source = String::from_utf8(self.read(path)?)
-            .map_err(|_| ResourceError::InvalidUtf8(PathBuf::from(self.namespace.key(path))))?;
-        let source = source
-            .trim_start_matches('\u{feff}')
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
-        let resolved = self.resolve(path);
-        if resolved
-            .file_name()
-            .is_some_and(|name| name == "Notist.toml")
-        {
-            let prepared = ManifestSource::new(source, !self.allow_commands);
-            let analysis = prepared.analysis.clone();
-            self.manifests.borrow_mut().insert(resolved, prepared);
-            Ok(analysis)
-        } else {
-            Ok(source)
-        }
-    }
-
-    fn entries(&self, _path: &Path) -> Result<Vec<PathBuf>, ResourceError> {
-        Ok(vec![])
     }
 }
 

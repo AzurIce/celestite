@@ -39,7 +39,7 @@ impl Resources for Discovery<'_> {
                 .insert(path.parent().unwrap().to_owned());
         }
         if let Some(source) = self.overlays.get(&path) {
-            return Ok(source.as_bytes().to_vec());
+            return Ok(discovery_bytes(&path, source.as_bytes().to_vec()));
         }
         let access = |error: std::io::Error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -62,7 +62,7 @@ impl Resources for Discovery<'_> {
                 message: "package input exceeds 16 MiB".into(),
             });
         }
-        Ok(data)
+        Ok(discovery_bytes(&path, data))
     }
     fn kind(&self, path: &FsPath) -> Result<Option<ResourceKind>, ResourceError> {
         let path = self.resolve(path);
@@ -94,6 +94,17 @@ impl Resources for Discovery<'_> {
             Ok(source)
         }
     }
+}
+
+fn discovery_bytes(path: &FsPath, bytes: Vec<u8>) -> Vec<u8> {
+    if path.file_name().is_some_and(|name| name == "Notist.toml") {
+        if let Ok(source) = std::str::from_utf8(&bytes) {
+            return ManifestSource::new(source.to_owned(), true)
+                .analysis
+                .into_bytes();
+        }
+    }
+    bytes
 }
 pub struct PackageResources {
     pub root: PathBuf,

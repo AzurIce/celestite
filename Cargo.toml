@@ -15,8 +15,8 @@ wildcard_imports = "deny"
 celestite-buffer = { path = "crates/celestite-buffer" }
 celestite-core = { path = "crates/celestite-core" }
 celestite-git = { path = "crates/celestite-git" }
-notist = { git = "https://github.com/AzurIce/notist.git", rev = "fb5a5e50d6a25849f1dea4599c92763fda6a5b8b" }
-notist-html = { git = "https://github.com/AzurIce/notist.git", rev = "fb5a5e50d6a25849f1dea4599c92763fda6a5b8b" }
+notist = { git = "https://github.com/AzurIce/notist.git", rev = "3d17013b60a01a7e53e68bd076540494f4c5549a" }
+notist-html = { git = "https://github.com/AzurIce/notist.git", rev = "3d17013b60a01a7e53e68bd076540494f4c5549a" }
 serde = "1"
 serde_json = "1"
 thiserror = "2"

@@ -84,6 +84,22 @@ fn diagnostics_for<'a>(messages: &'a [Value], uri: &str) -> Option<&'a Vec<Value
 }
 
 #[test]
+fn goto_definition_resolves_path_links_in_the_document_namespace() {
+    let mut service = LanguageService::new("/workspace/notes");
+    initialize(&mut service);
+    let uri = "file:///vault/chapter/a.not";
+    open(&mut service, uri, "#link(p\"../guide.not\")[指南]\n");
+    let messages = run(
+        &mut service,
+        json!({
+            "jsonrpc": "2.0", "id": 9, "method": "textDocument/definition",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 0, "character": 23 } }
+        }),
+    );
+    assert_eq!(messages[0]["result"]["uri"], "file:///vault/guide.not");
+}
+
+#[test]
 fn initialize_advertises_capabilities() {
     let mut service = LanguageService::new("/vault");
     let messages = run(

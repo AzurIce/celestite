@@ -409,15 +409,7 @@ impl LanguageService {
             }
             // Source texts for cross-file range mapping, keyed by the module
             // identities diagnostics carry.
-            let mut sources: notist::Sources = self
-                .documents
-                .iter()
-                .filter_map(|(uri, source)| {
-                    let key = self.key_for(uri)?;
-                    let path = self.namespace.resolve(Path::new(&key));
-                    Some((path.to_string_lossy().into_owned(), source.as_str().into()))
-                })
-                .collect();
+            let mut sources = notist::Sources::new();
             let mut pending: Vec<(String, notist::Diagnostic)> = Vec::new();
             for (uri, source) in &self.documents {
                 let Some(key) = self.key_for(uri) else {
@@ -427,7 +419,10 @@ impl LanguageService {
                 if key.ends_with(".notc") {
                     match vault.analyze_code(&path, source) {
                         Ok(analysis) => {
-                            sources.extend(analysis.sources.clone());
+                            if let Err(error) = sources.merge(&analysis.sources) {
+                                self.route_vault_error(&mut published, uri, source, error.into());
+                                continue;
+                            }
                             pending.extend(
                                 analysis
                                     .diagnostics
@@ -451,7 +446,10 @@ impl LanguageService {
                 }
                 match vault.analyze(&path, source) {
                     Ok(analysis) => {
-                        sources.extend(analysis.sources().clone());
+                        if let Err(error) = sources.merge(analysis.sources()) {
+                            self.route_vault_error(&mut published, uri, source, error.into());
+                            continue;
+                        }
                         pending.extend(
                             analysis
                                 .into_parts()
@@ -549,6 +547,22 @@ impl LanguageService {
                     ..Default::default()
                 });
             }
+            notist::VaultError::Source(error) => {
+                published.entry(uri.into()).or_default().push(Diagnostic {
+                    range: Range::default(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("notist:source".into()),
+                    message: error.to_string(),
+                    ..Default::default()
+                });
+            }
+            notist::VaultError::NeedResources(paths) => {
+                for path in paths {
+                    self.requests
+                        .borrow_mut()
+                        .insert(self.namespace.key(Path::new(&path.logical_path())), true);
+                }
+            }
         }
     }
 
@@ -609,7 +623,8 @@ impl LanguageService {
         self.with_resources(|resources| {
             let mut vault = notist::Vault::new(resources);
             let path = self.namespace.resolve(Path::new(&key));
-            let item = vault.analyze(&path, &source).ok()?.into_parts().0;
+            let analysis = vault.analyze(&path, &source).ok()?;
+            let item = analysis.root();
             if let Some(name) = call_path_at(&key, &source, offset)
                 && let Ok(project) = vault.environment_for(&path, &source)
                 && let Some(definition) = project.context().resolve(&name)
@@ -618,8 +633,7 @@ impl LanguageService {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::PlainText,
                         value: project
-                            .modules()
-                            .get(&definition.id.module)
+                            .module(&definition.id.module)
                             .and_then(|module| {
                                 module.source.get(
                                     usize::from(definition.span.start())
@@ -650,11 +664,11 @@ impl LanguageService {
                     range: None,
                 });
             }
-            let target = smallest_at(&item, offset)?;
+            let target = smallest_at(item, offset)?;
             Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
-                    value: hover_text(target),
+                    value: hover_text(target, analysis.sources().definitions()),
                 }),
                 range: Some(lines.range(&source, target.span)),
             })
@@ -670,11 +684,12 @@ impl LanguageService {
         self.with_resources(|resources| {
             let mut vault = notist::Vault::new(resources);
             let path = self.namespace.resolve(Path::new(&key));
-            let item = vault.analyze(&path, &source).ok()?.into_parts().0;
+            let analysis = vault.analyze(&path, &source).ok()?;
+            let item = analysis.root();
             if let Some(name) = call_path_at(&key, &source, offset) {
                 let project = vault.environment_for(&path, &source).ok()?;
                 let definition = project.context().resolve(&name)?;
-                let module = project.modules().get(&definition.id.module)?;
+                let module = project.module(&definition.id.module)?;
                 let engine = project
                     .context()
                     .program()
@@ -693,14 +708,21 @@ impl LanguageService {
             let target = item
                 .descendants()
                 .filter(|item| {
-                    item.ctor == Ctor::Link && item.span.contains((offset as u32).into())
+                    item.ctor() == Ctor::Link && item.span.contains((offset as u32).into())
                 })
                 .min_by_key(|item| item.span.len())?;
-            let Some(Value::Str(target_text)) = target.fields.get("target") else {
+            let fields = target.fields();
+            if let Some(Value::Path(target)) = fields.get("target") {
+                return Some(json!({
+                    "uri": self.uri_for(&self.namespace.key(Path::new(&target.logical_path()))),
+                    "range": Range::default(),
+                }));
+            }
+            let Some(Value::Str(target_text)) = fields.get("target") else {
                 return None;
             };
             if let Some(item_id) = target_text.strip_prefix('#') {
-                let index = notist::index::Index::build(&item, &mut Vec::new());
+                let index = notist::index::Index::build(item, analysis.sources(), &mut Vec::new());
                 let span = index.by_id(item_id)?;
                 return Some(json!({ "uri": uri, "range": lines.range(&source, span) }));
             }
@@ -750,7 +772,7 @@ impl LanguageService {
             let path = self.namespace.resolve(Path::new(&key));
             let item = vault.analyze(&path, &source).ok()?.into_parts().0;
             let symbols = item
-                .children
+                .children()
                 .iter()
                 .filter_map(|item| symbol(item, &lines, &source))
                 .collect::<Vec<_>>();
@@ -1006,7 +1028,7 @@ struct PositionParams {
 
 /// The smallest item whose span contains `offset`.
 fn smallest_at(item: &Item, offset: usize) -> Option<&Item> {
-    for child in &item.children {
+    for child in item.children() {
         if child.span.contains(notist::TextSize::from(offset as u32)) {
             return Some(smallest_at(child, offset).unwrap_or(child));
         }
@@ -1014,16 +1036,21 @@ fn smallest_at(item: &Item, offset: usize) -> Option<&Item> {
     None
 }
 
-fn hover_text(item: &Item) -> String {
+fn hover_text(item: &Item, definitions: &notist::Definitions) -> String {
     let mut out = format!(
         "`{}` ({:?})",
-        item.ctor
-            .function_id()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| item.ctor.name().into_owned()),
+        item.ctor()
+            .function_name(definitions)
+            .map(|name| name.map(|name| name.to_string()).unwrap_or_else(|| {
+                item.ctor()
+                    .name(definitions)
+                    .map(|name| name.into_owned())
+                    .unwrap_or_else(|error| error.to_string())
+            }))
+            .unwrap_or_else(|error| error.to_string()),
         item.level
     );
-    for (k, v) in item.fields.iter() {
+    for (k, v) in item.fields().iter() {
         out.push_str(&format!("\n- `{k}` = {v}"));
     }
     for (k, v) in item.attrs.iter() {
@@ -1034,15 +1061,15 @@ fn hover_text(item: &Item) -> String {
 
 /// A heading → a symbol; sections nest. Section names are their heading text.
 fn symbol(item: &Item, lines: &LineIndex, src: &str) -> Option<DocumentSymbol> {
-    let (name, range, selection, children) = match item.ctor {
+    let (name, range, selection, children) = match item.ctor() {
         Ctor::Section => {
-            let heading = item.children.first()?;
+            let heading = item.children().first()?;
             let name = text_of(heading);
             (
                 name,
                 lines.range(src, item.span),
                 lines.range(src, heading.span),
-                item.children[1..]
+                item.children()[1..]
                     .iter()
                     .filter_map(|c| symbol(c, lines, src))
                     .collect(),
@@ -1071,9 +1098,9 @@ fn symbol(item: &Item, lines: &LineIndex, src: &str) -> Option<DocumentSymbol> {
 
 /// The text content of a heading: its children's text fields, joined.
 fn text_of(item: &Item) -> String {
-    match item.fields.get("text") {
-        Some(Value::Str(text)) => text.to_owned(),
-        _ => item.children.iter().map(text_of).collect(),
+    match item.fields().get("text") {
+        Some(Value::Str(text)) => text.to_string(),
+        _ => item.children().iter().map(text_of).collect(),
     }
 }
 

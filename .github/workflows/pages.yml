@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: "2"
+
 jobs:
   build:
     concurrency:

@@ -693,7 +693,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "toml 0.8.2",
+ "toml 0.8.23",
  "tsify",
  "uuid",
  "wasm-bindgen",
@@ -853,6 +853,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "comemo"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c963350b2b08aa4b725d7802593245380ab53dacfedcaa971385fc33306c0d4"
+dependencies = [
+ "comemo-macros",
+ "parking_lot",
+ "rustc-hash 2.1.3",
+ "siphasher",
+ "slab",
+]
+
+[[package]]
+name = "comemo-macros"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3c400139ba1389ef9e20ad2d87cda68b437a66483aa0da616bdf2cea7413853"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1001,7 +1025,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1886,7 +1910,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bb0228f477c0900c880fd78c8759b95c7636dbd7842707f49e132378aa2acdc"
 dependencies = [
  "heck 0.4.1",
- "proc-macro-crate 2.0.2",
+ "proc-macro-crate 2.0.0",
  "proc-macro-error",
  "proc-macro2",
  "quote",
@@ -3116,8 +3140,10 @@ dependencies = [
 [[package]]
 name = "notist"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=fb5a5e50d6a25849f1dea4599c92763fda6a5b8b#fb5a5e50d6a25849f1dea4599c92763fda6a5b8b"
+source = "git+https://github.com/AzurIce/notist.git?rev=3d17013b60a01a7e53e68bd076540494f4c5549a#3d17013b60a01a7e53e68bd076540494f4c5549a"
 dependencies = [
+ "cap-std",
+ "libc",
  "notist-core",
  "notist-html",
  "notist-pipeline",
@@ -3126,23 +3152,37 @@ dependencies = [
  "rowan",
  "serde",
  "serde_json",
- "toml 0.8.2",
+ "toml 0.8.23",
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "notist-core"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=fb5a5e50d6a25849f1dea4599c92763fda6a5b8b#fb5a5e50d6a25849f1dea4599c92763fda6a5b8b"
+source = "git+https://github.com/AzurIce/notist.git?rev=3d17013b60a01a7e53e68bd076540494f4c5549a#3d17013b60a01a7e53e68bd076540494f4c5549a"
 dependencies = [
+ "percent-encoding",
  "rowan",
  "serde",
+ "serde_json",
+ "smallvec",
+ "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "notist-eval"
+version = "0.1.0"
+source = "git+https://github.com/AzurIce/notist.git?rev=3d17013b60a01a7e53e68bd076540494f4c5549a#3d17013b60a01a7e53e68bd076540494f4c5549a"
+dependencies = [
+ "notist-core",
+ "rowan",
+ "smallvec",
 ]
 
 [[package]]
 name = "notist-html"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=fb5a5e50d6a25849f1dea4599c92763fda6a5b8b#fb5a5e50d6a25849f1dea4599c92763fda6a5b8b"
+source = "git+https://github.com/AzurIce/notist.git?rev=3d17013b60a01a7e53e68bd076540494f4c5549a#3d17013b60a01a7e53e68bd076540494f4c5549a"
 dependencies = [
  "notist-core",
  "serde_json",
@@ -3151,9 +3191,11 @@ dependencies = [
 [[package]]
 name = "notist-pipeline"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=fb5a5e50d6a25849f1dea4599c92763fda6a5b8b#fb5a5e50d6a25849f1dea4599c92763fda6a5b8b"
+source = "git+https://github.com/AzurIce/notist.git?rev=3d17013b60a01a7e53e68bd076540494f4c5549a#3d17013b60a01a7e53e68bd076540494f4c5549a"
 dependencies = [
+ "comemo",
  "notist-core",
+ "notist-eval",
  "notist-syntax",
  "rowan",
  "rushdown",
@@ -3162,7 +3204,7 @@ dependencies = [
 [[package]]
 name = "notist-syntax"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/notist.git?rev=fb5a5e50d6a25849f1dea4599c92763fda6a5b8b#fb5a5e50d6a25849f1dea4599c92763fda6a5b8b"
+source = "git+https://github.com/AzurIce/notist.git?rev=3d17013b60a01a7e53e68bd076540494f4c5549a#3d17013b60a01a7e53e68bd076540494f4c5549a"
 dependencies = [
  "rowan",
 ]
@@ -3825,11 +3867,10 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-crate"
-version = "2.0.2"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b00f26d3400549137f92511a46ac1cd8ce37cb5598a96d382381458b992a5d24"
+checksum = "7e8366a6159044a37876a2b9817124296703c586a5c92e2c53751fa06d8d43e8"
 dependencies = [
- "toml_datetime 0.6.3",
  "toml_edit 0.20.2",
 ]
 
@@ -4840,7 +4881,7 @@ dependencies = [
  "cfg-expr",
  "heck 0.5.0",
  "pkg-config",
- "toml 0.8.2",
+ "toml 0.8.23",
  "version-compare",
 ]
 
@@ -5383,14 +5424,14 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.8.2"
+version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "185d8ab0dfbb35cf1399a6344d8484209c088f75f8f68230da55d48d95d43e3d"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
  "serde",
  "serde_spanned 0.6.9",
- "toml_datetime 0.6.3",
- "toml_edit 0.20.2",
+ "toml_datetime 0.6.11",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -5425,9 +5466,9 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "0.6.3"
+version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cda73e2f1397b1262d6dfdcef8aafae14d1de7748d66822d3bfeeb6d03e5e4b"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
 dependencies = [
  "serde",
 ]
@@ -5457,7 +5498,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b5bb770da30e5cbfde35a2d7b9b8a2c4b8ef89548a7a6aeab5c9a576e3e7421"
 dependencies = [
  "indexmap 2.14.2",
- "toml_datetime 0.6.3",
+ "toml_datetime 0.6.11",
  "winnow 0.5.40",
 ]
 
@@ -5468,10 +5509,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "396e4d48bbb2b7554c944bde63101b5ae446cff6ec4a24227428f15eb72ef338"
 dependencies = [
  "indexmap 2.14.2",
+ "toml_datetime 0.6.11",
+ "winnow 0.5.40",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap 2.14.2",
  "serde",
  "serde_spanned 0.6.9",
- "toml_datetime 0.6.3",
- "winnow 0.5.40",
+ "toml_datetime 0.6.11",
+ "toml_write",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -5494,6 +5547,12 @@ checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow 1.0.4",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
@@ -6442,6 +6501,9 @@ name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winnow"

@@ -887,6 +887,51 @@ fn resource_snapshots_support_sibling_and_absolute_modules_with_a_stable_documen
 
 #[cfg(feature = "preview")]
 #[test]
+fn constrained_path_links_and_join_render_with_the_document_resource_mapping() {
+    block_on(async {
+        let mut fixture = core(
+            "chapter/a.not",
+            "#import \"../links.notc\" as links;\n#links.download(p\"..\", \"guide.not\")\n",
+        );
+        fixture.subscribe_preview("doc", "client").unwrap();
+        let mut task = fixture.take_preview_task("doc").unwrap().unwrap();
+        task.overlays.insert("links.notc".into(), "fn download(directory: Path, name: String) -> InlineContent { [#link(directory.join(name), fragment: \"简介\")[指南]] }".into());
+        while !preview_resource_requests(&task).is_empty() {
+            for request in preview_resource_requests(&task) {
+                task.resources.insert(request.path, resource(None, None));
+            }
+        }
+        let completion = compute_preview(&task);
+        let PreviewOutcome::Success { output } = completion.outcome else {
+            panic!("Path link preview failed: {:?}", completion.outcome);
+        };
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(
+            output
+                .html
+                .contains("href=\"../guide.not#%E7%AE%80%E4%BB%8B\""),
+            "{}",
+            output.html
+        );
+        assert!(output.html.contains("指南"));
+        assert!(!output.source_map.is_empty());
+        let source = task.source.encode_utf16().collect::<Vec<_>>();
+        assert!(
+            output
+                .source_map
+                .iter()
+                .all(|entry| entry.to <= source.len())
+        );
+        assert!(output.source_map.iter().any(|entry| {
+            String::from_utf16(&source[entry.from..entry.to])
+                .unwrap()
+                .contains("links.download")
+        }));
+    });
+}
+
+#[cfg(feature = "preview")]
+#[test]
 fn foreign_manifests_keep_original_diagnostic_sources_and_offsets() {
     block_on(async {
         let mut core = core("a.not", "正文\n");

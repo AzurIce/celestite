@@ -482,7 +482,30 @@ fn compute_preview_with(task: &PreviewTask, native: bool) -> PreviewCompletion {
             })?;
         let analysis = computed.analysis;
         let evaluation = computed.evaluation;
-        let rendered = computed.rendered;
+        let mut rendered = computed.rendered;
+        // Expanded content owns module-local byte ranges. Editor mappings must
+        // address the current document, using its call site for module output.
+        let document_source = analysis.source().id();
+        rendered.source_map.retain_mut(|entry| {
+            let Some(origin) = &entry.origin else {
+                return true;
+            };
+            let range = if origin.source == document_source {
+                Some((origin.start, origin.end))
+            } else {
+                origin
+                    .expansion
+                    .iter()
+                    .find(|location| location.source == document_source)
+                    .map(|location| (location.start, location.end))
+            };
+            if let Some((start, end)) = range {
+                entry.range = start as usize..end as usize;
+                true
+            } else {
+                false
+            }
+        });
         let environment = vault
             .environment_for(&path, &task.source)
             .map_err(|error| {
@@ -496,7 +519,7 @@ fn compute_preview_with(task: &PreviewTask, native: bool) -> PreviewCompletion {
             .used_components
             .iter()
             .filter_map(|component| {
-                let module = environment.modules().get(&component.id.module)?;
+                let module = environment.module(&component.id.module)?;
                 let root = module.path.parent()?;
                 Some(PreviewComponent {
                     package: project::resource_key(

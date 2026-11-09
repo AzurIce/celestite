@@ -20,18 +20,36 @@ impl ManifestSource {
 }
 
 fn without_commands(source: &str) -> Option<String> {
-    let mut value = source.parse::<toml::Value>().ok()?;
-    let extensions = value.get_mut("extensions")?.as_array_mut()?;
-    let before = extensions.len();
-    extensions
-        .retain(|extension| extension.get("kind").and_then(toml::Value::as_str) != Some("command"));
-    if extensions.len() == before {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(default)]
+        extensions: Vec<toml::Spanned<toml::Value>>,
+    }
+    let config: Config = toml::from_str(source).ok()?;
+    let spans: Vec<_> = config
+        .extensions
+        .iter()
+        .filter(|extension| {
+            extension
+                .get_ref()
+                .get("kind")
+                .and_then(toml::Value::as_str)
+                == Some("command")
+        })
+        .map(toml::Spanned::span)
+        .collect();
+    if spans.is_empty() {
         return None;
     }
-    if extensions.is_empty() {
-        value.as_table_mut()?.remove("extensions");
+    let mut bytes = source.as_bytes().to_vec();
+    for span in spans {
+        for byte in &mut bytes[span] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
     }
-    toml::to_string(&value).ok()
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -62,6 +80,24 @@ mod tests {
         assert_eq!(parsed.extensions.len(), 1);
         assert!(stripped.contains("notist.math"));
         assert!(!stripped.contains("command"));
+        assert_eq!(stripped.len(), source.len());
+        assert!(stripped.starts_with(REPLACE));
         assert!(without_commands(REPLACE).is_none());
+    }
+
+    #[test]
+    fn discovery_preserves_package_site_and_later_diagnostic_byte_ranges() {
+        let source = format!(
+            "[package]\nname = 'notes'\n[site]\ncontent = '.'\ntheme = 'builtins.book'\n[[extensions]]\nkind = 'command'\ncommand = ['echo', '😀 中文']\nstages = ['after_check']\n{REPLACE}"
+        );
+        let stripped = without_commands(&source).unwrap();
+        let parsed = notist::environment::parse_config(&stripped).unwrap();
+        assert_eq!(parsed.extensions.len(), 1);
+        let import = &parsed.extensions[0].imports()[0];
+        let range = usize::from(import.span.start())..usize::from(import.span.end());
+        assert_eq!(&source[range.clone()], &stripped[range]);
+        let config: toml::Value = toml::from_str(&stripped).unwrap();
+        assert_eq!(config["package"]["name"].as_str(), Some("notes"));
+        assert_eq!(config["site"]["theme"].as_str(), Some("builtins.book"));
     }
 }
